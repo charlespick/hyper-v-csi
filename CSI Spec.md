@@ -65,15 +65,32 @@ manages is ever attached to anything, and the CSI contract (ControllerUnpublishV
 is the only ordering guarantee. **That guarantee becomes load-bearing the moment attach lands, so
 the detachment check belongs in the publish/unpublish slice, not here.**
 
-What an authoritative check would take, when it's built: query `Msvm_StorageAllocationSettingData`
-in `root\virtualization\v2`, matching `HostResource[0]` against the VHDX path with `ResourceSubType`
-`Microsoft:Hyper-V:Virtual Hard Disk`. That is *configuration* data — it exists whether or not the
-VM is running, which is exactly the property the file lock lacks. Two caveats. It is one WQL query
-rather than a walk over every VM, but it is answered by the local host's `vmms.exe` and therefore
-covers only VMs registered on *that node*; a cluster-wide answer means asking every node, as there
-is no single cluster-scoped equivalent. And `Get-VHD` is not a substitute — its `Attached` property
-and its documented "in use" error on shared storage are both about open handles, the same signal
-with the same blind spot.
+What an authoritative check would take, when it's built. The attachment itself lives in
+`Msvm_StorageAllocationSettingData` in `root\virtualization\v2`: match `HostResource[0]` against the
+VHDX path with `ResourceSubType` `Microsoft:Hyper-V:Virtual Hard Disk`. That is *configuration* data
+— it exists whether or not the VM is running, which is exactly the property the file lock lacks.
+But that provider is `vmms.exe` on one host, so it only sees VMs registered on *that node*.
+
+The cluster database closes the gap, though not by holding disk data. `CLUSDB` is replicated to
+every node, so `root\MSCluster` answers cluster-wide from whichever host the agent's role happens
+to be on, with no fan-out: `MSCluster_Resource` (plus `MSCluster_NodeToActiveResource`) gives every
+clustered VM and the node currently hosting it, authoritatively — the same source section 2 already
+leans on for ownership. What it does *not* contain is any VM's device list; a VM's disks live in its
+`.vmcx`, and `MSCluster_ResourceToDisk`/`ResourceToDiskPartition` associate *Physical Disk cluster
+resources* (LUNs, CSVs) to partitions, not VHDX files to VMs.
+
+So the shape is two steps, and which way you traverse them decides the cost:
+
+- **Forward — "what is attached to this VM?"** One `root\MSCluster` query resolves the VM to its
+  owning host, then one CIM call to that host answers. This is the direction ControllerPublishVolume
+  and ControllerUnpublishVolume need, they already know the node VM, and it is cheap.
+- **Reverse — "is this VHDX attached to anything, anywhere?"** No single query answers it; it means
+  a `Msvm_StorageAllocationSettingData` query per node. This is the direction a DeleteVolume-time
+  guard would need, and it is the expensive one — which is a further reason the check belongs on the
+  unpublish path rather than here.
+
+`Get-VHD` is not a substitute for any of it: its `Attached` property and its documented "in use"
+error on shared storage are both about open handles, the same signal with the same blind spot.
 
 **Other DeleteVolume notes.** A volume ID that could not have come from CreateVolume (one failing
 the safe filename rule) reports success rather than INVALID_ARGUMENT: no such volume can exist, CSI
