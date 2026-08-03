@@ -1,3 +1,5 @@
+using System.Security.Cryptography.X509Certificates;
+
 namespace HyperVCsiAgent.Core.Configuration;
 
 /// <summary>
@@ -32,12 +34,39 @@ public sealed class TlsOptions
 
     public bool IsConfigured => !string.IsNullOrWhiteSpace(SubjectName);
 
+    /// <summary>
+    /// Parsed store identity. Parsing here rather than at the point of use
+    /// means a typo fails the role at startup - loudly, where the cluster
+    /// reports it - instead of throwing inside every TLS handshake while the
+    /// service still reports itself Online.
+    /// </summary>
+    public (StoreName Name, StoreLocation Location) ResolveStore()
+    {
+        if (!Enum.TryParse<StoreName>(StoreName, ignoreCase: true, out var name))
+        {
+            throw new InvalidOperationException(
+                $"{AgentOptions.SectionName}:Tls:{nameof(StoreName)} '{StoreName}' is not a certificate store name; " +
+                $"expected one of {string.Join(", ", Enum.GetNames<StoreName>())}");
+        }
+
+        if (!Enum.TryParse<StoreLocation>(StoreLocation, ignoreCase: true, out var location))
+        {
+            throw new InvalidOperationException(
+                $"{AgentOptions.SectionName}:Tls:{nameof(StoreLocation)} '{StoreLocation}' is not a certificate store location; " +
+                $"expected one of {string.Join(", ", Enum.GetNames<StoreLocation>())}");
+        }
+
+        return (name, location);
+    }
+
     public void Validate()
     {
         if (!IsConfigured)
         {
             return;
         }
+
+        ResolveStore();
 
         if (ReloadInterval <= TimeSpan.Zero)
         {

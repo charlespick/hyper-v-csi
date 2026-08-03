@@ -41,18 +41,10 @@ func main() {
 	// Fail fast on mode-specific required flags: an empty node ID otherwise
 	// surfaces as a kubelet registration failure far from the actual cause,
 	// and an empty agent address as a broken client at the first job.
-	var agent *agentclient.Client
-
 	switch *mode {
 	case "controller":
 		if *agentAddress == "" {
 			log.Fatal("--agent-address is required in controller mode")
-		}
-
-		var err error
-		agent, err = buildAgentClient(*agentAddress, *agentClientCert, *agentClientKey, *allowInsecureAgent)
-		if err != nil {
-			log.Fatal(err)
 		}
 	case "node":
 		if *nodeID == "" {
@@ -60,6 +52,19 @@ func main() {
 		}
 	default:
 		log.Fatalf("invalid --mode %q: must be \"controller\" or \"node\"", *mode)
+	}
+
+	// Built in either mode when an address is given. Node mode has no RPC that
+	// calls the agent yet, but building the client here rather than leaving it
+	// nil means the first one that does gets a working client instead of a nil
+	// dereference, and it holds node mode to the same credential rules.
+	var agent *agentclient.Client
+	if *agentAddress != "" {
+		var err error
+		agent, err = buildAgentClient(*agentAddress, *agentClientCert, *agentClientKey, *allowInsecureAgent)
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	d := driver.New(*nodeID, agent)

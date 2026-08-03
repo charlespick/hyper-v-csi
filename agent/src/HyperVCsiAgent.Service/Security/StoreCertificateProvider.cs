@@ -12,21 +12,33 @@ namespace HyperVCsiAgent.Service.Security;
 /// next connection instead of requiring the clustered role to be restarted,
 /// which would be a deliberate outage on a fixed schedule.
 /// </summary>
-public sealed class StoreCertificateProvider : IDisposable
+public sealed class StoreCertificateProvider : IServerCertificateProvider
 {
     private readonly TlsOptions _options;
     private readonly ILogger<StoreCertificateProvider> _logger;
     private readonly TimeProvider _clock;
+    private readonly Func<DateTimeOffset, X509Certificate2?> _load;
     private readonly Lock _gate = new();
 
     private X509Certificate2? _current;
     private DateTimeOffset _nextReload = DateTimeOffset.MinValue;
 
-    public StoreCertificateProvider(IOptions<AgentOptions> options, ILogger<StoreCertificateProvider> logger, TimeProvider? clock = null)
+    /// <param name="loadCertificate">
+    /// Overrides reading the Windows certificate store. Only tests pass this -
+    /// the caching and fallback rules below decide whether the agent stays
+    /// reachable across a renewal, which is worth testing somewhere other than
+    /// a production Hyper-V host.
+    /// </param>
+    public StoreCertificateProvider(
+        IOptions<AgentOptions> options,
+        ILogger<StoreCertificateProvider> logger,
+        TimeProvider? clock = null,
+        Func<DateTimeOffset, X509Certificate2?>? loadCertificate = null)
     {
         _options = options.Value.Tls;
         _logger = logger;
         _clock = clock ?? TimeProvider.System;
+        _load = loadCertificate ?? LoadFromStore;
     }
 
     /// <summary>
@@ -45,24 +57,12 @@ public sealed class StoreCertificateProvider : IDisposable
                     return _current;
                 }
 
-                var selected = Load(now);
+                _nextReload = now + _options.ReloadInterval;
+                var selected = _load(now);
+
                 if (selected is null)
                 {
-                    // Keep serving the certificate we already have rather than
-                    // failing every handshake: a store that momentarily has no
-                    // match is far more likely to be a renewal glitch than a
-                    // reason to take the whole agent offline.
-                    if (_current is not null)
-                    {
-                        _logger.LogError(
-                            "no certificate matching {SubjectName} in {StoreLocation}/{StoreName}; continuing with the previous one, which expires {NotAfter}",
-                            _options.SubjectName, _options.StoreLocation, _options.StoreName, _current.NotAfter);
-                        _nextReload = now + _options.ReloadInterval;
-                        return _current;
-                    }
-
-                    throw new InvalidOperationException(
-                        $"no valid certificate for {_options.SubjectName} with a private key in {_options.StoreLocation}/{_options.StoreName}");
+                    return FallBack(now);
                 }
 
                 if (_current is not null && !_current.Thumbprint.Equals(selected.Thumbprint, StringComparison.OrdinalIgnoreCase))
@@ -70,29 +70,51 @@ public sealed class StoreCertificateProvider : IDisposable
                     _logger.LogInformation(
                         "certificate for {SubjectName} rotated to {Thumbprint}, valid until {NotAfter}",
                         _options.SubjectName, selected.Thumbprint, selected.NotAfter);
-                    _current.Dispose();
                 }
 
+                // The outgoing certificate is deliberately not disposed: a
+                // handshake that already took a reference to it is using it
+                // outside this lock, and disposing it out from under that
+                // connection breaks it with an opaque transport error. It is
+                // released when the last user drops it. This happens once a
+                // renewal, so the garbage is trivial.
                 _current = selected;
-                _nextReload = now + _options.ReloadInterval;
                 return _current;
             }
         }
     }
 
-    public void Dispose()
+    /// <summary>
+    /// Reads the store once so a bad certificate configuration fails at
+    /// startup. Without this the first symptom is a role the cluster reports
+    /// Online whose every connection fails - the store isn't touched until the
+    /// first handshake.
+    /// </summary>
+    public void Warmup() => _ = Current;
+
+    private X509Certificate2 FallBack(DateTimeOffset now)
     {
-        lock (_gate)
+        // Serving the certificate we already have rides out a momentary glitch
+        // mid-renewal. But only while it is still valid: past its expiry every
+        // client rejects it anyway, so continuing would turn a loud failure
+        // into an agent that looks healthy and serves nothing.
+        if (_current is not null && now <= _current.NotAfter)
         {
-            _current?.Dispose();
-            _current = null;
+            _logger.LogError(
+                "no certificate matching {SubjectName} in {StoreLocation}/{StoreName}; continuing with the current one, which expires {NotAfter}",
+                _options.SubjectName, _options.StoreLocation, _options.StoreName, _current.NotAfter);
+            return _current;
         }
+
+        _current = null;
+        throw new InvalidOperationException(
+            $"no valid certificate for {_options.SubjectName} with a private key in " +
+            $"{_options.StoreLocation}/{_options.StoreName}; has certbot renewed it?");
     }
 
-    private X509Certificate2? Load(DateTimeOffset now)
+    private X509Certificate2? LoadFromStore(DateTimeOffset now)
     {
-        var storeName = Enum.Parse<StoreName>(_options.StoreName, ignoreCase: true);
-        var storeLocation = Enum.Parse<StoreLocation>(_options.StoreLocation, ignoreCase: true);
+        var (storeName, storeLocation) = _options.ResolveStore();
 
         using var store = new X509Store(storeName, storeLocation);
         store.Open(OpenFlags.ReadOnly);
@@ -102,7 +124,9 @@ public sealed class StoreCertificateProvider : IDisposable
 
         // The selected certificate outlives the store handle, so hand back a
         // copy and release everything else.
-        var result = selected is null ? null : new X509Certificate2(selected);
+        var result = selected is null ? null : X509CertificateLoader.LoadPkcs12(
+            selected.Export(X509ContentType.Pkcs12), password: null, X509KeyStorageFlags.EphemeralKeySet);
+
         foreach (var candidate in candidates)
         {
             candidate.Dispose();

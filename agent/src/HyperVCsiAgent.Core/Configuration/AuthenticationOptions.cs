@@ -1,3 +1,5 @@
+using HyperVCsiAgent.Core.Security;
+
 namespace HyperVCsiAgent.Core.Configuration;
 
 /// <summary>
@@ -30,11 +32,22 @@ public sealed class AuthenticationOptions
     {
         foreach (var thumbprint in AllowedClientCertificateThumbprints)
         {
-            if (string.IsNullOrWhiteSpace(thumbprint))
+            var normalized = ClientCertificateAuthenticator.Normalize(thumbprint);
+            if (ClientCertificateAuthenticator.IsWellFormed(normalized))
             {
-                throw new InvalidOperationException(
-                    $"{AgentOptions.SectionName}:Authentication:{nameof(AllowedClientCertificateThumbprints)} contains an empty entry");
+                continue;
             }
+
+            // Caught here rather than left to fail at runtime, because the
+            // symptom is otherwise baffling: a pin that looks right in the
+            // config file matches nothing, and every caller is locked out with
+            // a TLS error. The usual cause is pasting openssl's whole line -
+            // "sha1 Fingerprint=AA:BB:..." - whose label contributes hex
+            // letters of its own.
+            throw new InvalidOperationException(
+                $"{AgentOptions.SectionName}:Authentication:{nameof(AllowedClientCertificateThumbprints)} entry " +
+                $"'{thumbprint}' is not a SHA-1 thumbprint: expected {ClientCertificateAuthenticator.ThumbprintLength} " +
+                $"hex characters, got {normalized.Length}. Paste only the fingerprint, without any label.");
         }
     }
 }

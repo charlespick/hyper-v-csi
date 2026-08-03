@@ -1,7 +1,7 @@
-using Microsoft.AspNetCore.Server.Kestrel.Https;
+using System.Security.Authentication;
 using HyperVCsiAgent.Core.Configuration;
 using HyperVCsiAgent.Core.Security;
-using Microsoft.Extensions.Options;
+using Microsoft.AspNetCore.Server.Kestrel.Https;
 
 namespace HyperVCsiAgent.Service.Security;
 
@@ -18,12 +18,14 @@ public static class HttpsConfiguration
     /// is that a rejected client sees a TLS failure rather than a 403, which is
     /// why every rejection is logged with the fingerprint that was presented.
     /// </summary>
-    public static void ConfigureHttps(this WebApplicationBuilder builder)
+    /// <param name="options">
+    /// The same instance the rest of the host resolves from DI. Kestrel has to
+    /// be configured before the container exists, so it would be easy to bind a
+    /// second copy here - and then the startup guards would be vouching for a
+    /// listener they don't actually describe.
+    /// </param>
+    public static void ConfigureHttps(this WebApplicationBuilder builder, AgentOptions options)
     {
-        var options = builder.Configuration
-            .GetSection(AgentOptions.SectionName)
-            .Get<AgentOptions>() ?? new AgentOptions();
-
         if (!options.Tls.IsConfigured)
         {
             return;
@@ -35,10 +37,12 @@ public static class HttpsConfiguration
             {
                 listen.UseHttps(https =>
                 {
-                    var certificates = listen.ApplicationServices.GetRequiredService<StoreCertificateProvider>();
+                    var certificates = listen.ApplicationServices.GetRequiredService<IServerCertificateProvider>();
                     var logger = listen.ApplicationServices.GetRequiredService<ILoggerFactory>()
                         .CreateLogger("HyperVCsiAgent.Service.Security.ClientCertificate");
                     var clock = listen.ApplicationServices.GetRequiredService<TimeProvider>();
+
+                    https.SslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13;
 
                     // Re-read per handshake (cheap - the provider caches) so a
                     // certbot renewal is picked up without a restart.
@@ -51,10 +55,18 @@ public static class HttpsConfiguration
 
                     https.ClientCertificateMode = ClientCertificateMode.RequireCertificate;
 
-                    // The client certificates are self-signed, so the built-in
-                    // chain validation would reject every one of them. The
-                    // fingerprint pin replaces it outright.
-                    https.AllowAnyClientCertificate();
+                    // Assigning this delegate is what disables the built-in
+                    // chain check - Kestrel skips its own sslPolicyErrors
+                    // handling entirely once a validation callback is set. That
+                    // is deliberate: these certificates are self-signed, so
+                    // there is no chain to validate and the built-in check
+                    // would reject every one of them. The fingerprint pin below
+                    // is the whole of the authorization, so this delegate must
+                    // never be replaced by anything more permissive -
+                    // AllowAnyClientCertificate() in particular assigns a
+                    // callback that returns true for everything, and setting it
+                    // after this line would accept any certificate at all.
+                    // ClientCertificateEnforcementTests guards exactly that.
                     https.ClientCertificateValidation = (certificate, _, _) =>
                     {
                         var allowed = ClientCertificateAuthenticator.IsAllowed(

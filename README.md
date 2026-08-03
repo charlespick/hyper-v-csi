@@ -101,9 +101,16 @@ reject every self-signed certificate — and the fingerprint pin replaces it out
 ```bash
 openssl req -x509 -newkey rsa:4096 -sha256 -days 730 -nodes \
   -keyout tls.key -out tls.crt -subj "/CN=hyperv-csi-driver"
-openssl x509 -in tls.crt -noout -fingerprint -sha1   # goes in the agent config
+
+# The fingerprint alone. openssl prints it as "sha1 Fingerprint=AA:BB:...", and
+# pasting that whole line into the config gives a pin that matches nothing.
+openssl x509 -in tls.crt -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':'
+
 kubectl create secret tls hyperv-csi-agent-client --cert=tls.crt --key=tls.key
 ```
+
+The agent rejects anything that isn't exactly 40 hex characters at startup, so a
+mispasted fingerprint fails the role rather than silently locking the driver out.
 
 ```json
 "Authentication": {
@@ -123,6 +130,13 @@ Authorization happens during the TLS handshake, not in middleware, so an unrecog
 caller never reaches the job API — including `/healthz`, which also requires the client
 certificate. The tradeoff is that a rejected client sees a TLS failure rather than a 403,
 so the agent logs every rejection with the fingerprint that was presented.
+
+The driver verifies the agent's certificate against the system root store, which means
+trusting every public CA in it. Mutual TLS still stops anyone impersonating the *driver* —
+they'd need the pinned private key — but a CA mis-issuing for the agent's DNS name could
+intercept the connection and forge job responses, e.g. reporting a volume as created when
+it wasn't. Accepted for now on the grounds that the alternative is running a private CA;
+pinning the agent's leaf public key is the cheap fix if that trade stops being acceptable.
 
 **Rotating the client certificate** without an outage: list both fingerprints, roll the
 controller onto the new Secret, then remove the old fingerprint. Expiry is still enforced —

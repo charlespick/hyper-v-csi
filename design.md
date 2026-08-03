@@ -135,7 +135,10 @@ These worked in the old design and don't need to change just because the topolog
 - The agent's HTTPS listener uses a publicly-trusted **Let's Encrypt** certificate for the
   clustered role's DNS name, renewed into the Windows certificate store by certbot. The agent
   matches it by subject rather than thumbprint, so a renewal doesn't take the role offline, and
-  the driver needs no CA configuration because the system roots already cover it.
+  the driver needs no CA configuration because the system roots already cover it. The accepted
+  cost is that this trusts every public CA: mutual TLS still prevents impersonating the driver,
+  but a mis-issued certificate for the agent's name could intercept the connection and forge job
+  responses. Pinning the agent's leaf public key is the fix if that becomes unacceptable.
 - WinRM/DCOM to a Hyper-V host is permitted **only when initiated by the agent itself**, and only
   against the host it has resolved as the current VM owner. It is never used Linux → Windows, and
   no other component initiates it.

@@ -1,6 +1,7 @@
 using HyperVCsiAgent.Core;
 using HyperVCsiAgent.Core.Configuration;
 using HyperVCsiAgent.Core.Jobs;
+using HyperVCsiAgent.Core.Security;
 using HyperVCsiAgent.Core.Storage;
 using HyperVCsiAgent.Service.Security;
 using HyperVCsiAgent.Service.Storage;
@@ -27,8 +28,15 @@ if (!string.IsNullOrWhiteSpace(configPath))
     builder.Configuration.AddJsonFile(Path.GetFullPath(configPath), optional: false, reloadOnChange: false);
 }
 
+// Bound once and shared: Kestrel has to be configured before the container
+// exists, so binding a second copy for it would let the startup guards below
+// vouch for a listener they don't describe.
+var agentOptions = builder.Configuration
+    .GetSection(AgentOptions.SectionName)
+    .Get<AgentOptions>() ?? new AgentOptions();
+
 builder.Services.ConfigureHttpJsonOptions(options => AgentJson.Apply(options.SerializerOptions));
-builder.Services.Configure<AgentOptions>(builder.Configuration.GetSection(AgentOptions.SectionName));
+builder.Services.AddSingleton(Options.Create(agentOptions));
 builder.Services.AddSingleton<IJobStore, InMemoryJobStore>();
 
 if (OperatingSystem.IsWindows())
@@ -44,15 +52,16 @@ builder.Services.AddSingleton<IVhdxService, VhdxService>();
 builder.Services.AddSingleton<JobDispatcher>();
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<StoreCertificateProvider>();
+builder.Services.AddSingleton<IServerCertificateProvider>(
+    services => services.GetRequiredService<StoreCertificateProvider>());
 
-builder.ConfigureHttps();
+builder.ConfigureHttps(agentOptions);
 
 var app = builder.Build();
 
 // Fail at startup rather than on the first CreateVolume: a missing
 // CsvVolumesRoot is a deployment mistake, and the cluster failing to bring the
 // role online is a far louder signal than volumes that silently never provision.
-var agentOptions = app.Services.GetRequiredService<IOptions<AgentOptions>>().Value;
 agentOptions.Validate();
 
 // Running without TLS or without client authentication is a development
@@ -79,6 +88,15 @@ else if (!agentOptions.Tls.IsConfigured || !agentOptions.Authentication.IsConfig
     app.Logger.LogWarning(
         "running without {Missing}. This is Development only - any caller that can reach this agent can create and delete volumes",
         !agentOptions.Tls.IsConfigured ? "TLS" : "client certificate authentication");
+}
+
+// Read the certificate store now rather than at the first handshake. Otherwise
+// a mistyped store or a missing certificate produces a role the cluster happily
+// reports Online whose every connection fails - the loudest possible symptom in
+// the quietest possible place.
+if (agentOptions.Tls.IsConfigured)
+{
+    app.Services.GetRequiredService<StoreCertificateProvider>().Warmup();
 }
 
 app.MapGet("/healthz", () => Results.Ok());
