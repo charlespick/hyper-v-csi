@@ -3,6 +3,22 @@
   "Agent": {
     "CsvVolumesRoot": "C:\\ClusterStorage\\Volume1\\hyperv-csi\\volumes",
     "MaxConcurrentDiskOperations": 4,
-    "DiskOperationTimeout": "00:10:00"
+    "DiskOperationTimeout": "00:10:00",
+
+    "//Tls": "The server certificate, issued by Let's Encrypt and renewed into the Windows store by certbot. Matched by subject rather than thumbprint so a renewal doesn't take the agent down; the store is re-read every ReloadInterval, so a new certificate is served without restarting the clustered role.",
+    "Tls": {
+      "SubjectName": "hyperv-csi-agent.makerland.xyz",
+      "StoreName": "My",
+      "StoreLocation": "LocalMachine",
+      "ReloadInterval": "01:00:00",
+      "Port": 443
+    },
+
+    "//Authentication": "Fingerprints of the self-signed client certificates allowed to call this agent. The matching key lives in a Kubernetes Secret mounted into the CSI controller. List two during a rotation - add the new one, roll the driver, then remove the old.",
+    "Authentication": {
+      "AllowedClientCertificateThumbprints": [
+        "A1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4"
+      ]
+    }
   }
 }

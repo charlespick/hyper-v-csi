@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -27,16 +28,31 @@ func main() {
 		mode         = flag.String("mode", "node", "driver mode: controller or node")
 		nodeID       = flag.String("node-id", "", "node ID (required in node mode)")
 		agentAddress = flag.String("agent-address", "", "hyperv-csi-agent base URL (required in controller mode)")
+
+		agentClientCert = flag.String("agent-client-cert", "",
+			"PEM client certificate presented to the agent, whose fingerprint the agent pins (required in controller mode)")
+		agentClientKey = flag.String("agent-client-key", "",
+			"PEM private key for --agent-client-cert")
+		allowInsecureAgent = flag.Bool("allow-insecure-agent", false,
+			"talk to the agent without TLS or a client certificate. Development only: the credentials are what stop anyone who can reach the agent from creating and deleting volumes")
 	)
 	flag.Parse()
 
 	// Fail fast on mode-specific required flags: an empty node ID otherwise
 	// surfaces as a kubelet registration failure far from the actual cause,
 	// and an empty agent address as a broken client at the first job.
+	var agent *agentclient.Client
+
 	switch *mode {
 	case "controller":
 		if *agentAddress == "" {
 			log.Fatal("--agent-address is required in controller mode")
+		}
+
+		var err error
+		agent, err = buildAgentClient(*agentAddress, *agentClientCert, *agentClientKey, *allowInsecureAgent)
+		if err != nil {
+			log.Fatal(err)
 		}
 	case "node":
 		if *nodeID == "" {
@@ -46,7 +62,7 @@ func main() {
 		log.Fatalf("invalid --mode %q: must be \"controller\" or \"node\"", *mode)
 	}
 
-	d := driver.New(*nodeID, agentclient.New(*agentAddress))
+	d := driver.New(*nodeID, agent)
 
 	listener, err := listen(*endpoint)
 	if err != nil {
@@ -77,6 +93,35 @@ func main() {
 	if err := server.Serve(listener); err != nil {
 		log.Fatalf("gRPC server exited: %v", err)
 	}
+}
+
+// buildAgentClient refuses to fall back to an unauthenticated connection
+// silently. Losing mutual TLS isn't a degraded mode — it removes the only thing
+// standing between the agent's job API and anything that can route to it — so
+// dropping it has to be something an operator asked for in writing.
+func buildAgentClient(address, certificateFile, keyFile string, allowInsecure bool) (*agentclient.Client, error) {
+	hasCertificate := certificateFile != "" || keyFile != ""
+
+	if hasCertificate && (certificateFile == "" || keyFile == "") {
+		return nil, fmt.Errorf("--agent-client-cert and --agent-client-key must be given together")
+	}
+
+	if !hasCertificate {
+		if !allowInsecure {
+			return nil, fmt.Errorf(
+				"--agent-client-cert and --agent-client-key are required in controller mode; pass --allow-insecure-agent only for local development")
+		}
+
+		log.Printf("WARNING: talking to %s without TLS or a client certificate", address)
+		return agentclient.New(address), nil
+	}
+
+	if !strings.HasPrefix(address, "https://") {
+		return nil, fmt.Errorf(
+			"--agent-address %q must be https:// when a client certificate is configured; over plaintext the certificate proves nothing", address)
+	}
+
+	return agentclient.NewMutualTLS(address, certificateFile, keyFile)
 }
 
 func listen(endpoint string) (net.Listener, error) {

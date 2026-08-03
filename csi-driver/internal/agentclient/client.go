@@ -7,6 +7,7 @@ package agentclient
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -89,8 +90,37 @@ type Client struct {
 	HTTPClient *http.Client
 }
 
+// New builds a client with no client certificate. Plaintext and unauthenticated
+// — only for tests and local development against a Development-mode agent,
+// which is the only configuration that will serve without mutual TLS.
 func New(baseURL string) *Client {
 	return &Client{BaseURL: baseURL, HTTPClient: &http.Client{Timeout: defaultTimeout}}
+}
+
+// NewMutualTLS builds the client the controller actually deploys with. The
+// certificate and key come from a mounted Kubernetes Secret; the agent pins
+// this certificate's fingerprint, so possession of the key is the whole of the
+// authentication.
+//
+// The agent's own certificate is a normal publicly-trusted one (Let's Encrypt),
+// so the system roots verify it and there is nothing to configure for the
+// server side — and, importantly, no verification to disable.
+func NewMutualTLS(baseURL, certificateFile, keyFile string) (*Client, error) {
+	certificate, err := tls.LoadX509KeyPair(certificateFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("loading client certificate from %s and %s: %w", certificateFile, keyFile, err)
+	}
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{
+		Certificates: []tls.Certificate{certificate},
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	return &Client{
+		BaseURL:    baseURL,
+		HTTPClient: &http.Client{Timeout: defaultTimeout, Transport: transport},
+	}, nil
 }
 
 // EnqueueJob calls POST /v1/jobs. idempotencyKey is the raw identifier from

@@ -125,9 +125,17 @@ These worked in the old design and don't need to change just because the topolog
   independently of Kubernetes — this driver requires domain authentication to operate, which is a
   deliberate reversal of the old design's blackout-survival requirement.
 - Kubernetes components (controller and node plugins) authenticate to the single agent endpoint
-  using that same domain service account.
-- The agent's HTTPS listener uses a TLS certificate per Hyper-V host it may run on; the driver can
-  be configured to pin by thumbprint or trust a custom CA, depending on deployment.
+  with **mutual TLS**, using a self-signed client certificate held in a Kubernetes Secret whose
+  fingerprint is pinned in the agent's config. Deliberately *not* the domain service account: a
+  username and password sent to the agent would be replayable and would put a credential with
+  Hyper-V Administrator rights on every host into the blast radius of any agent compromise, while
+  buying nothing a pinned certificate doesn't already give. It also removes AD from the
+  Kubernetes-facing path entirely — the domain account is now only used for what actually needs
+  it, the agent's own calls to hosts and the cluster.
+- The agent's HTTPS listener uses a publicly-trusted **Let's Encrypt** certificate for the
+  clustered role's DNS name, renewed into the Windows certificate store by certbot. The agent
+  matches it by subject rather than thumbprint, so a renewal doesn't take the role offline, and
+  the driver needs no CA configuration because the system roots already cover it.
 - WinRM/DCOM to a Hyper-V host is permitted **only when initiated by the agent itself**, and only
   against the host it has resolved as the current VM owner. It is never used Linux → Windows, and
   no other component initiates it.
@@ -153,8 +161,8 @@ too loose, not something to build up front.
 
 ## 6. Open questions
 
-- **Exact k8s → agent auth handshake** — mutual TLS, Kerberos/Negotiate via the service account, or
-  a token layered on top — needs to be picked, not just named.
+- ~~**Exact k8s → agent auth handshake.**~~ Settled: mutual TLS with a pinned self-signed client
+  certificate. See section 4.
 - **WinRM session scope.** Getting a remote session at all typically requires local
   Administrators; narrowing the agent's remote footprint to just Hyper-V Administrators plus
   cluster-fencing rights likely means a constrained/JEA endpoint on each host, which is unbuilt.

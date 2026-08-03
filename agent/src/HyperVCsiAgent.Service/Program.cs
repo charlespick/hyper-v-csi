@@ -2,6 +2,7 @@ using HyperVCsiAgent.Core;
 using HyperVCsiAgent.Core.Configuration;
 using HyperVCsiAgent.Core.Jobs;
 using HyperVCsiAgent.Core.Storage;
+using HyperVCsiAgent.Service.Security;
 using HyperVCsiAgent.Service.Storage;
 using Microsoft.Extensions.Options;
 
@@ -41,13 +42,44 @@ else
 
 builder.Services.AddSingleton<IVhdxService, VhdxService>();
 builder.Services.AddSingleton<JobDispatcher>();
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddSingleton<StoreCertificateProvider>();
+
+builder.ConfigureHttps();
 
 var app = builder.Build();
 
 // Fail at startup rather than on the first CreateVolume: a missing
 // CsvVolumesRoot is a deployment mistake, and the cluster failing to bring the
 // role online is a far louder signal than volumes that silently never provision.
-app.Services.GetRequiredService<IOptions<AgentOptions>>().Value.Validate();
+var agentOptions = app.Services.GetRequiredService<IOptions<AgentOptions>>().Value;
+agentOptions.Validate();
+
+// Running without TLS or without client authentication is a development
+// convenience, never a deployment state. Anything that can reach an unsecured
+// agent can create and delete volumes on the CSV, so refuse to start rather
+// than let a misconfigured deployment come up quietly serving plaintext.
+if (!app.Environment.IsDevelopment())
+{
+    if (!agentOptions.Tls.IsConfigured)
+    {
+        throw new InvalidOperationException(
+            $"{AgentOptions.SectionName}:Tls:SubjectName is required outside Development; the agent must not serve plaintext HTTP");
+    }
+
+    if (!agentOptions.Authentication.IsConfigured)
+    {
+        throw new InvalidOperationException(
+            $"{AgentOptions.SectionName}:Authentication:AllowedClientCertificateThumbprints is required outside Development; " +
+            "an agent without client authentication lets anything that can reach it provision and delete volumes");
+    }
+}
+else if (!agentOptions.Tls.IsConfigured || !agentOptions.Authentication.IsConfigured)
+{
+    app.Logger.LogWarning(
+        "running without {Missing}. This is Development only - any caller that can reach this agent can create and delete volumes",
+        !agentOptions.Tls.IsConfigured ? "TLS" : "client certificate authentication");
+}
 
 app.MapGet("/healthz", () => Results.Ok());
 

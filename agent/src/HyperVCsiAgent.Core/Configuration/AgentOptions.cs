@@ -35,8 +35,15 @@ public sealed class AgentOptions
     /// </summary>
     public TimeSpan DiskOperationTimeout { get; set; } = TimeSpan.FromMinutes(10);
 
+    public TlsOptions Tls { get; set; } = new();
+
+    public AuthenticationOptions Authentication { get; set; } = new();
+
     public void Validate()
     {
+        Tls.Validate();
+        Authentication.Validate();
+
         if (string.IsNullOrWhiteSpace(CsvVolumesRoot))
         {
             throw new InvalidOperationException(
