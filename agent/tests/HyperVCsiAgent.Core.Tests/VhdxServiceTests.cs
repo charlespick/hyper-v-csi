@@ -363,11 +363,13 @@ public sealed class VhdxServiceTests : IDisposable
     }
 
     [WindowsOnlyFact]
-    public async Task DeleteAsync_WhenTheDiskIsStillAttached_FailsAsFailedPrecondition()
+    public async Task DeleteAsync_WhenTheFileIsOpenElsewhere_FailsAsFailedPrecondition()
     {
-        // Hyper-V holds an open handle on an attached VHDX, so Windows fails
-        // the delete with a sharing violation. CSI wants that reported as
-        // FAILED_PRECONDITION - detach it first - not retried as a CSV blip.
+        // A busy file can't be deleted, and saying so beats retrying it as a
+        // transient CSV fault. Note what this does NOT test: that the volume is
+        // attached to a VM. Hyper-V only holds a VHDX open while the VM is
+        // running, so this catches a subset of attachments and some things that
+        // aren't attachments at all.
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks);
         await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
@@ -406,8 +408,8 @@ public sealed class VhdxServiceTests : IDisposable
     }
 
     /// <summary>
-    /// Opens a file with no sharing, which is how Hyper-V holds a VHDX attached
-    /// to a running VM: any delete against it fails with a sharing violation.
+    /// Opens a file with no sharing, which is how Hyper-V holds a VHDX while a
+    /// VM is running: any delete against it fails with a sharing violation.
     /// </summary>
     private static FileStream HoldOpenExclusively(string path) =>
         new(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);

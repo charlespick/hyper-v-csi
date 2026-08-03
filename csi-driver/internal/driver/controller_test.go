@@ -461,10 +461,10 @@ func TestDeleteVolumeTranslatesAgentFailures(t *testing.T) {
 		want codes.Code
 	}{
 		{
-			// CSI's answer for a volume still in use: tell the operator what to
-			// fix rather than dressing it up as a transient fault.
-			name: "still attached to a VM",
-			job:  agentclient.Job{Status: agentclient.JobFailed, Error: "still attached", ErrorCode: agentclient.ErrorCodeFailedPrecondition},
+			// CSI's answer for a volume in use: tell the operator what to fix
+			// rather than dressing it up as a transient fault.
+			name: "the disk file is open by something else",
+			job:  agentclient.Job{Status: agentclient.JobFailed, Error: "file is open", ErrorCode: agentclient.ErrorCodeFailedPrecondition},
 			want: codes.FailedPrecondition,
 		},
 		{

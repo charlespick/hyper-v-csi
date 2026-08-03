@@ -43,11 +43,19 @@ public sealed partial class VhdxService : IVhdxService, IDisposable
     private const long SizeTolerance = 4096;
 
     /// <summary>
-    /// ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION as HRESULTs. Hyper-V
-    /// keeps an open handle on every VHDX attached to a VM, so this is exactly
-    /// what deleting a still-attached disk looks like - the one delete failure
-    /// CSI wants reported as FAILED_PRECONDITION instead of retried as a
-    /// transient CSV fault.
+    /// ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION as HRESULTs: something
+    /// holds an open handle on the file.
+    ///
+    /// This says the delete could not proceed. It does NOT say a VM has the
+    /// disk attached, and its absence emphatically does not say no VM has:
+    /// Hyper-V only opens a VHDX while the VM is actually running, so a disk
+    /// attached to a stopped VM has no handle on it at all and deletes
+    /// cleanly - which is how a VM ends up unable to start because its disk is
+    /// gone. In the other direction, the storage stack can leave a kernel-mode
+    /// lock behind after a worker process exits, so a violation can outlive any
+    /// attachment. Treat this purely as "the file was busy", never as a
+    /// detachment check. Nothing here performs one; see "DeleteVolume gaps" in
+    /// CSI Spec.md for what a real one would take.
     /// </summary>
     private const int SharingViolationHResult = unchecked((int)0x80070020);
 
@@ -261,8 +269,12 @@ public sealed partial class VhdxService : IVhdxService, IDisposable
         }
         catch (IOException ex) when (ex.HResult is SharingViolationHResult or LockViolationHResult)
         {
+            // Deliberately reports what happened rather than diagnosing it: a
+            // running VM, a backup, and a stale kernel lock are indistinguishable
+            // from here, and naming the wrong one sends the operator hunting.
             throw JobFailureException.FailedPrecondition(
-                $"volume {volumeId} is still attached to a VM, so {path} cannot be deleted; detach it first");
+                $"volume {volumeId} could not be deleted because {path} is open by something else; " +
+                "check whether a VM is running with it attached");
         }
     }
 

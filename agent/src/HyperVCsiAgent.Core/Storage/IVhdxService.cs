@@ -25,9 +25,15 @@ public interface IVhdxService
     /// which is what CSI requires of DeleteVolume and what makes a re-driven
     /// delete safe after the agent forgets the job.
     /// </summary>
+    /// <remarks>
+    /// Does not verify the volume is detached first - nothing here can. A VHDX
+    /// attached to a stopped VM is not held open, so it deletes as readily as
+    /// an unused one. Ordering is the caller's to guarantee, which for CSI means
+    /// ControllerUnpublishVolume having already run.
+    /// </remarks>
     /// <exception cref="Jobs.JobFailureException">
-    /// FailedPrecondition if the disk is still attached to a VM, which Windows
-    /// surfaces as a sharing violation on the delete.
+    /// FailedPrecondition if the file is open by something else. That means the
+    /// delete could not proceed, not that the volume is attached anywhere.
     /// </exception>
     Task DeleteAsync(string volumeId, CancellationToken cancellationToken);
 

@@ -48,13 +48,36 @@ running this in a cluster. What each one currently overstates:
 access *type* (mount vs block) is not validated, and `volume_context` is left empty.
 `VolumeContentSource` returns Unimplemented by design; restore-from-snapshot is a separate slice.
 
-**DeleteVolume gaps.** "Volume in use" is inferred from the sharing violation Windows raises when
-Hyper-V holds the VHDX open, not from asking the cluster what is attached where. That is a real
-safety net — the delete fails rather than pulling a disk out from under a running VM — but it is
-inference, and the mapping onto FAILED_PRECONDITION only runs on Windows, so it is unverified by
-the test suite on a developer machine. Once ControllerUnpublishVolume exists, the authoritative
-check belongs there. A volume ID that could not have come from CreateVolume (one failing the safe
-filename rule) reports success rather than INVALID_ARGUMENT: no such volume can exist, CSI requires
-OK for a volume that isn't there, and failing would strand the PV in Terminating on a retry nothing
-could satisfy. Deleting a volume that still has snapshots is not considered, because snapshots are
-not built yet.
+**DeleteVolume does not check that the volume is detached.** It deletes the file. The delete fails
+if something holds the VHDX open, which is reported as FAILED_PRECONDITION, but *that is not a
+detachment check and must not be mistaken for one*:
+
+- **A lock proves nothing about attachment.** Hyper-V opens a VHDX through its storage stack while
+  a VM is running. A disk attached to a *stopped* VM is not held open at all, so it deletes exactly
+  as cleanly as an unused one — this is precisely how a VM ends up unable to start with its disk
+  missing, and it is the failure mode that matters, because it is silent and irreversible.
+- **And a lock doesn't prove attachment either.** `storvsp.sys`/`vhdmp.sys` hold kernel-mode locks
+  invisible to handle enumeration, and a crashed checkpoint or backup can orphan one after the
+  worker process exits. So a sharing violation can outlive any attachment.
+
+Right now nothing else guards this: ControllerPublishVolume doesn't exist, so no VHDX this driver
+manages is ever attached to anything, and the CSI contract (ControllerUnpublishVolume runs first)
+is the only ordering guarantee. **That guarantee becomes load-bearing the moment attach lands, so
+the detachment check belongs in the publish/unpublish slice, not here.**
+
+What an authoritative check would take, when it's built: query `Msvm_StorageAllocationSettingData`
+in `root\virtualization\v2`, matching `HostResource[0]` against the VHDX path with `ResourceSubType`
+`Microsoft:Hyper-V:Virtual Hard Disk`. That is *configuration* data — it exists whether or not the
+VM is running, which is exactly the property the file lock lacks. Two caveats. It is one WQL query
+rather than a walk over every VM, but it is answered by the local host's `vmms.exe` and therefore
+covers only VMs registered on *that node*; a cluster-wide answer means asking every node, as there
+is no single cluster-scoped equivalent. And `Get-VHD` is not a substitute — its `Attached` property
+and its documented "in use" error on shared storage are both about open handles, the same signal
+with the same blind spot.
+
+**Other DeleteVolume notes.** A volume ID that could not have come from CreateVolume (one failing
+the safe filename rule) reports success rather than INVALID_ARGUMENT: no such volume can exist, CSI
+requires OK for a volume that isn't there, and failing would strand the PV in Terminating on a retry
+nothing could satisfy. Deleting a volume that still has snapshots is not considered, because
+snapshots are not built yet. The FAILED_PRECONDITION mapping needs mandatory file locking to
+exercise, so its test is skipped off Windows.

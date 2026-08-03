@@ -22,10 +22,10 @@ public static class AgentErrorCodes
 
     /// <summary>
     /// The resource exists but is in a state that forbids the operation - a
-    /// volume still attached to a VM being the case that matters here. CSI
-    /// requires FAILED_PRECONDITION for DeleteVolume against a volume in use,
-    /// which tells the operator what to fix rather than reading as a transient
-    /// fault worth retrying blindly.
+    /// disk file held open by something else being the case that matters here.
+    /// CSI requires FAILED_PRECONDITION for DeleteVolume against a volume in
+    /// use, which tells the operator what to fix rather than reading as a
+    /// transient fault worth retrying blindly.
     /// </summary>
     public const string FailedPrecondition = "FailedPrecondition";
 
