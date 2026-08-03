@@ -15,6 +15,10 @@ public sealed class VhdxServiceTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), "hyperv-csi-tests", Guid.NewGuid().ToString("n"));
 
+    private string VolumePath(string volumeName) => Path.Combine(_root, volumeName + ".vhdx");
+
+    private string InProgressPath(string volumeName) => Path.Combine(_root, volumeName + ".creating.vhdx");
+
     public void Dispose()
     {
         if (Directory.Exists(_root))
@@ -33,7 +37,8 @@ public sealed class VhdxServiceTests : IDisposable
 
         Assert.Equal("pvc-1", result.VolumeId);
         Assert.Equal(10L * 1024 * 1024 * 1024, result.ActualSizeBytes);
-        Assert.True(File.Exists(Path.Combine(_root, "pvc-1.vhdx")));
+        Assert.False(result.AlreadyPresent);
+        Assert.True(File.Exists(VolumePath("pvc-1")));
     }
 
     [Fact]
@@ -46,16 +51,19 @@ public sealed class VhdxServiceTests : IDisposable
 
         // The CIM call must have been handed the in-progress path, never the
         // final one - that's what keeps a crash mid-create from leaving
-        // something that looks like a finished volume.
-        Assert.Equal(Path.Combine(_root, "pvc-1.vhdx.creating"), Assert.Single(disks.Created));
-        Assert.False(File.Exists(Path.Combine(_root, "pvc-1.vhdx.creating")));
+        // something that looks like a finished volume. The name still ends in
+        // .vhdx because Hyper-V infers the disk format from the extension.
+        var created = Assert.Single(disks.Created);
+        Assert.Equal(InProgressPath("pvc-1"), created);
+        Assert.EndsWith(".vhdx", created, StringComparison.Ordinal);
+        Assert.False(File.Exists(InProgressPath("pvc-1")));
     }
 
     [Fact]
     public async Task CreateAsync_ReportsTheSizeTheDiskActuallyGot()
     {
-        // CIM rounds to its own allocation granularity; ActualSizeBytes has to
-        // be what exists, not what was asked for.
+        // Hyper-V rounds to its own allocation granularity; ActualSizeBytes has
+        // to be what exists, not what was asked for.
         var disks = new FakeVirtualDiskManager { RoundUpTo = 4096 };
         using var service = NewService(disks);
 
@@ -65,7 +73,22 @@ public sealed class VhdxServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task CreateAsync_WhenTheVolumeAlreadyExists_ReturnsItWithoutCallingCim()
+    public async Task CreateAsync_WhenTheSizeCannotBeReadBack_KeepsTheDiskAndReportsTheRequestedSize()
+    {
+        // A disk that exists but won't report its size is still a good disk.
+        // Failing here would delete it and leave the controller retrying a
+        // create that can never report success.
+        var disks = new FakeVirtualDiskManager { FailSizeReads = true };
+        using var service = NewService(disks);
+
+        var result = await service.CreateAsync("pvc-1", 4096, CancellationToken.None);
+
+        Assert.Equal(4096, result.ActualSizeBytes);
+        Assert.True(File.Exists(VolumePath("pvc-1")));
+    }
+
+    [Fact]
+    public async Task CreateAsync_WhenTheVolumeAlreadyExists_ReturnsItWithoutCreatingAnything()
     {
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks);
@@ -76,11 +99,12 @@ public sealed class VhdxServiceTests : IDisposable
         var replay = await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
 
         Assert.Equal(1024, replay.ActualSizeBytes);
+        Assert.True(replay.AlreadyPresent);
         Assert.Empty(disks.Created);
     }
 
     [Fact]
-    public async Task CreateAsync_WhenTheExistingVolumeIsBigEnough_IsStillCompatible()
+    public async Task CreateAsync_WhenTheExistingDiskWasRoundedUp_IsStillCompatible()
     {
         // A disk rounded up past the request still satisfies it, so a retry
         // after a rounded create must not look like a conflict.
@@ -91,18 +115,21 @@ public sealed class VhdxServiceTests : IDisposable
         var replay = await service.CreateAsync("pvc-1", 5000, CancellationToken.None);
 
         Assert.Equal(8192, replay.ActualSizeBytes);
+        Assert.True(replay.AlreadyPresent);
     }
 
-    [Fact]
-    public async Task CreateAsync_WhenTheExistingVolumeIsTooSmall_FailsAsAlreadyExists()
+    [Theory]
+    [InlineData(1024, 4096)] // existing disk is smaller than the request
+    [InlineData(1L << 40, 1024)] // far larger: a real collision, not our rounding
+    public async Task CreateAsync_WhenTheExistingDiskDoesNotFitTheRequest_FailsAsAlreadyExists(long existingSize, long requestedSize)
     {
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks);
 
-        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-1", existingSize, CancellationToken.None);
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
-            () => service.CreateAsync("pvc-1", 4096, CancellationToken.None));
+            () => service.CreateAsync("pvc-1", requestedSize, CancellationToken.None));
 
         Assert.Equal(AgentErrorCodes.AlreadyExists, failure.ErrorCode);
     }
@@ -118,12 +145,12 @@ public sealed class VhdxServiceTests : IDisposable
 
         // Nothing at the final path means the retry takes the create path
         // again rather than mistaking a partial file for a finished volume.
-        Assert.False(File.Exists(Path.Combine(_root, "pvc-1.vhdx")));
+        Assert.False(File.Exists(VolumePath("pvc-1")));
 
         var result = await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
 
         Assert.Equal(1024, result.ActualSizeBytes);
-        Assert.True(File.Exists(Path.Combine(_root, "pvc-1.vhdx")));
+        Assert.True(File.Exists(VolumePath("pvc-1")));
     }
 
     [Fact]
@@ -133,12 +160,30 @@ public sealed class VhdxServiceTests : IDisposable
         using var service = NewService(disks);
 
         Directory.CreateDirectory(_root);
-        await File.WriteAllTextAsync(Path.Combine(_root, "pvc-1.vhdx.creating"), "half-written disk");
+        await File.WriteAllTextAsync(InProgressPath("pvc-1"), "half-written disk");
 
         var result = await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
 
         Assert.Equal(1024, result.ActualSizeBytes);
-        Assert.Equal("fake vhdx", await File.ReadAllTextAsync(Path.Combine(_root, "pvc-1.vhdx")));
+        Assert.Equal("fake vhdx", await File.ReadAllTextAsync(VolumePath("pvc-1")));
+    }
+
+    [Fact]
+    public async Task CreateAsync_WhenTheDiskOperationHangs_TimesOutAndCleansUp()
+    {
+        // A CIM job that never settles would otherwise pin this volume's job
+        // queue - and everything queued behind it - forever.
+        var disks = new FakeVirtualDiskManager();
+        disks.BeforeCreate = cancellationToken => Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        using var service = NewService(disks, diskOperationTimeout: TimeSpan.FromMilliseconds(100));
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => service.CreateAsync("pvc-1", 1024, CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
+        Assert.Contains("timed out", failure.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(InProgressPath("pvc-1")));
+        Assert.False(File.Exists(VolumePath("pvc-1")));
     }
 
     [Theory]
@@ -173,7 +218,7 @@ public sealed class VhdxServiceTests : IDisposable
     {
         var disks = new FakeVirtualDiskManager();
         using var release = new SemaphoreSlim(0);
-        disks.BeforeCreate = () => release.WaitAsync();
+        disks.BeforeCreate = _ => release.WaitAsync();
         using var service = NewService(disks, maxConcurrentDiskOperations: 2);
 
         var creates = Enumerable.Range(0, 5)
@@ -189,13 +234,47 @@ public sealed class VhdxServiceTests : IDisposable
         Assert.Equal(2, disks.InFlightPeak);
     }
 
-    private VhdxService NewService(IVirtualDiskManager disks, int maxConcurrentDiskOperations = 4) =>
+    [Fact]
+    public async Task CreateAsync_ReplaysAreBoundedByTheSameConcurrencyLimit()
+    {
+        // A burst of controller retries hits the existence check, not the
+        // create - and that check is a CIM query too, so it has to be capped
+        // just the same.
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks, maxConcurrentDiskOperations: 2);
+
+        for (var i = 0; i < 5; i++)
+        {
+            await service.CreateAsync($"pvc-{i}", 1024, CancellationToken.None);
+        }
+
+        using var release = new SemaphoreSlim(0);
+        disks.ResetPeak();
+        disks.BeforeGetSize = _ => release.WaitAsync();
+
+        var replays = Enumerable.Range(0, 5)
+            .Select(i => service.CreateAsync($"pvc-{i}", 1024, CancellationToken.None))
+            .ToArray();
+
+        await WaitFor(() => disks.InFlightPeak >= 2);
+        await Task.Delay(50);
+        Assert.Equal(2, disks.InFlightPeak);
+
+        release.Release(5);
+        await Task.WhenAll(replays);
+    }
+
+    private VhdxService NewService(
+        IVirtualDiskManager disks,
+        int maxConcurrentDiskOperations = 4,
+        TimeSpan? diskOperationTimeout = null) =>
         new(
             disks,
             Options.Create(new AgentOptions
             {
                 CsvVolumesRoot = _root,
                 MaxConcurrentDiskOperations = maxConcurrentDiskOperations,
+                DiskOperationTimeout = diskOperationTimeout ?? TimeSpan.FromMinutes(10),
             }),
             NullLogger<VhdxService>.Instance);
 
@@ -227,25 +306,33 @@ public sealed class VhdxServiceTests : IDisposable
 
         public bool FailNextCreate { get; set; }
 
-        /// <summary>Emulates CIM's allocation granularity.</summary>
+        public bool FailSizeReads { get; set; }
+
+        /// <summary>Emulates Hyper-V's allocation granularity.</summary>
         public long RoundUpTo { get; set; } = 1;
 
-        public Func<Task>? BeforeCreate { get; set; }
+        public Func<CancellationToken, Task>? BeforeCreate { get; set; }
+
+        public Func<CancellationToken, Task>? BeforeGetSize { get; set; }
 
         public int InFlightPeak { get; private set; }
 
-        public async Task CreateDynamicVhdxAsync(string path, long maxInternalSizeBytes, CancellationToken cancellationToken)
+        public void ResetPeak()
         {
             lock (_gate)
             {
-                InFlightPeak = Math.Max(InFlightPeak, ++_inFlight);
+                InFlightPeak = 0;
             }
+        }
 
+        public async Task CreateDynamicVhdxAsync(string path, long maxInternalSizeBytes, CancellationToken cancellationToken)
+        {
+            Enter();
             try
             {
                 if (BeforeCreate is not null)
                 {
-                    await BeforeCreate();
+                    await BeforeCreate(cancellationToken);
                 }
 
                 if (FailNextCreate)
@@ -260,32 +347,64 @@ public sealed class VhdxServiceTests : IDisposable
                 lock (_gate)
                 {
                     Created.Add(path);
-                    _sizes[path] = rounded;
+                    _sizes[Path.GetFileName(path)] = rounded;
                 }
             }
             finally
             {
-                lock (_gate)
-                {
-                    _inFlight--;
-                }
+                Exit();
             }
         }
 
-        public Task<long> GetVirtualSizeAsync(string path, CancellationToken cancellationToken)
+        public async Task<long> GetVirtualSizeAsync(string path, CancellationToken cancellationToken)
+        {
+            Enter();
+            try
+            {
+                if (BeforeGetSize is not null)
+                {
+                    await BeforeGetSize(cancellationToken);
+                }
+
+                if (FailSizeReads)
+                {
+                    throw new InvalidOperationException("CIM would not say");
+                }
+
+                // The service renames the disk into place after creating it,
+                // so the in-progress name is what got recorded.
+                var name = Path.GetFileName(path);
+                lock (_gate)
+                {
+                    if (_sizes.TryGetValue(name, out var size)
+                        || _sizes.TryGetValue(name.Replace(".vhdx", ".creating.vhdx"), out size))
+                    {
+                        return size;
+                    }
+                }
+
+                throw new InvalidOperationException($"no such disk: {path}");
+            }
+            finally
+            {
+                Exit();
+            }
+        }
+
+        private void Enter()
         {
             lock (_gate)
             {
-                // The service renames the disk after creating it, so look under
-                // the in-progress name too.
-                if (_sizes.TryGetValue(path, out var size)
-                    || _sizes.TryGetValue(path + ".creating", out size))
-                {
-                    return Task.FromResult(size);
-                }
+                InFlightPeak = Math.Max(InFlightPeak, ++_inFlight);
             }
+        }
 
-            throw new InvalidOperationException($"no such disk: {path}");
+        private void Exit()
+        {
+            lock (_gate)
+            {
+                _inFlight--;
+            }
         }
     }
 }

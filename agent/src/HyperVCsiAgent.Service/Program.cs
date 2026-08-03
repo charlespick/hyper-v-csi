@@ -88,3 +88,10 @@ app.MapGet("/v1/jobs/{id}", (string id, IJobStore jobStore) =>
 });
 
 app.Run();
+
+/// <summary>
+/// Named so the test host can boot this exact application. The wire format the
+/// Go client depends on is a property of the configured host, not of
+/// AgentJson alone, so it has to be asserted against the real thing.
+/// </summary>
+public partial class Program;

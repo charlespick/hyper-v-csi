@@ -13,4 +13,9 @@ namespace HyperVCsiAgent.Core.Storage;
 /// What the disk was actually created with, which is what CSI wants reported
 /// back rather than what was asked for.
 /// </param>
-public sealed record CreateVolumeResult(string VolumeId, long ActualSizeBytes);
+/// <param name="AlreadyPresent">
+/// True when the disk was already on the CSV and this call only confirmed it.
+/// Lets the controller tell a genuine name collision apart from a disk it just
+/// created, which matters when the size doesn't fit the request.
+/// </param>
+public sealed record CreateVolumeResult(string VolumeId, long ActualSizeBytes, bool AlreadyPresent);

@@ -21,15 +21,24 @@ public sealed class CimVirtualDiskManager(ILogger<CimVirtualDiskManager> logger)
     private const ushort TypeDynamic = 3;
     private const ushort FormatVhdx = 3;
 
-    // 0 means "let Hyper-V pick", which is what New-VHD does by default.
-    private const uint UseDefaultSize = 0;
+    // CREATE_VIRTUAL_DISK_PARAMETERS_DEFAULT_BLOCK_SIZE. Only the block size
+    // documents 0 as "let Hyper-V pick"; the sector sizes do not, so those are
+    // left unset entirely, which is what New-VHD does when you omit them.
+    private const uint UseDefaultBlockSize = 0;
 
     // Msvm method return values.
     private const uint Completed = 0;
     private const uint JobStarted = 4096;
 
-    // Msvm_ConcreteJob.JobState. Anything at or past Completed is terminal.
+    // Msvm_ConcreteJob.JobState. Everything below Completed is still in
+    // flight; 8/9/10 (Terminated/Killed/Exception) are failures.
     private const ushort JobStateCompleted = 7;
+    private const ushort JobStateException = 10;
+
+    // Hyper-V's non-CIM-standard success state, which Microsoft's own sample
+    // utilities count as successful. Treating it as a failure would mean
+    // deleting a disk that was created just fine and retrying forever.
+    private const ushort JobStateCompletedWithWarnings = 32768;
 
     private static readonly TimeSpan JobPollInterval = TimeSpan.FromMilliseconds(500);
 
@@ -48,9 +57,7 @@ public sealed class CimVirtualDiskManager(ILogger<CimVirtualDiskManager> logger)
             settings["Format"] = FormatVhdx;
             settings["Path"] = path;
             settings["MaxInternalSize"] = (ulong)maxInternalSizeBytes;
-            settings["BlockSize"] = UseDefaultSize;
-            settings["LogicalSectorSize"] = UseDefaultSize;
-            settings["PhysicalSectorSize"] = UseDefaultSize;
+            settings["BlockSize"] = UseDefaultBlockSize;
 
             using var inParams = service.GetMethodParameters("CreateVirtualHardDisk");
             // The MOF types this parameter as a string: it carries an embedded
@@ -58,7 +65,7 @@ public sealed class CimVirtualDiskManager(ILogger<CimVirtualDiskManager> logger)
             inParams["VirtualDiskSettingData"] = settings.GetText(TextFormat.WmiDtd20);
 
             using var outParams = service.InvokeMethod("CreateVirtualHardDisk", inParams, null);
-            WaitForCompletion(scope, outParams, "CreateVirtualHardDisk", cancellationToken);
+            _ = WaitForCompletion(scope, outParams, "CreateVirtualHardDisk", cancellationToken);
 
             logger.LogInformation("created VHDX {Path} at {SizeBytes} bytes", path, maxInternalSizeBytes);
         }, cancellationToken);
@@ -73,12 +80,19 @@ public sealed class CimVirtualDiskManager(ILogger<CimVirtualDiskManager> logger)
             inParams["Path"] = path;
 
             using var outParams = service.InvokeMethod("GetVirtualHardDiskSettingData", inParams, null);
-            WaitForCompletion(scope, outParams, "GetVirtualHardDiskSettingData", cancellationToken);
+            var completedInline = WaitForCompletion(scope, outParams, "GetVirtualHardDiskSettingData", cancellationToken);
 
             var settingData = outParams["SettingData"] as string;
             if (string.IsNullOrEmpty(settingData))
             {
-                throw new InvalidOperationException($"GetVirtualHardDiskSettingData returned no setting data for {path}");
+                // Out parameters are captured at invoke time, so a method that
+                // defers to a job leaves them empty even once the job
+                // succeeds. In practice this metadata read answers inline;
+                // if a host ever doesn't, say so plainly instead of pretending
+                // the disk has no size.
+                throw new InvalidOperationException(completedInline
+                    ? $"GetVirtualHardDiskSettingData returned no setting data for {path}"
+                    : $"GetVirtualHardDiskSettingData for {path} deferred to a job, which does not populate its out parameters");
             }
 
             return ReadMaxInternalSize(settingData, path);
@@ -99,14 +113,16 @@ public sealed class CimVirtualDiskManager(ILogger<CimVirtualDiskManager> logger)
 
     /// <summary>
     /// Msvm methods either finish inline (ReturnValue 0) or hand back an
-    /// Msvm_ConcreteJob to poll (4096). Anything else failed outright.
+    /// Msvm_ConcreteJob to poll (4096). Anything else failed outright. Returns
+    /// whether the method answered inline, which decides whether its other out
+    /// parameters hold anything.
     /// </summary>
-    private static void WaitForCompletion(ManagementScope scope, ManagementBaseObject outParams, string methodName, CancellationToken cancellationToken)
+    private static bool WaitForCompletion(ManagementScope scope, ManagementBaseObject outParams, string methodName, CancellationToken cancellationToken)
     {
         var returnValue = (uint)outParams["ReturnValue"];
         if (returnValue == Completed)
         {
-            return;
+            return true;
         }
 
         if (returnValue != JobStarted)
@@ -119,25 +135,31 @@ public sealed class CimVirtualDiskManager(ILogger<CimVirtualDiskManager> logger)
 
         while (true)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-
             using var job = new ManagementObject(scope, new ManagementPath(jobPath), null);
             job.Get();
 
             var state = (ushort)job["JobState"];
-            if (state == JobStateCompleted)
+            if (state is JobStateCompleted or JobStateCompletedWithWarnings)
             {
-                return;
+                return false;
             }
 
-            if (state > JobStateCompleted)
+            if (state > JobStateCompleted && state <= JobStateException)
             {
                 var description = job["ErrorDescription"] as string;
                 throw new InvalidOperationException(
                     $"{methodName} job ended in state {state}: {(string.IsNullOrWhiteSpace(description) ? "no error description" : description)}");
             }
 
-            Thread.Sleep(JobPollInterval);
+            // Everything else - New, Starting, Running, Suspended, Shutting
+            // Down, Service, Query Pending - is still in flight. The caller's
+            // token carries the per-operation timeout, so a job that never
+            // settles becomes a failure the controller can retry rather than
+            // wedging this volume's queue forever.
+            if (cancellationToken.WaitHandle.WaitOne(JobPollInterval))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
         }
     }
 

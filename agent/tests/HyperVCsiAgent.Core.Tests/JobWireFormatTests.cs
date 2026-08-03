@@ -70,7 +70,7 @@ public class JobWireFormatTests
             OperationType = "CreateVolume",
             Target = "vol-pvc-1",
             Status = JobStatus.Succeeded,
-            Result = new CreateVolumeResult("pvc-1", 10737418240),
+            Result = new CreateVolumeResult("pvc-1", 10737418240, AlreadyPresent: true),
         };
 
         using var document = JsonDocument.Parse(JsonSerializer.Serialize(job, WireOptions()));
@@ -78,6 +78,7 @@ public class JobWireFormatTests
 
         Assert.Equal("pvc-1", result.GetProperty("volumeId").GetString());
         Assert.Equal(10737418240, result.GetProperty("actualSizeBytes").GetInt64());
+        Assert.True(result.GetProperty("alreadyPresent").GetBoolean());
     }
 
     [Fact]

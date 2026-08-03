@@ -3,9 +3,11 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -19,7 +21,7 @@ import (
 const gibibyte = 1 << 30
 
 func TestCreateVolumeReturnsTheVolumeTheAgentCreated(t *testing.T) {
-	agent := newFakeAgent(t, succeeded(`{"volumeId":"pvc-1","actualSizeBytes":10737418240}`))
+	agent := newFakeAgent(t, created(10*gibibyte))
 	server := newControllerServer(agent)
 
 	resp, err := server.CreateVolume(context.Background(), createVolumeRequest("pvc-1", 10*gibibyte, 0))
@@ -38,7 +40,7 @@ func TestCreateVolumeReturnsTheVolumeTheAgentCreated(t *testing.T) {
 }
 
 func TestCreateVolumeEnqueuesUnderTheVolumeNameAsIdempotencyKey(t *testing.T) {
-	agent := newFakeAgent(t, succeeded(`{"volumeId":"pvc-1","actualSizeBytes":10737418240}`))
+	agent := newFakeAgent(t, created(10*gibibyte))
 	server := newControllerServer(agent)
 
 	if _, err := server.CreateVolume(context.Background(), createVolumeRequest("pvc-1", 10*gibibyte, 0)); err != nil {
@@ -60,6 +62,22 @@ func TestCreateVolumeEnqueuesUnderTheVolumeNameAsIdempotencyKey(t *testing.T) {
 	}
 }
 
+func TestCreateVolumePollsTheJobItEnqueued(t *testing.T) {
+	agent := newFakeAgent(t, created(1024))
+	agent.jobID = "job-abc"
+	server := newControllerServer(agent)
+
+	if _, err := server.CreateVolume(context.Background(), createVolumeRequest("pvc-1", 1024, 0)); err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+
+	for _, polled := range agent.polledIDs() {
+		if polled != "job-abc" {
+			t.Errorf("polled job %q, want the id the agent handed back", polled)
+		}
+	}
+}
+
 func TestCreateVolumeSizeSelection(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -67,23 +85,31 @@ func TestCreateVolumeSizeSelection(t *testing.T) {
 		limit    int64
 		want     int64
 	}{
-		{name: "required bytes wins", required: 5 * gibibyte, limit: 0, want: 5 * gibibyte},
-		{name: "no capacity range at all falls back to the default", required: 0, limit: 0, want: defaultVolumeSizeBytes},
-		{name: "a limit below the default caps it", required: 0, limit: 1024, want: 1024},
-		{name: "a limit above the default leaves it alone", required: 0, limit: 100 * gibibyte, want: defaultVolumeSizeBytes},
+		{name: "required bytes wins", required: 5 * gibibyte, want: 5 * gibibyte},
+		{name: "no capacity range at all falls back to the default", want: defaultVolumeSizeBytes},
+		{name: "a limit below the default caps it", limit: 8192, want: 8192},
+		{name: "a limit above the default leaves it alone", limit: 100 * gibibyte, want: defaultVolumeSizeBytes},
 		{name: "required within the limit is used as-is", required: 2 * gibibyte, limit: 4 * gibibyte, want: 2 * gibibyte},
+		{
+			// Hyper-V rounds up to a sector multiple, so asking for exactly an
+			// unaligned limit would come back over it.
+			name:     "an unaligned limit is aligned down",
+			required: 4096,
+			limit:    8000,
+			want:     4096,
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			agent := newFakeAgent(t, succeeded(`{"volumeId":"pvc-1","actualSizeBytes":1024}`))
+			agent := newFakeAgent(t, created(test.want))
 			server := newControllerServer(agent)
 
 			req := createVolumeRequest("pvc-1", test.required, test.limit)
 			if test.required == 0 && test.limit == 0 {
 				req.CapacityRange = nil
 			}
-			if _, err := server.CreateVolume(context.Background(), req); err != nil && status.Code(err) != codes.AlreadyExists {
+			if _, err := server.CreateVolume(context.Background(), req); err != nil {
 				t.Fatalf("CreateVolume: %v", err)
 			}
 
@@ -115,18 +141,38 @@ func TestCreateVolumeRejectsUnusableRequests(t *testing.T) {
 			want: codes.InvalidArgument,
 		},
 		{
-			name: "an access mode a VHDX cannot back",
-			request: func() *csi.CreateVolumeRequest {
-				req := createVolumeRequest("pvc-1", gibibyte, 0)
-				req.VolumeCapabilities[0].AccessMode.Mode = csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER
-				return req
-			}(),
-			want: codes.InvalidArgument,
+			name:    "an access mode a VHDX cannot back",
+			request: withAccessMode(csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER),
+			want:    codes.InvalidArgument,
 		},
 		{
+			name:    "single node but multi writer",
+			request: withAccessMode(csi.VolumeCapability_AccessMode_SINGLE_NODE_MULTI_WRITER),
+			want:    codes.InvalidArgument,
+		},
+		{
+			// An impossible range is OUT_OF_RANGE per the CSI error table,
+			// not INVALID_ARGUMENT.
 			name:    "required bytes above the limit",
 			request: createVolumeRequest("pvc-1", 4*gibibyte, 2*gibibyte),
-			want:    codes.InvalidArgument,
+			want:    codes.OutOfRange,
+		},
+		{
+			name:    "a negative capacity range",
+			request: createVolumeRequest("pvc-1", -1, 0),
+			want:    codes.OutOfRange,
+		},
+		{
+			// Nothing at 4 KiB alignment fits between 5000 and 8000, since
+			// 8192 would breach the limit and 4096 misses the requirement.
+			name:    "no aligned size satisfies the range",
+			request: createVolumeRequest("pvc-1", 5000, 8000),
+			want:    codes.OutOfRange,
+		},
+		{
+			name:    "a limit smaller than one sector",
+			request: createVolumeRequest("pvc-1", 0, 1024),
+			want:    codes.OutOfRange,
 		},
 		{
 			name: "restore from a snapshot",
@@ -145,7 +191,7 @@ func TestCreateVolumeRejectsUnusableRequests(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			agent := newFakeAgent(t, succeeded(`{"volumeId":"pvc-1","actualSizeBytes":1024}`))
+			agent := newFakeAgent(t, created(1024))
 			server := newControllerServer(agent)
 
 			_, err := server.CreateVolume(context.Background(), test.request)
@@ -162,11 +208,32 @@ func TestCreateVolumeRejectsUnusableRequests(t *testing.T) {
 	}
 }
 
+func TestCreateVolumeAcceptsEverySingleNodeAccessMode(t *testing.T) {
+	// SINGLE_NODE_SINGLE_WRITER is what Kubernetes maps ReadWriteOncePod to.
+	// It is stricter than plain RWO, not looser, so turning it down would
+	// refuse a workload a VHDX can serve perfectly well.
+	modes := []csi.VolumeCapability_AccessMode_Mode{
+		csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+		csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY,
+		csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
+	}
+
+	for _, mode := range modes {
+		t.Run(mode.String(), func(t *testing.T) {
+			server := newControllerServer(newFakeAgent(t, created(1024)))
+
+			if _, err := server.CreateVolume(context.Background(), withAccessMode(mode)); err != nil {
+				t.Fatalf("CreateVolume with %s: %v", mode, err)
+			}
+		})
+	}
+}
+
 func TestCreateVolumeWaitsForAJobThatIsStillRunning(t *testing.T) {
 	agent := newFakeAgent(t,
-		agentclient.Job{ID: "job-1", Status: agentclient.JobPending},
-		agentclient.Job{ID: "job-1", Status: agentclient.JobRunning},
-		succeeded(`{"volumeId":"pvc-1","actualSizeBytes":1024}`),
+		agentclient.Job{Status: agentclient.JobPending},
+		agentclient.Job{Status: agentclient.JobRunning},
+		created(1024),
 	)
 	server := newControllerServer(agent)
 
@@ -193,24 +260,24 @@ func TestCreateVolumeTranslatesAgentFailures(t *testing.T) {
 			// The response CSI mandates for a name collision with
 			// incompatible parameters — a terminal answer, not a retry.
 			name: "incompatible existing volume",
-			job:  agentclient.Job{ID: "job-1", Status: agentclient.JobFailed, Error: "different size", ErrorCode: agentclient.ErrorCodeAlreadyExists},
+			job:  agentclient.Job{Status: agentclient.JobFailed, Error: "different size", ErrorCode: agentclient.ErrorCodeAlreadyExists},
 			want: codes.AlreadyExists,
 		},
 		{
 			name: "out of space",
-			job:  agentclient.Job{ID: "job-1", Status: agentclient.JobFailed, Error: "csv full", ErrorCode: agentclient.ErrorCodeResourceExhausted},
+			job:  agentclient.Job{Status: agentclient.JobFailed, Error: "csv full", ErrorCode: agentclient.ErrorCodeResourceExhausted},
 			want: codes.ResourceExhausted,
 		},
 		{
 			name: "rejected by the agent",
-			job:  agentclient.Job{ID: "job-1", Status: agentclient.JobFailed, Error: "bad name", ErrorCode: agentclient.ErrorCodeInvalidArgument},
+			job:  agentclient.Job{Status: agentclient.JobFailed, Error: "bad name", ErrorCode: agentclient.ErrorCodeInvalidArgument},
 			want: codes.InvalidArgument,
 		},
 		{
 			// No classification means "assume transient", which is the
 			// design's default posture: reconcile and retry.
 			name: "unclassified failure",
-			job:  agentclient.Job{ID: "job-1", Status: agentclient.JobFailed, Error: "CIM said no"},
+			job:  agentclient.Job{Status: agentclient.JobFailed, Error: "CIM said no"},
 			want: codes.Internal,
 		},
 	}
@@ -244,9 +311,23 @@ func TestCreateVolumeForgottenJobIsRetryable(t *testing.T) {
 	}
 }
 
+func TestCreateVolumeAgentRestartMidPollIsRetryable(t *testing.T) {
+	// Same thing, but the agent goes away after we've already seen the job
+	// running — the poll loop has to handle a 404 arriving at any point.
+	agent := newFakeAgent(t, agentclient.Job{Status: agentclient.JobRunning})
+	agent.forgetAfter = 2
+	server := newControllerServer(agent)
+
+	_, err := server.CreateVolume(context.Background(), createVolumeRequest("pvc-1", 1024, 0))
+
+	if got := status.Code(err); got != codes.Aborted {
+		t.Fatalf("code = %s, want Aborted (err: %v)", got, err)
+	}
+}
+
 func TestCreateVolumeUnreachableAgentIsRetryable(t *testing.T) {
 	// The clustered role failing over between hosts looks exactly like this.
-	agent := newFakeAgent(t, succeeded(`{"volumeId":"pvc-1","actualSizeBytes":1024}`))
+	agent := newFakeAgent(t, created(1024))
 	agent.Close()
 	server := newControllerServer(agent)
 
@@ -259,16 +340,17 @@ func TestCreateVolumeUnreachableAgentIsRetryable(t *testing.T) {
 
 func TestCreateVolumeRejectsAnUnusableResult(t *testing.T) {
 	tests := []struct {
-		name   string
-		result string
+		name string
+		job  agentclient.Job
 	}{
-		{name: "not decodable", result: `"nonsense"`},
-		{name: "no volume id", result: `{"actualSizeBytes":1024}`},
+		{name: "not decodable", job: succeeded(`"nonsense"`)},
+		{name: "no volume id", job: succeeded(`{"actualSizeBytes":1024}`)},
+		{name: "no result at all", job: agentclient.Job{Status: agentclient.JobSucceeded}},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			server := newControllerServer(newFakeAgent(t, succeeded(test.result)))
+			server := newControllerServer(newFakeAgent(t, test.job))
 
 			_, err := server.CreateVolume(context.Background(), createVolumeRequest("pvc-1", 1024, 0))
 
@@ -282,12 +364,25 @@ func TestCreateVolumeRejectsAnUnusableResult(t *testing.T) {
 func TestCreateVolumeExistingVolumeOverTheLimitIsAlreadyExists(t *testing.T) {
 	// A replay for a name whose disk is bigger than this request allows: the
 	// existing volume is incompatible, which CSI spells ALREADY_EXISTS.
-	server := newControllerServer(newFakeAgent(t, succeeded(`{"volumeId":"pvc-1","actualSizeBytes":10737418240}`)))
+	server := newControllerServer(newFakeAgent(t, succeeded(`{"volumeId":"pvc-1","actualSizeBytes":10737418240,"alreadyPresent":true}`)))
 
 	_, err := server.CreateVolume(context.Background(), createVolumeRequest("pvc-1", gibibyte, 2*gibibyte))
 
 	if got := status.Code(err); got != codes.AlreadyExists {
 		t.Fatalf("code = %s, want AlreadyExists (err: %v)", got, err)
+	}
+}
+
+func TestCreateVolumeCreatingAVolumeOverTheLimitIsOurBugNotACollision(t *testing.T) {
+	// Aligning the request down is supposed to make this unreachable. If it
+	// ever happens it's ours to fix, and reporting AlreadyExists would send
+	// the operator hunting for a colliding volume that doesn't exist.
+	server := newControllerServer(newFakeAgent(t, created(10*gibibyte)))
+
+	_, err := server.CreateVolume(context.Background(), createVolumeRequest("pvc-1", gibibyte, 2*gibibyte))
+
+	if got := status.Code(err); got != codes.Internal {
+		t.Fatalf("code = %s, want Internal (err: %v)", got, err)
 	}
 }
 
@@ -311,8 +406,20 @@ func createVolumeRequest(name string, requiredBytes, limitBytes int64) *csi.Crea
 	}
 }
 
+func withAccessMode(mode csi.VolumeCapability_AccessMode_Mode) *csi.CreateVolumeRequest {
+	req := createVolumeRequest("pvc-1", gibibyte, 0)
+	req.VolumeCapabilities[0].AccessMode.Mode = mode
+	return req
+}
+
 func succeeded(result string) agentclient.Job {
-	return agentclient.Job{ID: "job-1", Status: agentclient.JobSucceeded, Result: json.RawMessage(result)}
+	return agentclient.Job{Status: agentclient.JobSucceeded, Result: json.RawMessage(result)}
+}
+
+// created is a job that provisioned a new disk of the given size, as opposed
+// to finding one already there.
+func created(sizeBytes int64) agentclient.Job {
+	return succeeded(fmt.Sprintf(`{"volumeId":"pvc-1","actualSizeBytes":%d,"alreadyPresent":false}`, sizeBytes))
 }
 
 // enqueuedJob is what the agent sees on POST /v1/jobs.
@@ -334,20 +441,29 @@ type fakeAgent struct {
 	*httptest.Server
 
 	mu       sync.Mutex
+	jobID    string
 	sequence []agentclient.Job
 	enqueued []enqueuedJob
-	polls    int
+	polled   []string
+
+	// forgetAfter makes GET start 404ing once this many polls have happened,
+	// standing in for the agent restarting mid-operation.
+	forgetAfter int
 }
 
 func newFakeAgent(t *testing.T, sequence ...agentclient.Job) *fakeAgent {
 	t.Helper()
 
-	agent := &fakeAgent{sequence: sequence}
+	agent := &fakeAgent{jobID: "job-1", sequence: sequence}
 	agent.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		agent.mu.Lock()
 		defer agent.mu.Unlock()
 
 		if r.Method == http.MethodPost {
+			if r.URL.Path != "/v1/jobs" {
+				t.Errorf("enqueued to %q, want /v1/jobs", r.URL.Path)
+			}
+
 			var request enqueuedJob
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 				t.Errorf("decoding enqueue request: %v", err)
@@ -355,17 +471,22 @@ func newFakeAgent(t *testing.T, sequence ...agentclient.Job) *fakeAgent {
 			agent.enqueued = append(agent.enqueued, request)
 
 			w.WriteHeader(http.StatusAccepted)
-			_, _ = io.WriteString(w, `{"id":"job-1","status":"Pending"}`)
+			_, _ = io.WriteString(w, fmt.Sprintf(`{"id":%q,"status":"Pending"}`, agent.jobID))
 			return
 		}
 
-		if len(agent.sequence) == 0 {
+		id := strings.TrimPrefix(r.URL.Path, "/v1/jobs/")
+		agent.polled = append(agent.polled, id)
+
+		forgotten := len(agent.sequence) == 0 ||
+			(agent.forgetAfter > 0 && len(agent.polled) > agent.forgetAfter)
+		if id != agent.jobID || forgotten {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 
-		job := agent.sequence[min(agent.polls, len(agent.sequence)-1)]
-		agent.polls++
+		job := agent.sequence[min(len(agent.polled)-1, len(agent.sequence)-1)]
+		job.ID = agent.jobID
 		if err := json.NewEncoder(w).Encode(job); err != nil {
 			t.Errorf("encoding job: %v", err)
 		}
@@ -384,7 +505,13 @@ func (a *fakeAgent) enqueueCount() int {
 func (a *fakeAgent) pollCount() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.polls
+	return len(a.polled)
+}
+
+func (a *fakeAgent) polledIDs() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.polled...)
 }
 
 func (a *fakeAgent) onlyEnqueued(t *testing.T) enqueuedJob {

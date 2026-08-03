@@ -13,11 +13,18 @@ import (
 
 const (
 	// jobPollBudget bounds how long an RPC waits for a job before handing back
-	// a retryable status. Deliberately well inside the sidecars' own RPC
-	// timeouts (external-provisioner defaults to 60s) so a slow operation
-	// surfaces as our clean ABORTED rather than as the caller's deadline
-	// expiring on a call we never answered.
-	jobPollBudget = 25 * time.Second
+	// a retryable status. It has to stay well under the calling sidecar's own
+	// RPC timeout — external-provisioner's --timeout defaults to 10s (15s on
+	// older releases), not the minute one might assume — otherwise the caller
+	// gives up first and the clean ABORTED below never reaches anyone.
+	jobPollBudget = 6 * time.Second
+
+	// When the caller sets a deadline we spend at most this fraction of it
+	// polling. The remainder is headroom for our answer to travel back before
+	// the caller stops listening, and it keeps this correct against a sidecar
+	// configured with a shorter timeout than we assume.
+	callerDeadlineNumerator   = 4
+	callerDeadlineDenominator = 5
 
 	jobPollInitialInterval = 100 * time.Millisecond
 	jobPollMaxInterval     = 2 * time.Second
@@ -27,11 +34,19 @@ const (
 // a gRPC status the sidecar knows what to do with, so callers can return it
 // unchanged.
 func awaitJob(ctx context.Context, agent *agentclient.Client, jobID string, budget time.Duration) (*agentclient.Job, error) {
-	deadline := time.Now().Add(budget)
+	budget = clampToCallerDeadline(ctx, budget)
+
+	// Deriving a context rather than tracking a deadline by hand means the
+	// budget also bounds each individual request, so one hung poll can't
+	// outlast it.
+	pollCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+
+	lastStatus := agentclient.JobPending
 	backoff := jobPollInitialInterval
 
 	for {
-		job, err := agent.GetJob(ctx, jobID)
+		job, err := agent.GetJob(pollCtx, jobID)
 		switch {
 		case errors.Is(err, agentclient.ErrJobNotFound):
 			// The agent's job store is in-memory, so a forgotten job means it
@@ -41,10 +56,10 @@ func awaitJob(ctx context.Context, agent *agentclient.Client, jobID string, budg
 			return nil, status.Errorf(codes.Aborted,
 				"agent no longer knows job %s (it likely restarted); retry the operation", jobID)
 		case err != nil:
-			// A poll that failed because the caller went away says nothing
-			// about the agent's health, so report it as what it is.
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, status.FromContextError(ctxErr).Err()
+			// A poll that failed because we ran out of time says nothing about
+			// the agent's health, so report it as what it is.
+			if pollCtx.Err() != nil {
+				return nil, pollStopped(ctx, jobID, lastStatus, budget)
 			}
 			// Otherwise, most often the clustered role is mid-failover.
 			return nil, status.Errorf(codes.Unavailable, "polling job %s: %v", jobID, err)
@@ -54,19 +69,41 @@ func awaitJob(ctx context.Context, agent *agentclient.Client, jobID string, budg
 			return nil, translateJobFailure(job)
 		}
 
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return nil, status.Errorf(codes.Aborted,
-				"job %s is still %s after %s; operation in progress, retry", jobID, job.Status, budget)
-		}
+		lastStatus = job.Status
 
 		select {
-		case <-ctx.Done():
-			return nil, status.FromContextError(ctx.Err()).Err()
-		case <-time.After(min(backoff, remaining)):
+		case <-pollCtx.Done():
+			return nil, pollStopped(ctx, jobID, lastStatus, budget)
+		case <-time.After(backoff):
 		}
 		backoff = min(backoff*2, jobPollMaxInterval)
 	}
+}
+
+// clampToCallerDeadline shrinks the budget to fit inside whatever deadline the
+// caller set on the RPC.
+func clampToCallerDeadline(ctx context.Context, budget time.Duration) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return budget
+	}
+
+	if share := time.Until(deadline) * callerDeadlineNumerator / callerDeadlineDenominator; share < budget {
+		return share
+	}
+
+	return budget
+}
+
+// pollStopped decides which of the two clocks ran out: ours, which the caller
+// should retry against, or the caller's own, which it already knows about.
+func pollStopped(ctx context.Context, jobID string, lastStatus agentclient.JobStatus, budget time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return status.FromContextError(err).Err()
+	}
+
+	return status.Errorf(codes.Aborted,
+		"job %s is still %s after %s; operation in progress, retry", jobID, lastStatus, budget)
 }
 
 // translateJobFailure maps the agent's coarse error classification onto gRPC

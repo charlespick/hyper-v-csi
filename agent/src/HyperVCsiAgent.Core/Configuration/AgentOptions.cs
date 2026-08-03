@@ -27,6 +27,14 @@ public sealed class AgentOptions
     /// </summary>
     public int MaxConcurrentDiskOperations { get; set; } = 4;
 
+    /// <summary>
+    /// How long a single VHDX operation may run before it is abandoned. A CIM
+    /// job that never reaches a terminal state would otherwise pin its
+    /// volume's job queue forever, and every later job for that volume behind
+    /// it - a stuck operation has to become a failure the controller can retry.
+    /// </summary>
+    public TimeSpan DiskOperationTimeout { get; set; } = TimeSpan.FromMinutes(10);
+
     public void Validate()
     {
         if (string.IsNullOrWhiteSpace(CsvVolumesRoot))
@@ -39,6 +47,12 @@ public sealed class AgentOptions
         {
             throw new InvalidOperationException(
                 $"{SectionName}:{nameof(MaxConcurrentDiskOperations)} must be at least 1");
+        }
+
+        if (DiskOperationTimeout <= TimeSpan.Zero)
+        {
+            throw new InvalidOperationException(
+                $"{SectionName}:{nameof(DiskOperationTimeout)} must be positive");
         }
     }
 }

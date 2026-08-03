@@ -104,14 +104,18 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
         job.Status = JobStatus.Running;
         try
         {
+            // Status is what a poller keys off, so it must be the last thing
+            // set: run fills in Result, and a reader that saw Succeeded before
+            // the result landed would treat a good job as having returned
+            // nothing. Same reasoning for Error/ErrorCode below.
             await run(job, _shutdown.Token).ConfigureAwait(false);
             job.Status = JobStatus.Succeeded;
         }
         catch (Exception ex)
         {
-            job.Status = JobStatus.Failed;
             job.Error = ex.Message;
             job.ErrorCode = ex is JobFailureException failure ? failure.ErrorCode : AgentErrorCodes.Internal;
+            job.Status = JobStatus.Failed;
         }
         finally
         {

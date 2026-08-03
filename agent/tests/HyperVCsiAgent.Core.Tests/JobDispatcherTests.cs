@@ -19,7 +19,7 @@ public class JobDispatcherTests
         await run(job, CancellationToken.None);
 
         Assert.Equal(("pvc-1", 2048L), vhdx.LastCreate);
-        Assert.Equal(new CreateVolumeResult("pvc-1", 2048), job.Result);
+        Assert.Equal(new CreateVolumeResult("pvc-1", 2048, AlreadyPresent: false), job.Result);
     }
 
     [Theory]
@@ -55,7 +55,7 @@ public class JobDispatcherTests
         public Task<CreateVolumeResult> CreateAsync(string volumeName, long sizeBytes, CancellationToken cancellationToken)
         {
             LastCreate = (volumeName, sizeBytes);
-            return Task.FromResult(new CreateVolumeResult(volumeName, sizeBytes));
+            return Task.FromResult(new CreateVolumeResult(volumeName, sizeBytes, AlreadyPresent: false));
         }
 
         public Task ExpandAsync(string volumeId, long newSizeBytes, CancellationToken cancellationToken) =>

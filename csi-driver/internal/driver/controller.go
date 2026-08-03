@@ -19,6 +19,13 @@ const operationCreateVolume = "CreateVolume"
 // actually written to.
 const defaultVolumeSizeBytes = 1 << 30 // 1 GiB
 
+// vhdxSectorAlignment is the largest sector size a VHDX uses. Hyper-V rounds
+// MaxInternalSize *up* to a sector multiple, so an unaligned request can come
+// back as a slightly larger disk — which would breach limit_bytes if we asked
+// for exactly the limit. Aligning the request down first makes that overshoot
+// impossible.
+const vhdxSectorAlignment = 4096
+
 // controllerServer implements the RPCs marked "Controller" in CSI Spec.md.
 // Each dispatches to hyperv-csi-agent's async job API rather than talking to
 // Hyper-V hosts directly; idempotency keys follow the column in that table.
@@ -59,6 +66,10 @@ type createVolumePayload struct {
 type createVolumeResult struct {
 	VolumeID        string `json:"volumeId"`
 	ActualSizeBytes int64  `json:"actualSizeBytes"`
+	// AlreadyPresent distinguishes a disk this call created from one that was
+	// already on the CSV, which is the difference between our own bug and a
+	// genuine name collision when the size doesn't fit the request.
+	AlreadyPresent bool `json:"alreadyPresent"`
 }
 
 // CreateVolume provisions a new VHDX on the CSV. Idempotency key: volume name.
@@ -108,13 +119,20 @@ func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		return nil, status.Errorf(codes.Internal, "agent returned no volume id for %s", req.GetName())
 	}
 
-	// A disk that overshoots limit_bytes is an incompatible volume under this
-	// name, which CSI says to report as ALREADY_EXISTS. In practice this means
-	// a pre-existing volume larger than the new request rather than something
-	// we just created, since we never ask for more than the limit.
 	if limit := req.GetCapacityRange().GetLimitBytes(); limit > 0 && result.ActualSizeBytes > limit {
-		return nil, status.Errorf(codes.AlreadyExists,
-			"volume %s exists at %d bytes, above the requested limit of %d",
+		// A pre-existing disk too big for this request is a name collision
+		// with incompatible parameters, which CSI spells ALREADY_EXISTS.
+		if result.AlreadyPresent {
+			return nil, status.Errorf(codes.AlreadyExists,
+				"volume %s already exists at %d bytes, above the requested limit of %d",
+				req.GetName(), result.ActualSizeBytes, limit)
+		}
+
+		// One we just created should be impossible — the request is aligned
+		// down so Hyper-V's round-up stays inside the limit. Say so rather
+		// than hand back a volume that violates the range that was asked for.
+		return nil, status.Errorf(codes.Internal,
+			"created volume %s at %d bytes, above the requested limit of %d",
 			req.GetName(), result.ActualSizeBytes, limit)
 	}
 
@@ -129,19 +147,28 @@ func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	}, nil
 }
 
-// validateVolumeCapabilities rejects anything a VHDX can't back. A VHDX is
-// attached to exactly one VM at a time, so RWO is the only honest access mode
-// — advertising more would let Kubernetes schedule a workload that then can't
-// mount.
+// supportedAccessModes is every mode a VHDX can honestly back: it attaches to
+// exactly one VM at a time, so anything single-node is fine and anything
+// multi-node is not. SINGLE_NODE_SINGLE_WRITER (what Kubernetes maps
+// ReadWriteOncePod to) is stricter than plain RWO, not looser, so rejecting it
+// would turn down a workload we can actually serve.
+var supportedAccessModes = map[csi.VolumeCapability_AccessMode_Mode]bool{
+	csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER:        true,
+	csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY:   true,
+	csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER: true,
+}
+
+// validateVolumeCapabilities rejects anything a VHDX can't back — advertising
+// more would let Kubernetes schedule a workload that then can't mount.
 func validateVolumeCapabilities(capabilities []*csi.VolumeCapability) error {
 	if len(capabilities) == 0 {
 		return status.Error(codes.InvalidArgument, "volume capabilities are required")
 	}
 
 	for _, capability := range capabilities {
-		if mode := capability.GetAccessMode().GetMode(); mode != csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER {
+		if mode := capability.GetAccessMode().GetMode(); !supportedAccessModes[mode] {
 			return status.Errorf(codes.InvalidArgument,
-				"access mode %s is not supported; a VHDX is single-writer, so only SINGLE_NODE_WRITER is", mode)
+				"access mode %s is not supported; a VHDX attaches to one node at a time", mode)
 		}
 	}
 
@@ -149,16 +176,18 @@ func validateVolumeCapabilities(capabilities []*csi.VolumeCapability) error {
 }
 
 // pickVolumeSize resolves the CSI capacity range to the single number the
-// agent needs.
+// agent needs. An unsatisfiable range is OUT_OF_RANGE, which is what the CSI
+// spec's CreateVolume error table calls for — INVALID_ARGUMENT is for a
+// malformed request, not an impossible one.
 func pickVolumeSize(capacityRange *csi.CapacityRange) (int64, error) {
 	required, limit := capacityRange.GetRequiredBytes(), capacityRange.GetLimitBytes()
 
 	if required < 0 || limit < 0 {
-		return 0, status.Errorf(codes.InvalidArgument,
-			"capacity range must not be negative, got required=%d limit=%d", required, limit)
+		return 0, status.Errorf(codes.OutOfRange,
+			"capacity range must not be negative, got required_bytes=%d limit_bytes=%d", required, limit)
 	}
 	if required > 0 && limit > 0 && required > limit {
-		return 0, status.Errorf(codes.InvalidArgument,
+		return 0, status.Errorf(codes.OutOfRange,
 			"required_bytes %d exceeds limit_bytes %d", required, limit)
 	}
 
@@ -168,6 +197,18 @@ func pickVolumeSize(capacityRange *csi.CapacityRange) (int64, error) {
 	}
 	if limit > 0 && size > limit {
 		size = limit
+	}
+
+	// Only worth aligning when there's a ceiling to breach; without one,
+	// Hyper-V rounding up is free and gets reported back truthfully.
+	if limit > 0 && size%vhdxSectorAlignment != 0 {
+		aligned := size / vhdxSectorAlignment * vhdxSectorAlignment
+		if aligned < required || aligned == 0 {
+			return 0, status.Errorf(codes.OutOfRange,
+				"no VHDX size satisfies required_bytes=%d and limit_bytes=%d at %d-byte sector alignment",
+				required, limit, vhdxSectorAlignment)
+		}
+		size = aligned
 	}
 
 	return size, nil
