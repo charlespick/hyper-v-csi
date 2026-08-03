@@ -1,1 +1,8 @@
 .DS_Store
+
+# .NET
+agent/**/bin/
+agent/**/obj/
+
+# Go
+csi-driver/bin/
