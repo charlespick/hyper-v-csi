@@ -7,6 +7,15 @@ using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// The agent runs as a Failover Cluster Generic Service resource, so it has to
+// answer the SCM's start control or the cluster gives up on it (error 1053)
+// and never brings the role online. This also moves the content root off the
+// SCM's working directory - C:\Windows\System32 - and sends logs to the event
+// log, which is where an operator looks when a clustered role won't start.
+// It is a no-op when the process isn't running as a service, so dotnet run is
+// unaffected.
+builder.Services.AddWindowsService(options => options.ServiceName = "hyperv-csi-agent");
+
 // Config comes from a file on the CSV named by --config, not from
 // appsettings-next-to-the-exe or per-host environment variables: the clustered
 // role's command line has to resolve identically on whichever host starts the

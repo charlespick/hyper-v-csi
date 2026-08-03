@@ -1,0 +1,8 @@
+{
+  "//": "Local development config, loaded by the 'config file (dev)' launch profile via --config. Exists so the production configuration path - a JSON file named on the command line - is the one you exercise while developing, rather than appsettings.Development.json standing in for it.",
+  "Agent": {
+    "CsvVolumesRoot": "./dev-volumes",
+    "MaxConcurrentDiskOperations": 2,
+    "DiskOperationTimeout": "00:02:00"
+  }
+}
