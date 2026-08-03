@@ -6,3 +6,6 @@ agent/**/obj/
 
 # Go
 csi-driver/bin/
+
+# macOS
+.DS_Store

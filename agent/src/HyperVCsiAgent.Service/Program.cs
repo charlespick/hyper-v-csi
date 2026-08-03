@@ -1,7 +1,9 @@
+using HyperVCsiAgent.Core;
 using HyperVCsiAgent.Core.Jobs;
 
 var builder = WebApplication.CreateBuilder(args);
 
+builder.Services.ConfigureHttpJsonOptions(options => AgentJson.Apply(options.SerializerOptions));
 builder.Services.AddSingleton<IJobStore, InMemoryJobStore>();
 
 var app = builder.Build();

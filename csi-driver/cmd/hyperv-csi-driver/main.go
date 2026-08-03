@@ -5,11 +5,14 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc"
@@ -27,7 +30,19 @@ func main() {
 	)
 	flag.Parse()
 
-	if *mode != "controller" && *mode != "node" {
+	// Fail fast on mode-specific required flags: an empty node ID otherwise
+	// surfaces as a kubelet registration failure far from the actual cause,
+	// and an empty agent address as a broken client at the first job.
+	switch *mode {
+	case "controller":
+		if *agentAddress == "" {
+			log.Fatal("--agent-address is required in controller mode")
+		}
+	case "node":
+		if *nodeID == "" {
+			log.Fatal("--node-id is required in node mode")
+		}
+	default:
 		log.Fatalf("invalid --mode %q: must be \"controller\" or \"node\"", *mode)
 	}
 
@@ -47,6 +62,16 @@ func main() {
 	case "node":
 		csi.RegisterNodeServer(server, d.NodeServer())
 	}
+
+	// Kubelet stops the container with SIGTERM; drain in-flight RPCs instead
+	// of dying mid-call. Serve returns nil after GracefulStop.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		log.Print("shutdown signal received, draining gRPC server")
+		server.GracefulStop()
+	}()
 
 	log.Printf("hyperv-csi-driver starting in %s mode on %s", *mode, *endpoint)
 	if err := server.Serve(listener); err != nil {

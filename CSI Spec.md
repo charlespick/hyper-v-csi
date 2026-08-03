@@ -1,5 +1,9 @@
 # CSI Spec Implementation
 
+The "Idempotency Key" column lists the **raw identifier** sent to the agent. The operation type
+is never baked into the key — it travels as a separate field, and the agent dedupes in-flight
+jobs on the (operation type, idempotency key) pair.
+
 | CSI Surface Call | Implementation Spot | Description | Idempotency Key | |
 |---|---|---|---|---|
 | GetPluginInfo | Both | Returns the plugin's name and version so Kubernetes can identify it. | N/A | |

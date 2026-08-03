@@ -10,10 +10,10 @@ public class InMemoryJobStoreTests
         var store = new InMemoryJobStore();
         var release = new TaskCompletionSource();
 
-        var first = store.GetOrCreate("pvc-1", "CreateVolume", async (_, _) => await release.Task);
+        var first = store.GetOrCreate("pvc-1", "CreateVolume", "vol-pvc-1", async (_, _) => await release.Task);
         await WaitForStatus(first, JobStatus.Running);
 
-        var second = store.GetOrCreate("pvc-1", "CreateVolume", (_, _) =>
+        var second = store.GetOrCreate("pvc-1", "CreateVolume", "vol-pvc-1", (_, _) =>
             throw new InvalidOperationException("must not run a second time while the first is in flight"));
 
         Assert.Same(first, second);
@@ -28,11 +28,11 @@ public class InMemoryJobStoreTests
     {
         var store = new InMemoryJobStore();
 
-        var first = store.GetOrCreate("pvc-1", "CreateVolume", (_, _) => throw new InvalidOperationException("boom"));
+        var first = store.GetOrCreate("pvc-1", "CreateVolume", "vol-pvc-1", (_, _) => throw new InvalidOperationException("boom"));
         await WaitForTerminal(first);
         Assert.Equal(JobStatus.Failed, first.Status);
 
-        var second = store.GetOrCreate("pvc-1", "CreateVolume", (_, _) => Task.CompletedTask);
+        var second = store.GetOrCreate("pvc-1", "CreateVolume", "vol-pvc-1", (_, _) => Task.CompletedTask);
 
         Assert.NotSame(first, second);
     }
@@ -43,23 +43,89 @@ public class InMemoryJobStoreTests
         var store = new InMemoryJobStore();
         var release = new TaskCompletionSource();
 
-        var create = store.GetOrCreate("pvc-1", "CreateVolume", async (_, _) => await release.Task);
+        var create = store.GetOrCreate("pvc-1", "CreateVolume", "vol-pvc-1", async (_, _) => await release.Task);
         await WaitForStatus(create, JobStatus.Running);
 
-        var delete = store.GetOrCreate("pvc-1", "DeleteVolume", (_, _) => Task.CompletedTask);
+        var delete = store.GetOrCreate("pvc-1", "DeleteVolume", "vol-pvc-1", (_, _) => Task.CompletedTask);
 
         Assert.NotSame(create, delete);
         Assert.Equal("DeleteVolume", delete.OperationType);
 
         release.SetResult();
+        await WaitForTerminal(delete);
     }
 
     [Fact]
-    public void Get_UnknownId_ReturnsNull()
+    public async Task GetOrCreate_SameTarget_RunsJobsStrictlyInOrder()
     {
         var store = new InMemoryJobStore();
+        var release = new TaskCompletionSource();
 
-        Assert.Null(store.Get("does-not-exist"));
+        var attach = store.GetOrCreate("pvc-1+node-a", "ControllerPublishVolume", "vm-node-a", async (_, _) => await release.Task);
+        await WaitForStatus(attach, JobStatus.Running);
+
+        var detach = store.GetOrCreate("pvc-1+node-a", "ControllerUnpublishVolume", "vm-node-a", (_, _) => Task.CompletedTask);
+
+        await Task.Delay(50);
+        Assert.Equal(JobStatus.Pending, detach.Status);
+
+        release.SetResult();
+        await WaitForTerminal(detach);
+        Assert.Equal(JobStatus.Succeeded, detach.Status);
+    }
+
+    [Fact]
+    public async Task GetOrCreate_DifferentTargets_RunConcurrently()
+    {
+        var store = new InMemoryJobStore();
+        var release = new TaskCompletionSource();
+
+        var blocked = store.GetOrCreate("pvc-1", "CreateVolume", "vol-pvc-1", async (_, _) => await release.Task);
+        await WaitForStatus(blocked, JobStatus.Running);
+
+        var independent = store.GetOrCreate("pvc-2", "CreateVolume", "vol-pvc-2", (_, _) => Task.CompletedTask);
+        await WaitForTerminal(independent);
+
+        Assert.Equal(JobStatus.Succeeded, independent.Status);
+        Assert.Equal(JobStatus.Running, blocked.Status);
+
+        release.SetResult();
+        await WaitForTerminal(blocked);
+    }
+
+    [Fact]
+    public async Task Get_TerminalJobPastRetention_IsEvicted()
+    {
+        var clock = new FakeClock();
+        var store = new InMemoryJobStore(clock);
+
+        var job = store.GetOrCreate("pvc-1", "CreateVolume", "vol-pvc-1", (_, _) => Task.CompletedTask);
+        await WaitForTerminal(job);
+
+        Assert.Same(job, store.Get(job.Id));
+
+        clock.Advance(InMemoryJobStore.Retention + TimeSpan.FromSeconds(1));
+
+        Assert.Null(store.Get(job.Id));
+    }
+
+    [Fact]
+    public async Task Dispose_CancelsInFlightJobTokens()
+    {
+        var store = new InMemoryJobStore();
+        var started = new TaskCompletionSource();
+
+        var job = store.GetOrCreate("pvc-1", "CreateVolume", "vol-pvc-1", async (_, cancellationToken) =>
+        {
+            started.SetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        });
+
+        await started.Task;
+        store.Dispose();
+
+        await WaitForTerminal(job);
+        Assert.Equal(JobStatus.Failed, job.Status);
     }
 
     private static async Task WaitForStatus(Job job, JobStatus status)
@@ -88,5 +154,14 @@ public class InMemoryJobStoreTests
 
             await Task.Delay(10);
         }
+    }
+
+    private sealed class FakeClock : TimeProvider
+    {
+        private DateTimeOffset _now = DateTimeOffset.UtcNow;
+
+        public void Advance(TimeSpan by) => _now += by;
+
+        public override DateTimeOffset GetUtcNow() => _now;
     }
 }
