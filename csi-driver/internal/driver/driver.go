@@ -11,7 +11,11 @@ import (
 )
 
 const (
-	DriverName = "csi.hyperv.local"
+	// DriverName is what GetPluginInfo reports, and it has to match the
+	// CSIDriver object's metadata.name and every StorageClass's provisioner
+	// field. Changing it after anything references it orphans existing
+	// PersistentVolumes, so it is fixed from here on.
+	DriverName = "csi.hyper-v.makerland.xyz"
 )
 
 // Version is overridden at build time via -ldflags.
