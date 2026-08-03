@@ -1,0 +1,115 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hyperv-csi.fullname" . }}-controller
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "hyperv-csi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+spec:
+  replicas: {{ .Values.controller.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "hyperv-csi.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: controller
+  template:
+    metadata:
+      labels:
+        {{- include "hyperv-csi.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: controller
+      {{- with .Values.controller.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "hyperv-csi.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+      containers:
+        - name: csi-provisioner
+          image: {{ .Values.controller.provisioner.image }}
+          args:
+            - --csi-address=$(ADDRESS)
+            # Bounds how long it waits for CreateVolume. The driver clamps its
+            # own job polling to a fraction of whatever deadline arrives here,
+            # so it always answers with a retryable status before this expires
+            # rather than leaving the call to time out.
+            - --timeout={{ .Values.controller.provisioner.timeout }}
+            - --leader-election
+            - --leader-election-namespace=$(NAMESPACE)
+            {{- range .Values.controller.provisioner.extraArgs }}
+            - {{ . }}
+            {{- end }}
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+        - name: hyperv-csi-driver
+          image: {{ include "hyperv-csi.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --mode=controller
+            - --endpoint=unix:///csi/csi.sock
+            - --agent-address={{ .Values.agent.address }}
+            {{- if .Values.agent.allowInsecure }}
+            - --allow-insecure-agent
+            {{- else }}
+            - --agent-client-cert=/etc/hyperv-csi/tls.crt
+            - --agent-client-key=/etc/hyperv-csi/tls.key
+            {{- end }}
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            {{- if not .Values.agent.allowInsecure }}
+            - name: client-cert
+              mountPath: /etc/hyperv-csi
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.controller.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        # The CSI socket is shared between the driver and the sidecar and lives
+        # only as long as the pod; nothing about it needs to survive a restart.
+        - name: socket-dir
+          emptyDir: {}
+        {{- if not .Values.agent.allowInsecure }}
+        - name: client-cert
+          secret:
+            secretName: {{ include "hyperv-csi.clientCertificateSecret" . }}
+            defaultMode: 0400
+        {{- end }}
+      {{- with .Values.controller.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

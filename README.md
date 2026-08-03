@@ -66,6 +66,46 @@ VHDX operations need Windows with the Hyper-V role. The agent still starts on ot
 platforms — useful for working on the HTTP surface — but any job that would touch a
 disk fails instead of silently doing nothing.
 
+## Deploying to Kubernetes
+
+A Helm chart lives in [deploy/helm/hyperv-csi](deploy/helm/hyperv-csi). Build and push
+the driver image first — the chart's default repository is a placeholder:
+
+```bash
+docker build -t ghcr.io/charlespick/hyperv-csi-driver:0.1.0 csi-driver
+docker push ghcr.io/charlespick/hyperv-csi-driver:0.1.0
+```
+
+```bash
+kubectl create namespace hyperv-csi
+kubectl -n hyperv-csi create secret tls hyperv-csi-agent-client --cert=tls.crt --key=tls.key
+helm install hyperv-csi deploy/helm/hyperv-csi \
+  --namespace hyperv-csi \
+  --set agent.address=https://hyperv-csi-agent.makerland.xyz
+```
+
+The chart is scoped to what the driver implements, which today is `CreateVolume` alone.
+That shapes three defaults worth knowing about:
+
+- **Only external-provisioner is deployed.** Attacher, resizer, and snapshotter would sit
+  in a retry loop against RPCs that return `Unimplemented`.
+- **`attachRequired: false` on the CSIDriver object.** `ControllerPublishVolume` doesn't
+  exist, so declaring attachment required would have Kubernetes wait forever on a
+  `VolumeAttachment` nothing can satisfy — every PVC would hang at first use rather than
+  simply failing to mount.
+- **The StorageClass reclaims with `Retain`.** `DeleteVolume` isn't implemented; under
+  `Delete`, removing a PVC would loop forever and strand the PV in `Released`. VHDX files
+  are removed by hand for now.
+
+The node plugin (`node.enabled`) is off by default for the same reason: every `Node*` RPC
+that does real work is still a stub, so running it would register a plugin with kubelet
+that can't mount anything. Provisioning is controller-side, so a PVC binds without it.
+
+Installing with an unusable configuration fails at `helm install` rather than as a
+`CrashLoopBackOff` — a missing agent address, a plaintext address without the explicit
+opt-out, or no client certificate are all rejected during templating. `helm install`
+prints a PVC you can apply to watch a volume get provisioned end to end.
+
 ## TLS and authentication
 
 The agent serves HTTPS and requires a client certificate. Both are mandatory outside

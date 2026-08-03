@@ -1,0 +1,17 @@
+apiVersion: v2
+name: hyperv-csi
+description: CSI driver for VHDX-backed volumes on a Hyper-V failover cluster
+type: application
+
+# version is the chart's own version; appVersion is the driver image tag used
+# when image.tag is left empty.
+version: 0.1.0
+appVersion: "0.1.0"
+
+keywords:
+  - csi
+  - storage
+  - hyper-v
+home: https://github.com/charlespick/hyper-v-csi
+sources:
+  - https://github.com/charlespick/hyper-v-csi

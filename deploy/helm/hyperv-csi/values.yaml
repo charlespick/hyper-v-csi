@@ -1,0 +1,120 @@
+# hyperv-csi
+#
+# Scoped to what the driver actually implements today: CreateVolume. Deleting,
+# attaching, mounting, expanding, and snapshotting are all still Unimplemented,
+# so the chart deliberately does not deploy the sidecars that would call them —
+# they would sit in a retry loop against RPCs that cannot succeed. The knobs to
+# turn those on are here, defaulted off, for when the RPCs land.
+
+image:
+  repository: ghcr.io/charlespick/hyperv-csi-driver
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# The hyperv-csi-agent running as a clustered role on the Hyper-V failover
+# cluster. Must be https:// — the driver refuses a plaintext address whenever a
+# client certificate is configured, since over plaintext the certificate proves
+# nothing.
+agent:
+  address: ""
+
+  # Development escape hatch. Drops TLS and the client certificate entirely,
+  # which is what stands between the agent's job API and anything that can route
+  # to it. The agent only serves such callers when it is itself running in
+  # Development.
+  allowInsecure: false
+
+# The self-signed client certificate the agent pins by fingerprint. Create it
+# with the commands in the repository README, and put its fingerprint in the
+# agent's own config file — the agent will reject anything else at the TLS
+# handshake.
+clientCertificate:
+  # Preferred: a kubernetes.io/tls Secret you created yourself, so the private
+  # key never passes through Helm values or release history.
+  #   kubectl create secret tls hyperv-csi-agent-client --cert=tls.crt --key=tls.key
+  existingSecret: "hyperv-csi-agent-client"
+
+  # Alternative: have the chart create the Secret. Supply these with
+  # --set-file rather than writing a private key into a values file.
+  cert: ""
+  key: ""
+
+controller:
+  replicaCount: 1
+
+  # external-provisioner is the only sidecar whose RPCs exist. Its --timeout
+  # bounds how long it waits for CreateVolume; the driver clamps its own polling
+  # to a fraction of whatever deadline arrives, so these stay consistent
+  # automatically.
+  provisioner:
+    image: registry.k8s.io/sig-storage/csi-provisioner:v5.1.0
+    timeout: 30s
+    extraArgs: []
+
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+
+# The node plugin stages and mounts volumes in the guest. Every Node* RPC that
+# does real work is still Unimplemented, so running it would register a plugin
+# with kubelet that cannot mount anything. Provisioning is controller-side and
+# works without it — a PVC binds either way.
+node:
+  enabled: false
+
+  registrar:
+    image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0
+
+  kubeletDir: /var/lib/kubelet
+
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
+
+  nodeSelector: {}
+  tolerations:
+    - operator: Exists
+  affinity: {}
+  podAnnotations: {}
+
+storageClass:
+  create: true
+  name: hyperv-csi
+  isDefault: false
+
+  # Retain, not Delete, because DeleteVolume is not implemented. Under Delete,
+  # removing a PVC puts external-provisioner into a permanent retry loop against
+  # an RPC that returns Unimplemented, and the PV never leaves Released. Retain
+  # never calls it — the VHDX is cleaned up by hand for now.
+  reclaimPolicy: Retain
+
+  # WaitForFirstConsumer would hold the PVC Pending until a pod is scheduled,
+  # and nothing can mount it yet, so binding immediately is what makes
+  # provisioning observable on its own.
+  volumeBindingMode: Immediate
+
+  allowVolumeExpansion: false
+  parameters: {}
+
+rbac:
+  create: true
+
+serviceAccount:
+  create: true
+  # Defaults to the fullname.
+  name: ""
+  annotations: {}

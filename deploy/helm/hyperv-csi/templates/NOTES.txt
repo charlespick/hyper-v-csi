@@ -1,0 +1,48 @@
+hyperv-csi {{ .Chart.AppVersion }} installed as {{ .Release.Name }} in {{ .Release.Namespace }}.
+
+Driver name: {{ include "hyperv-csi.driverName" . }}
+Agent:       {{ .Values.agent.address }}
+
+What works right now: CreateVolume, and nothing else. A PVC will provision and
+bind; a pod that tries to use it will not mount.
+
+Watch a volume get provisioned:
+
+  kubectl apply -f - <<'YAML'
+  apiVersion: v1
+  kind: PersistentVolumeClaim
+  metadata:
+    name: hyperv-csi-smoke
+  spec:
+    accessModes: [ReadWriteOnce]
+    storageClassName: {{ .Values.storageClass.name }}
+    resources:
+      requests:
+        storage: 1Gi
+  YAML
+
+  kubectl get pvc hyperv-csi-smoke -w
+
+Bound means the agent created a VHDX under its configured CsvVolumesRoot; the
+file is named after the PVC's volume handle. If it stays Pending, the reason is
+in the provisioner's events and the driver's logs:
+
+  kubectl describe pvc hyperv-csi-smoke
+  kubectl logs -n {{ .Release.Namespace }} deploy/{{ include "hyperv-csi.fullname" . }}-controller -c hyperv-csi-driver
+  kubectl logs -n {{ .Release.Namespace }} deploy/{{ include "hyperv-csi.fullname" . }}-controller -c csi-provisioner
+
+A TLS error in the driver's logs with nothing on the agent side usually means
+the client certificate's fingerprint isn't in the agent's config — the agent
+rejects unrecognized callers during the handshake and logs the fingerprint it
+was shown.
+{{ if eq .Values.storageClass.reclaimPolicy "Retain" }}
+Note: the StorageClass reclaims with Retain because DeleteVolume isn't
+implemented. Deleting the PVC leaves the PV and the VHDX behind, to be removed
+by hand.
+{{- end }}
+{{- if .Values.agent.allowInsecure }}
+
+WARNING: agent.allowInsecure is set. The connection to the agent has no TLS and
+no client certificate, which is the only thing that stops anything able to route
+to the agent from creating and deleting volumes. Development only.
+{{- end }}

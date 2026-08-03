@@ -1,0 +1,100 @@
+{{- if .Values.node.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "hyperv-csi.fullname" . }}-node
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "hyperv-csi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+spec:
+  selector:
+    matchLabels:
+      {{- include "hyperv-csi.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: node
+  template:
+    metadata:
+      labels:
+        {{- include "hyperv-csi.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: node
+      {{- with .Values.node.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "hyperv-csi.serviceAccountName" . }}
+      hostNetwork: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: node-driver-registrar
+          image: {{ .Values.node.registrar.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path={{ .Values.node.kubeletDir }}/plugins/{{ include "hyperv-csi.driverName" . }}/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+        - name: hyperv-csi-driver
+          image: {{ include "hyperv-csi.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --mode=node
+            # NOTE: this is the Kubernetes node name. ControllerPublishVolume
+            # will need to resolve the same value to the VM's identity in the
+            # failover cluster; if those don't line up, attach will look up the
+            # wrong VM. Revisit when that RPC is implemented.
+            - --node-id=$(KUBE_NODE_NAME)
+            - --endpoint=unix:///csi/csi.sock
+          env:
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: pods-mount-dir
+              mountPath: {{ .Values.node.kubeletDir }}/pods
+              mountPropagation: Bidirectional
+          resources:
+            {{- toYaml .Values.node.resources | nindent 12 }}
+          securityContext:
+            # Staging and publishing a volume means mounting inside the guest,
+            # which needs privilege. Nothing here does that work yet.
+            privileged: true
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: {{ .Values.node.kubeletDir }}/plugins/{{ include "hyperv-csi.driverName" . }}
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: {{ .Values.node.kubeletDir }}/plugins_registry
+            type: Directory
+        - name: pods-mount-dir
+          hostPath:
+            path: {{ .Values.node.kubeletDir }}/pods
+            type: Directory
+      {{- with .Values.node.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

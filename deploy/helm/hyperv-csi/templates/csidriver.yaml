@@ -1,0 +1,25 @@
+{{- include "hyperv-csi.validate" . -}}
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  # Must equal the DriverName compiled into the binary and the provisioner of
+  # every StorageClass below.
+  name: {{ include "hyperv-csi.driverName" . }}
+  labels:
+    {{- include "hyperv-csi.labels" . | nindent 4 }}
+spec:
+  # ControllerPublishVolume is not implemented. Declaring attachment required
+  # would have Kubernetes create VolumeAttachment objects and wait forever for
+  # an external-attacher that cannot succeed, so every PVC would hang at first
+  # use rather than simply failing to mount.
+  attachRequired: false
+
+  # NodePublishVolume receives no pod metadata; nothing consumes it yet.
+  podInfoOnMount: false
+
+  storageCapacity: false
+
+  volumeLifecycleModes:
+    - Persistent
+
+  fsGroupPolicy: File
