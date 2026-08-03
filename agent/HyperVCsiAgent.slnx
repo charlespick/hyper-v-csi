@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/HyperVCsiAgent.Core/HyperVCsiAgent.Core.csproj" />
+    <Project Path="src/HyperVCsiAgent.Service/HyperVCsiAgent.Service.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/HyperVCsiAgent.Core.Tests/HyperVCsiAgent.Core.Tests.csproj" />
+  </Folder>
+</Solution>
