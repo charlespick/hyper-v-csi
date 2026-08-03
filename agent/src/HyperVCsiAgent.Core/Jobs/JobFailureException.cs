@@ -20,4 +20,7 @@ public sealed class JobFailureException : Exception
 
     public static JobFailureException ResourceExhausted(string message) =>
         new(AgentErrorCodes.ResourceExhausted, message);
+
+    public static JobFailureException FailedPrecondition(string message) =>
+        new(AgentErrorCodes.FailedPrecondition, message);
 }

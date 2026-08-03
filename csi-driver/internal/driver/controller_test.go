@@ -386,6 +386,134 @@ func TestCreateVolumeCreatingAVolumeOverTheLimitIsOurBugNotACollision(t *testing
 	}
 }
 
+func TestDeleteVolumeEnqueuesUnderTheVolumeIDAsIdempotencyKey(t *testing.T) {
+	agent := newFakeAgent(t, agentclient.Job{Status: agentclient.JobSucceeded})
+	server := newControllerServer(agent)
+
+	if _, err := server.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "pvc-1"}); err != nil {
+		t.Fatalf("DeleteVolume: %v", err)
+	}
+
+	enqueued := agent.onlyEnqueued(t)
+	if enqueued.IdempotencyKey != "pvc-1" {
+		t.Errorf("idempotency key = %q, want the CSI volume id", enqueued.IdempotencyKey)
+	}
+	if enqueued.OperationType != operationDeleteVolume {
+		t.Errorf("operation type = %q, want %q", enqueued.OperationType, operationDeleteVolume)
+	}
+	// Same target as a create for this volume, so the two can never interleave.
+	if enqueued.Target != "volume:pvc-1" {
+		t.Errorf("target = %q, want volume:pvc-1", enqueued.Target)
+	}
+	if enqueued.Payload.VolumeID != "pvc-1" {
+		t.Errorf("payload = %+v, want the volume id", enqueued.Payload)
+	}
+}
+
+func TestDeleteVolumeSucceedsWithoutAResultPayload(t *testing.T) {
+	// A deleted volume has nothing left to describe, so the agent sends no
+	// result. Requiring one would fail every successful delete.
+	server := newControllerServer(newFakeAgent(t, agentclient.Job{Status: agentclient.JobSucceeded}))
+
+	resp, err := server.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "pvc-1"})
+	if err != nil {
+		t.Fatalf("DeleteVolume: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("DeleteVolume returned no response")
+	}
+}
+
+func TestDeleteVolumeRequiresAVolumeID(t *testing.T) {
+	agent := newFakeAgent(t, agentclient.Job{Status: agentclient.JobSucceeded})
+	server := newControllerServer(agent)
+
+	_, err := server.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{})
+
+	if got := status.Code(err); got != codes.InvalidArgument {
+		t.Fatalf("code = %s, want InvalidArgument (err: %v)", got, err)
+	}
+	if n := agent.enqueueCount(); n != 0 {
+		t.Errorf("enqueued %d jobs, want none", n)
+	}
+}
+
+func TestDeleteVolumeWaitsForAJobThatIsStillRunning(t *testing.T) {
+	agent := newFakeAgent(t,
+		agentclient.Job{Status: agentclient.JobRunning},
+		agentclient.Job{Status: agentclient.JobSucceeded},
+	)
+	server := newControllerServer(agent)
+
+	if _, err := server.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "pvc-1"}); err != nil {
+		t.Fatalf("DeleteVolume: %v", err)
+	}
+
+	if agent.pollCount() < 2 {
+		t.Errorf("polled %d times, want it to keep polling until terminal", agent.pollCount())
+	}
+}
+
+func TestDeleteVolumeTranslatesAgentFailures(t *testing.T) {
+	tests := []struct {
+		name string
+		job  agentclient.Job
+		want codes.Code
+	}{
+		{
+			// CSI's answer for a volume still in use: tell the operator what to
+			// fix rather than dressing it up as a transient fault.
+			name: "still attached to a VM",
+			job:  agentclient.Job{Status: agentclient.JobFailed, Error: "still attached", ErrorCode: agentclient.ErrorCodeFailedPrecondition},
+			want: codes.FailedPrecondition,
+		},
+		{
+			name: "unclassified failure",
+			job:  agentclient.Job{Status: agentclient.JobFailed, Error: "CSV said no"},
+			want: codes.Internal,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := newControllerServer(newFakeAgent(t, test.job))
+
+			_, err := server.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "pvc-1"})
+
+			if got := status.Code(err); got != test.want {
+				t.Fatalf("code = %s, want %s (err: %v)", got, test.want, err)
+			}
+			if s, _ := status.FromError(err); s.Message() != test.job.Error {
+				t.Errorf("message = %q, want the agent's detail %q", s.Message(), test.job.Error)
+			}
+		})
+	}
+}
+
+func TestDeleteVolumeForgottenJobIsRetryable(t *testing.T) {
+	// The agent restarted mid-delete. Re-driving is safe: it decides what's
+	// left to do from the CSV, and a volume already gone is a success.
+	server := newControllerServer(newFakeAgent(t))
+
+	_, err := server.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "pvc-1"})
+
+	if got := status.Code(err); got != codes.Aborted {
+		t.Fatalf("code = %s, want Aborted (err: %v)", got, err)
+	}
+}
+
+func TestDeleteVolumeUnreachableAgentIsRetryable(t *testing.T) {
+	agent := newFakeAgent(t, agentclient.Job{Status: agentclient.JobSucceeded})
+	agent.Close()
+	server := newControllerServer(agent)
+
+	_, err := server.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "pvc-1"})
+
+	if got := status.Code(err); got != codes.Unavailable {
+		t.Fatalf("code = %s, want Unavailable (err: %v)", got, err)
+	}
+}
+
 func newControllerServer(agent *fakeAgent) *controllerServer {
 	return &controllerServer{driver: New("", agentclient.New(agent.URL))}
 }
@@ -427,9 +555,12 @@ type enqueuedJob struct {
 	OperationType  string `json:"operationType"`
 	IdempotencyKey string `json:"idempotencyKey"`
 	Target         string `json:"target"`
-	Payload        struct {
+	// The union of every operation's payload, so one decode covers whichever
+	// one the test under way enqueued.
+	Payload struct {
 		Name      string `json:"name"`
 		SizeBytes int64  `json:"sizeBytes"`
+		VolumeID  string `json:"volumeId"`
 	} `json:"payload"`
 }
 

@@ -100,12 +100,57 @@ public sealed class JobsEndpointTests : IDisposable
         Assert.False(conflict.RootElement.TryGetProperty("result", out _));
     }
 
+    [Fact]
+    public async Task GetJob_SucceededDelete_CarriesNoResultAtAll()
+    {
+        var client = _factory.CreateClient();
+        await RunToCompletionAsync(client, CreateVolumeRequest("pvc-1", 4096));
+
+        var deleted = await RunToCompletionAsync(client, DeleteVolumeRequest("pvc-1"));
+
+        Assert.Equal("Succeeded", deleted.RootElement.GetProperty("status").GetString());
+        Assert.Equal("DeleteVolume", deleted.RootElement.GetProperty("operationType").GetString());
+        // The Go controller reads only the status for a delete, so an absent
+        // result has to stay absent rather than serializing as a null it would
+        // then try to decode.
+        Assert.False(deleted.RootElement.TryGetProperty("result", out _));
+    }
+
+    [Fact]
+    public async Task GetJob_DeleteOfAVolumeThatWasNeverCreated_Succeeds()
+    {
+        // CSI requires OK when the volume isn't there, which is also what a
+        // delete re-driven after an agent restart looks like.
+        var client = _factory.CreateClient();
+
+        var deleted = await RunToCompletionAsync(client, DeleteVolumeRequest("pvc-nonexistent"));
+
+        Assert.Equal("Succeeded", deleted.RootElement.GetProperty("status").GetString());
+    }
+
+    [Fact]
+    public async Task PostJobs_CreateAndDeleteForOneVolume_AreSeparateJobs()
+    {
+        // Dedupe is on the (operationType, idempotencyKey) pair, so a delete
+        // must not attach to the create that shares its key - which would
+        // report the volume deleted the moment the create finished.
+        var client = _factory.CreateClient();
+
+        using var created = await ReadJsonAsync(await client.PostAsJsonAsync("/v1/jobs", CreateVolumeRequest("pvc-1", 4096)));
+        using var deleted = await ReadJsonAsync(await client.PostAsJsonAsync("/v1/jobs", DeleteVolumeRequest("pvc-1")));
+
+        Assert.NotEqual(
+            created.RootElement.GetProperty("id").GetString(),
+            deleted.RootElement.GetProperty("id").GetString());
+    }
+
     [Theory]
     [InlineData("""{"idempotencyKey":"pvc-1","target":"volume:pvc-1","payload":{"name":"pvc-1","sizeBytes":4096}}""")]
     [InlineData("""{"operationType":"CreateVolume","target":"volume:pvc-1","payload":{"name":"pvc-1","sizeBytes":4096}}""")]
     [InlineData("""{"operationType":"CreateVolume","idempotencyKey":"pvc-1","payload":{"name":"pvc-1","sizeBytes":4096}}""")]
     [InlineData("""{"operationType":"Nope","idempotencyKey":"pvc-1","target":"volume:pvc-1","payload":{}}""")]
     [InlineData("""{"operationType":"CreateVolume","idempotencyKey":"pvc-1","target":"volume:pvc-1","payload":{"sizeBytes":4096}}""")]
+    [InlineData("""{"operationType":"DeleteVolume","idempotencyKey":"pvc-1","target":"volume:pvc-1","payload":{}}""")]
     public async Task PostJobs_UnusableRequest_IsRejectedWithoutCreatingAJob(string body)
     {
         var client = _factory.CreateClient();
@@ -132,6 +177,14 @@ public sealed class JobsEndpointTests : IDisposable
         idempotencyKey = name,
         target = "volume:" + name,
         payload = new { name, sizeBytes },
+    };
+
+    private static object DeleteVolumeRequest(string volumeId) => new
+    {
+        operationType = "DeleteVolume",
+        idempotencyKey = volumeId,
+        target = "volume:" + volumeId,
+        payload = new { volumeId },
     };
 
     private static async Task<JsonDocument> RunToCompletionAsync(HttpClient client, object request)

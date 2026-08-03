@@ -84,8 +84,9 @@ helm install hyperv-csi deploy/helm/hyperv-csi \
   --set agent.address=https://hyperv-csi-agent.makerland.xyz
 ```
 
-The chart is scoped to what the driver implements, which today is `CreateVolume` alone.
-That shapes three defaults worth knowing about:
+The chart is scoped to what the driver implements, which today is `CreateVolume` and
+`DeleteVolume` — enough to provision and reclaim, not to attach. That shapes three
+defaults worth knowing about:
 
 - **Only external-provisioner is deployed.** Attacher, resizer, and snapshotter would sit
   in a retry loop against RPCs that return `Unimplemented`.
@@ -93,9 +94,10 @@ That shapes three defaults worth knowing about:
   exist, so declaring attachment required would have Kubernetes wait forever on a
   `VolumeAttachment` nothing can satisfy — every PVC would hang at first use rather than
   simply failing to mount.
-- **The StorageClass reclaims with `Retain`.** `DeleteVolume` isn't implemented; under
-  `Delete`, removing a PVC would loop forever and strand the PV in `Released`. VHDX files
-  are removed by hand for now.
+- **The StorageClass reclaims with `Retain`.** `DeleteVolume` works, so `Delete` would
+  too — but it hasn't run against real Hyper-V yet, and `Delete` would make its first
+  real outing an irreversible one. VHDX files are removed by hand until you've watched a
+  delete succeed on your own hosts, then flip `storageClass.reclaimPolicy`.
 
 The node plugin (`node.enabled`) is off by default for the same reason: every `Node*` RPC
 that does real work is still a stub, so running it would register a plugin with kubelet

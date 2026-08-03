@@ -20,6 +20,15 @@ public interface IVhdxService
 
     Task ExpandAsync(string volumeId, long newSizeBytes, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// Deletes the volume's VHDX. Succeeds when there is nothing to delete,
+    /// which is what CSI requires of DeleteVolume and what makes a re-driven
+    /// delete safe after the agent forgets the job.
+    /// </summary>
+    /// <exception cref="Jobs.JobFailureException">
+    /// FailedPrecondition if the disk is still attached to a VM, which Windows
+    /// surfaces as a sharing violation on the delete.
+    /// </exception>
     Task DeleteAsync(string volumeId, CancellationToken cancellationToken);
 
     Task<string> CreateCheckpointAsync(string volumeId, string snapshotName, CancellationToken cancellationToken);

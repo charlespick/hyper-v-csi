@@ -264,6 +264,154 @@ public sealed class VhdxServiceTests : IDisposable
         await Task.WhenAll(replays);
     }
 
+    [Fact]
+    public async Task DeleteAsync_RemovesTheVolumesVhdx()
+    {
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks);
+        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+
+        await service.DeleteAsync("pvc-1", CancellationToken.None);
+
+        Assert.False(File.Exists(VolumePath("pvc-1")));
+    }
+
+    [Fact]
+    public async Task DeleteAsync_LeavesOtherVolumesAlone()
+    {
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks);
+        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-2", 1024, CancellationToken.None);
+
+        await service.DeleteAsync("pvc-1", CancellationToken.None);
+
+        Assert.True(File.Exists(VolumePath("pvc-2")));
+    }
+
+    [Fact]
+    public async Task DeleteAsync_VolumeThatIsNotThere_Succeeds()
+    {
+        // CSI requires OK when the volume is already gone, and that is also
+        // what a re-driven delete looks like after the agent forgets the job
+        // that already ran it.
+        using var service = NewService(new FakeVirtualDiskManager());
+
+        await service.DeleteAsync("pvc-1", CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task DeleteAsync_IsIdempotent()
+    {
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks);
+        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+
+        await service.DeleteAsync("pvc-1", CancellationToken.None);
+        await service.DeleteAsync("pvc-1", CancellationToken.None);
+
+        Assert.False(File.Exists(VolumePath("pvc-1")));
+    }
+
+    [Fact]
+    public async Task DeleteAsync_WhenTheCsvRootDoesNotExist_Succeeds()
+    {
+        // Nothing has been provisioned yet, so the root itself is absent - the
+        // volume is doubly not there, not a failure to report.
+        using var service = NewService(new FakeVirtualDiskManager());
+
+        await service.DeleteAsync("pvc-1", CancellationToken.None);
+
+        Assert.False(Directory.Exists(_root));
+    }
+
+    [Fact]
+    public async Task DeleteAsync_AlsoCollectsALeftoverInProgressFile()
+    {
+        // A create that died between the CIM call and its rename left this
+        // behind. Only a later create for the same name would otherwise clean
+        // it up, which for a volume being reclaimed never comes.
+        var disks = new FakeVirtualDiskManager { FailNextCreate = true };
+        using var service = NewService(disks);
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.CreateAsync("pvc-1", 1024, CancellationToken.None));
+        Directory.CreateDirectory(_root);
+        await File.WriteAllTextAsync(InProgressPath("pvc-1"), "half-written disk");
+
+        await service.DeleteAsync("pvc-1", CancellationToken.None);
+
+        Assert.False(File.Exists(InProgressPath("pvc-1")));
+    }
+
+    [Theory]
+    [InlineData("../escape")]
+    [InlineData("sub/dir")]
+    [InlineData(@"sub\dir")]
+    [InlineData("")]
+    public async Task DeleteAsync_VolumeIdThatCouldNotHaveBeenCreated_SucceedsWithoutTouchingAnything(string volumeId)
+    {
+        // No create could have produced this name, so nothing under it exists.
+        // Failing would strand the PV in Terminating on a retry that no attempt
+        // could ever satisfy.
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks);
+        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+
+        await service.DeleteAsync(volumeId, CancellationToken.None);
+
+        Assert.True(File.Exists(VolumePath("pvc-1")));
+    }
+
+    [WindowsOnlyFact]
+    public async Task DeleteAsync_WhenTheDiskIsStillAttached_FailsAsFailedPrecondition()
+    {
+        // Hyper-V holds an open handle on an attached VHDX, so Windows fails
+        // the delete with a sharing violation. CSI wants that reported as
+        // FAILED_PRECONDITION - detach it first - not retried as a CSV blip.
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks);
+        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+
+        using (HoldOpenExclusively(VolumePath("pvc-1")))
+        {
+            var failure = await Assert.ThrowsAsync<JobFailureException>(
+                () => service.DeleteAsync("pvc-1", CancellationToken.None));
+
+            Assert.Equal(AgentErrorCodes.FailedPrecondition, failure.ErrorCode);
+        }
+    }
+
+    [Fact]
+    public async Task DeleteAsync_NeverExceedsTheConfiguredConcurrencyLimit()
+    {
+        // A reclaim burst funnels through the CSV coordinator node just like a
+        // create burst does, so the same cap has to cover it.
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks, maxConcurrentDiskOperations: 1);
+        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+
+        using var blocked = new SemaphoreSlim(0);
+        disks.BeforeCreate = _ => blocked.WaitAsync();
+        var holdsTheGate = service.CreateAsync("pvc-2", 1024, CancellationToken.None);
+        await WaitFor(() => disks.InFlightPeak >= 1);
+
+        var delete = service.DeleteAsync("pvc-1", CancellationToken.None);
+        await Task.Delay(50);
+        Assert.False(delete.IsCompleted);
+        Assert.True(File.Exists(VolumePath("pvc-1")));
+
+        blocked.Release();
+        await Task.WhenAll(holdsTheGate, delete);
+        Assert.False(File.Exists(VolumePath("pvc-1")));
+    }
+
+    /// <summary>
+    /// Opens a file with no sharing, which is how Hyper-V holds a VHDX attached
+    /// to a running VM: any delete against it fails with a sharing violation.
+    /// </summary>
+    private static FileStream HoldOpenExclusively(string path) =>
+        new(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+
     private VhdxService NewService(
         IVirtualDiskManager disks,
         int maxConcurrentDiskOperations = 4,

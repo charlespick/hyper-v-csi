@@ -96,10 +96,12 @@ storageClass:
   name: hyperv-csi
   isDefault: false
 
-  # Retain, not Delete, because DeleteVolume is not implemented. Under Delete,
-  # removing a PVC puts external-provisioner into a permanent retry loop against
-  # an RPC that returns Unimplemented, and the PV never leaves Released. Retain
-  # never calls it — the VHDX is cleaned up by hand for now.
+  # Retain, not Delete. DeleteVolume is implemented now, so Delete would work —
+  # but it has not yet run against a real Hyper-V host, and under Delete the
+  # first time it ever does would be an irreversible disk deletion triggered by
+  # someone removing a PVC. Retain never calls it, so the VHDX outlives the PV
+  # and is removed by hand. Switch this to Delete once you have watched a
+  # DeleteVolume succeed on your cluster.
   reclaimPolicy: Retain
 
   # WaitForFirstConsumer would hold the PVC Pending until a pod is scheduled,

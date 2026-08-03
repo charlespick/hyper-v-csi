@@ -36,10 +36,11 @@ func (s JobStatus) Terminal() bool {
 // the .NET side. Anything else — including a failure carrying no code at all —
 // is treated as Internal, and therefore retryable, by callers.
 const (
-	ErrorCodeInvalidArgument   = "InvalidArgument"
-	ErrorCodeAlreadyExists     = "AlreadyExists"
-	ErrorCodeResourceExhausted = "ResourceExhausted"
-	ErrorCodeInternal          = "Internal"
+	ErrorCodeInvalidArgument    = "InvalidArgument"
+	ErrorCodeAlreadyExists      = "AlreadyExists"
+	ErrorCodeResourceExhausted  = "ResourceExhausted"
+	ErrorCodeFailedPrecondition = "FailedPrecondition"
+	ErrorCodeInternal           = "Internal"
 )
 
 // ErrJobNotFound is what GetJob returns for a 404. The agent's job store is

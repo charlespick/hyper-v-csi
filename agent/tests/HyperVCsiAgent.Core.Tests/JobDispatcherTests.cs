@@ -22,12 +22,32 @@ public class JobDispatcherTests
         Assert.Equal(new CreateVolumeResult("pvc-1", 2048, AlreadyPresent: false), job.Result);
     }
 
+    [Fact]
+    public async Task Resolve_DeleteVolume_RunsTheDeleteAndPublishesNoResult()
+    {
+        var vhdx = new RecordingVhdxService();
+        var run = new JobDispatcher(vhdx).Resolve(
+            JobDispatcher.DeleteVolume, Payload("""{"volumeId":"pvc-1"}"""), WireOptions);
+
+        var job = NewJob();
+        await run(job, CancellationToken.None);
+
+        Assert.Equal("pvc-1", vhdx.LastDelete);
+        // A deleted volume has nothing left to describe, so the job carries no
+        // result and the controller reads only its status.
+        Assert.Null(job.Result);
+    }
+
     [Theory]
     [InlineData("UnknownOperation", """{"name":"pvc-1","sizeBytes":2048}""")]
     [InlineData(JobDispatcher.CreateVolume, """{"sizeBytes":2048}""")]
     [InlineData(JobDispatcher.CreateVolume, """{"name":"pvc-1"}""")]
     [InlineData(JobDispatcher.CreateVolume, """{"name":"pvc-1","sizeBytes":"big"}""")]
     [InlineData(JobDispatcher.CreateVolume, "\"not an object\"")]
+    [InlineData(JobDispatcher.DeleteVolume, "{}")]
+    [InlineData(JobDispatcher.DeleteVolume, """{"volumeId":""}""")]
+    [InlineData(JobDispatcher.DeleteVolume, """{"volumeId":42}""")]
+    [InlineData(JobDispatcher.DeleteVolume, "\"not an object\"")]
     public void Resolve_BadRequest_ThrowsBeforeAnyJobExists(string operationType, string payload)
     {
         var vhdx = new RecordingVhdxService();
@@ -36,6 +56,7 @@ public class JobDispatcherTests
             () => new JobDispatcher(vhdx).Resolve(operationType, Payload(payload), WireOptions));
 
         Assert.Null(vhdx.LastCreate);
+        Assert.Null(vhdx.LastDelete);
     }
 
     private static JsonElement Payload(string json) => JsonDocument.Parse(json).RootElement;
@@ -52,6 +73,8 @@ public class JobDispatcherTests
     {
         public (string VolumeName, long SizeBytes)? LastCreate { get; private set; }
 
+        public string? LastDelete { get; private set; }
+
         public Task<CreateVolumeResult> CreateAsync(string volumeName, long sizeBytes, CancellationToken cancellationToken)
         {
             LastCreate = (volumeName, sizeBytes);
@@ -61,8 +84,11 @@ public class JobDispatcherTests
         public Task ExpandAsync(string volumeId, long newSizeBytes, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
-        public Task DeleteAsync(string volumeId, CancellationToken cancellationToken) =>
-            throw new NotSupportedException();
+        public Task DeleteAsync(string volumeId, CancellationToken cancellationToken)
+        {
+            LastDelete = volumeId;
+            return Task.CompletedTask;
+        }
 
         public Task<string> CreateCheckpointAsync(string volumeId, string snapshotName, CancellationToken cancellationToken) =>
             throw new NotSupportedException();

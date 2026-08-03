@@ -13,6 +13,8 @@ public sealed class JobDispatcher(IVhdxService vhdxService)
 {
     public const string CreateVolume = "CreateVolume";
 
+    public const string DeleteVolume = "DeleteVolume";
+
     /// <exception cref="InvalidJobRequestException">
     /// The operation is unknown or its payload is unusable.
     /// </exception>
@@ -35,6 +37,17 @@ public sealed class JobDispatcher(IVhdxService vhdxService)
                 return async (job, cancellationToken) =>
                     job.Result = await vhdxService.CreateAsync(request.Name, request.SizeBytes, cancellationToken)
                         .ConfigureAwait(false);
+
+            case DeleteVolume:
+                var deleteRequest = Decode<DeleteVolumePayload>(payload, jsonOptions);
+                if (string.IsNullOrWhiteSpace(deleteRequest.VolumeId))
+                {
+                    throw new InvalidJobRequestException("payload.volumeId is required");
+                }
+
+                // No job.Result: a deleted volume has nothing left to describe,
+                // so the controller reads only the status.
+                return (_, cancellationToken) => vhdxService.DeleteAsync(deleteRequest.VolumeId, cancellationToken);
 
             default:
                 throw new InvalidJobRequestException($"unsupported operationType {operationType}");

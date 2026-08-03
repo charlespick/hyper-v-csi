@@ -13,6 +13,10 @@ import (
 // match JobDispatcher.CreateVolume on the .NET side.
 const operationCreateVolume = "CreateVolume"
 
+// operationDeleteVolume is the operationType the agent dispatches on; it must
+// match JobDispatcher.DeleteVolume on the .NET side.
+const operationDeleteVolume = "DeleteVolume"
+
 // defaultVolumeSizeBytes is used when a request carries no capacity range at
 // all. CSI allows that, and a VHDX has to be created with *some* size; the
 // disk is dynamically expanding, so this costs nothing on the CSV until it's
@@ -221,9 +225,38 @@ func volumeTarget(volumeName string) string {
 	return "volume:" + volumeName
 }
 
+// deleteVolumePayload is the operation-specific half of the agent's job
+// envelope, matching DeleteVolumePayload on the .NET side. There is no result
+// half: a volume that's gone has nothing left to report about it.
+type deleteVolumePayload struct {
+	VolumeID string `json:"volumeId"`
+}
+
 // DeleteVolume removes a previously provisioned VHDX. Idempotency key: volume ID.
+//
+// A volume that isn't there is a success, which CSI mandates and which is also
+// what a retry of an already-finished delete looks like by the time it reaches
+// the agent — the two are indistinguishable from the CSV, and both mean the
+// caller got what it asked for.
 func (s *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "DeleteVolume not implemented")
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume id is required")
+	}
+
+	// The volume ID is the idempotency key per CSI Spec.md, and it doubles as
+	// the target so a delete can't interleave with other work on the same disk.
+	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetVolumeId(), operationDeleteVolume, volumeTarget(req.GetVolumeId()), deleteVolumePayload{
+		VolumeID: req.GetVolumeId(),
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "enqueueing DeleteVolume for %s: %v", req.GetVolumeId(), err)
+	}
+
+	if _, err := awaitJob(ctx, s.driver.Agent, job.ID, jobPollBudget); err != nil {
+		return nil, err
+	}
+
+	return &csi.DeleteVolumeResponse{}, nil
 }
 
 // ControllerPublishVolume attaches a VHDX to the node VM by resolving its

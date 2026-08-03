@@ -36,9 +36,10 @@ the client certificate's fingerprint isn't in the agent's config — the agent
 rejects unrecognized callers during the handshake and logs the fingerprint it
 was shown.
 {{ if eq .Values.storageClass.reclaimPolicy "Retain" }}
-Note: the StorageClass reclaims with Retain because DeleteVolume isn't
-implemented. Deleting the PVC leaves the PV and the VHDX behind, to be removed
-by hand.
+Note: the StorageClass reclaims with Retain, so deleting the PVC leaves the PV
+and the VHDX behind, to be removed by hand. DeleteVolume is implemented — set
+storageClass.reclaimPolicy=Delete once you have seen it succeed against your
+own hosts.
 {{- end }}
 {{- if .Values.agent.allowInsecure }}
 

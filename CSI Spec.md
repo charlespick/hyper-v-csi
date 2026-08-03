@@ -12,8 +12,8 @@ covered by unit tests but has never run against a real failover cluster or Hyper
 | GetPluginInfo | Both | Returns the plugin's name and version so Kubernetes can identify it. | N/A | Pending testing |
 | GetPluginCapabilities | Both | Reports which optional CSI features this plugin supports. | N/A | Over advertising until project is finished |
 | Probe | Both | Health check confirming the plugin is ready to serve requests. | N/A | Stub — always reports ready |
-| CreateVolume | Controller | Provisions a new volume and returns its identifier. | Volume name | Pending testing |
-| DeleteVolume | Controller | Removes a previously provisioned volume. | Volume ID | Not started |
+| CreateVolume | Controller | Provisions a new volume and returns its identifier. | Volume name | Tested — creates a VHDX on disk |
+| DeleteVolume | Controller | Removes a previously provisioned volume. | Volume ID | Pending testing |
 | ControllerPublishVolume | Controller | Attaches a volume to a specified node. | Volume ID + node ID | Not started |
 | ControllerUnpublishVolume | Controller | Detaches a volume from a specified node. | Volume ID + node ID | Not started |
 | ValidateVolumeCapabilities | Controller | Confirms a volume supports the requested access mode and type. | Volume ID (lookup only) | Not started |
@@ -40,11 +40,21 @@ running this in a cluster. What each one currently overstates:
 - `GetPluginCapabilities` — volume expansion (ONLINE), while both ControllerExpandVolume and
   NodeExpandVolume are stubs. It correctly omits VOLUME_ACCESSIBILITY_CONSTRAINTS.
 - `ControllerGetCapabilities` — PUBLISH_UNPUBLISH_VOLUME, EXPAND_VOLUME, CREATE_DELETE_SNAPSHOT,
-  and LIST_SNAPSHOTS. Only CREATE_DELETE_VOLUME is half true: CreateVolume works, DeleteVolume
-  doesn't.
+  and LIST_SNAPSHOTS. CREATE_DELETE_VOLUME is the one it does not overstate: both halves are built.
 - `NodeGetCapabilities` — STAGE_UNSTAGE_VOLUME, EXPAND_VOLUME, and GET_VOLUME_STATS, none of
   which are implemented.
 
 **CreateVolume gaps.** StorageClass `parameters` are ignored rather than consumed or rejected, the
 access *type* (mount vs block) is not validated, and `volume_context` is left empty.
 `VolumeContentSource` returns Unimplemented by design; restore-from-snapshot is a separate slice.
+
+**DeleteVolume gaps.** "Volume in use" is inferred from the sharing violation Windows raises when
+Hyper-V holds the VHDX open, not from asking the cluster what is attached where. That is a real
+safety net — the delete fails rather than pulling a disk out from under a running VM — but it is
+inference, and the mapping onto FAILED_PRECONDITION only runs on Windows, so it is unverified by
+the test suite on a developer machine. Once ControllerUnpublishVolume exists, the authoritative
+check belongs there. A volume ID that could not have come from CreateVolume (one failing the safe
+filename rule) reports success rather than INVALID_ARGUMENT: no such volume can exist, CSI requires
+OK for a volume that isn't there, and failing would strand the PV in Terminating on a retry nothing
+could satisfy. Deleting a volume that still has snapshots is not considered, because snapshots are
+not built yet.

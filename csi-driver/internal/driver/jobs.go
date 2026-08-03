@@ -123,6 +123,8 @@ func translateJobFailure(job *agentclient.Job) error {
 		return status.Error(codes.InvalidArgument, detail)
 	case agentclient.ErrorCodeResourceExhausted:
 		return status.Error(codes.ResourceExhausted, detail)
+	case agentclient.ErrorCodeFailedPrecondition:
+		return status.Error(codes.FailedPrecondition, detail)
 	default:
 		return status.Error(codes.Internal, detail)
 	}

@@ -42,6 +42,17 @@ public sealed partial class VhdxService : IVhdxService, IDisposable
     /// </summary>
     private const long SizeTolerance = 4096;
 
+    /// <summary>
+    /// ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION as HRESULTs. Hyper-V
+    /// keeps an open handle on every VHDX attached to a VM, so this is exactly
+    /// what deleting a still-attached disk looks like - the one delete failure
+    /// CSI wants reported as FAILED_PRECONDITION instead of retried as a
+    /// transient CSV fault.
+    /// </summary>
+    private const int SharingViolationHResult = unchecked((int)0x80070020);
+
+    private const int LockViolationHResult = unchecked((int)0x80070021);
+
     private readonly IVirtualDiskManager _diskManager;
     private readonly AgentOptions _options;
     private readonly ILogger<VhdxService> _logger;
@@ -63,7 +74,7 @@ public sealed partial class VhdxService : IVhdxService, IDisposable
         }
 
         var path = ResolveVolumePath(volumeName);
-        var inProgressPath = path[..^VhdxExtension.Length] + InProgressSuffix;
+        var inProgressPath = InProgressPathFor(path);
 
         // A CIM call that never comes back would otherwise pin this volume's
         // job queue - and everything queued behind it - indefinitely.
@@ -136,8 +147,53 @@ public sealed partial class VhdxService : IVhdxService, IDisposable
     public Task ExpandAsync(string volumeId, long newSizeBytes, CancellationToken cancellationToken) =>
         throw new NotSupportedException("ControllerExpandVolume is not implemented yet");
 
-    public Task DeleteAsync(string volumeId, CancellationToken cancellationToken) =>
-        throw new NotSupportedException("DeleteVolume is not implemented yet");
+    public async Task DeleteAsync(string volumeId, CancellationToken cancellationToken)
+    {
+        // An ID that isn't a name CreateAsync could have produced names a
+        // volume that cannot exist, so there is nothing to delete and CSI wants
+        // a success. Rejecting it instead would strand the PV in Terminating on
+        // a retry that no attempt could ever satisfy.
+        if (!SafeVolumeName.IsMatch(volumeId))
+        {
+            _logger.LogWarning(
+                "DeleteVolume {VolumeId}: not a name this agent could have created, so there is nothing to delete", volumeId);
+            return;
+        }
+
+        var path = ResolveVolumePath(volumeId);
+
+        // This timeout bounds the wait for a slot, not the delete itself:
+        // File.Delete is synchronous and takes no token, so once it starts
+        // there is nothing to cancel. Creates get a real timeout because the
+        // CIM call they make honours one; claiming the same here would be a
+        // comment the code can't keep.
+        using var attempt = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        attempt.CancelAfter(_options.DiskOperationTimeout);
+
+        // Deletes count against the same cap as creates: a CSV in redirected
+        // mode funnels every one of them through the coordinator node, so a
+        // burst of reclaims is exactly as worth bounding as a burst of creates.
+        await _concurrency.WaitAsync(attempt.Token).ConfigureAwait(false);
+        try
+        {
+            // A plain file delete, with no CIM call in sight: an unattached
+            // VHDX is just a file on the CSV, and Hyper-V has no notion of
+            // owning one it isn't currently serving to a VM.
+            DeleteFile(path, volumeId);
+
+            // A create that died between the CIM call and its rename leaves
+            // this behind, and only a later create for the same name would
+            // otherwise collect it - which for a volume being reclaimed is
+            // never. Clean it up here or it stays on the CSV forever.
+            DeleteFile(InProgressPathFor(path), volumeId);
+
+            _logger.LogInformation("DeleteVolume {VolumeId}: {Path} is gone", volumeId, path);
+        }
+        finally
+        {
+            _concurrency.Release();
+        }
+    }
 
     public Task<string> CreateCheckpointAsync(string volumeId, string snapshotName, CancellationToken cancellationToken) =>
         throw new NotSupportedException("CreateSnapshot is not implemented yet");
@@ -186,6 +242,37 @@ public sealed partial class VhdxService : IVhdxService, IDisposable
         // relative one against the process's working directory.
         return Path.GetFullPath(Path.Combine(_options.CsvVolumesRoot, volumeName + VhdxExtension));
     }
+
+    /// <summary>
+    /// Deletes one file, treating "already gone" as done. That is the state the
+    /// caller asked for either way, and it is what lets a delete be re-driven
+    /// after the agent forgets the job that already ran it.
+    /// </summary>
+    private static void DeleteFile(string path, string volumeId)
+    {
+        try
+        {
+            // File.Delete is already a no-op for a missing file; only a missing
+            // directory throws, and that means the volume is doubly absent.
+            File.Delete(path);
+        }
+        catch (DirectoryNotFoundException)
+        {
+        }
+        catch (IOException ex) when (ex.HResult is SharingViolationHResult or LockViolationHResult)
+        {
+            throw JobFailureException.FailedPrecondition(
+                $"volume {volumeId} is still attached to a VM, so {path} cannot be deleted; detach it first");
+        }
+    }
+
+    /// <summary>
+    /// The path a disk occupies while being created, before the rename that
+    /// publishes it. Kept in one place because create writes it and delete
+    /// collects it, and the two disagreeing would leak files onto the CSV.
+    /// </summary>
+    private static string InProgressPathFor(string path) =>
+        path[..^VhdxExtension.Length] + InProgressSuffix;
 
     private void TryDeleteInProgress(string inProgressPath)
     {
