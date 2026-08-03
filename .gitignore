@@ -10,5 +10,8 @@ agent/**/dev-volumes/
 # Go
 csi-driver/bin/
 
+# Machine-specific Helm values (real image/registry and agent addresses)
+deploy/helm/hyperv-csi/values.local.yaml
+
 # macOS
 .DS_Store

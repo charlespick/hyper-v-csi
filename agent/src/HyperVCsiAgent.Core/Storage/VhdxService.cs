@@ -181,7 +181,10 @@ public sealed partial class VhdxService : IVhdxService, IDisposable
                 $"volume name {volumeName} is not usable as a file name: expected 1-127 characters of [A-Za-z0-9._-] starting alphanumeric");
         }
 
-        return Path.Combine(_options.CsvVolumesRoot, volumeName + VhdxExtension);
+        // Made absolute because this path goes straight into the Hyper-V CIM
+        // call, which - unlike File/Directory APIs - does not resolve a
+        // relative one against the process's working directory.
+        return Path.GetFullPath(Path.Combine(_options.CsvVolumesRoot, volumeName + VhdxExtension));
     }
 
     private void TryDeleteInProgress(string inProgressPath)
