@@ -4,6 +4,9 @@
 agent/**/bin/
 agent/**/obj/
 
+# Agent dev default for CsvVolumesRoot (see appsettings.Development.json)
+agent/**/dev-volumes/
+
 # Go
 csi-driver/bin/
 

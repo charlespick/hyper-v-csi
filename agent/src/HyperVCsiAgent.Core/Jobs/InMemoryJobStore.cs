@@ -111,6 +111,7 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
         {
             job.Status = JobStatus.Failed;
             job.Error = ex.Message;
+            job.ErrorCode = ex is JobFailureException failure ? failure.ErrorCode : AgentErrorCodes.Internal;
         }
         finally
         {

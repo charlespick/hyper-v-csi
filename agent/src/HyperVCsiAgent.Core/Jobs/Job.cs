@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace HyperVCsiAgent.Core.Jobs;
 
 /// <summary>
@@ -26,11 +28,29 @@ public sealed class Job
     public JobStatus Status { get; set; } = JobStatus.Pending;
 
     /// <summary>
-    /// Human-readable diagnostic for a Failed job, returned verbatim over the
-    /// API. Deliberately not a machine classification: the controller treats
-    /// every failure the same way - reconcile observed state and retry.
+    /// Operation-specific success payload, set by the run delegate before it
+    /// returns and read by the controller once Status is Succeeded. Serialized
+    /// by its runtime type, so each operation defines its own record.
     /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public object? Result { get; set; }
+
+    /// <summary>
+    /// Human-readable diagnostic for a Failed job, returned verbatim over the API.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Error { get; set; }
+
+    /// <summary>
+    /// Coarse classification of a failure, from <see cref="AgentErrorCodes"/>.
+    /// The controller's default response to a failure is still "reconcile
+    /// observed state and retry" - this exists only for the cases where the CSI
+    /// spec mandates a specific terminal gRPC status instead, notably the
+    /// ALREADY_EXISTS that CreateVolume must return (not retry) when a volume of
+    /// the same name exists with incompatible parameters.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ErrorCode { get; set; }
 
     public DateTimeOffset CreatedAt { get; init; } = DateTimeOffset.UtcNow;
 

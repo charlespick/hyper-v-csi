@@ -1,0 +1,7 @@
+{
+  "//": "Copy next to the agent's binaries on the CSV and point the clustered role's command line at it: HyperVCsiAgent.Service.exe --config C:\\ClusterStorage\\Volume1\\HyperVCsiAgent\\agent.config.json",
+  "Agent": {
+    "CsvVolumesRoot": "C:\\ClusterStorage\\Volume1\\hyperv-csi\\volumes",
+    "MaxConcurrentDiskOperations": 4
+  }
+}

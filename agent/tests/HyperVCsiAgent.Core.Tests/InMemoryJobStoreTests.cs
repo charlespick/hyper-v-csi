@@ -38,6 +38,32 @@ public class InMemoryJobStoreTests
     }
 
     [Fact]
+    public async Task GetOrCreate_JobFailureException_KeepsItsErrorCode()
+    {
+        var store = new InMemoryJobStore();
+
+        var job = store.GetOrCreate("pvc-1", "CreateVolume", "vol-pvc-1",
+            (_, _) => throw JobFailureException.AlreadyExists("different size"));
+        await WaitForTerminal(job);
+
+        Assert.Equal(JobStatus.Failed, job.Status);
+        Assert.Equal(AgentErrorCodes.AlreadyExists, job.ErrorCode);
+        Assert.Equal("different size", job.Error);
+    }
+
+    [Fact]
+    public async Task GetOrCreate_UnclassifiedException_FailsAsInternal()
+    {
+        var store = new InMemoryJobStore();
+
+        var job = store.GetOrCreate("pvc-1", "CreateVolume", "vol-pvc-1",
+            (_, _) => throw new InvalidOperationException("boom"));
+        await WaitForTerminal(job);
+
+        Assert.Equal(AgentErrorCodes.Internal, job.ErrorCode);
+    }
+
+    [Fact]
     public async Task GetOrCreate_SameIdempotencyKeyDifferentOperation_DoesNotCollide()
     {
         var store = new InMemoryJobStore();

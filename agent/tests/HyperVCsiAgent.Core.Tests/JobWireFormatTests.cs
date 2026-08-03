@@ -1,5 +1,6 @@
 using System.Text.Json;
 using HyperVCsiAgent.Core.Jobs;
+using HyperVCsiAgent.Core.Storage;
 
 namespace HyperVCsiAgent.Core.Tests;
 
@@ -41,6 +42,7 @@ public class JobWireFormatTests
             Target = "vol-pvc-1",
             Status = JobStatus.Failed,
             Error = "boom",
+            ErrorCode = AgentErrorCodes.AlreadyExists,
         };
 
         using var document = JsonDocument.Parse(JsonSerializer.Serialize(job, WireOptions()));
@@ -52,5 +54,49 @@ public class JobWireFormatTests
         Assert.Equal("vol-pvc-1", root.GetProperty("target").GetString());
         Assert.Equal("Failed", root.GetProperty("status").GetString());
         Assert.Equal("boom", root.GetProperty("error").GetString());
+        Assert.Equal("AlreadyExists", root.GetProperty("errorCode").GetString());
+    }
+
+    [Fact]
+    public void Job_SerializesItsResultByRuntimeType()
+    {
+        // The Go client decodes result into an operation-specific struct, so the
+        // concrete payload's own field names have to make it onto the wire even
+        // though Job.Result is declared as object.
+        var job = new Job
+        {
+            Id = "abc123",
+            IdempotencyKey = "pvc-1",
+            OperationType = "CreateVolume",
+            Target = "vol-pvc-1",
+            Status = JobStatus.Succeeded,
+            Result = new CreateVolumeResult("pvc-1", 10737418240),
+        };
+
+        using var document = JsonDocument.Parse(JsonSerializer.Serialize(job, WireOptions()));
+        var result = document.RootElement.GetProperty("result");
+
+        Assert.Equal("pvc-1", result.GetProperty("volumeId").GetString());
+        Assert.Equal(10737418240, result.GetProperty("actualSizeBytes").GetInt64());
+    }
+
+    [Fact]
+    public void Job_OmitsResultAndErrorWhenUnset()
+    {
+        var job = new Job
+        {
+            Id = "abc123",
+            IdempotencyKey = "pvc-1",
+            OperationType = "CreateVolume",
+            Target = "vol-pvc-1",
+            Status = JobStatus.Running,
+        };
+
+        using var document = JsonDocument.Parse(JsonSerializer.Serialize(job, WireOptions()));
+        var root = document.RootElement;
+
+        Assert.False(root.TryGetProperty("result", out _));
+        Assert.False(root.TryGetProperty("error", out _));
+        Assert.False(root.TryGetProperty("errorCode", out _));
     }
 }

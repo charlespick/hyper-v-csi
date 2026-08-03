@@ -5,8 +5,15 @@
 package agentclient
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 )
 
@@ -19,16 +26,49 @@ const (
 	JobFailed    JobStatus = "Failed"
 )
 
+// Terminal reports whether the agent will do no further work on this job.
+func (s JobStatus) Terminal() bool {
+	return s == JobSucceeded || s == JobFailed
+}
+
+// Error codes the agent may set on a failed job, mirroring AgentErrorCodes on
+// the .NET side. Anything else — including a failure carrying no code at all —
+// is treated as Internal, and therefore retryable, by callers.
+const (
+	ErrorCodeInvalidArgument   = "InvalidArgument"
+	ErrorCodeAlreadyExists     = "AlreadyExists"
+	ErrorCodeResourceExhausted = "ResourceExhausted"
+	ErrorCodeInternal          = "Internal"
+)
+
+// ErrJobNotFound is what GetJob returns for a 404. The agent's job store is
+// in-memory, so this means the agent restarted and forgot the job — not that
+// the operation didn't happen. Callers recover by re-driving the operation,
+// which is safe precisely because every operation is idempotent against
+// observed state rather than against a job record.
+var ErrJobNotFound = errors.New("job not found")
+
 // Job mirrors the agent's wire format, which is pinned on the .NET side by
 // AgentJson and JobWireFormatTests: camelCase field names, PascalCase status
 // strings. Change this struct and those tests together.
 type Job struct {
-	ID             string    `json:"id"`
-	IdempotencyKey string    `json:"idempotencyKey"`
-	OperationType  string    `json:"operationType"`
-	Target         string    `json:"target"`
-	Status         JobStatus `json:"status"`
-	Error          string    `json:"error,omitempty"`
+	ID             string          `json:"id"`
+	IdempotencyKey string          `json:"idempotencyKey"`
+	OperationType  string          `json:"operationType"`
+	Target         string          `json:"target"`
+	Status         JobStatus       `json:"status"`
+	Result         json.RawMessage `json:"result,omitempty"`
+	Error          string          `json:"error,omitempty"`
+	ErrorCode      string          `json:"errorCode,omitempty"`
+}
+
+// enqueueRequest is the POST /v1/jobs body, matching EnqueueJobRequest on the
+// .NET side.
+type enqueueRequest struct {
+	OperationType  string `json:"operationType"`
+	IdempotencyKey string `json:"idempotencyKey"`
+	Target         string `json:"target"`
+	Payload        any    `json:"payload"`
 }
 
 // defaultTimeout bounds every request to the agent. The agent is expected to
@@ -37,6 +77,10 @@ type Job struct {
 // retry, not wedge an RPC forever. Both endpoints return immediately by
 // design (enqueue-and-return, status lookup), so 30s is generous.
 const defaultTimeout = 30 * time.Second
+
+// maxErrorBody caps how much of an unexpected response body ends up quoted in
+// an error message.
+const maxErrorBody = 4 << 10
 
 // Client is a thin wrapper around the agent's job API. Retries and polling
 // backoff belong to the controller/node RPC handlers that call it, not here.
@@ -56,10 +100,63 @@ func New(baseURL string) *Client {
 // duplicate. target names the resource the agent serializes jobs against:
 // the VM for attach/detach/resize, the volume for create/expand/delete.
 func (c *Client) EnqueueJob(ctx context.Context, idempotencyKey, operationType, target string, payload any) (*Job, error) {
-	panic("not implemented")
+	body, err := json.Marshal(enqueueRequest{
+		OperationType:  operationType,
+		IdempotencyKey: idempotencyKey,
+		Target:         target,
+		Payload:        payload,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("encoding %s job: %w", operationType, err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url("/v1/jobs"), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	return c.do(req)
 }
 
-// GetJob calls GET /v1/jobs/{id}.
+// GetJob calls GET /v1/jobs/{id}. A job the agent has forgotten comes back as
+// ErrJobNotFound.
 func (c *Client) GetJob(ctx context.Context, jobID string) (*Job, error) {
-	panic("not implemented")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/v1/jobs/"+url.PathEscape(jobID)), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return c.do(req)
+}
+
+func (c *Client) do(req *http.Request) (*Job, error) {
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		return nil, ErrJobNotFound
+	case resp.StatusCode >= 300:
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
+		return nil, fmt.Errorf("agent returned %s from %s: %s",
+			resp.Status, req.URL.Path, strings.TrimSpace(string(detail)))
+	}
+
+	var job Job
+	if err := json.NewDecoder(resp.Body).Decode(&job); err != nil {
+		return nil, fmt.Errorf("decoding job from %s: %w", req.URL.Path, err)
+	}
+	if job.ID == "" {
+		return nil, fmt.Errorf("agent returned a job with no id from %s", req.URL.Path)
+	}
+
+	return &job, nil
+}
+
+func (c *Client) url(path string) string {
+	return strings.TrimSuffix(c.BaseURL, "/") + path
 }
