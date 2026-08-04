@@ -8,8 +8,12 @@ namespace HyperVCsiAgent.Core.Cluster;
 public interface IClusterService
 {
     /// <summary>
-    /// Resolves a CSI node ID to its VM and the host currently running it, or
-    /// null when the cluster has no such VM.
+    /// Resolves a CSI node ID to its VM and the host currently running it.
+    /// Null means one thing only: the cluster has no such VM. An implementation
+    /// that finds the VM but cannot determine its owner must throw rather than
+    /// return null - callers read null as "there is no VM here, so nothing is
+    /// attached to it", and a detach acting on that would report success
+    /// without having touched anything.
     /// </summary>
     /// <remarks>
     /// This is the only place a node ID is interpreted. Everything downstream

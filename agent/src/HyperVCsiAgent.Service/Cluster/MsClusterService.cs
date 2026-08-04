@@ -69,11 +69,14 @@ public sealed class MsClusterService(ILogger<MsClusterService> logger) : ICluste
                 // association traversal.
                 if (resource["OwnerNode"] as string is not { } owner || string.IsNullOrWhiteSpace(owner))
                 {
-                    // A VM role that is offline has no owner. Nothing can be
-                    // attached to a VM no host is running, and saying so beats
-                    // returning a host that is not hosting it.
-                    logger.LogWarning("the virtual machine for node {NodeId} has no owning node; is its role offline?", nodeId);
-                    return null;
+                    // Not expected to be reachable: a cluster group always has a
+                    // current owner, including while offline or failed -
+                    // ownership transfers rather than lapsing. Failing loudly
+                    // because the alternative reading, "no owner means nothing
+                    // is attached", would have a detach report success without
+                    // having touched the VM.
+                    throw new InvalidOperationException(
+                        $"the cluster reports no owning node for the virtual machine in group {nodeId}, which should not be possible");
                 }
 
                 return new ClusteredVm(VmNameOf(resource, nodeId), owner);

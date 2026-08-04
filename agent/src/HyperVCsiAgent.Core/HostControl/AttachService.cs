@@ -119,7 +119,7 @@ public sealed class AttachService : IAttachService, IDisposable
         try
         {
             var vm = await _cluster.ResolveVmAsync(nodeId, attempt.Token).ConfigureAwait(false);
-            if (vm is null || string.IsNullOrWhiteSpace(vm.OwningHost))
+            if (vm is null)
             {
                 // Where attach reports NotFound, this reports success. A node
                 // the cluster no longer has is a VM that no longer exists, and
@@ -145,7 +145,7 @@ public sealed class AttachService : IAttachService, IDisposable
                 // Re-resolved as tolerantly as the first lookup: a VM that has
                 // gone away between the two is one with nothing left attached.
                 var current = await _cluster.ResolveVmAsync(nodeId, attempt.Token).ConfigureAwait(false);
-                if (current is null || string.IsNullOrWhiteSpace(current.OwningHost))
+                if (current is null)
                 {
                     _logger.LogWarning(
                         "DetachVolume {VolumeId}: node {NodeId} disappeared from the cluster mid-detach, so nothing is attached to it",
@@ -181,7 +181,7 @@ public sealed class AttachService : IAttachService, IDisposable
     {
         var vm = await _cluster.ResolveVmAsync(nodeId, attempt.Token).ConfigureAwait(false);
 
-        if (vm is null || string.IsNullOrWhiteSpace(vm.OwningHost))
+        if (vm is null)
         {
             // The node ID names no VM this cluster knows about. Terminal for the
             // same reason a missing VHDX is: retrying cannot conjure the VM, and
