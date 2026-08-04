@@ -2,30 +2,60 @@ using System.Management;
 using System.Runtime.Versioning;
 using HyperVCsiAgent.Core.Cluster;
 using HyperVCsiAgent.Service.Cim;
+using Microsoft.Win32;
 
 namespace HyperVCsiAgent.Service.Cluster;
 
 /// <summary>
-/// Reads ownership out of <c>root\MSCluster</c> on the local host. Local, and
-/// still cluster-wide: CLUSDB is replicated to every node, so whichever host
+/// Reads ownership out of the local node's copy of the cluster database. Local,
+/// and still cluster-wide: CLUSDB is replicated to every node, so whichever host
 /// currently owns the agent's clustered role answers for the whole cluster with
 /// no fan-out.
 /// </summary>
+/// <remarks>
+/// Two steps, because no single lookup answers both halves cheaply.
+///
+/// The VM ID lives in a cluster resource's private properties, and every way of
+/// reaching those through WMI costs a round trip to the cluster service per
+/// resource inspected - measured at roughly 8ms each when WQL evaluates a
+/// <c>PrivateProperties.VmID</c> predicate, and roughly 19ms each when the
+/// resources are enumerated and matched in memory. Either way the cost is
+/// per-VM, so a thousand-VM cluster spends seconds resolving one node.
+///
+/// The same private properties are also mirrored into the local registry, where
+/// reading one costs about 0.04ms - no RPC, just a local key read. So the VM ID
+/// is matched there, and WMI is asked only for <c>OwnerNode</c>, keyed on the
+/// resource name. Name is <c>MSCluster_Resource</c>'s key property, so that is an
+/// indexed lookup whose cost does not grow with the cluster.
+/// </remarks>
 [SupportedOSPlatform("windows")]
 public sealed class MsClusterService(ILogger<MsClusterService> logger) : IClusterService
 {
     private const string ScopePath = @"\\.\root\MSCluster";
 
+    /// <summary>
+    /// The cluster database's mirror of the resource table, replicated to every
+    /// node. Readable by Authenticated Users, so the agent needs no privilege
+    /// beyond running on a cluster node.
+    /// </summary>
+    private const string ResourcesKeyPath = @"Cluster\Resources";
+
+    /// <summary>
+    /// The cluster resource type a clustered VM has. Matching on it keeps a
+    /// resource of another type in the same group - the Virtual Machine
+    /// Configuration resource, most obviously - from being mistaken for the VM.
+    /// Both carry the same VmID, so the type is what distinguishes them.
+    /// </summary>
+    private const string VirtualMachineResourceType = "Virtual Machine";
+
     public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
-        // System.Management is entirely synchronous, so the query runs on a
-        // pool thread.
+        // System.Management and the registry APIs are entirely synchronous, so
+        // the work runs on a pool thread.
         Task.Run<ClusteredVm?>(() =>
         {
-            // No longer an injection guard - the node ID is compared in memory
-            // below rather than interpolated into the query - but still worth
-            // asserting: a node ID that is not a GUID means the node plugin sent
-            // something other than its VM ID, and quietly matching nothing would
-            // report that as "no such VM in the cluster".
+            // A node ID that is not a GUID means the node plugin sent something
+            // other than its VM ID, and quietly matching nothing would report
+            // that as "no such VM in the cluster".
             //
             // Throwing rather than returning null for the same reason: null is
             // this interface's word for a claim about the cluster, and this is a
@@ -36,83 +66,119 @@ public sealed class MsClusterService(ILogger<MsClusterService> logger) : ICluste
                     $"node ID {nodeId} is not a virtual machine GUID, so it cannot identify a VM");
             }
 
-            var scope = new ManagementScope(ScopePath);
-
-            // One round trip for every clustered VM resource, then the match in
-            // memory. Not a WHERE, because VmID is not a property of
-            // MSCluster_Resource at all - it is a member of the embedded
-            // PrivateProperties object, and WQL cannot reach inside one. The
-            // filtering is local rather than the query being repeated, so this
-            // stays a single call to the provider whatever the cluster's size.
-            //
-            // Both resource types are asked for because a clustered VM has two -
-            // "Virtual Machine <name>" and "Virtual Machine Configuration
-            // <name>" - and both carry VmID. They live in the same group and so
-            // report the same OwnerNode, which is the only thing read off them
-            // here, so whichever matches first is as good as the other.
-            var query = new ObjectQuery(
-                "SELECT * FROM MSCluster_Resource " +
-                "WHERE Type = 'Virtual Machine' OR Type = 'Virtual Machine Configuration'");
-
-            using var searcher = new ManagementObjectSearcher(scope, query);
-            using var results = searcher.Get();
-
-            foreach (var instance in results)
+            if (FindResourceName(nodeId, cancellationToken) is not { } resourceName)
             {
-                using var resource = (ManagementObject)instance;
-                cancellationToken.ThrowIfCancellationRequested();
-
-                if (!IsVm(resource, nodeId))
-                {
-                    continue;
-                }
-
-                // OwnerNode is the node currently running the resource - the
-                // same answer MSCluster_NodeToActiveResource gives, without the
-                // association traversal.
-                if (resource["OwnerNode"] as string is not { } owner || string.IsNullOrWhiteSpace(owner))
-                {
-                    // Not expected to be reachable: a cluster group always has a
-                    // current owner, including while offline or failed -
-                    // ownership transfers rather than lapsing. Failing loudly
-                    // because the alternative reading, "no owner means nothing
-                    // is attached", would have a detach report success without
-                    // having touched the VM.
-                    throw new InvalidOperationException(
-                        $"the cluster reports no owning node for VM {nodeId}, which should not be possible");
-                }
-
-                logger.LogDebug("VM {VmId} is owned by {OwnerNode}", nodeId, owner);
-                return new ClusteredVm(nodeId, owner);
+                return null;
             }
 
-            return null;
+            var owner = ReadOwnerNode(resourceName);
+
+            if (string.IsNullOrWhiteSpace(owner))
+            {
+                // Two readings, both worth failing on. Either the cluster
+                // reports no owning node - not expected to be possible, because
+                // ownership transfers rather than lapsing, even while a group is
+                // offline or failed - or the resource was deleted between the
+                // registry read and this query. Returning null would render both
+                // as "no such VM", and a detach acting on that would report
+                // success without having touched the VM.
+                throw new InvalidOperationException(
+                    $"the cluster reports no owning node for VM {nodeId} (resource {resourceName}), " +
+                    "which should not be possible");
+            }
+
+            logger.LogDebug("VM {VmId} is resource {Resource}, owned by {OwnerNode}", nodeId, resourceName, owner);
+            return new ClusteredVm(nodeId, owner);
         }, cancellationToken);
 
     /// <summary>
-    /// Whether a cluster resource is the VM with this ID, read out of the
-    /// embedded PrivateProperties object where clustering keeps a resource's
-    /// type-specific settings.
+    /// Finds the cluster resource for a VM by its ID, returning the resource's
+    /// name. Reads the local mirror of the cluster database rather than querying
+    /// WMI, because this is the step whose cost would otherwise grow with the
+    /// number of VMs in the cluster.
     /// </summary>
-    private static bool IsVm(ManagementObject resource, string vmId)
+    private string? FindResourceName(string vmId, CancellationToken cancellationToken)
     {
-        // A resource whose private properties cannot be read is not a match, but
-        // it is also not this method's business to decide what that means: it
-        // simply is not the VM we are looking for, and the caller's "no such VM"
-        // answer is the honest outcome if none of them are.
-        if (resource["PrivateProperties"] is not ManagementBaseObject privateProperties)
+        using var resources = Registry.LocalMachine.OpenSubKey(ResourcesKeyPath);
+        if (resources is null)
         {
-            return false;
+            // Not "no such VM": the cluster database is missing entirely, so
+            // this host cannot answer for any VM. Saying so beats reporting
+            // every node as absent.
+            throw new InvalidOperationException(
+                $@"the cluster database is not present at HKLM\{ResourcesKeyPath}; " +
+                "is this host a member of a failover cluster and is the cluster service running?");
         }
 
-        using (privateProperties)
+        foreach (var resourceId in resources.GetSubKeyNames())
         {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            using var resource = resources.OpenSubKey(resourceId);
+            if (resource is null)
+            {
+                // Deleted between listing and opening. Nothing to match.
+                continue;
+            }
+
+            // Checked before the private properties are opened, so that
+            // resources which are not VMs cost one value read rather than two
+            // key opens. Most of a real cluster's resources are not VMs.
+            if (resource.GetValue("Type") as string != VirtualMachineResourceType)
+            {
+                continue;
+            }
+
+            using var parameters = resource.OpenSubKey("Parameters");
+            if (parameters?.GetValue("VmID") as string is not { } candidate)
+            {
+                continue;
+            }
+
             // Braces are stripped because clustering and the guest's key-value
             // pools do not agree on whether to include them, and the comparison
-            // is case-insensitive because neither agrees on case either.
-            return privateProperties["VmID"] as string is { } candidate
-                && string.Equals(candidate.Trim('{', '}'), vmId, StringComparison.OrdinalIgnoreCase);
+            // is case-insensitive because neither agrees on case either. Doing
+            // this in memory is also why the match is not a WQL predicate: WQL
+            // compares case-insensitively but does not tolerate braces, so a
+            // braced value in the database would silently match nothing.
+            if (!string.Equals(candidate.Trim('{', '}'), vmId, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            return resource.GetValue("Name") as string;
         }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Reads which node currently runs a resource. OwnerNode is the node running
+    /// it - the same answer MSCluster_NodeToActiveResource gives, without the
+    /// association traversal - and is live state, which is why it comes from WMI
+    /// rather than from the registry that supplied the name.
+    /// </summary>
+    private static string? ReadOwnerNode(string resourceName)
+    {
+        var scope = new ManagementScope(ScopePath);
+
+        // Keyed on Name, which is MSCluster_Resource's key property, so this
+        // does not scan. The name comes from the cluster database rather than
+        // from a caller, but it is still escaped: a resource named with an
+        // apostrophe would otherwise produce a malformed query.
+        var query = new ObjectQuery(
+            $"SELECT Name, OwnerNode FROM MSCluster_Resource WHERE Name = '{WqlNames.EscapeLiteral(resourceName)}'");
+
+        using var searcher = new ManagementObjectSearcher(scope, query);
+        using var results = searcher.Get();
+
+        foreach (var instance in results)
+        {
+            using var resource = (ManagementObject)instance;
+            return resource["OwnerNode"] as string;
+        }
+
+        return null;
     }
 
     public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
