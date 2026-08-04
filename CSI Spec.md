@@ -108,6 +108,13 @@ So the shape is two steps, and which way you traverse them decides the cost:
 `Get-VHD` is not a substitute for any of it: its `Attached` property and its documented "in use"
 error on shared storage are both about open handles, the same signal with the same blind spot.
 
+**A wedged delete is conceded, not prevented.** `File.Delete` takes no cancellation token, so a
+delete stuck on a CSV in redirected mode cannot be called off. The timeout is therefore *observed*
+rather than enforced: the job fails, the volume's job chain drains and its concurrency slot is
+released, but the thread stays in the syscall. Abandoning it is safe here in a way it would not be
+for CreateVolume — if the call does eventually return, it returns having deleted the file, which is
+what was asked for. A create abandoned the same way could leave a disk nobody expects.
+
 **Other DeleteVolume notes.** A volume ID that could not have come from CreateVolume (one failing
 the safe filename rule) reports success rather than INVALID_ARGUMENT: no such volume can exist, CSI
 requires OK for a volume that isn't there, and failing would strand the PV in Terminating on a retry

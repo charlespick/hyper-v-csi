@@ -244,7 +244,7 @@ public sealed class JobsEndpointTests : IDisposable
             // the in-progress name is what got recorded.
             var name = Path.GetFileName(path);
             if (_sizes.TryGetValue(name, out var size)
-                || _sizes.TryGetValue(name.Replace(".vhdx", ".creating.vhdx"), out size))
+                || _sizes.TryGetValue(name.Replace(".vhdx", "~creating.vhdx"), out size))
             {
                 return Task.FromResult(size);
             }

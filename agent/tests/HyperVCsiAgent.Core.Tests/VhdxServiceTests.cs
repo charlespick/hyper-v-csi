@@ -17,7 +17,7 @@ public sealed class VhdxServiceTests : IDisposable
 
     private string VolumePath(string volumeName) => Path.Combine(_root, volumeName + ".vhdx");
 
-    private string InProgressPath(string volumeName) => Path.Combine(_root, volumeName + ".creating.vhdx");
+    private string InProgressPath(string volumeName) => Path.Combine(_root, volumeName + "~creating.vhdx");
 
     public void Dispose()
     {
@@ -290,12 +290,49 @@ public sealed class VhdxServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task DeleteAsync_VolumeNamedLikeAnotherVolumesInProgressFile_Survives()
+    {
+        // Regression: the in-progress marker used to be "<name>.creating.vhdx",
+        // which is the real path of a volume legitimately named "pvc-1.creating"
+        // - dots are legal in a volume name. Deleting pvc-1 therefore deleted a
+        // second, unrelated volume, silently. The marker now uses a character no
+        // volume name can contain, which is what keeps these two disjoint.
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks);
+        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-1.creating", 1024, CancellationToken.None);
+
+        await service.DeleteAsync("pvc-1", CancellationToken.None);
+
+        Assert.False(File.Exists(VolumePath("pvc-1")));
+        Assert.True(File.Exists(VolumePath("pvc-1.creating")));
+    }
+
+    [Fact]
+    public async Task CreateAsync_VolumeNamedLikeAnotherVolumesInProgressFile_IsNotClobbered()
+    {
+        // The same collision from the other side: creating pvc-1 used to delete
+        // an existing "pvc-1.creating" as though it were its own leftover.
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks);
+        await service.CreateAsync("pvc-1.creating", 1024, CancellationToken.None);
+
+        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+
+        Assert.True(File.Exists(VolumePath("pvc-1.creating")));
+    }
+
+    [Fact]
     public async Task DeleteAsync_VolumeThatIsNotThere_Succeeds()
     {
         // CSI requires OK when the volume is already gone, and that is also
         // what a re-driven delete looks like after the agent forgets the job
-        // that already ran it.
-        using var service = NewService(new FakeVirtualDiskManager());
+        // that already ran it. The root exists here - a provisioned CSV with
+        // this one volume already reclaimed, which is the re-drive case proper.
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks);
+        await service.CreateAsync("pvc-other", 1024, CancellationToken.None);
+        Assert.True(Directory.Exists(_root));
 
         await service.DeleteAsync("pvc-1", CancellationToken.None);
     }
@@ -329,18 +366,55 @@ public sealed class VhdxServiceTests : IDisposable
     public async Task DeleteAsync_AlsoCollectsALeftoverInProgressFile()
     {
         // A create that died between the CIM call and its rename left this
-        // behind. Only a later create for the same name would otherwise clean
-        // it up, which for a volume being reclaimed never comes.
-        var disks = new FakeVirtualDiskManager { FailNextCreate = true };
+        // behind - the process died, so its own cleanup never ran either. Only
+        // a later create for the same name would otherwise collect it, which
+        // for a volume being reclaimed never comes. Written by hand because
+        // that is what a killed process leaves; a create that merely throws
+        // cleans up after itself.
+        var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks);
-        await Assert.ThrowsAsync<InvalidOperationException>(
-            () => service.CreateAsync("pvc-1", 1024, CancellationToken.None));
-        Directory.CreateDirectory(_root);
+        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
         await File.WriteAllTextAsync(InProgressPath("pvc-1"), "half-written disk");
 
         await service.DeleteAsync("pvc-1", CancellationToken.None);
 
         Assert.False(File.Exists(InProgressPath("pvc-1")));
+        Assert.False(File.Exists(VolumePath("pvc-1")));
+    }
+
+    [Theory]
+    [InlineData("create")]
+    [InlineData("delete")]
+    public async Task WhenTheAgentIsSaturated_QueuingTimesOutWithSomethingDiagnosable(string operation)
+    {
+        // Timing out while waiting for a slot used to escape as a bare
+        // OperationCanceledException, which the job store reports as
+        // "The operation was canceled." - no volume, no timeout, and
+        // indistinguishable from the agent shutting down. A saturated agent is
+        // exactly when that message has to be worth something.
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks, maxConcurrentDiskOperations: 1, diskOperationTimeout: TimeSpan.FromMilliseconds(150));
+
+        using var release = new SemaphoreSlim(0);
+        disks.BeforeCreate = _ => release.WaitAsync();
+        var hog = service.CreateAsync("pvc-hog", 1024, CancellationToken.None);
+        await WaitFor(() => disks.InFlightPeak >= 1);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => operation == "create"
+                ? service.CreateAsync("pvc-1", 1024, CancellationToken.None)
+                : service.DeleteAsync("pvc-1", CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
+        Assert.Contains("timed out", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("pvc-1", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("slots", failure.Message, StringComparison.Ordinal);
+
+        release.Release();
+        // The hog's own timeout fired while it sat in BeforeCreate. That is
+        // incidental to what this test is about, but it still has to be
+        // observed rather than left as an unhandled fault.
+        await Assert.ThrowsAsync<JobFailureException>(() => hog);
     }
 
     [Theory]
@@ -394,6 +468,10 @@ public sealed class VhdxServiceTests : IDisposable
 
         using var blocked = new SemaphoreSlim(0);
         disks.BeforeCreate = _ => blocked.WaitAsync();
+        // Peak is monotonic and the create above already drove it to 1, so it
+        // has to be reset for this wait to mean "the second create holds the
+        // slot" rather than returning immediately on stale state.
+        disks.ResetPeak();
         var holdsTheGate = service.CreateAsync("pvc-2", 1024, CancellationToken.None);
         await WaitFor(() => disks.InFlightPeak >= 1);
 
@@ -527,7 +605,7 @@ public sealed class VhdxServiceTests : IDisposable
                 lock (_gate)
                 {
                     if (_sizes.TryGetValue(name, out var size)
-                        || _sizes.TryGetValue(name.Replace(".vhdx", ".creating.vhdx"), out size))
+                        || _sizes.TryGetValue(name.Replace(".vhdx", "~creating.vhdx"), out size))
                     {
                         return size;
                     }

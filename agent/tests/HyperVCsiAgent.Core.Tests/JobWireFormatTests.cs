@@ -100,4 +100,20 @@ public class JobWireFormatTests
         Assert.False(root.TryGetProperty("error", out _));
         Assert.False(root.TryGetProperty("errorCode", out _));
     }
+
+    [Fact]
+    public void AgentErrorCodes_AreTheExactStringsTheGoClientMatchesOn()
+    {
+        // These travel as strings and are compared literally against the
+        // constants in csi-driver/internal/agentclient/client.go. A typo here
+        // compiles, passes every test that goes through the constant, and shows
+        // up only in production as a silent downgrade to codes.Internal -
+        // turning a terminal answer into an infinite sidecar retry. Change
+        // either side and you must change the other.
+        Assert.Equal("InvalidArgument", AgentErrorCodes.InvalidArgument);
+        Assert.Equal("AlreadyExists", AgentErrorCodes.AlreadyExists);
+        Assert.Equal("ResourceExhausted", AgentErrorCodes.ResourceExhausted);
+        Assert.Equal("FailedPrecondition", AgentErrorCodes.FailedPrecondition);
+        Assert.Equal("Internal", AgentErrorCodes.Internal);
+    }
 }
