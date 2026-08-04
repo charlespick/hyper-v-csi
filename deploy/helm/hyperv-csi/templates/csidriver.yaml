@@ -12,6 +12,12 @@ spec:
   # would have Kubernetes create VolumeAttachment objects and wait forever for
   # an external-attacher that cannot succeed, so every PVC would hang at first
   # use rather than simply failing to mount.
+  #
+  # This must flip to true in the same change that implements
+  # ControllerPublishVolume. While it is false Kubernetes never calls Publish or
+  # Unpublish, and DeleteVolume deletes on the assumption that Unpublish already
+  # detached the disk — so attach landing without this flag means reclaims start
+  # deleting attached disks with nothing having asked for a detach.
   attachRequired: false
 
   # NodePublishVolume receives no pod metadata; nothing consumes it yet.

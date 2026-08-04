@@ -238,6 +238,12 @@ type deleteVolumePayload struct {
 // what a retry of an already-finished delete looks like by the time it reaches
 // the agent — the two are indistinguishable from the CSV, and both mean the
 // caller got what it asked for.
+//
+// Nothing here checks the volume is detached first: ControllerUnpublishVolume
+// has already run by the time CSI asks for a delete. If some attachment this
+// driver didn't make is holding the disk, the delete fails and that error is
+// passed through rather than cleared out of the way. See "DeleteVolume" in
+// CSI Spec.md — that decision has a real prerequisite attached to it.
 func (s *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume id is required")
@@ -262,6 +268,13 @@ func (s *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 // ControllerPublishVolume attaches a VHDX to the node VM by resolving its
 // owning host via cluster APIs, then attaching through that host.
 // Idempotency key: volume ID + node ID.
+//
+// Implementing this means setting attachRequired: true on the CSIDriver object
+// in the same change. While it is false Kubernetes creates no VolumeAttachment
+// and never calls this RPC or its Unpublish counterpart — which is fine for a
+// stub, but DeleteVolume reclaims on the assumption that unpublish ran first.
+// Land attach without flipping the flag and every reclaim deletes a disk that
+// was never detached, silently, because nothing ever asked for the detach.
 func (s *controllerServer) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "ControllerPublishVolume not implemented")
 }

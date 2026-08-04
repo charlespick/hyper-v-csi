@@ -48,8 +48,18 @@ running this in a cluster. What each one currently overstates:
 access *type* (mount vs block) is not validated, and `volume_context` is left empty.
 `VolumeContentSource` returns Unimplemented by design; restore-from-snapshot is a separate slice.
 
-**DeleteVolume does not check that the volume is detached.** It deletes the file. The delete fails
-if something holds the VHDX open, which is reported as FAILED_PRECONDITION, but *that is not a
+**DeleteVolume deliberately does not check that the volume is detached.** It deletes the file. By
+the time CSI calls DeleteVolume, ControllerUnpublishVolume has already detached the volume from the
+node that had it — that is the contract, and it is the same guarantee every CSI driver reclaims on.
+Re-deriving it here would mean a query per cluster node (see below), which is a lot of machinery to
+re-answer a question the caller already answered.
+
+If something *else* holds the disk — an administrator mounted it by hand, a backup has it open — the
+delete fails and that error is surfaced as-is. That is the intended outcome, not a shortfall: an
+attachment this driver did not make is not one it should quietly undo. Failing loudly leaves the
+operator with a disk and a message; "helpfully" detaching it first would leave them with neither.
+
+The delete failing on a held-open file is reported as FAILED_PRECONDITION, but *that is not a
 detachment check and must not be mistaken for one*:
 
 - **A lock proves nothing about attachment.** Hyper-V opens a VHDX through its storage stack while
@@ -60,12 +70,18 @@ detachment check and must not be mistaken for one*:
   invisible to handle enumeration, and a crashed checkpoint or backup can orphan one after the
   worker process exits. So a sharing violation can outlive any attachment.
 
-Right now nothing else guards this: ControllerPublishVolume doesn't exist, so no VHDX this driver
-manages is ever attached to anything, and the CSI contract (ControllerUnpublishVolume runs first)
-is the only ordering guarantee. **That guarantee becomes load-bearing the moment attach lands, so
-the detachment check belongs in the publish/unpublish slice, not here.**
+So the safety of a reclaim rests entirely on unpublish having run. Today nothing tests that, because
+ControllerPublishVolume doesn't exist and no VHDX this driver manages is ever attached to anything.
 
-What an authoritative check would take, when it's built. The attachment itself lives in
+> **Landing ControllerPublishVolume means flipping `attachRequired` to `true` in the same change.**
+> The CSIDriver object currently sets `attachRequired: false`, which stops Kubernetes creating
+> VolumeAttachment objects at all — so ControllerPublishVolume and ControllerUnpublishVolume are
+> never called. That is correct while attach is a stub, but it means the ordering DeleteVolume
+> relies on does not exist yet. Implement attach without flipping the flag and every reclaim
+> deletes a disk that was never unpublished, silently, because the RPC that would have detached it
+> was never invoked.
+
+What an authoritative check would take, if one is ever wanted anyway. The attachment itself lives in
 `Msvm_StorageAllocationSettingData` in `root\virtualization\v2`: match `HostResource[0]` against the
 VHDX path with `ResourceSubType` `Microsoft:Hyper-V:Virtual Hard Disk`. That is *configuration* data
 — it exists whether or not the VM is running, which is exactly the property the file lock lacks.
@@ -85,9 +101,9 @@ So the shape is two steps, and which way you traverse them decides the cost:
   owning host, then one CIM call to that host answers. This is the direction ControllerPublishVolume
   and ControllerUnpublishVolume need, they already know the node VM, and it is cheap.
 - **Reverse — "is this VHDX attached to anything, anywhere?"** No single query answers it; it means
-  a `Msvm_StorageAllocationSettingData` query per node. This is the direction a DeleteVolume-time
-  guard would need, and it is the expensive one — which is a further reason the check belongs on the
-  unpublish path rather than here.
+  a `Msvm_StorageAllocationSettingData` query per node. This is what a DeleteVolume-time guard would
+  need, and its cost is the concrete reason there isn't one — the cheap direction is the one
+  unpublish already has.
 
 `Get-VHD` is not a substitute for any of it: its `Attached` property and its documented "in use"
 error on shared storage are both about open handles, the same signal with the same blind spot.
