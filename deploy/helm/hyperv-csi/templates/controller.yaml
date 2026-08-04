@@ -121,7 +121,7 @@ spec:
             capabilities:
               drop: ["ALL"]
       volumes:
-        # The CSI socket is shared between the driver and the sidecar and lives
+        # The CSI socket is shared between the driver and both sidecars and lives
         # only as long as the pod; nothing about it needs to survive a restart.
         - name: socket-dir
           emptyDir: {}

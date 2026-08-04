@@ -254,11 +254,14 @@ public sealed class AttachService : IAttachService, IDisposable
 
         try
         {
-            // Same forward query attach uses, for the same reason: the VM's
-            // configuration is what says whether this still needs doing, so a
-            // re-drive after a restart finds nothing attached and stops.
-            var existing = await _host.FindAttachedDiskAsync(vm.OwningHost, vm.VmName, path, attempt.Token).ConfigureAwait(false);
-            if (existing is null)
+            // Presence only, never the address: detach has no use for the LUN,
+            // and asking for it would make an unreadable one fail an operation
+            // that would otherwise have succeeded - permanently, since no retry
+            // fixes it, with the VolumeAttachment and the PV's deletion stuck
+            // behind it. The VM's configuration is still what says whether this
+            // needs doing, so a re-drive after a restart finds nothing and stops.
+            var attached = await _host.IsDiskAttachedAsync(vm.OwningHost, vm.VmName, path, attempt.Token).ConfigureAwait(false);
+            if (!attached)
             {
                 _logger.LogInformation(
                     "DetachVolume {VolumeId}: not attached to {VmName} on {Host}, so there is nothing to detach",
@@ -273,8 +276,8 @@ public sealed class AttachService : IAttachService, IDisposable
             // reclaims on it, and reporting success while the disk is still in the
             // VM's configuration is exactly how a reclaim comes to delete a disk a
             // stopped VM is still expecting.
-            var still = await _host.FindAttachedDiskAsync(vm.OwningHost, vm.VmName, path, attempt.Token).ConfigureAwait(false);
-            if (still is not null)
+            var stillAttached = await _host.IsDiskAttachedAsync(vm.OwningHost, vm.VmName, path, attempt.Token).ConfigureAwait(false);
+            if (stillAttached)
             {
                 throw new JobFailureException(
                     AgentErrorCodes.Internal,

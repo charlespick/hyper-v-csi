@@ -41,6 +41,15 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
             return FindAttachedDisk(scope, settings, vhdxPath, cancellationToken);
         }, cancellationToken);
 
+    public Task<bool> IsDiskAttachedAsync(
+        string hostName, string vmName, string vhdxPath, CancellationToken cancellationToken) =>
+        Task.Run(() =>
+        {
+            var scope = ScopeFor(hostName);
+            using var settings = GetActiveSettings(scope, hostName, vmName);
+            return LocateDisk(scope, settings, vhdxPath, cancellationToken) is not null;
+        }, cancellationToken);
+
     public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmName, CancellationToken cancellationToken) =>
         Task.Run<DiskSlot?>(() =>
         {
@@ -119,7 +128,7 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
                 // good: nothing else ever collects one, and every later attach
                 // simply picks the next address until the controller is full of
                 // drives holding no disks.
-                RemoveEmptyDrive(scope, management, drivePath, vmName, cancellationToken);
+                TryRemoveEmptyDrive(scope, management, drivePath, vmName, "a failed attach", CancellationToken.None);
                 throw;
             }
 
@@ -147,12 +156,20 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
             // as its parent, so the other order would orphan the reference. Two
             // calls rather than one array, because a single RemoveResourceSettings
             // makes no promise about the order it processes its arguments in.
+            //
+            // Only the first is allowed to fail the operation. Once the disk is
+            // gone the volume IS detached, which is the whole of what unpublish
+            // promises and what DeleteVolume relies on. Throwing on the drive
+            // afterwards would fail an operation that had already succeeded, and
+            // every retry would then find no disk, report success, and leave the
+            // drive exactly where it was - so the leak would happen anyway, with
+            // a stuck VolumeAttachment on top of it.
             RemoveResource(scope, management, located.DiskPath, "the disk", cancellationToken);
 
             // Removing the drive too, not just the disk: an empty drive keeps
             // its address on the controller, so leaving them behind would walk a
             // VM up to its 64-per-controller limit one detach at a time.
-            RemoveResource(scope, management, located.DrivePath, "its drive", cancellationToken);
+            TryRemoveEmptyDrive(scope, management, located.DrivePath, vmName, "detaching its disk", cancellationToken);
 
             logger.LogInformation("detached {VhdxPath} from {VmName} on {HostName}", vhdxPath, vmName, hostName);
         }, cancellationToken);
@@ -210,13 +227,20 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
                     continue;
                 }
 
+                // Past this point the disk IS attached - the path matched. Every
+                // remaining failure therefore throws rather than continuing:
+                // falling through to "return null" would report a disk that is
+                // demonstrably in the VM's configuration as not attached, and
+                // detach would then report success without removing anything.
+                //
                 // The disk names its drive, and the drive names its controller
                 // and address. This is configuration data, so it reads the same
                 // whether or not the VM is running - which is exactly the
                 // property a file lock lacks.
                 if (disk["Parent"] as string is not { } drivePath)
                 {
-                    continue;
+                    throw new InvalidOperationException(
+                        $"{vhdxPath} is in the VM's configuration but its disk setting names no drive");
                 }
 
                 using var drive = new ManagementObject(scope, new ManagementPath(drivePath), null);
@@ -224,10 +248,15 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
 
                 if (drive["Parent"] as string is not { } controllerPath)
                 {
-                    continue;
+                    throw new InvalidOperationException(
+                        $"the drive holding {vhdxPath} names no controller");
                 }
 
-                return new DiskLocation(disk.Path.Path, drivePath, controllerPath, AddressOf(drive));
+                // The drive's own canonical path, not the raw Parent reference
+                // it was found by: the two are the same object, but only this
+                // one has the same provenance as the disk path beside it, and
+                // both are handed straight back to vmms as REFs.
+                return new DiskLocation(disk.Path.Path, drive.Path.Path, controllerPath, AddressOf(drive));
             }
         }
 
@@ -339,12 +368,26 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
         CimJobs.WaitForCompletion(scope, outParams, $"RemoveResourceSettings ({description})", cancellationToken);
     }
 
-    private void RemoveEmptyDrive(
+    /// <summary>
+    /// Removes a disk drive that no longer holds anything, reporting rather than
+    /// throwing if it cannot. Both callers have already reached the outcome that
+    /// matters - a rolled-back attach, or a disk that is genuinely detached - so
+    /// an empty drive left behind is a resource leak to tell an operator about,
+    /// not a reason to fail an operation that otherwise did what was asked.
+    /// </summary>
+    /// <param name="waitToken">
+    /// The attach rollback passes None deliberately: it runs because the
+    /// caller's token fired, so honouring that token would abandon the cleanup
+    /// immediately. Detach passes its real token, since it is on the success
+    /// path and a drive removal that never settles must not hang the job.
+    /// </param>
+    private void TryRemoveEmptyDrive(
         ManagementScope scope,
         ManagementObject management,
         string drivePath,
         string vmName,
-        CancellationToken cancellationToken)
+        string context,
+        CancellationToken waitToken)
     {
         try
         {
@@ -352,19 +395,13 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
             inParams["ResourceSettings"] = new[] { drivePath };
 
             using var outParams = management.InvokeMethod("RemoveResourceSettings", inParams, null);
-
-            // Deliberately not the caller's token: this runs on the failure path,
-            // and the most likely reason we are here is that token firing.
-            CimJobs.WaitForCompletion(scope, outParams, "RemoveResourceSettings", CancellationToken.None);
+            CimJobs.WaitForCompletion(scope, outParams, "RemoveResourceSettings", waitToken);
         }
         catch (Exception ex)
         {
-            // Reported, not rethrown: the attach failure that brought us here is
-            // the one worth surfacing, and burying it under a cleanup error
-            // would cost the operator the actual cause.
             logger.LogWarning(ex,
-                "could not remove the empty disk drive left on {VmName} after a failed attach; it occupies a LUN until removed by hand",
-                vmName);
+                "could not remove the empty disk drive left on {VmName} after {Context}; it occupies an address on its controller until removed by hand",
+                vmName, context);
         }
     }
 

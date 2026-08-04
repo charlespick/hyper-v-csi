@@ -21,6 +21,21 @@ public interface IHyperVHostClient
     Task<AttachedDisk?> FindAttachedDiskAsync(string hostName, string vmName, string vhdxPath, CancellationToken cancellationToken);
 
     /// <summary>
+    /// Whether the VHDX is in the VM's configuration at all.
+    /// </summary>
+    /// <remarks>
+    /// Separate from <see cref="FindAttachedDiskAsync"/> because detach must not
+    /// depend on anything it does not need. That one reports the disk's address
+    /// and fails when the address cannot be read, which is right for attach - a
+    /// wrong address sends the node plugin to the wrong disk. Detach never uses
+    /// the address, and failing on it would leave the disk attached forever
+    /// behind a retry that cannot succeed, with the VolumeAttachment, the PV's
+    /// deletion, and the node's drain all stuck behind it.
+    /// </remarks>
+    /// <exception cref="VmNotOnHostException">The VM is not registered on this host.</exception>
+    Task<bool> IsDiskAttachedAsync(string hostName, string vmName, string vhdxPath, CancellationToken cancellationToken);
+
+    /// <summary>
     /// Finds an unoccupied address on one of the VM's existing SCSI controllers,
     /// or null when every one of them is full.
     /// </summary>

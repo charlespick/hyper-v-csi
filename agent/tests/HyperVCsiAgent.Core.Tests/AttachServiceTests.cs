@@ -312,6 +312,68 @@ public sealed class AttachServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task DetachAsync_HostRefusingTheReconfiguration_Fails()
+    {
+        // The direction that matters most: a host that would not remove the disk
+        // must never come back as a successful unpublish, because DeleteVolume
+        // is free to reclaim the moment this reports success.
+        GivenVolume("pvc-1");
+        var host = new FakeHostClient { Existing = new AttachedDisk("controller-guid", 4), DetachThrows = true };
+        using var service = NewService(host);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DetachAsync("pvc-1", Node, CancellationToken.None));
+
+        Assert.Null(host.Detached);
+    }
+
+    [Fact]
+    public async Task DetachAsync_LooksUpTheSamePathItRemoves()
+    {
+        // A divergence between the path used to decide "is it attached" and the
+        // one handed to the removal would detach the wrong disk, or nothing.
+        var volume = GivenVolume("pvc-1");
+        var host = new FakeHostClient { Existing = new AttachedDisk("controller-guid", 4), DetachWorks = true };
+        using var service = NewService(host);
+
+        await service.DetachAsync("pvc-1", Node, CancellationToken.None);
+
+        Assert.All(host.PathsLookedUp, path => Assert.Equal(volume, path));
+        Assert.Equal(volume, host.Detached?.Path);
+    }
+
+    [Fact]
+    public async Task DetachAsync_HostThatNeverAnswers_TimesOutAsInternal()
+    {
+        GivenVolume("pvc-1");
+        var host = new FakeHostClient { HangsForever = true };
+        using var service = NewService(host, timeout: TimeSpan.FromMilliseconds(50));
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => service.DetachAsync("pvc-1", Node, CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
+        Assert.Contains("timed out", failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DetachAsync_TimeoutDuringTheRetry_IsStillClassified()
+    {
+        // Detach has the same nested-catch shape as attach, so it has the same
+        // way of losing a timeout out of the retry path.
+        GivenVolume("pvc-1");
+        var host = new FakeHostClient { NotOnHost = Host, HangsAfterMigrating = true };
+        using var service = NewService(
+            host, new FakeClusterService { Owner = Host, NextOwner = "hv-02" }, TimeSpan.FromMilliseconds(50));
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => service.DetachAsync("pvc-1", Node, CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
+        Assert.Contains("timed out", failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task DetachAsync_MigratedVm_ReResolvesTheOwnerAndRetriesOnce()
     {
         GivenVolume("pvc-1");
@@ -407,6 +469,12 @@ public sealed class AttachServiceTests : IDisposable
         /// <summary>Whether a detach actually removes the disk, or silently leaves it in place.</summary>
         public bool DetachWorks { get; init; }
 
+        /// <summary>A host that refuses the reconfiguration outright.</summary>
+        public bool DetachThrows { get; init; }
+
+        /// <summary>Every path the client was asked to look up, so a lookup/removal mismatch is visible.</summary>
+        public List<string> PathsLookedUp { get; } = [];
+
         public int FreeSlotQueries { get; private set; }
 
         public (string Host, string Vm, string Path, int Lun)? Attached { get; private set; }
@@ -439,6 +507,17 @@ public sealed class AttachServiceTests : IDisposable
             return PlacedAt ?? new AttachedDisk(FreeSlot!.ControllerInstanceId, Attached.Value.Lun);
         }
 
+        public async Task<bool> IsDiskAttachedAsync(
+            string hostName, string vmName, string vhdxPath, CancellationToken cancellationToken)
+        {
+            PathsLookedUp.Add(vhdxPath);
+
+            // Deliberately the same underlying state as FindAttachedDiskAsync,
+            // minus the address: a fake where the two could disagree would hide
+            // the very thing detach relies on them agreeing about.
+            return await FindAttachedDiskAsync(hostName, vmName, vhdxPath, cancellationToken).ConfigureAwait(false) is not null;
+        }
+
         public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmName, CancellationToken cancellationToken)
         {
             Migrated(hostName, vmName);
@@ -457,6 +536,12 @@ public sealed class AttachServiceTests : IDisposable
         public Task DetachDiskAsync(string hostName, string vmName, string vhdxPath, CancellationToken cancellationToken)
         {
             Migrated(hostName, vmName);
+
+            if (DetachThrows)
+            {
+                throw new InvalidOperationException("the host refused to reconfigure the VM");
+            }
+
             Detached = (hostName, vmName, vhdxPath);
             return Task.CompletedTask;
         }

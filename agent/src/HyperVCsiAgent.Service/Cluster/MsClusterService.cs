@@ -40,9 +40,14 @@ public sealed class MsClusterService(ILogger<MsClusterService> logger) : ICluste
             // one piece of caller-supplied text that reaches a WQL query.
             if (!WqlNames.IsSafe(nodeId))
             {
-                logger.LogWarning(
-                    "node {NodeId} is not a usable cluster group name, so it resolves to no virtual machine", nodeId);
-                return null;
+                // Not null, which this interface reserves for "the cluster has
+                // no such VM" - a claim about the cluster, and we have not asked
+                // it anything. Unreachable for a real Kubernetes node name
+                // (DNS-1123 is a strict subset of this shape), but a caller that
+                // read this as "nothing is attached" would be acting on an
+                // answer nobody gave.
+                throw new InvalidOperationException(
+                    $"node {nodeId} is not a usable cluster group name, so the cluster cannot be asked about it");
             }
 
             var scope = new ManagementScope(ScopePath);

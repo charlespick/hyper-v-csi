@@ -422,8 +422,12 @@ func (s *controllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 			"node id is required; unpublishing from every node at once is not supported")
 	}
 
-	// Same key and target as publish, so a detach can neither duplicate nor
-	// interleave with an attach for the same volume and node.
+	// Same key and target as publish. The target is what stops an attach and a
+	// detach for one VM from interleaving — the agent runs one job at a time per
+	// target — and the operation type keeps them from deduping onto each other,
+	// since the agent keys in-flight jobs on the pair. The shared key does
+	// neither of those; it is here so a retry of this detach finds the job
+	// already running rather than starting a second one.
 	job, err := s.driver.Agent.EnqueueJob(ctx, publishKey(req.GetVolumeId(), req.GetNodeId()), operationDetachVolume,
 		vmTarget(req.GetNodeId()), detachVolumePayload{
 			VolumeID: req.GetVolumeId(),

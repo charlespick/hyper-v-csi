@@ -737,8 +737,9 @@ func TestControllerUnpublishVolumeEnqueuesUnderTheSameKeyAndTargetAsPublish(t *t
 	}
 
 	enqueued := agent.onlyEnqueued(t)
-	// Same key and target as a publish for this pair, so the two can neither
-	// duplicate nor interleave.
+	// The target is what keeps this from interleaving with an attach on the
+	// same VM; the operation type is what keeps the two from deduping onto each
+	// other despite sharing a key.
 	if enqueued.IdempotencyKey != "pvc-1/node-a" {
 		t.Errorf("idempotency key = %q, want the volume id and node id", enqueued.IdempotencyKey)
 	}

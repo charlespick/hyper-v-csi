@@ -14,6 +14,10 @@ public sealed class UnsupportedHyperVHostClient : IHyperVHostClient
         string hostName, string vmName, string vhdxPath, CancellationToken cancellationToken) =>
         throw Unsupported();
 
+    public Task<bool> IsDiskAttachedAsync(
+        string hostName, string vmName, string vhdxPath, CancellationToken cancellationToken) =>
+        throw Unsupported();
+
     public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmName, CancellationToken cancellationToken) =>
         throw Unsupported();
 
