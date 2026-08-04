@@ -123,9 +123,13 @@ public sealed class StoreCertificateProvider : IServerCertificateProvider
         var selected = CertificateSelector.Select(candidates, _options.SubjectName, now);
 
         // The selected certificate outlives the store handle, so hand back a
-        // copy and release everything else.
-        var result = selected is null ? null : X509CertificateLoader.LoadPkcs12(
-            selected.Export(X509ContentType.Pkcs12), password: null, X509KeyStorageFlags.EphemeralKeySet);
+        // copy and release everything else. Cloning via the copy constructor
+        // rather than a PKCS#12 export/reimport keeps the private key tied to
+        // its original CNG/CAPI key container - re-importing with
+        // EphemeralKeySet produced a key SChannel refuses to use as a TLS
+        // server credential ("the platform does not support ephemeral keys"),
+        // which broke every HTTPS handshake on the only OS this agent runs on.
+        var result = selected is null ? null : new X509Certificate2(selected);
 
         foreach (var candidate in candidates)
         {
