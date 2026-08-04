@@ -73,11 +73,20 @@ controller:
   podAnnotations: {}
 
 # The node plugin stages and mounts volumes in the guest. Every Node* RPC that
-# does real work is still Unimplemented, so running it would register a plugin
-# with kubelet that cannot mount anything. Provisioning is controller-side and
-# works without it — a PVC binds either way.
+# does real work is still Unimplemented, so it cannot mount anything yet.
+#
+# On anyway, because attach needs it for a reason unrelated to mounting: the
+# node plugin's registration is what creates the CSINode object, and CSINode is
+# where external-attacher reads the CSI node ID it passes to
+# ControllerPublishVolume. Without it there is no node ID to resolve and no
+# attach can complete, whatever attachRequired says.
+#
+# So a pod using a PVC now gets as far as a real attach — VolumeAttachment,
+# ControllerPublishVolume, a disk appearing in the VM's configuration — and then
+# fails at NodeStageVolume. That is the intended state: the failure moves to the
+# step that is genuinely unbuilt instead of hanging at one that isn't.
 node:
-  enabled: false
+  enabled: true
 
   registrar:
     image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0

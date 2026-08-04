@@ -99,10 +99,17 @@ shapes three defaults worth knowing about:
   real outing an irreversible one. VHDX files are removed by hand until you've watched a
   delete succeed on your own hosts, then flip `storageClass.reclaimPolicy`.
 
-The node plugin (`node.enabled`) is off by default: every `Node*` RPC that does real work
-is still a stub, so running it would register a plugin with kubelet that can't mount
-anything. Provisioning is controller-side, so a PVC binds without it — but a pod that
-mounts one will not start until staging and publishing exist, which is the next slice.
+The node plugin (`node.enabled`) is **on**, even though every `Node*` RPC that does real
+work is still a stub, because attach needs it for a reason unrelated to mounting. The node
+plugin's registration with kubelet is what creates the `CSINode` object, and `CSINode` is
+where external-attacher reads the CSI node ID it passes to `ControllerPublishVolume`.
+Without it there is no node ID to resolve and no attach can complete, whatever
+`attachRequired` says.
+
+So a pod using a PVC now gets as far as a real attach — a `VolumeAttachment`, a
+`ControllerPublishVolume` call, a disk appearing in the VM's configuration — and then
+fails at `NodeStageVolume`. That is deliberate: it puts the failure at the step that is
+actually unbuilt, and it is the cheapest way to exercise attach end to end.
 
 Installing with an unusable configuration fails at `helm install` rather than as a
 `CrashLoopBackOff` — a missing agent address, a plaintext address without the explicit

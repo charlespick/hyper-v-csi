@@ -49,10 +49,12 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --mode=node
-            # NOTE: this is the Kubernetes node name. ControllerPublishVolume
-            # will need to resolve the same value to the VM's identity in the
-            # failover cluster; if those don't line up, attach will look up the
-            # wrong VM. Revisit when that RPC is implemented.
+            # The Kubernetes node name, which kubelet records in the CSINode
+            # object and external-attacher then hands to ControllerPublishVolume.
+            # The agent resolves it by matching a failover cluster group of the
+            # same name, so a node whose VM role is named something else will
+            # fail to attach — see "ControllerPublishVolume identifies a node by
+            # cluster group name" in CSI Spec.md.
             - --node-id=$(KUBE_NODE_NAME)
             - --endpoint=unix:///csi/csi.sock
           env:

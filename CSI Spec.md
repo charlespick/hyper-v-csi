@@ -126,6 +126,13 @@ So the shape is two steps, and which way you traverse them decides the cost:
 `Get-VHD` is not a substitute for any of it: its `Attached` property and its documented "in use"
 error on shared storage are both about open handles, the same signal with the same blind spot.
 
+**The node plugin is deployed even though it cannot mount.** Its registration with kubelet
+is what creates the `CSINode` object, and `CSINode` is where external-attacher reads the CSI
+node ID it passes to ControllerPublishVolume. Without it there is no node ID to resolve and
+no attach completes, whatever `attachRequired` is set to — so `node.enabled` being off would
+silently disable the RPC this section is about. A pod using a PVC therefore reaches a real
+attach and then fails at NodeStageVolume, which is the honest place for it to fail.
+
 **ControllerPublishVolume identifies a node by cluster group name.** The CSI node ID is whatever the
 node plugin reports, which today is the Kubernetes node name. The agent resolves it with one
 `MSCluster_Resource` query for a resource of type `Virtual Machine` whose `OwnerGroup` is exactly
