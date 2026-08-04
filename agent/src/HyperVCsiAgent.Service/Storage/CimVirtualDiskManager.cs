@@ -2,8 +2,16 @@ using System.Globalization;
 using System.Management;
 using System.Runtime.Versioning;
 using System.Xml.Linq;
+using HyperVCsiAgent.Core.Configuration;
 using HyperVCsiAgent.Core.Storage;
 using HyperVCsiAgent.Service.Cim;
+using Microsoft.Extensions.Options;
+using Microsoft.Management.Infrastructure;
+using Microsoft.Management.Infrastructure.Generic;
+
+// Both libraries define CimType. System.Management is here only to serialize the
+// embedded instance; every CIM operation goes through MI.
+using CimType = Microsoft.Management.Infrastructure.CimType;
 
 namespace HyperVCsiAgent.Service.Storage;
 
@@ -14,8 +22,14 @@ namespace HyperVCsiAgent.Service.Storage;
 /// involved for file-level VHDX work (that's only needed to touch a running VM).
 /// </summary>
 [SupportedOSPlatform("windows")]
-public sealed class CimVirtualDiskManager(ILogger<CimVirtualDiskManager> logger) : IVirtualDiskManager
+public sealed class CimVirtualDiskManager : IVirtualDiskManager
 {
+    private const string NamespaceName = @"root\virtualization\v2";
+
+    /// <summary>
+    /// The same namespace addressed the System.Management way, which is still
+    /// used to build the embedded instance below.
+    /// </summary>
     private const string ScopePath = @"\\.\root\virtualization\v2";
 
     // Msvm_VirtualHardDiskSettingData.Type / .Format.
@@ -27,47 +41,70 @@ public sealed class CimVirtualDiskManager(ILogger<CimVirtualDiskManager> logger)
     // left unset entirely, which is what New-VHD does when you omit them.
     private const uint UseDefaultBlockSize = 0;
 
+    private readonly AgentOptions _options;
+    private readonly ILogger<CimVirtualDiskManager> _logger;
+
+    public CimVirtualDiskManager(IOptions<AgentOptions> options, ILogger<CimVirtualDiskManager> logger)
+    {
+        _options = options.Value;
+        _logger = logger;
+    }
+
     public Task CreateDynamicVhdxAsync(string path, long maxInternalSizeBytes, CancellationToken cancellationToken) =>
-        // System.Management is entirely synchronous, so the whole exchange -
-        // including polling the Msvm_ConcreteJob - runs on a pool thread.
+        // The CIM calls are synchronous, so the exchange runs on a pool thread.
+        // The token does not make them interruptible - the deadline does - but
+        // it still keeps queued work from starting after a cancellation.
         Task.Run(() =>
         {
-            var scope = new ManagementScope(ScopePath);
-            using var service = GetImageManagementService(scope);
+            var deadline = CimDeadline.After(_options.DiskOperationTimeout);
 
-            using var settingsClass = new ManagementClass(scope, new ManagementPath("Msvm_VirtualHardDiskSettingData"), null);
-            using var settings = settingsClass.CreateInstance()
-                ?? throw new InvalidOperationException("could not create an Msvm_VirtualHardDiskSettingData instance");
-            settings["Type"] = TypeDynamic;
-            settings["Format"] = FormatVhdx;
-            settings["Path"] = path;
-            settings["MaxInternalSize"] = (ulong)maxInternalSizeBytes;
-            settings["BlockSize"] = UseDefaultBlockSize;
+            // Built through System.Management because the parameter is a MOF
+            // string carrying an embedded instance, and MI refuses to marshal a
+            // CimInstance into one ("Type mismatch for parameter
+            // VirtualDiskSettingData"). This is schema work against the local
+            // repository, not a call to a host, so it is not the kind of
+            // operation the deadline exists to bound.
+            var settingsXml = BuildSettingsXml(path, maxInternalSizeBytes);
 
-            using var inParams = service.GetMethodParameters("CreateVirtualHardDisk");
-            // The MOF types this parameter as a string: it carries an embedded
-            // instance serialized as WMI XML, which is what GetText produces.
-            inParams["VirtualDiskSettingData"] = settings.GetText(TextFormat.WmiDtd20);
+            using var session = CimSession.Create(null);
+            using var service = GetImageManagementService(session, deadline, cancellationToken);
 
-            using var outParams = service.InvokeMethod("CreateVirtualHardDisk", inParams, null);
-            _ = CimJobs.WaitForCompletion(scope, outParams, "CreateVirtualHardDisk", cancellationToken);
+            var parameters = new CimMethodParametersCollection
+            {
+                CimMethodParameter.Create("VirtualDiskSettingData", settingsXml, CimType.String, CimFlags.In),
+            };
 
-            logger.LogInformation("created VHDX {Path} at {SizeBytes} bytes", path, maxInternalSizeBytes);
+            using var result = session.InvokeMethod(
+                NamespaceName, service, "CreateVirtualHardDisk", parameters,
+                deadline.Options("CreateVirtualHardDisk", cancellationToken));
+
+            _ = CimJobs.WaitForCompletion(
+                session, NamespaceName, result, "CreateVirtualHardDisk", deadline, cancellationToken);
+
+            _logger.LogInformation("created VHDX {Path} at {SizeBytes} bytes", path, maxInternalSizeBytes);
         }, cancellationToken);
 
     public Task<long> GetVirtualSizeAsync(string path, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
-            var scope = new ManagementScope(ScopePath);
-            using var service = GetImageManagementService(scope);
+            var deadline = CimDeadline.After(_options.DiskOperationTimeout);
 
-            using var inParams = service.GetMethodParameters("GetVirtualHardDiskSettingData");
-            inParams["Path"] = path;
+            using var session = CimSession.Create(null);
+            using var service = GetImageManagementService(session, deadline, cancellationToken);
 
-            using var outParams = service.InvokeMethod("GetVirtualHardDiskSettingData", inParams, null);
-            var completedInline = CimJobs.WaitForCompletion(scope, outParams, "GetVirtualHardDiskSettingData", cancellationToken);
+            var parameters = new CimMethodParametersCollection
+            {
+                CimMethodParameter.Create("Path", path, CimType.String, CimFlags.In),
+            };
 
-            var settingData = outParams["SettingData"] as string;
+            using var result = session.InvokeMethod(
+                NamespaceName, service, "GetVirtualHardDiskSettingData", parameters,
+                deadline.Options("GetVirtualHardDiskSettingData", cancellationToken));
+
+            var completedInline = CimJobs.WaitForCompletion(
+                session, NamespaceName, result, "GetVirtualHardDiskSettingData", deadline, cancellationToken);
+
+            var settingData = result.OutParameters["SettingData"]?.Value as string;
             if (string.IsNullOrEmpty(settingData))
             {
                 // Out parameters are captured at invoke time, so a method that
@@ -83,17 +120,38 @@ public sealed class CimVirtualDiskManager(ILogger<CimVirtualDiskManager> logger)
             return ReadMaxInternalSize(settingData, path);
         }, cancellationToken);
 
-    private static ManagementObject GetImageManagementService(ManagementScope scope)
+    /// <summary>
+    /// Serializes the disk's settings the way the MOF wants them: an embedded
+    /// instance rendered as WMI DTD 2.0 XML.
+    /// </summary>
+    private static string BuildSettingsXml(string path, long maxInternalSizeBytes)
     {
-        using var searcher = new ManagementObjectSearcher(scope, new SelectQuery("Msvm_ImageManagementService"));
-        using var results = searcher.Get();
-        foreach (var instance in results)
+        var scope = new ManagementScope(ScopePath);
+        using var settingsClass = new ManagementClass(scope, new ManagementPath("Msvm_VirtualHardDiskSettingData"), null);
+        using var settings = settingsClass.CreateInstance()
+            ?? throw new InvalidOperationException("could not create an Msvm_VirtualHardDiskSettingData instance");
+
+        settings["Type"] = TypeDynamic;
+        settings["Format"] = FormatVhdx;
+        settings["Path"] = path;
+        settings["MaxInternalSize"] = (ulong)maxInternalSizeBytes;
+        settings["BlockSize"] = UseDefaultBlockSize;
+
+        return settings.GetText(TextFormat.WmiDtd20);
+    }
+
+    private static CimInstance GetImageManagementService(
+        CimSession session, CimDeadline deadline, CancellationToken cancellationToken)
+    {
+        var options = deadline.Options("locating Msvm_ImageManagementService", cancellationToken);
+        foreach (var instance in session.QueryInstances(
+            NamespaceName, "WQL", "SELECT * FROM Msvm_ImageManagementService", options))
         {
-            return (ManagementObject)instance;
+            return instance;
         }
 
         throw new InvalidOperationException(
-            $"no Msvm_ImageManagementService in {ScopePath}; is the Hyper-V role installed on this host?");
+            $"no Msvm_ImageManagementService in {NamespaceName}; is the Hyper-V role installed on this host?");
     }
 
     /// <summary>

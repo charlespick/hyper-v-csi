@@ -1,5 +1,6 @@
 using System.Management;
 using System.Runtime.Versioning;
+using Microsoft.Management.Infrastructure;
 
 namespace HyperVCsiAgent.Service.Cim;
 
@@ -29,11 +30,17 @@ public static class CimJobs
     private static readonly TimeSpan JobPollInterval = TimeSpan.FromMilliseconds(500);
 
     /// <summary>
-    /// Waits for an Msvm method to finish. Returns whether it answered inline,
-    /// which decides whether its other out parameters hold anything - they are
-    /// captured at invoke time, so a method that deferred to a job leaves them
-    /// empty even once the job succeeds.
+    /// The System.Management form, kept only until CimHyperVHostClient is moved
+    /// across. TEMPORARY - delete this overload with the last caller.
     /// </summary>
+    /// <remarks>
+    /// This is the shape with the defect the migration exists to remove: its
+    /// only bound is the token, and a token cannot interrupt a blocked RPC, so
+    /// the attach rollback's <c>CancellationToken.None</c> makes it unbounded.
+    /// It is left in place so the tree builds and the suite passes at every step
+    /// of the migration rather than only at the end; it is not a design anyone
+    /// should copy.
+    /// </remarks>
     public static bool WaitForCompletion(
         ManagementScope scope, ManagementBaseObject outParams, string methodName, CancellationToken cancellationToken)
     {
@@ -69,11 +76,82 @@ public static class CimJobs
                     $"{methodName} job ended in state {state}: {(string.IsNullOrWhiteSpace(description) ? "no error description" : description)}");
             }
 
+            if (cancellationToken.WaitHandle.WaitOne(JobPollInterval))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Waits for an Msvm method to finish. Returns whether it answered inline,
+    /// which decides whether its other out parameters hold anything - they are
+    /// captured at invoke time, so a method that deferred to a job leaves them
+    /// empty even once the job succeeds.
+    /// </summary>
+    /// <remarks>
+    /// The deadline, not the token, is what guarantees this returns. A job that
+    /// never reaches a terminal state - including one sitting in a DMTF-reserved
+    /// state this code deliberately does not classify - becomes a timeout the
+    /// controller can retry, rather than a loop that holds its target's queue
+    /// forever.
+    /// </remarks>
+    public static bool WaitForCompletion(
+        CimSession session,
+        string namespaceName,
+        CimMethodResult result,
+        string methodName,
+        CimDeadline deadline,
+        CancellationToken cancellationToken)
+    {
+        var returnValue = Convert.ToUInt32(result.ReturnValue.Value);
+        if (returnValue == Completed)
+        {
+            return true;
+        }
+
+        if (returnValue != JobStarted)
+        {
+            throw new InvalidOperationException($"{methodName} failed with return value {returnValue}");
+        }
+
+        if (result.OutParameters["Job"]?.Value is not CimInstance jobReference)
+        {
+            throw new InvalidOperationException($"{methodName} reported a started job but returned no job reference");
+        }
+
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (deadline.HasExpired)
+            {
+                throw new TimeoutException(
+                    $"{methodName} started a job that had not reached a terminal state when this operation ran out of time");
+            }
+
+            using var job = session.GetInstance(
+                namespaceName, jobReference, deadline.Options($"polling the {methodName} job", cancellationToken));
+
+            var state = Convert.ToUInt16(job.CimInstanceProperties["JobState"].Value);
+            if (state is JobStateCompleted or JobStateCompletedWithWarnings)
+            {
+                return false;
+            }
+
+            if (state > JobStateCompleted && state <= JobStateException)
+            {
+                var description = job.CimInstanceProperties["ErrorDescription"]?.Value as string;
+                throw new InvalidOperationException(
+                    $"{methodName} job ended in state {state}: {(string.IsNullOrWhiteSpace(description) ? "no error description" : description)}");
+            }
+
             // Everything else - New, Starting, Running, Suspended, Shutting
-            // Down, Service, Query Pending - is still in flight. The caller's
-            // token carries the per-operation timeout, so a job that never
-            // settles becomes a failure the controller can retry rather than
-            // wedging this target's queue forever.
+            // Down, Service, Query Pending, and the DMTF-reserved range above
+            // them - is treated as still in flight. That is the right default
+            // for a state whose meaning is not defined here, and it is only safe
+            // because the deadline above bounds how long we will keep believing
+            // it.
             if (cancellationToken.WaitHandle.WaitOne(JobPollInterval))
             {
                 cancellationToken.ThrowIfCancellationRequested();
