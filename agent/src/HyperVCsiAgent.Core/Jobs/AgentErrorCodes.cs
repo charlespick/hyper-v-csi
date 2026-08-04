@@ -17,8 +17,21 @@ public static class AgentErrorCodes
     /// </summary>
     public const string AlreadyExists = "AlreadyExists";
 
-    /// <summary>Not enough capacity on the CSV to satisfy the request.</summary>
+    /// <summary>
+    /// Not enough capacity to satisfy the request: space on the CSV, or a free
+    /// slot on the VM's SCSI controllers for an attach.
+    /// </summary>
     public const string ResourceExhausted = "ResourceExhausted";
+
+    /// <summary>
+    /// The thing being operated on isn't there - a volume with no VHDX on the
+    /// CSV, or a node ID that names no VM in this failover cluster. CSI requires
+    /// NOT_FOUND for both in ControllerPublishVolume, and it matters that this
+    /// is not <see cref="Internal"/>: a retry against something that does not
+    /// exist never succeeds, so classifying it as transient would have the
+    /// sidecar retry forever.
+    /// </summary>
+    public const string NotFound = "NotFound";
 
     /// <summary>
     /// The resource exists but is in a state that forbids the operation - a

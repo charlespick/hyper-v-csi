@@ -514,6 +514,239 @@ func TestDeleteVolumeUnreachableAgentIsRetryable(t *testing.T) {
 	}
 }
 
+func TestControllerPublishVolumeReturnsWhereTheDiskLanded(t *testing.T) {
+	server := newControllerServer(newFakeAgent(t, attached("controller-guid", 3)))
+
+	resp, err := server.ControllerPublishVolume(context.Background(), publishRequest("pvc-1", "node-a"))
+	if err != nil {
+		t.Fatalf("ControllerPublishVolume: %v", err)
+	}
+
+	// The publish context is the only channel by which NodeStageVolume learns
+	// which of the guest's block devices this volume is.
+	published := resp.GetPublishContext()
+	if published[publishContextController] != "controller-guid" {
+		t.Errorf("controller = %q, want the VMBus instance the agent reported", published[publishContextController])
+	}
+	if published[publishContextLun] != "3" {
+		t.Errorf("lun = %q, want 3", published[publishContextLun])
+	}
+}
+
+func TestControllerPublishVolumeEnqueuesUnderTheVolumeAndNodeAsIdempotencyKey(t *testing.T) {
+	agent := newFakeAgent(t, attached("controller-guid", 0))
+	server := newControllerServer(agent)
+
+	if _, err := server.ControllerPublishVolume(context.Background(), publishRequest("pvc-1", "node-a")); err != nil {
+		t.Fatalf("ControllerPublishVolume: %v", err)
+	}
+
+	enqueued := agent.onlyEnqueued(t)
+	if enqueued.IdempotencyKey != "pvc-1/node-a" {
+		t.Errorf("idempotency key = %q, want the volume and node pair", enqueued.IdempotencyKey)
+	}
+	if enqueued.OperationType != operationAttachVolume {
+		t.Errorf("operation type = %q, want %q", enqueued.OperationType, operationAttachVolume)
+	}
+	// The VM, not the volume: what must not race is slot allocation on one VM.
+	if enqueued.Target != "vm:node-a" {
+		t.Errorf("target = %q, want vm:node-a", enqueued.Target)
+	}
+	if enqueued.Payload.VolumeID != "pvc-1" || enqueued.Payload.NodeID != "node-a" {
+		t.Errorf("payload = %+v, want the volume and node ids", enqueued.Payload)
+	}
+}
+
+func TestControllerPublishVolumeAlreadyAttachedIsStillASuccess(t *testing.T) {
+	// A replay after the agent restarted. The disk is where it should be, which
+	// is what the caller asked for either way.
+	server := newControllerServer(newFakeAgent(t,
+		succeeded(`{"vhdxPath":"C:\\ClusterStorage\\Volume1\\pvc-1.vhdx","controllerInstanceId":"controller-guid","lun":5,"alreadyAttached":true}`)))
+
+	resp, err := server.ControllerPublishVolume(context.Background(), publishRequest("pvc-1", "node-a"))
+	if err != nil {
+		t.Fatalf("ControllerPublishVolume: %v", err)
+	}
+
+	if resp.GetPublishContext()[publishContextLun] != "5" {
+		t.Errorf("lun = %q, want the existing attachment's 5", resp.GetPublishContext()[publishContextLun])
+	}
+}
+
+func TestControllerPublishVolumeRejectsUnusableRequests(t *testing.T) {
+	tests := []struct {
+		name    string
+		request *csi.ControllerPublishVolumeRequest
+		want    codes.Code
+	}{
+		{
+			name:    "no volume id",
+			request: publishRequest("", "node-a"),
+			want:    codes.InvalidArgument,
+		},
+		{
+			name:    "no node id",
+			request: publishRequest("pvc-1", ""),
+			want:    codes.InvalidArgument,
+		},
+		{
+			name: "no volume capability",
+			request: func() *csi.ControllerPublishVolumeRequest {
+				req := publishRequest("pvc-1", "node-a")
+				req.VolumeCapability = nil
+				return req
+			}(),
+			want: codes.InvalidArgument,
+		},
+		{
+			name: "an access mode a VHDX cannot back",
+			request: func() *csi.ControllerPublishVolumeRequest {
+				req := publishRequest("pvc-1", "node-a")
+				req.VolumeCapability.AccessMode.Mode = csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER
+				return req
+			}(),
+			want: codes.InvalidArgument,
+		},
+		{
+			// A VHDX attaches read-write. Reporting success would promise
+			// something no layer below actually delivers.
+			name: "read-only",
+			request: func() *csi.ControllerPublishVolumeRequest {
+				req := publishRequest("pvc-1", "node-a")
+				req.Readonly = true
+				return req
+			}(),
+			want: codes.InvalidArgument,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			agent := newFakeAgent(t, attached("controller-guid", 0))
+			server := newControllerServer(agent)
+
+			_, err := server.ControllerPublishVolume(context.Background(), test.request)
+
+			if got := status.Code(err); got != test.want {
+				t.Fatalf("code = %s, want %s (err: %v)", got, test.want, err)
+			}
+			if n := agent.enqueueCount(); n != 0 {
+				t.Errorf("enqueued %d jobs, want none", n)
+			}
+		})
+	}
+}
+
+func TestControllerPublishVolumeTranslatesAgentFailures(t *testing.T) {
+	tests := []struct {
+		name string
+		job  agentclient.Job
+		want codes.Code
+	}{
+		{
+			// No VHDX on the CSV, or a node ID naming no VM in the cluster.
+			// Terminal: no retry brings either into existence.
+			name: "nothing to attach, or nowhere to attach it",
+			job:  agentclient.Job{Status: agentclient.JobFailed, Error: "no such volume", ErrorCode: agentclient.ErrorCodeNotFound},
+			want: codes.NotFound,
+		},
+		{
+			name: "every scsi slot occupied",
+			job:  agentclient.Job{Status: agentclient.JobFailed, Error: "no free lun", ErrorCode: agentclient.ErrorCodeResourceExhausted},
+			want: codes.ResourceExhausted,
+		},
+		{
+			name: "unclassified failure",
+			job:  agentclient.Job{Status: agentclient.JobFailed, Error: "CIM said no"},
+			want: codes.Internal,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := newControllerServer(newFakeAgent(t, test.job))
+
+			_, err := server.ControllerPublishVolume(context.Background(), publishRequest("pvc-1", "node-a"))
+
+			if got := status.Code(err); got != test.want {
+				t.Fatalf("code = %s, want %s (err: %v)", got, test.want, err)
+			}
+			if s, _ := status.FromError(err); s.Message() != test.job.Error {
+				t.Errorf("message = %q, want the agent's detail %q", s.Message(), test.job.Error)
+			}
+		})
+	}
+}
+
+func TestControllerPublishVolumeRejectsAnUnusableResult(t *testing.T) {
+	// Without a controller the LUN is ambiguous across a VM's several SCSI
+	// controllers, so the node plugin could stage the wrong disk.
+	tests := []struct {
+		name string
+		job  agentclient.Job
+	}{
+		{name: "not decodable", job: succeeded(`"nonsense"`)},
+		{name: "no controller", job: succeeded(`{"lun":3}`)},
+		{name: "no result at all", job: agentclient.Job{Status: agentclient.JobSucceeded}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := newControllerServer(newFakeAgent(t, test.job))
+
+			_, err := server.ControllerPublishVolume(context.Background(), publishRequest("pvc-1", "node-a"))
+
+			if got := status.Code(err); got != codes.Internal {
+				t.Fatalf("code = %s, want Internal (err: %v)", got, err)
+			}
+		})
+	}
+}
+
+func TestControllerPublishVolumeForgottenJobIsRetryable(t *testing.T) {
+	// The agent restarted mid-attach. Re-driving is safe: it decides what's
+	// left to do from the VM's configuration, not from the job it just lost.
+	server := newControllerServer(newFakeAgent(t))
+
+	_, err := server.ControllerPublishVolume(context.Background(), publishRequest("pvc-1", "node-a"))
+
+	if got := status.Code(err); got != codes.Aborted {
+		t.Fatalf("code = %s, want Aborted (err: %v)", got, err)
+	}
+}
+
+func TestControllerPublishVolumeUnreachableAgentIsRetryable(t *testing.T) {
+	agent := newFakeAgent(t, attached("controller-guid", 0))
+	agent.Close()
+	server := newControllerServer(agent)
+
+	_, err := server.ControllerPublishVolume(context.Background(), publishRequest("pvc-1", "node-a"))
+
+	if got := status.Code(err); got != codes.Unavailable {
+		t.Fatalf("code = %s, want Unavailable (err: %v)", got, err)
+	}
+}
+
+func publishRequest(volumeID, nodeID string) *csi.ControllerPublishVolumeRequest {
+	return &csi.ControllerPublishVolumeRequest{
+		VolumeId: volumeID,
+		NodeId:   nodeID,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{FsType: "ext4"}},
+			AccessMode: &csi.VolumeCapability_AccessMode{
+				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+			},
+		},
+	}
+}
+
+// attached is a job that put the disk on a VM at the given address.
+func attached(controllerID string, lun int) agentclient.Job {
+	return succeeded(fmt.Sprintf(
+		`{"vhdxPath":"C:\\ClusterStorage\\Volume1\\pvc-1.vhdx","controllerInstanceId":%q,"lun":%d,"alreadyAttached":false}`,
+		controllerID, lun))
+}
+
 func newControllerServer(agent *fakeAgent) *controllerServer {
 	return &controllerServer{driver: New("", agentclient.New(agent.URL))}
 }
@@ -561,6 +794,7 @@ type enqueuedJob struct {
 		Name      string `json:"name"`
 		SizeBytes int64  `json:"sizeBytes"`
 		VolumeID  string `json:"volumeId"`
+		NodeID    string `json:"nodeId"`
 	} `json:"payload"`
 }
 

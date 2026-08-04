@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
@@ -16,6 +17,10 @@ const operationCreateVolume = "CreateVolume"
 // operationDeleteVolume is the operationType the agent dispatches on; it must
 // match JobDispatcher.DeleteVolume on the .NET side.
 const operationDeleteVolume = "DeleteVolume"
+
+// operationAttachVolume is the operationType the agent dispatches on; it must
+// match JobDispatcher.AttachVolume on the .NET side.
+const operationAttachVolume = "AttachVolume"
 
 // defaultVolumeSizeBytes is used when a request carries no capacity range at
 // all. CSI allows that, and a VHDX has to be created with *some* size; the
@@ -265,18 +270,121 @@ func (s *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 	return &csi.DeleteVolumeResponse{}, nil
 }
 
+// attachVolumePayload and attachVolumeResult are the operation-specific halves
+// of the agent's job envelope, matching AttachVolumePayload and
+// AttachVolumeResult on the .NET side.
+type attachVolumePayload struct {
+	VolumeID string `json:"volumeId"`
+	NodeID   string `json:"nodeId"`
+}
+
+type attachVolumeResult struct {
+	VhdxPath             string `json:"vhdxPath"`
+	ControllerInstanceID string `json:"controllerInstanceId"`
+	Lun                  int32  `json:"lun"`
+	AlreadyAttached      bool   `json:"alreadyAttached"`
+}
+
+// Keys of the publish context handed to NodeStageVolume. It is the only channel
+// by which the node learns which of the guest's block devices this volume is,
+// which is why the controller picks the slot rather than leaving the node to
+// guess: the controller GUID is the SCSI controller's VMBus instance, visible
+// in a Linux guest under /sys/bus/vmbus/devices, and the LUN is the disk's
+// address on it.
+const (
+	publishContextController = "controllerId"
+	publishContextLun        = "lun"
+	publishContextVhdxPath   = "vhdxPath"
+)
+
 // ControllerPublishVolume attaches a VHDX to the node VM by resolving its
 // owning host via cluster APIs, then attaching through that host.
 // Idempotency key: volume ID + node ID.
 //
-// Implementing this means setting attachRequired: true on the CSIDriver object
-// in the same change. While it is false Kubernetes creates no VolumeAttachment
-// and never calls this RPC or its Unpublish counterpart — which is fine for a
-// stub, but DeleteVolume reclaims on the assumption that unpublish ran first.
-// Land attach without flipping the flag and every reclaim deletes a disk that
-// was never detached, silently, because nothing ever asked for the detach.
+// The node ID is opaque here and stays that way. The agent alone interprets it
+// — today by matching it against a cluster resource name — so replacing that
+// with a guest-reported VM identity later is a change to the agent and to what
+// the node plugin reports, and to nothing in this file.
+//
+// The CSIDriver object sets attachRequired: true, so Kubernetes creates a
+// VolumeAttachment and expects this to run before a volume is first used. Two
+// things that turns on are still unbuilt: ControllerUnpublishVolume returns
+// Unimplemented, so an attached volume never detaches and DeleteVolume can
+// reclaim a disk still attached to a VM, and no external-attacher is deployed,
+// so nothing acts on the VolumeAttachment objects.
 func (s *controllerServer) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "ControllerPublishVolume not implemented")
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume id is required")
+	}
+	if req.GetNodeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "node id is required")
+	}
+
+	if capability := req.GetVolumeCapability(); capability == nil {
+		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
+	} else if err := validateVolumeCapabilities([]*csi.VolumeCapability{capability}); err != nil {
+		return nil, err
+	}
+
+	if req.GetReadonly() {
+		// A VHDX attaches read-write; read-only is enforced where it actually
+		// works, at the guest mount. Silently attaching read-write while
+		// reporting success here would promise something no layer delivers.
+		return nil, status.Error(codes.InvalidArgument,
+			"read-only publishing is not supported; the node plugin mounts read-only when asked")
+	}
+
+	// Volume ID + node ID per CSI Spec.md. The target is the VM, not the
+	// volume: what must not race is slot allocation on one VM, and the agent
+	// runs one job at a time per target.
+	job, err := s.driver.Agent.EnqueueJob(ctx, publishKey(req.GetVolumeId(), req.GetNodeId()), operationAttachVolume,
+		vmTarget(req.GetNodeId()), attachVolumePayload{
+			VolumeID: req.GetVolumeId(),
+			NodeID:   req.GetNodeId(),
+		})
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable,
+			"enqueueing ControllerPublishVolume for %s on %s: %v", req.GetVolumeId(), req.GetNodeId(), err)
+	}
+
+	done, err := awaitJob(ctx, s.driver.Agent, job.ID, jobPollBudget)
+	if err != nil {
+		return nil, err
+	}
+
+	var result attachVolumeResult
+	if err := json.Unmarshal(done.Result, &result); err != nil {
+		return nil, status.Errorf(codes.Internal,
+			"decoding ControllerPublishVolume result for %s on %s: %v", req.GetVolumeId(), req.GetNodeId(), err)
+	}
+	if result.ControllerInstanceID == "" {
+		// Without the controller the LUN alone is ambiguous across a VM's
+		// several SCSI controllers, so the node could stage the wrong disk.
+		return nil, status.Errorf(codes.Internal,
+			"agent attached %s to %s but reported no controller", req.GetVolumeId(), req.GetNodeId())
+	}
+
+	return &csi.ControllerPublishVolumeResponse{
+		PublishContext: map[string]string{
+			publishContextController: result.ControllerInstanceID,
+			publishContextLun:        strconv.FormatInt(int64(result.Lun), 10),
+			publishContextVhdxPath:   result.VhdxPath,
+		},
+	}, nil
+}
+
+// publishKey is the idempotency key for attach and detach: the pair the
+// operation is actually about, so a retry for one node doesn't collide with
+// work for the same volume on another.
+func publishKey(volumeID, nodeID string) string {
+	return volumeID + "/" + nodeID
+}
+
+// vmTarget names the resource the agent serializes VM-level work against. Two
+// attaches to one VM must not run at once — they would race for the same free
+// LUN — while attaches to different VMs are free to proceed in parallel.
+func vmTarget(nodeID string) string {
+	return "vm:" + nodeID
 }
 
 // ControllerUnpublishVolume detaches a VHDX from the node VM, including the

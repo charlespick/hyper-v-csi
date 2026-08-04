@@ -125,6 +125,11 @@ func translateJobFailure(job *agentclient.Job) error {
 		return status.Error(codes.ResourceExhausted, detail)
 	case agentclient.ErrorCodeFailedPrecondition:
 		return status.Error(codes.FailedPrecondition, detail)
+	case agentclient.ErrorCodeNotFound:
+		// A volume with no VHDX, or a node ID naming no VM. Terminal on
+		// purpose: retrying cannot bring either into existence, so treating it
+		// as transient would loop until an operator noticed.
+		return status.Error(codes.NotFound, detail)
 	default:
 		return status.Error(codes.Internal, detail)
 	}

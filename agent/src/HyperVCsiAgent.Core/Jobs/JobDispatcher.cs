@@ -1,4 +1,5 @@
 using System.Text.Json;
+using HyperVCsiAgent.Core.HostControl;
 using HyperVCsiAgent.Core.Storage;
 
 namespace HyperVCsiAgent.Core.Jobs;
@@ -9,11 +10,13 @@ namespace HyperVCsiAgent.Core.Jobs;
 /// comes back as a 400 the controller can see immediately rather than as a job
 /// that fails a moment later.
 /// </summary>
-public sealed class JobDispatcher(IVhdxService vhdxService)
+public sealed class JobDispatcher(IVhdxService vhdxService, IAttachService attachService)
 {
     public const string CreateVolume = "CreateVolume";
 
     public const string DeleteVolume = "DeleteVolume";
+
+    public const string AttachVolume = "AttachVolume";
 
     /// <exception cref="InvalidJobRequestException">
     /// The operation is unknown or its payload is unusable.
@@ -48,6 +51,22 @@ public sealed class JobDispatcher(IVhdxService vhdxService)
                 // No job.Result: a deleted volume has nothing left to describe,
                 // so the controller reads only the status.
                 return (_, cancellationToken) => vhdxService.DeleteAsync(deleteRequest.VolumeId, cancellationToken);
+
+            case AttachVolume:
+                var attachRequest = Decode<AttachVolumePayload>(payload, jsonOptions);
+                if (string.IsNullOrWhiteSpace(attachRequest.VolumeId))
+                {
+                    throw new InvalidJobRequestException("payload.volumeId is required");
+                }
+
+                if (string.IsNullOrWhiteSpace(attachRequest.NodeId))
+                {
+                    throw new InvalidJobRequestException("payload.nodeId is required");
+                }
+
+                return async (job, cancellationToken) =>
+                    job.Result = await attachService.AttachAsync(attachRequest.VolumeId, attachRequest.NodeId, cancellationToken)
+                        .ConfigureAwait(false);
 
             default:
                 throw new InvalidJobRequestException($"unsupported operationType {operationType}");

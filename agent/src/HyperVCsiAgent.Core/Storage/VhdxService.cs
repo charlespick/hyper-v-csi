@@ -1,4 +1,3 @@
-using System.Text.RegularExpressions;
 using HyperVCsiAgent.Core.Configuration;
 using HyperVCsiAgent.Core.Jobs;
 using Microsoft.Extensions.Logging;
@@ -13,17 +12,9 @@ namespace HyperVCsiAgent.Core.Storage;
 /// so "has this already been done" must always be answerable from the files on
 /// disk alone.
 /// </summary>
-public sealed partial class VhdxService : IVhdxService, IDisposable
+public sealed class VhdxService : IVhdxService, IDisposable
 {
-    // The volume name becomes a file name on the CSV, so it has to be a safe
-    // one. external-provisioner derives it from the PVC UID ("pvc-<uuid>"),
-    // which fits comfortably; anything that doesn't is rejected rather than
-    // rewritten, because rewriting would let two distinct names collapse onto
-    // one file.
-    [GeneratedRegex(@"^[A-Za-z0-9][A-Za-z0-9._-]{0,126}$")]
-    private static partial Regex SafeVolumeName { get; }
-
-    private const string VhdxExtension = ".vhdx";
+    private const string VhdxExtension = VolumeNaming.VhdxExtension;
 
     /// <summary>
     /// Marks the in-progress file. A VHDX only lands at its real path via an
@@ -31,8 +22,9 @@ public sealed partial class VhdxService : IVhdxService, IDisposable
     /// looks like a finished volume. The .vhdx extension is kept on the end
     /// because Hyper-V infers the disk format from it.
     ///
-    /// The separator is '~' specifically because <see cref="SafeVolumeName"/>
-    /// forbids it, which keeps this namespace disjoint from the volume one.
+    /// The separator is '~' specifically because <see cref="VolumeNaming"/>'s
+    /// safe-name rule forbids it, which keeps this namespace disjoint from the
+    /// volume one.
     /// With a '.' here the marker for volume "foo" would be the real path of a
     /// volume legitimately named "foo.creating", and deleting the first would
     /// silently take the second with it. Any replacement has to keep that
@@ -175,7 +167,7 @@ public sealed partial class VhdxService : IVhdxService, IDisposable
         // volume that cannot exist, so there is nothing to delete and CSI wants
         // a success. Rejecting it instead would strand the PV in Terminating on
         // a retry that no attempt could ever satisfy.
-        if (!SafeVolumeName.IsMatch(volumeId))
+        if (!VolumeNaming.IsSafeName(volumeId))
         {
             _logger.LogWarning(
                 "DeleteVolume {VolumeId}: not a name this agent could have created, so there is nothing to delete", volumeId);
@@ -246,24 +238,8 @@ public sealed partial class VhdxService : IVhdxService, IDisposable
         }
     }
 
-    /// <summary>
-    /// Maps a volume name to its CSV path. Because the CSI volume ID is the
-    /// volume name verbatim, this is a pure function of the ID - no lookup
-    /// table, nothing to persist.
-    /// </summary>
-    private string ResolveVolumePath(string volumeName)
-    {
-        if (!SafeVolumeName.IsMatch(volumeName))
-        {
-            throw JobFailureException.InvalidArgument(
-                $"volume name {volumeName} is not usable as a file name: expected 1-127 characters of [A-Za-z0-9._-] starting alphanumeric");
-        }
-
-        // Made absolute because this path goes straight into the Hyper-V CIM
-        // call, which - unlike File/Directory APIs - does not resolve a
-        // relative one against the process's working directory.
-        return Path.GetFullPath(Path.Combine(_options.CsvVolumesRoot, volumeName + VhdxExtension));
-    }
+    private string ResolveVolumePath(string volumeName) =>
+        VolumeNaming.ResolvePath(_options.CsvVolumesRoot, volumeName);
 
     /// <summary>
     /// Takes a slot against the concurrency cap, reporting a timeout spent

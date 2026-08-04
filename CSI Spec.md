@@ -13,8 +13,8 @@ covered by unit tests but has never run against a real failover cluster or Hyper
 | GetPluginCapabilities | Both | Reports which optional CSI features this plugin supports. | N/A | Over advertising until project is finished |
 | Probe | Both | Health check confirming the plugin is ready to serve requests. | N/A | Stub — always reports ready |
 | CreateVolume | Controller | Provisions a new volume and returns its identifier. | Volume name | Tested — creates a VHDX on disk |
-| DeleteVolume | Controller | Removes a previously provisioned volume. | Volume ID | Pending testing |
-| ControllerPublishVolume | Controller | Attaches a volume to a specified node. | Volume ID + node ID | Not started |
+| DeleteVolume | Controller | Removes a previously provisioned volume. | Volume ID | Tested |
+| ControllerPublishVolume | Controller | Attaches a volume to a specified node. | Volume ID + node ID | Pending testing — not yet reachable from Kubernetes |
 | ControllerUnpublishVolume | Controller | Detaches a volume from a specified node. | Volume ID + node ID | Not started |
 | ValidateVolumeCapabilities | Controller | Confirms a volume supports the requested access mode and type. | Volume ID (lookup only) | Not started |
 | ControllerGetCapabilities | Controller | Reports which controller RPCs this plugin implements. | N/A | Over advertising until project is finished |
@@ -70,16 +70,19 @@ detachment check and must not be mistaken for one*:
   invisible to handle enumeration, and a crashed checkpoint or backup can orphan one after the
   worker process exits. So a sharing violation can outlive any attachment.
 
-So the safety of a reclaim rests entirely on unpublish having run. Today nothing tests that, because
-ControllerPublishVolume doesn't exist and no VHDX this driver manages is ever attached to anything.
+So the safety of a reclaim rests entirely on unpublish having run, and right now nothing makes it
+run: `attachRequired` is true and ControllerPublishVolume is built, so a volume can be attached, but
+ControllerUnpublishVolume still returns Unimplemented. **A reclaim can therefore delete a disk that
+is still attached to a VM, exactly as described above, and nothing in the driver prevents it.** The
+StorageClass defaults to `Retain`, which is what keeps that theoretical for now; do not switch it to
+`Delete` until unpublish exists.
 
-> **Landing ControllerPublishVolume means flipping `attachRequired` to `true` in the same change.**
-> The CSIDriver object currently sets `attachRequired: false`, which stops Kubernetes creating
-> VolumeAttachment objects at all — so ControllerPublishVolume and ControllerUnpublishVolume are
-> never called. That is correct while attach is a stub, but it means the ordering DeleteVolume
-> relies on does not exist yet. Implement attach without flipping the flag and every reclaim
-> deletes a disk that was never unpublished, silently, because the RPC that would have detached it
-> was never invoked.
+> **The chart is not in a runnable state until ControllerUnpublishVolume lands.** `attachRequired`
+> is true, so Kubernetes creates a VolumeAttachment for every volume before first use — but the
+> external-attacher sidecar is not deployed, so nothing services those objects and a pod would wait
+> at `ContainerCreating` indefinitely. Attach is exercisable by calling the controller's gRPC
+> surface directly; it is not yet exercisable through Kubernetes, and the chart says so rather than
+> pretending otherwise.
 
 What an authoritative check would take, if one is ever wanted anyway. The attachment itself lives in
 `Msvm_StorageAllocationSettingData` in `root\virtualization\v2`: match `HostResource[0]` against the
@@ -107,6 +110,51 @@ So the shape is two steps, and which way you traverse them decides the cost:
 
 `Get-VHD` is not a substitute for any of it: its `Attached` property and its documented "in use"
 error on shared storage are both about open handles, the same signal with the same blind spot.
+
+**ControllerPublishVolume identifies a node by cluster group name.** The CSI node ID is whatever the
+node plugin reports, which today is the Kubernetes node name. The agent resolves it with one
+`MSCluster_Resource` query for a resource of type `Virtual Machine` whose `OwnerGroup` is exactly
+that name — the *group*, not the resource, because clustering names the group after the VM while the
+resource inside it is `Virtual Machine <name>`. Matching the resource name against the node would
+find nothing, and since a node that resolves to no VM is reported NOT_FOUND (terminal, by design),
+that mistake fails every attach permanently rather than noisily. Exactly, too: never a prefix, never
+a fuzzy match, because a near-miss resolving to a neighbouring VM attaches a disk to the wrong
+machine. Requiring the group to contain a Virtual Machine resource is what stops an unrelated group
+that happens to share a node's name from resolving.
+
+The VM's own name then comes back from that query — the resource name with the `Virtual Machine `
+prefix stripped — rather than being re-derived from the node ID downstream. That is not tidiness: it
+is what makes the next paragraph's claim true.
+
+The sturdier identity is one the guest reports about itself — its SMBIOS UUID, which is the VM's
+BIOSGUID — and swapping to it later is cheap by construction rather than by luck. Nothing but
+`IClusterService.ResolveVmAsync` interprets the node ID: the Go controller only concatenates
+it into an idempotency key and a job target, and no PV field records it, because the driver
+advertises no topology and `VOLUME_ACCESSIBILITY_CONSTRAINTS` would put a node identity into
+`PV.spec.nodeAffinity`, where it is immutable for the life of the volume. The only persisted copy is
+in `CSINode`, which kubelet rewrites whenever the node plugin re-registers. Keep it that way: the day
+something parses the node ID, or a topology key starts carrying it, this stops being a local change.
+
+**Attach does not scan the cluster for an existing attachment elsewhere.** That is the reverse
+direction priced above — one `Msvm_StorageAllocationSettingData` query per node — and attach declines
+it for the same reason DeleteVolume does: the CSI attacher's ordering is what the driver reclaims on.
+The gap this admits is real and worth naming, because a VHDX attached to two *running* VMs is
+corruption, not merely a mess. Hyper-V's own file lock covers most of it: the second attach fails
+while the first VM is running. What it does not cover is a **stopped** VM holding a stale attachment
+— the same blind spot, in the same place, for the same reason.
+
+What attach does check is the forward direction, on the host it already resolved: if the VHDX is
+already in *this* VM's configuration, the existing controller and LUN come back and nothing is
+changed. That is what makes a re-drive after an agent restart free, and it is one query, not a
+fan-out.
+
+**The publish context is load-bearing, and its guest half is unverified.** Attach returns the SCSI
+controller's VMBus instance GUID and the LUN, because that pair is the only thing telling
+NodeStageVolume which of the guest's block devices this volume is — the CSV path means nothing inside
+the VM. A Linux guest sees the same GUID under `/sys/bus/vmbus/devices`, which is the assumption the
+node plugin will be built on and the one piece of this that has not been confirmed against real
+hardware. If it doesn't hold, the fallback is the disk's SCSI page-83 identifier, which would mean
+returning that in the publish context too.
 
 **A wedged delete is conceded, not prevented.** `File.Delete` takes no cancellation token, so a
 delete stuck on a CSV in redirected mode cannot be called off. The timeout is therefore *observed*

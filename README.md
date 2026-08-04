@@ -84,20 +84,26 @@ helm install hyperv-csi deploy/helm/hyperv-csi \
   --set agent.address=https://hyperv-csi-agent.makerland.xyz
 ```
 
-The chart is scoped to what the driver implements, which today is `CreateVolume` and
-`DeleteVolume` — enough to provision and reclaim, not to attach. That shapes three
-defaults worth knowing about:
+The chart is scoped to what the driver implements, which today is `CreateVolume`,
+`DeleteVolume`, and `ControllerPublishVolume`. That shapes three defaults worth knowing
+about — and one hazard, stated first because it is the one that can lose data:
+
+> **Do not run this in a cluster you care about yet.** `attachRequired` is `true`, so a
+> volume can now be attached to a node's VM, but `ControllerUnpublishVolume` is still a
+> stub — nothing can detach it, and `DeleteVolume` deletes on the assumption that a
+> detach already happened. The `Retain` reclaim policy below is what keeps that from
+> being destructive. Attach is meant to be exercised by calling the controller's gRPC
+> surface directly until unpublish lands.
 
 - **Only external-provisioner is deployed.** Attacher, resizer, and snapshotter would sit
-  in a retry loop against RPCs that return `Unimplemented`.
-- **`attachRequired: false` on the CSIDriver object.** `ControllerPublishVolume` doesn't
-  exist, so declaring attachment required would have Kubernetes wait forever on a
-  `VolumeAttachment` nothing can satisfy — every PVC would hang at first use rather than
-  simply failing to mount.
+  in a retry loop against RPCs that return `Unimplemented`. With no attacher, the
+  `VolumeAttachment` objects `attachRequired: true` causes Kubernetes to create are never
+  serviced, so a pod using a PVC waits at `ContainerCreating` instead of starting.
 - **The StorageClass reclaims with `Retain`.** `DeleteVolume` works, so `Delete` would
   too — but it hasn't run against real Hyper-V yet, and `Delete` would make its first
   real outing an irreversible one. VHDX files are removed by hand until you've watched a
-  delete succeed on your own hosts, then flip `storageClass.reclaimPolicy`.
+  delete succeed on your own hosts, then flip `storageClass.reclaimPolicy` — and not
+  before `ControllerUnpublishVolume` exists, per the warning above.
 
 The node plugin (`node.enabled`) is off by default for the same reason: every `Node*` RPC
 that does real work is still a stub, so running it would register a plugin with kubelet

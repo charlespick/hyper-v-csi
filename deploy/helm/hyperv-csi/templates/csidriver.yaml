@@ -8,17 +8,17 @@ metadata:
   labels:
     {{- include "hyperv-csi.labels" . | nindent 4 }}
 spec:
-  # ControllerPublishVolume is not implemented. Declaring attachment required
-  # would have Kubernetes create VolumeAttachment objects and wait forever for
-  # an external-attacher that cannot succeed, so every PVC would hang at first
-  # use rather than simply failing to mount.
+  # ControllerPublishVolume is implemented, so Kubernetes creates a
+  # VolumeAttachment and calls it before a volume is first used.
   #
-  # This must flip to true in the same change that implements
-  # ControllerPublishVolume. While it is false Kubernetes never calls Publish or
-  # Unpublish, and DeleteVolume deletes on the assumption that Unpublish already
-  # detached the disk — so attach landing without this flag means reclaims start
-  # deleting attached disks with nothing having asked for a detach.
-  attachRequired: false
+  # Two things this turns on are still unbuilt, and both matter before running
+  # this anywhere real. ControllerUnpublishVolume returns Unimplemented, so a
+  # volume that attaches never detaches — and DeleteVolume deletes on the
+  # assumption that Unpublish already ran, which now means a reclaim can remove
+  # a disk still attached to a VM. The external-attacher sidecar is also not
+  # deployed (see controller.yaml), so nothing acts on the VolumeAttachment
+  # objects this causes to be created.
+  attachRequired: true
 
   # NodePublishVolume receives no pod metadata; nothing consumes it yet.
   podInfoOnMount: false

@@ -23,4 +23,7 @@ public sealed class JobFailureException : Exception
 
     public static JobFailureException FailedPrecondition(string message) =>
         new(AgentErrorCodes.FailedPrecondition, message);
+
+    public static JobFailureException NotFound(string message) =>
+        new(AgentErrorCodes.NotFound, message);
 }

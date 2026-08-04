@@ -5,6 +5,10 @@
     "MaxConcurrentDiskOperations": 4,
     "DiskOperationTimeout": "00:10:00",
 
+    "//HostOperations": "Attaching a disk goes through the Hyper-V host that currently owns the node's VM. Bounded per host, and on a shorter clock than disk operations because none of it is bulk I/O.",
+    "MaxConcurrentHostOperations": 4,
+    "HostOperationTimeout": "00:02:00",
+
     "//Tls": "The server certificate, issued by Let's Encrypt and renewed into the Windows store by certbot. Matched by subject rather than thumbprint so a renewal doesn't take the agent down; the store is re-read every ReloadInterval, so a new certificate is served without restarting the clustered role.",
     "Tls": {
       "SubjectName": "hyperv-csi-agent.makerland.xyz",

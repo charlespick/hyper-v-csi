@@ -35,6 +35,22 @@ public sealed class AgentOptions
     /// </summary>
     public TimeSpan DiskOperationTimeout { get; set; } = TimeSpan.FromMinutes(10);
 
+    /// <summary>
+    /// Cap on operations issued to any one Hyper-V host at once - the design's
+    /// bounded-concurrency principle scoped to the target host. Per-VM
+    /// serialization comes free from the job store, which runs one job at a time
+    /// per target, and an attach targets the VM.
+    /// </summary>
+    public int MaxConcurrentHostOperations { get; set; } = 4;
+
+    /// <summary>
+    /// How long a single operation against a Hyper-V host may run, ownership
+    /// resolution included. Shorter than <see cref="DiskOperationTimeout"/>
+    /// because none of it is bulk I/O: these are configuration changes on a VM,
+    /// and one that hasn't answered in this long is stuck rather than slow.
+    /// </summary>
+    public TimeSpan HostOperationTimeout { get; set; } = TimeSpan.FromMinutes(2);
+
     public TlsOptions Tls { get; set; } = new();
 
     public AuthenticationOptions Authentication { get; set; } = new();
@@ -60,6 +76,18 @@ public sealed class AgentOptions
         {
             throw new InvalidOperationException(
                 $"{SectionName}:{nameof(DiskOperationTimeout)} must be positive");
+        }
+
+        if (MaxConcurrentHostOperations < 1)
+        {
+            throw new InvalidOperationException(
+                $"{SectionName}:{nameof(MaxConcurrentHostOperations)} must be at least 1");
+        }
+
+        if (HostOperationTimeout <= TimeSpan.Zero)
+        {
+            throw new InvalidOperationException(
+                $"{SectionName}:{nameof(HostOperationTimeout)} must be positive");
         }
     }
 }

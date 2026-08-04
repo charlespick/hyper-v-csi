@@ -40,6 +40,7 @@ const (
 	ErrorCodeAlreadyExists      = "AlreadyExists"
 	ErrorCodeResourceExhausted  = "ResourceExhausted"
 	ErrorCodeFailedPrecondition = "FailedPrecondition"
+	ErrorCodeNotFound           = "NotFound"
 	ErrorCodeInternal           = "Internal"
 )
 

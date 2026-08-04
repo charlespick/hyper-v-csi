@@ -3,6 +3,7 @@ using System.Management;
 using System.Runtime.Versioning;
 using System.Xml.Linq;
 using HyperVCsiAgent.Core.Storage;
+using HyperVCsiAgent.Service.Cim;
 
 namespace HyperVCsiAgent.Service.Storage;
 
@@ -25,22 +26,6 @@ public sealed class CimVirtualDiskManager(ILogger<CimVirtualDiskManager> logger)
     // documents 0 as "let Hyper-V pick"; the sector sizes do not, so those are
     // left unset entirely, which is what New-VHD does when you omit them.
     private const uint UseDefaultBlockSize = 0;
-
-    // Msvm method return values.
-    private const uint Completed = 0;
-    private const uint JobStarted = 4096;
-
-    // Msvm_ConcreteJob.JobState. Everything below Completed is still in
-    // flight; 8/9/10 (Terminated/Killed/Exception) are failures.
-    private const ushort JobStateCompleted = 7;
-    private const ushort JobStateException = 10;
-
-    // Hyper-V's non-CIM-standard success state, which Microsoft's own sample
-    // utilities count as successful. Treating it as a failure would mean
-    // deleting a disk that was created just fine and retrying forever.
-    private const ushort JobStateCompletedWithWarnings = 32768;
-
-    private static readonly TimeSpan JobPollInterval = TimeSpan.FromMilliseconds(500);
 
     public Task CreateDynamicVhdxAsync(string path, long maxInternalSizeBytes, CancellationToken cancellationToken) =>
         // System.Management is entirely synchronous, so the whole exchange -
@@ -65,7 +50,7 @@ public sealed class CimVirtualDiskManager(ILogger<CimVirtualDiskManager> logger)
             inParams["VirtualDiskSettingData"] = settings.GetText(TextFormat.WmiDtd20);
 
             using var outParams = service.InvokeMethod("CreateVirtualHardDisk", inParams, null);
-            _ = WaitForCompletion(scope, outParams, "CreateVirtualHardDisk", cancellationToken);
+            _ = CimJobs.WaitForCompletion(scope, outParams, "CreateVirtualHardDisk", cancellationToken);
 
             logger.LogInformation("created VHDX {Path} at {SizeBytes} bytes", path, maxInternalSizeBytes);
         }, cancellationToken);
@@ -80,7 +65,7 @@ public sealed class CimVirtualDiskManager(ILogger<CimVirtualDiskManager> logger)
             inParams["Path"] = path;
 
             using var outParams = service.InvokeMethod("GetVirtualHardDiskSettingData", inParams, null);
-            var completedInline = WaitForCompletion(scope, outParams, "GetVirtualHardDiskSettingData", cancellationToken);
+            var completedInline = CimJobs.WaitForCompletion(scope, outParams, "GetVirtualHardDiskSettingData", cancellationToken);
 
             var settingData = outParams["SettingData"] as string;
             if (string.IsNullOrEmpty(settingData))
@@ -109,58 +94,6 @@ public sealed class CimVirtualDiskManager(ILogger<CimVirtualDiskManager> logger)
 
         throw new InvalidOperationException(
             $"no Msvm_ImageManagementService in {ScopePath}; is the Hyper-V role installed on this host?");
-    }
-
-    /// <summary>
-    /// Msvm methods either finish inline (ReturnValue 0) or hand back an
-    /// Msvm_ConcreteJob to poll (4096). Anything else failed outright. Returns
-    /// whether the method answered inline, which decides whether its other out
-    /// parameters hold anything.
-    /// </summary>
-    private static bool WaitForCompletion(ManagementScope scope, ManagementBaseObject outParams, string methodName, CancellationToken cancellationToken)
-    {
-        var returnValue = (uint)outParams["ReturnValue"];
-        if (returnValue == Completed)
-        {
-            return true;
-        }
-
-        if (returnValue != JobStarted)
-        {
-            throw new InvalidOperationException($"{methodName} failed with return value {returnValue}");
-        }
-
-        var jobPath = (string?)outParams["Job"]
-            ?? throw new InvalidOperationException($"{methodName} reported a started job but returned no job reference");
-
-        while (true)
-        {
-            using var job = new ManagementObject(scope, new ManagementPath(jobPath), null);
-            job.Get();
-
-            var state = (ushort)job["JobState"];
-            if (state is JobStateCompleted or JobStateCompletedWithWarnings)
-            {
-                return false;
-            }
-
-            if (state > JobStateCompleted && state <= JobStateException)
-            {
-                var description = job["ErrorDescription"] as string;
-                throw new InvalidOperationException(
-                    $"{methodName} job ended in state {state}: {(string.IsNullOrWhiteSpace(description) ? "no error description" : description)}");
-            }
-
-            // Everything else - New, Starting, Running, Suspended, Shutting
-            // Down, Service, Query Pending - is still in flight. The caller's
-            // token carries the per-operation timeout, so a job that never
-            // settles becomes a failure the controller can retry rather than
-            // wedging this volume's queue forever.
-            if (cancellationToken.WaitHandle.WaitOne(JobPollInterval))
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-            }
-        }
     }
 
     /// <summary>

@@ -1,8 +1,12 @@
 using HyperVCsiAgent.Core;
+using HyperVCsiAgent.Core.Cluster;
 using HyperVCsiAgent.Core.Configuration;
+using HyperVCsiAgent.Core.HostControl;
 using HyperVCsiAgent.Core.Jobs;
 using HyperVCsiAgent.Core.Security;
 using HyperVCsiAgent.Core.Storage;
+using HyperVCsiAgent.Service.Cluster;
+using HyperVCsiAgent.Service.HostControl;
 using HyperVCsiAgent.Service.Security;
 using HyperVCsiAgent.Service.Storage;
 using Microsoft.Extensions.Options;
@@ -42,13 +46,18 @@ builder.Services.AddSingleton<IJobStore, InMemoryJobStore>();
 if (OperatingSystem.IsWindows())
 {
     builder.Services.AddSingleton<IVirtualDiskManager, CimVirtualDiskManager>();
+    builder.Services.AddSingleton<IClusterService, MsClusterService>();
+    builder.Services.AddSingleton<IHyperVHostClient, CimHyperVHostClient>();
 }
 else
 {
     builder.Services.AddSingleton<IVirtualDiskManager, UnsupportedVirtualDiskManager>();
+    builder.Services.AddSingleton<IClusterService, UnsupportedClusterService>();
+    builder.Services.AddSingleton<IHyperVHostClient, UnsupportedHyperVHostClient>();
 }
 
 builder.Services.AddSingleton<IVhdxService, VhdxService>();
+builder.Services.AddSingleton<IAttachService, AttachService>();
 builder.Services.AddSingleton<JobDispatcher>();
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<StoreCertificateProvider>();

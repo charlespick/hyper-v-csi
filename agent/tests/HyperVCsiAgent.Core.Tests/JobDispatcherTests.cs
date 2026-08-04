@@ -1,4 +1,5 @@
 using System.Text.Json;
+using HyperVCsiAgent.Core.HostControl;
 using HyperVCsiAgent.Core.Jobs;
 using HyperVCsiAgent.Core.Storage;
 
@@ -12,7 +13,7 @@ public class JobDispatcherTests
     public async Task Resolve_CreateVolume_RunsTheCreateAndPublishesItsResult()
     {
         var vhdx = new RecordingVhdxService();
-        var run = new JobDispatcher(vhdx).Resolve(
+        var run = new JobDispatcher(vhdx, new RecordingAttachService()).Resolve(
             JobDispatcher.CreateVolume, Payload("""{"name":"pvc-1","sizeBytes":2048}"""), WireOptions);
 
         var job = NewJob();
@@ -26,7 +27,7 @@ public class JobDispatcherTests
     public async Task Resolve_DeleteVolume_RunsTheDeleteAndPublishesNoResult()
     {
         var vhdx = new RecordingVhdxService();
-        var run = new JobDispatcher(vhdx).Resolve(
+        var run = new JobDispatcher(vhdx, new RecordingAttachService()).Resolve(
             JobDispatcher.DeleteVolume, Payload("""{"volumeId":"pvc-1"}"""), WireOptions);
 
         var job = NewJob();
@@ -36,6 +37,24 @@ public class JobDispatcherTests
         // A deleted volume has nothing left to describe, so the job carries no
         // result and the controller reads only its status.
         Assert.Null(job.Result);
+    }
+
+    [Fact]
+    public async Task Resolve_AttachVolume_RunsTheAttachAndPublishesWhereItLanded()
+    {
+        var attach = new RecordingAttachService();
+        var run = new JobDispatcher(new RecordingVhdxService(), attach).Resolve(
+            JobDispatcher.AttachVolume, Payload("""{"volumeId":"pvc-1","nodeId":"node-a"}"""), WireOptions);
+
+        var job = NewJob();
+        await run(job, CancellationToken.None);
+
+        Assert.Equal(("pvc-1", "node-a"), attach.LastAttach);
+        // The slot is the whole point of the result: it is the only way the node
+        // plugin can tell this disk from the others attached to the VM.
+        Assert.Equal(
+            new AttachVolumeResult(@"C:\ClusterStorage\Volume1\pvc-1.vhdx", "controller-guid", 3, AlreadyAttached: false),
+            job.Result);
     }
 
     [Theory]
@@ -48,15 +67,22 @@ public class JobDispatcherTests
     [InlineData(JobDispatcher.DeleteVolume, """{"volumeId":""}""")]
     [InlineData(JobDispatcher.DeleteVolume, """{"volumeId":42}""")]
     [InlineData(JobDispatcher.DeleteVolume, "\"not an object\"")]
+    [InlineData(JobDispatcher.AttachVolume, """{"nodeId":"node-a"}""")]
+    [InlineData(JobDispatcher.AttachVolume, """{"volumeId":"pvc-1"}""")]
+    [InlineData(JobDispatcher.AttachVolume, """{"volumeId":"pvc-1","nodeId":""}""")]
+    [InlineData(JobDispatcher.AttachVolume, """{"volumeId":"pvc-1","nodeId":42}""")]
+    [InlineData(JobDispatcher.AttachVolume, "\"not an object\"")]
     public void Resolve_BadRequest_ThrowsBeforeAnyJobExists(string operationType, string payload)
     {
         var vhdx = new RecordingVhdxService();
+        var attach = new RecordingAttachService();
 
         Assert.Throws<InvalidJobRequestException>(
-            () => new JobDispatcher(vhdx).Resolve(operationType, Payload(payload), WireOptions));
+            () => new JobDispatcher(vhdx, attach).Resolve(operationType, Payload(payload), WireOptions));
 
         Assert.Null(vhdx.LastCreate);
         Assert.Null(vhdx.LastDelete);
+        Assert.Null(attach.LastAttach);
     }
 
     private static JsonElement Payload(string json) => JsonDocument.Parse(json).RootElement;
@@ -95,5 +121,17 @@ public class JobDispatcherTests
 
         public Task DeleteCheckpointAsync(string snapshotId, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
+    }
+
+    private sealed class RecordingAttachService : IAttachService
+    {
+        public (string VolumeId, string NodeId)? LastAttach { get; private set; }
+
+        public Task<AttachVolumeResult> AttachAsync(string volumeId, string nodeId, CancellationToken cancellationToken)
+        {
+            LastAttach = (volumeId, nodeId);
+            return Task.FromResult(new AttachVolumeResult(
+                $@"C:\ClusterStorage\Volume1\{volumeId}.vhdx", "controller-guid", 3, AlreadyAttached: false));
+        }
     }
 }
