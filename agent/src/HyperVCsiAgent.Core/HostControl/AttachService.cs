@@ -96,6 +96,74 @@ public sealed class AttachService : IAttachService, IDisposable
         }
     }
 
+    public async Task DetachAsync(string volumeId, string nodeId, CancellationToken cancellationToken)
+    {
+        // An ID that isn't a name CreateVolume could have produced names a
+        // volume that cannot exist, so nothing can be attached to anything and
+        // the caller already has what it asked for.
+        if (!VolumeNaming.IsSafeName(volumeId))
+        {
+            _logger.LogWarning(
+                "DetachVolume {VolumeId}: not a name this agent could have created, so nothing is attached", volumeId);
+            return;
+        }
+
+        // No File.Exists check, unlike attach: the attachment lives in the VM's
+        // configuration, not in the file. A VHDX deleted out of order still
+        // leaves the VM referencing it, and that reference is what this removes.
+        var path = VolumeNaming.ResolvePath(_options.CsvVolumesRoot, volumeId);
+
+        using var attempt = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        attempt.CancelAfter(_options.HostOperationTimeout);
+
+        try
+        {
+            var vm = await _cluster.ResolveVmAsync(nodeId, attempt.Token).ConfigureAwait(false);
+            if (vm is null || string.IsNullOrWhiteSpace(vm.OwningHost))
+            {
+                // Where attach reports NotFound, this reports success. A node
+                // the cluster no longer has is a VM that no longer exists, and
+                // its attachments went with it - there is nothing left to
+                // detach from. Failing here would strand the VolumeAttachment
+                // and block the PV's deletion behind a retry that can never
+                // succeed.
+                _logger.LogWarning(
+                    "DetachVolume {VolumeId}: node {NodeId} names no clustered virtual machine, so nothing is attached to it",
+                    volumeId, nodeId);
+                return;
+            }
+
+            try
+            {
+                await DetachOnHostAsync(vm, volumeId, path, attempt, cancellationToken).ConfigureAwait(false);
+            }
+            catch (VmNotOnHostException ex)
+            {
+                _logger.LogInformation(
+                    "DetachVolume {VolumeId}: {Message}; re-resolving its owner and retrying once", volumeId, ex.Message);
+
+                // Re-resolved as tolerantly as the first lookup: a VM that has
+                // gone away between the two is one with nothing left attached.
+                var current = await _cluster.ResolveVmAsync(nodeId, attempt.Token).ConfigureAwait(false);
+                if (current is null || string.IsNullOrWhiteSpace(current.OwningHost))
+                {
+                    _logger.LogWarning(
+                        "DetachVolume {VolumeId}: node {NodeId} disappeared from the cluster mid-detach, so nothing is attached to it",
+                        volumeId, nodeId);
+                    return;
+                }
+
+                await DetachOnHostAsync(current, volumeId, path, attempt, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (attempt.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            throw new JobFailureException(
+                AgentErrorCodes.Internal,
+                $"detaching volume {volumeId} from {nodeId} timed out after {_options.HostOperationTimeout}");
+        }
+    }
+
     /// <summary>
     /// Deliberately does not dispose the per-host semaphores. A SemaphoreSlim
     /// holds no unmanaged resource unless its AvailableWaitHandle is touched,
@@ -134,21 +202,7 @@ public sealed class AttachService : IAttachService, IDisposable
         CancellationTokenSource attempt,
         CancellationToken callerToken)
     {
-        var slots = _hostConcurrency.GetOrAdd(vm.OwningHost, _ => new SemaphoreSlim(_options.MaxConcurrentHostOperations));
-
-        // Deliberately outside the try below, which releases in a finally: a
-        // failed acquire must not release a slot it never took.
-        try
-        {
-            await slots.WaitAsync(attempt.Token).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (attempt.IsCancellationRequested && !callerToken.IsCancellationRequested)
-        {
-            throw new JobFailureException(
-                AgentErrorCodes.Internal,
-                $"attaching volume {volumeId} to {vm.VmName} timed out after {_options.HostOperationTimeout} waiting for one of " +
-                $"{_options.MaxConcurrentHostOperations} operation slots on {vm.OwningHost}");
-        }
+        var slots = await AcquireHostSlotAsync(vm, "attaching", volumeId, attempt, callerToken).ConfigureAwait(false);
 
         try
         {
@@ -187,5 +241,78 @@ public sealed class AttachService : IAttachService, IDisposable
         {
             slots.Release();
         }
+    }
+
+    private async Task DetachOnHostAsync(
+        ClusteredVm vm,
+        string volumeId,
+        string path,
+        CancellationTokenSource attempt,
+        CancellationToken callerToken)
+    {
+        var slots = await AcquireHostSlotAsync(vm, "detaching", volumeId, attempt, callerToken).ConfigureAwait(false);
+
+        try
+        {
+            // Same forward query attach uses, for the same reason: the VM's
+            // configuration is what says whether this still needs doing, so a
+            // re-drive after a restart finds nothing attached and stops.
+            var existing = await _host.FindAttachedDiskAsync(vm.OwningHost, vm.VmName, path, attempt.Token).ConfigureAwait(false);
+            if (existing is null)
+            {
+                _logger.LogInformation(
+                    "DetachVolume {VolumeId}: not attached to {VmName} on {Host}, so there is nothing to detach",
+                    volumeId, vm.VmName, vm.OwningHost);
+                return;
+            }
+
+            await _host.DetachDiskAsync(vm.OwningHost, vm.VmName, path, attempt.Token).ConfigureAwait(false);
+
+            // Read back, because everything downstream of this is built on the
+            // assumption that a successful unpublish means detached: DeleteVolume
+            // reclaims on it, and reporting success while the disk is still in the
+            // VM's configuration is exactly how a reclaim comes to delete a disk a
+            // stopped VM is still expecting.
+            var still = await _host.FindAttachedDiskAsync(vm.OwningHost, vm.VmName, path, attempt.Token).ConfigureAwait(false);
+            if (still is not null)
+            {
+                throw new JobFailureException(
+                    AgentErrorCodes.Internal,
+                    $"detaching volume {volumeId} from {vm.VmName} reported success but the disk is still in the VM's configuration");
+            }
+
+            _logger.LogInformation(
+                "DetachVolume {VolumeId}: detached from {VmName} on {Host}", volumeId, vm.VmName, vm.OwningHost);
+        }
+        finally
+        {
+            slots.Release();
+        }
+    }
+
+    /// <summary>
+    /// Takes a slot against the target host's concurrency cap, reporting a
+    /// timeout spent *queuing* as the operation timing out. Deliberately not
+    /// inside the callers' try blocks: those release in a finally, and a failed
+    /// acquire must not release a slot it never took.
+    /// </summary>
+    private async Task<SemaphoreSlim> AcquireHostSlotAsync(
+        ClusteredVm vm, string verb, string volumeId, CancellationTokenSource attempt, CancellationToken callerToken)
+    {
+        var slots = _hostConcurrency.GetOrAdd(vm.OwningHost, _ => new SemaphoreSlim(_options.MaxConcurrentHostOperations));
+
+        try
+        {
+            await slots.WaitAsync(attempt.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (attempt.IsCancellationRequested && !callerToken.IsCancellationRequested)
+        {
+            throw new JobFailureException(
+                AgentErrorCodes.Internal,
+                $"{verb} volume {volumeId} on {vm.VmName} timed out after {_options.HostOperationTimeout} waiting for one of " +
+                $"{_options.MaxConcurrentHostOperations} operation slots on {vm.OwningHost}");
+        }
+
+        return slots;
     }
 }

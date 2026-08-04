@@ -8,16 +8,11 @@ metadata:
   labels:
     {{- include "hyperv-csi.labels" . | nindent 4 }}
 spec:
-  # ControllerPublishVolume is implemented, so Kubernetes creates a
-  # VolumeAttachment and calls it before a volume is first used.
-  #
-  # Two things this turns on are still unbuilt, and both matter before running
-  # this anywhere real. ControllerUnpublishVolume returns Unimplemented, so a
-  # volume that attaches never detaches — and DeleteVolume deletes on the
-  # assumption that Unpublish already ran, which now means a reclaim can remove
-  # a disk still attached to a VM. The external-attacher sidecar is also not
-  # deployed (see controller.yaml), so nothing acts on the VolumeAttachment
-  # objects this causes to be created.
+  # Both halves of publish/unpublish are implemented and external-attacher is
+  # deployed, so Kubernetes creates a VolumeAttachment before a volume's first
+  # use and clears it before the PV can be deleted. DeleteVolume relies on that
+  # ordering — it does not re-check that a volume is detached — so this flag and
+  # the attacher in controller.yaml have to stay together.
   attachRequired: true
 
   # NodePublishVolume receives no pod metadata; nothing consumes it yet.

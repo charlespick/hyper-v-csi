@@ -84,7 +84,8 @@ public sealed class MsClusterService(ILogger<MsClusterService> logger) : ICluste
 
     public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
         throw new NotSupportedException(
-            "node liveness is only needed for the forced-detach path in ControllerUnpublishVolume, which is not implemented yet");
+            "node liveness is only needed for forced detach from a failed node, which is not implemented yet; " +
+            "an unpublish whose owning host is down fails and is retried rather than fenced");
 
     /// <summary>
     /// The VM's name on its host, taken from the cluster's own record of it

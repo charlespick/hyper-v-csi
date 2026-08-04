@@ -62,6 +62,36 @@ spec:
             capabilities:
               drop: ["ALL"]
 
+        - name: csi-attacher
+          image: {{ .Values.controller.attacher.image }}
+          args:
+            - --csi-address=$(ADDRESS)
+            # Bounds ControllerPublishVolume and ControllerUnpublishVolume the
+            # same way the provisioner's bounds CreateVolume: the driver clamps
+            # its job polling to a fraction of whatever deadline arrives, so it
+            # answers with a retryable status before this expires.
+            - --timeout={{ .Values.controller.attacher.timeout }}
+            - --leader-election
+            - --leader-election-namespace=$(NAMESPACE)
+            {{- range .Values.controller.attacher.extraArgs }}
+            - {{ . }}
+            {{- end }}
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
         - name: hyperv-csi-driver
           image: {{ include "hyperv-csi.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}

@@ -1,10 +1,11 @@
 # hyperv-csi
 #
-# Scoped to what the driver actually implements today: CreateVolume. Deleting,
-# attaching, mounting, expanding, and snapshotting are all still Unimplemented,
-# so the chart deliberately does not deploy the sidecars that would call them —
-# they would sit in a retry loop against RPCs that cannot succeed. The knobs to
-# turn those on are here, defaulted off, for when the RPCs land.
+# Scoped to what the driver actually implements today: provisioning, reclaim,
+# and attach/detach. Mounting, expanding, and snapshotting are still
+# Unimplemented, so the chart deliberately does not deploy the sidecars that
+# would call them — they would sit in a retry loop against RPCs that cannot
+# succeed. The knobs to turn those on are here, defaulted off, for when the
+# RPCs land.
 
 image:
   repository: ghcr.io/charlespick/hyperv-csi-driver
@@ -45,12 +46,17 @@ clientCertificate:
 controller:
   replicaCount: 1
 
-  # external-provisioner is the only sidecar whose RPCs exist. Its --timeout
-  # bounds how long it waits for CreateVolume; the driver clamps its own polling
-  # to a fraction of whatever deadline arrives, so these stay consistent
-  # automatically.
+  # external-provisioner and external-attacher are the sidecars whose RPCs
+  # exist. Each --timeout bounds how long the sidecar waits for one call; the
+  # driver clamps its own job polling to a fraction of whatever deadline
+  # arrives, so these stay consistent automatically.
   provisioner:
     image: registry.k8s.io/sig-storage/csi-provisioner:v5.1.0
+    timeout: 30s
+    extraArgs: []
+
+  attacher:
+    image: registry.k8s.io/sig-storage/csi-attacher:v4.7.0
     timeout: 30s
     extraArgs: []
 

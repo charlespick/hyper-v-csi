@@ -727,6 +727,128 @@ func TestControllerPublishVolumeUnreachableAgentIsRetryable(t *testing.T) {
 	}
 }
 
+func TestControllerUnpublishVolumeEnqueuesUnderTheSameKeyAndTargetAsPublish(t *testing.T) {
+	agent := newFakeAgent(t, agentclient.Job{Status: agentclient.JobSucceeded})
+	server := newControllerServer(agent)
+
+	req := &csi.ControllerUnpublishVolumeRequest{VolumeId: "pvc-1", NodeId: "node-a"}
+	if _, err := server.ControllerUnpublishVolume(context.Background(), req); err != nil {
+		t.Fatalf("ControllerUnpublishVolume: %v", err)
+	}
+
+	enqueued := agent.onlyEnqueued(t)
+	// Same key and target as a publish for this pair, so the two can neither
+	// duplicate nor interleave.
+	if enqueued.IdempotencyKey != "pvc-1/node-a" {
+		t.Errorf("idempotency key = %q, want the volume id and node id", enqueued.IdempotencyKey)
+	}
+	if enqueued.OperationType != operationDetachVolume {
+		t.Errorf("operation type = %q, want %q", enqueued.OperationType, operationDetachVolume)
+	}
+	if enqueued.Target != "vm:node-a" {
+		t.Errorf("target = %q, want vm:node-a", enqueued.Target)
+	}
+	if enqueued.Payload.VolumeID != "pvc-1" || enqueued.Payload.NodeID != "node-a" {
+		t.Errorf("payload = %+v, want the volume id and node id", enqueued.Payload)
+	}
+}
+
+func TestControllerUnpublishVolumeSucceedsWithoutAResultPayload(t *testing.T) {
+	// A detached volume has nothing left to describe, so the agent sends no
+	// result. Requiring one would fail every successful unpublish.
+	server := newControllerServer(newFakeAgent(t, agentclient.Job{Status: agentclient.JobSucceeded}))
+
+	resp, err := server.ControllerUnpublishVolume(context.Background(),
+		&csi.ControllerUnpublishVolumeRequest{VolumeId: "pvc-1", NodeId: "node-a"})
+	if err != nil {
+		t.Fatalf("ControllerUnpublishVolume: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("ControllerUnpublishVolume returned no response")
+	}
+}
+
+func TestControllerUnpublishVolumeRejectsUnusableRequests(t *testing.T) {
+	tests := []struct {
+		name    string
+		request *csi.ControllerUnpublishVolumeRequest
+	}{
+		{name: "no volume id", request: &csi.ControllerUnpublishVolumeRequest{NodeId: "node-a"}},
+		{
+			// CSI treats an absent node id as "detach from everywhere", which
+			// needs the per-node scan this design declines. Refused rather than
+			// answered wrongly.
+			name:    "no node id",
+			request: &csi.ControllerUnpublishVolumeRequest{VolumeId: "pvc-1"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			agent := newFakeAgent(t, agentclient.Job{Status: agentclient.JobSucceeded})
+			server := newControllerServer(agent)
+
+			_, err := server.ControllerUnpublishVolume(context.Background(), test.request)
+
+			if got := status.Code(err); got != codes.InvalidArgument {
+				t.Fatalf("code = %s, want InvalidArgument (err: %v)", got, err)
+			}
+			if n := agent.enqueueCount(); n != 0 {
+				t.Errorf("enqueued %d jobs, want none", n)
+			}
+		})
+	}
+}
+
+func TestControllerUnpublishVolumeTranslatesAgentFailures(t *testing.T) {
+	tests := []struct {
+		name string
+		job  agentclient.Job
+		want codes.Code
+	}{
+		{
+			// The disk is still in the VM's configuration. This must not come
+			// back as anything a caller could read as done — DeleteVolume
+			// reclaims on the belief that unpublish detached it.
+			name: "the detach did not take",
+			job:  agentclient.Job{Status: agentclient.JobFailed, Error: "still attached"},
+			want: codes.Internal,
+		},
+		{
+			name: "the host rejected it",
+			job:  agentclient.Job{Status: agentclient.JobFailed, Error: "no", ErrorCode: agentclient.ErrorCodeFailedPrecondition},
+			want: codes.FailedPrecondition,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := newControllerServer(newFakeAgent(t, test.job))
+
+			_, err := server.ControllerUnpublishVolume(context.Background(),
+				&csi.ControllerUnpublishVolumeRequest{VolumeId: "pvc-1", NodeId: "node-a"})
+
+			if got := status.Code(err); got != test.want {
+				t.Fatalf("code = %s, want %s (err: %v)", got, test.want, err)
+			}
+		})
+	}
+}
+
+func TestControllerUnpublishVolumeForgottenJobIsRetryable(t *testing.T) {
+	// The agent restarted mid-detach. Re-driving is safe: it decides what's
+	// left to do from the VM's configuration, and a volume already detached is
+	// a success.
+	server := newControllerServer(newFakeAgent(t))
+
+	_, err := server.ControllerUnpublishVolume(context.Background(),
+		&csi.ControllerUnpublishVolumeRequest{VolumeId: "pvc-1", NodeId: "node-a"})
+
+	if got := status.Code(err); got != codes.Aborted {
+		t.Fatalf("code = %s, want Aborted (err: %v)", got, err)
+	}
+}
+
 func publishRequest(volumeID, nodeID string) *csi.ControllerPublishVolumeRequest {
 	return &csi.ControllerPublishVolumeRequest{
 		VolumeId: volumeID,

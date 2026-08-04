@@ -18,6 +18,8 @@ public sealed class JobDispatcher(IVhdxService vhdxService, IAttachService attac
 
     public const string AttachVolume = "AttachVolume";
 
+    public const string DetachVolume = "DetachVolume";
+
     /// <exception cref="InvalidJobRequestException">
     /// The operation is unknown or its payload is unusable.
     /// </exception>
@@ -67,6 +69,23 @@ public sealed class JobDispatcher(IVhdxService vhdxService, IAttachService attac
                 return async (job, cancellationToken) =>
                     job.Result = await attachService.AttachAsync(attachRequest.VolumeId, attachRequest.NodeId, cancellationToken)
                         .ConfigureAwait(false);
+
+            case DetachVolume:
+                var detachRequest = Decode<DetachVolumePayload>(payload, jsonOptions);
+                if (string.IsNullOrWhiteSpace(detachRequest.VolumeId))
+                {
+                    throw new InvalidJobRequestException("payload.volumeId is required");
+                }
+
+                if (string.IsNullOrWhiteSpace(detachRequest.NodeId))
+                {
+                    throw new InvalidJobRequestException("payload.nodeId is required");
+                }
+
+                // No job.Result: a volume that is no longer attached has nothing
+                // left to describe, so the controller reads only the status.
+                return (_, cancellationToken) =>
+                    attachService.DetachAsync(detachRequest.VolumeId, detachRequest.NodeId, cancellationToken);
 
             default:
                 throw new InvalidJobRequestException($"unsupported operationType {operationType}");

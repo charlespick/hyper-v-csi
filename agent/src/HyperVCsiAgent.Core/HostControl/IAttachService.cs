@@ -18,4 +18,21 @@ public interface IAttachService
     /// in this cluster; ResourceExhausted if the VM has no free SCSI slot.
     /// </exception>
     Task<AttachVolumeResult> AttachAsync(string volumeId, string nodeId, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Removes the volume from the node's VM. Idempotent against the VM's
+    /// configuration: a volume that is not attached is already in the state the
+    /// caller asked for.
+    /// </summary>
+    /// <remarks>
+    /// Tolerant where attach is strict, and deliberately so - this is the RPC
+    /// that has to be able to finish. A volume ID that could not have come from
+    /// CreateVolume, or a node the cluster no longer knows about, both report
+    /// success: in each case nothing is attached, and failing instead would
+    /// leave a VolumeAttachment that no retry could ever clear, blocking the
+    /// PV's deletion and the node's drain behind it. What does NOT report
+    /// success is a VM that exists but cannot be reached or reconfigured, since
+    /// that one may well still be holding the disk.
+    /// </remarks>
+    Task DetachAsync(string volumeId, string nodeId, CancellationToken cancellationToken);
 }

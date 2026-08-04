@@ -84,30 +84,25 @@ helm install hyperv-csi deploy/helm/hyperv-csi \
   --set agent.address=https://hyperv-csi-agent.makerland.xyz
 ```
 
-The chart is scoped to what the driver implements, which today is `CreateVolume`,
-`DeleteVolume`, and `ControllerPublishVolume`. That shapes three defaults worth knowing
-about — and one hazard, stated first because it is the one that can lose data:
+The chart is scoped to what the driver implements, which today is provisioning, reclaim,
+and attach/detach — everything up to the point where a node has to mount the disk. That
+shapes three defaults worth knowing about:
 
-> **Do not run this in a cluster you care about yet.** `attachRequired` is `true`, so a
-> volume can now be attached to a node's VM, but `ControllerUnpublishVolume` is still a
-> stub — nothing can detach it, and `DeleteVolume` deletes on the assumption that a
-> detach already happened. The `Retain` reclaim policy below is what keeps that from
-> being destructive. Attach is meant to be exercised by calling the controller's gRPC
-> surface directly until unpublish lands.
-
-- **Only external-provisioner is deployed.** Attacher, resizer, and snapshotter would sit
-  in a retry loop against RPCs that return `Unimplemented`. With no attacher, the
-  `VolumeAttachment` objects `attachRequired: true` causes Kubernetes to create are never
-  serviced, so a pod using a PVC waits at `ContainerCreating` instead of starting.
+- **external-provisioner and external-attacher are deployed; resizer and snapshotter are
+  not.** Those two would sit in a retry loop against RPCs that return `Unimplemented`.
+- **`attachRequired: true` on the CSIDriver object.** Both `ControllerPublishVolume` and
+  `ControllerUnpublishVolume` exist, so Kubernetes creates a `VolumeAttachment` before a
+  volume's first use and clears it before the PV can be deleted — which is the ordering
+  `DeleteVolume` reclaims on.
 - **The StorageClass reclaims with `Retain`.** `DeleteVolume` works, so `Delete` would
   too — but it hasn't run against real Hyper-V yet, and `Delete` would make its first
   real outing an irreversible one. VHDX files are removed by hand until you've watched a
-  delete succeed on your own hosts, then flip `storageClass.reclaimPolicy` — and not
-  before `ControllerUnpublishVolume` exists, per the warning above.
+  delete succeed on your own hosts, then flip `storageClass.reclaimPolicy`.
 
-The node plugin (`node.enabled`) is off by default for the same reason: every `Node*` RPC
-that does real work is still a stub, so running it would register a plugin with kubelet
-that can't mount anything. Provisioning is controller-side, so a PVC binds without it.
+The node plugin (`node.enabled`) is off by default: every `Node*` RPC that does real work
+is still a stub, so running it would register a plugin with kubelet that can't mount
+anything. Provisioning is controller-side, so a PVC binds without it — but a pod that
+mounts one will not start until staging and publishing exist, which is the next slice.
 
 Installing with an unusable configuration fails at `helm install` rather than as a
 `CrashLoopBackOff` — a missing agent address, a plaintext address without the explicit

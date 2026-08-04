@@ -22,6 +22,10 @@ const operationDeleteVolume = "DeleteVolume"
 // match JobDispatcher.AttachVolume on the .NET side.
 const operationAttachVolume = "AttachVolume"
 
+// operationDetachVolume is the operationType the agent dispatches on; it must
+// match JobDispatcher.DetachVolume on the .NET side.
+const operationDetachVolume = "DetachVolume"
+
 // defaultVolumeSizeBytes is used when a request carries no capacity range at
 // all. CSI allows that, and a VHDX has to be created with *some* size; the
 // disk is dynamically expanding, so this costs nothing on the CSV until it's
@@ -306,12 +310,9 @@ const (
 // with a guest-reported VM identity later is a change to the agent and to what
 // the node plugin reports, and to nothing in this file.
 //
-// The CSIDriver object sets attachRequired: true, so Kubernetes creates a
-// VolumeAttachment and expects this to run before a volume is first used. Two
-// things that turns on are still unbuilt: ControllerUnpublishVolume returns
-// Unimplemented, so an attached volume never detaches and DeleteVolume can
-// reclaim a disk still attached to a VM, and no external-attacher is deployed,
-// so nothing acts on the VolumeAttachment objects.
+// The CSIDriver object sets attachRequired: true and external-attacher is
+// deployed, so Kubernetes creates a VolumeAttachment and calls this before a
+// volume's first use.
 func (s *controllerServer) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume id is required")
@@ -387,11 +388,57 @@ func vmTarget(nodeID string) string {
 	return "vm:" + nodeID
 }
 
-// ControllerUnpublishVolume detaches a VHDX from the node VM, including the
-// forced-detach path for a node that cluster membership/quorum reports as
-// down. Idempotency key: volume ID + node ID.
+// detachVolumePayload is the operation-specific half of the agent's job
+// envelope, matching DetachVolumePayload on the .NET side. There is no result
+// half: a volume that is no longer attached has nothing left to report.
+type detachVolumePayload struct {
+	VolumeID string `json:"volumeId"`
+	NodeID   string `json:"nodeId"`
+}
+
+// ControllerUnpublishVolume detaches a VHDX from the node VM.
+// Idempotency key: volume ID + node ID.
+//
+// This is the RPC everything downstream trusts. DeleteVolume does not check
+// that a volume is detached — it reclaims on the guarantee that this ran first
+// — so the agent confirms the disk is really gone from the VM's configuration
+// before reporting success, rather than trusting that the call it made worked.
+//
+// Tolerant where publish is strict: a volume that was never attached, or a node
+// the cluster no longer knows, both report success. Kubernetes cannot delete a
+// PV or drain a node until its VolumeAttachment clears, so an unpublish that
+// fails on something no retry can fix wedges both.
 func (s *controllerServer) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "ControllerUnpublishVolume not implemented")
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume id is required")
+	}
+
+	// CSI makes node_id optional, meaning "unpublish from every node this
+	// volume is published to". Answering that needs the cluster-wide scan the
+	// design declines — one query per node — so it is refused rather than
+	// answered wrongly. Kubernetes always sets it; see CSI Spec.md.
+	if req.GetNodeId() == "" {
+		return nil, status.Error(codes.InvalidArgument,
+			"node id is required; unpublishing from every node at once is not supported")
+	}
+
+	// Same key and target as publish, so a detach can neither duplicate nor
+	// interleave with an attach for the same volume and node.
+	job, err := s.driver.Agent.EnqueueJob(ctx, publishKey(req.GetVolumeId(), req.GetNodeId()), operationDetachVolume,
+		vmTarget(req.GetNodeId()), detachVolumePayload{
+			VolumeID: req.GetVolumeId(),
+			NodeID:   req.GetNodeId(),
+		})
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable,
+			"enqueueing ControllerUnpublishVolume for %s on %s: %v", req.GetVolumeId(), req.GetNodeId(), err)
+	}
+
+	if _, err := awaitJob(ctx, s.driver.Agent, job.ID, jobPollBudget); err != nil {
+		return nil, err
+	}
+
+	return &csi.ControllerUnpublishVolumeResponse{}, nil
 }
 
 // ValidateVolumeCapabilities confirms a volume supports the requested access

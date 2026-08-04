@@ -225,6 +225,111 @@ public sealed class AttachServiceTests : IDisposable
         Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
     }
 
+    [Fact]
+    public async Task DetachAsync_RemovesTheDiskFromTheVm()
+    {
+        var volume = GivenVolume("pvc-1");
+        var host = new FakeHostClient { Existing = new AttachedDisk("controller-guid", 4), DetachWorks = true };
+        using var service = NewService(host);
+
+        await service.DetachAsync("pvc-1", Node, CancellationToken.None);
+
+        Assert.Equal((Host, "vm-for-" + Node, volume), host.Detached);
+    }
+
+    [Fact]
+    public async Task DetachAsync_NotAttached_ChangesNothing()
+    {
+        // A replay after the agent forgot the job, or an unpublish for a volume
+        // that never got attached. Either way the caller already has what it
+        // asked for.
+        GivenVolume("pvc-1");
+        var host = new FakeHostClient();
+        using var service = NewService(host);
+
+        await service.DetachAsync("pvc-1", Node, CancellationToken.None);
+
+        Assert.Null(host.Detached);
+    }
+
+    [Fact]
+    public async Task DetachAsync_UnknownNode_Succeeds()
+    {
+        // Where attach reports NotFound, detach reports success: a node the
+        // cluster no longer has is a VM that no longer exists, so nothing is
+        // attached to it. Failing would strand the VolumeAttachment and block
+        // the PV's deletion and the node's drain behind it forever.
+        GivenVolume("pvc-1");
+        var host = new FakeHostClient();
+        using var service = NewService(host, new FakeClusterService { Owner = null });
+
+        await service.DetachAsync("pvc-1", "node-gone", CancellationToken.None);
+
+        Assert.Null(host.Detached);
+    }
+
+    [Fact]
+    public async Task DetachAsync_VolumeIdThatCouldNotBeOurs_Succeeds()
+    {
+        // Nothing to look up: no volume of that name can exist, so nothing can
+        // be attached to anything.
+        var host = new FakeHostClient();
+        using var service = NewService(host);
+
+        await service.DetachAsync("../etc/passwd", Node, CancellationToken.None);
+
+        Assert.Null(host.Detached);
+    }
+
+    [Fact]
+    public async Task DetachAsync_VolumeWithNoVhdxOnTheCsv_StillDetaches()
+    {
+        // The file being gone does not mean the VM has stopped referencing it -
+        // the attachment lives in the VM's configuration. Skipping the detach
+        // here would leave a VM pointing at a disk that no longer exists.
+        var host = new FakeHostClient { Existing = new AttachedDisk("controller-guid", 4), DetachWorks = true };
+        using var service = NewService(host);
+
+        await service.DetachAsync("pvc-never-created", Node, CancellationToken.None);
+
+        Assert.NotNull(host.Detached);
+    }
+
+    [Fact]
+    public async Task DetachAsync_DiskStillAttachedAfterwards_IsInternal()
+    {
+        // The one thing this RPC must never do is report success while the disk
+        // is still there: DeleteVolume reclaims on exactly that guarantee, and a
+        // VHDX attached to a stopped VM deletes without complaint.
+        GivenVolume("pvc-1");
+        var host = new FakeHostClient { Existing = new AttachedDisk("controller-guid", 4), DetachWorks = false };
+        using var service = NewService(host);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => service.DetachAsync("pvc-1", Node, CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
+    }
+
+    [Fact]
+    public async Task DetachAsync_MigratedVm_ReResolvesTheOwnerAndRetriesOnce()
+    {
+        GivenVolume("pvc-1");
+        var cluster = new FakeClusterService { Owner = Host, NextOwner = "hv-02" };
+        var host = new FakeHostClient
+        {
+            NotOnHost = Host,
+            Existing = new AttachedDisk("controller-guid", 4),
+            DetachWorks = true,
+        };
+        using var service = NewService(host, cluster);
+
+        await service.DetachAsync("pvc-1", Node, CancellationToken.None);
+
+        Assert.Equal(2, cluster.Resolutions);
+        Assert.Equal("hv-02", host.Detached?.Host);
+    }
+
     private string GivenVolume(string volumeName)
     {
         Directory.CreateDirectory(_root);
@@ -299,15 +404,27 @@ public sealed class AttachServiceTests : IDisposable
         /// <summary>Hangs only once the VM has been found somewhere else, so the timeout lands on the retry.</summary>
         public bool HangsAfterMigrating { get; init; }
 
+        /// <summary>Whether a detach actually removes the disk, or silently leaves it in place.</summary>
+        public bool DetachWorks { get; init; }
+
         public int FreeSlotQueries { get; private set; }
 
         public (string Host, string Vm, string Path, int Lun)? Attached { get; private set; }
+
+        public (string Host, string Vm, string Path)? Detached { get; private set; }
 
         public async Task<AttachedDisk?> FindAttachedDiskAsync(
             string hostName, string vmName, string vhdxPath, CancellationToken cancellationToken)
         {
             Migrated(hostName, vmName);
             await HangIfAskedTo(cancellationToken).ConfigureAwait(false);
+
+            // The read-back after a detach: gone if the detach worked, still
+            // there if it only claimed to.
+            if (Detached is not null)
+            {
+                return DetachWorks ? null : Existing;
+            }
 
             if (Existing is not null)
             {
@@ -337,8 +454,12 @@ public sealed class AttachServiceTests : IDisposable
             return Task.CompletedTask;
         }
 
-        public Task DetachDiskAsync(string hostName, string vmName, string vhdxPath, CancellationToken cancellationToken) =>
-            throw new NotSupportedException();
+        public Task DetachDiskAsync(string hostName, string vmName, string vhdxPath, CancellationToken cancellationToken)
+        {
+            Migrated(hostName, vmName);
+            Detached = (hostName, vmName, vhdxPath);
+            return Task.CompletedTask;
+        }
 
         public Task ResizeDiskAsync(string hostName, string vmName, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
             throw new NotSupportedException();

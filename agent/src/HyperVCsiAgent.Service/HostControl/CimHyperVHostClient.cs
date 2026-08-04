@@ -128,7 +128,34 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
         }, cancellationToken);
 
     public Task DetachDiskAsync(string hostName, string vmName, string vhdxPath, CancellationToken cancellationToken) =>
-        throw new NotSupportedException("ControllerUnpublishVolume is not implemented yet");
+        Task.Run(() =>
+        {
+            var scope = ScopeFor(hostName);
+            using var management = GetManagementService(scope);
+            using var settings = GetActiveSettings(scope, hostName, vmName);
+
+            var located = LocateDisk(scope, settings, vhdxPath, cancellationToken);
+            if (located is null)
+            {
+                logger.LogInformation(
+                    "{VhdxPath} is not in {VmName}'s configuration on {HostName}, so there is nothing to detach",
+                    vhdxPath, vmName, hostName);
+                return;
+            }
+
+            // Disk first, then the drive that held it - the disk names the drive
+            // as its parent, so the other order would orphan the reference. Two
+            // calls rather than one array, because a single RemoveResourceSettings
+            // makes no promise about the order it processes its arguments in.
+            RemoveResource(scope, management, located.DiskPath, "the disk", cancellationToken);
+
+            // Removing the drive too, not just the disk: an empty drive keeps
+            // its address on the controller, so leaving them behind would walk a
+            // VM up to its 64-per-controller limit one detach at a time.
+            RemoveResource(scope, management, located.DrivePath, "its drive", cancellationToken);
+
+            logger.LogInformation("detached {VhdxPath} from {VmName} on {HostName}", vhdxPath, vmName, hostName);
+        }, cancellationToken);
 
     public Task ResizeDiskAsync(string hostName, string vmName, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
         throw new NotSupportedException("ControllerExpandVolume is not implemented yet");
@@ -137,6 +164,36 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
         new($@"\\{hostName}\root\virtualization\v2");
 
     private static AttachedDisk? FindAttachedDisk(
+        ManagementScope scope, ManagementObject settings, string vhdxPath, CancellationToken cancellationToken)
+    {
+        if (LocateDisk(scope, settings, vhdxPath, cancellationToken) is not { } located)
+        {
+            return null;
+        }
+
+        using var controller = new ManagementObject(scope, new ManagementPath(located.ControllerPath), null);
+        controller.Get();
+
+        // Both halves have to be real. Defaulting either one would send the node
+        // plugin to a plausible-looking wrong disk - LUN 0 on the first
+        // controller is typically what the VM boots from - and it would do so
+        // while reporting success.
+        if (located.Lun is not { } lun)
+        {
+            throw new InvalidOperationException(
+                $"the drive holding {vhdxPath} reports no address on its controller");
+        }
+
+        return new AttachedDisk(VmBusInstanceIdOf(controller, vhdxPath), lun);
+    }
+
+    /// <summary>
+    /// Finds a VHDX in a VM's configuration and reports where every part of it
+    /// lives. Shared by attach, which wants the guest-visible address, and
+    /// detach, which wants the CIM paths to remove - one traversal, so the two
+    /// cannot disagree about what "attached" means.
+    /// </summary>
+    private static DiskLocation? LocateDisk(
         ManagementScope scope, ManagementObject settings, string vhdxPath, CancellationToken cancellationToken)
     {
         foreach (var disk in DeviceSettings(scope, settings, "Msvm_StorageAllocationSettingData", cancellationToken))
@@ -170,25 +227,15 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
                     continue;
                 }
 
-                using var controller = new ManagementObject(scope, new ManagementPath(controllerPath), null);
-                controller.Get();
-
-                // Both halves have to be real. Defaulting either one would send
-                // the node plugin to a plausible-looking wrong disk - LUN 0 on
-                // the first controller is typically what the VM boots from -
-                // and it would do so while reporting success.
-                if (AddressOf(drive) is not { } lun)
-                {
-                    throw new InvalidOperationException(
-                        $"the drive holding {vhdxPath} reports no address on its controller");
-                }
-
-                return new AttachedDisk(VmBusInstanceIdOf(controller, vhdxPath), lun);
+                return new DiskLocation(disk.Path.Path, drivePath, controllerPath, AddressOf(drive));
             }
         }
 
         return null;
     }
+
+    /// <param name="Lun">Null when the drive reports no readable address, which each caller decides what to do about.</param>
+    private sealed record DiskLocation(string DiskPath, string DrivePath, string ControllerPath, int? Lun);
 
     private static string? FindDrivePath(
         ManagementScope scope, ManagementObject settings, DiskSlot slot, CancellationToken cancellationToken)
@@ -270,6 +317,26 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
         }
 
         return added[0];
+    }
+
+    /// <summary>
+    /// Removes one resource from a VM's configuration, failing loudly if it
+    /// cannot. Unlike the rollback below, a detach that did not happen must
+    /// never be reported as success - DeleteVolume reclaims on the belief that
+    /// it did.
+    /// </summary>
+    private static void RemoveResource(
+        ManagementScope scope,
+        ManagementObject management,
+        string resourcePath,
+        string description,
+        CancellationToken cancellationToken)
+    {
+        using var inParams = management.GetMethodParameters("RemoveResourceSettings");
+        inParams["ResourceSettings"] = new[] { resourcePath };
+
+        using var outParams = management.InvokeMethod("RemoveResourceSettings", inParams, null);
+        CimJobs.WaitForCompletion(scope, outParams, $"RemoveResourceSettings ({description})", cancellationToken);
     }
 
     private void RemoveEmptyDrive(

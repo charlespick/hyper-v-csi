@@ -57,6 +57,20 @@ public class JobDispatcherTests
             job.Result);
     }
 
+    [Fact]
+    public async Task Resolve_DetachVolume_RunsTheDetachAndPublishesNoResult()
+    {
+        var attach = new RecordingAttachService();
+        var run = new JobDispatcher(new RecordingVhdxService(), attach).Resolve(
+            JobDispatcher.DetachVolume, Payload("""{"volumeId":"pvc-1","nodeId":"node-a"}"""), WireOptions);
+
+        var job = NewJob();
+        await run(job, CancellationToken.None);
+
+        Assert.Equal(("pvc-1", "node-a"), attach.LastDetach);
+        Assert.Null(job.Result);
+    }
+
     [Theory]
     [InlineData("UnknownOperation", """{"name":"pvc-1","sizeBytes":2048}""")]
     [InlineData(JobDispatcher.CreateVolume, """{"sizeBytes":2048}""")]
@@ -72,6 +86,10 @@ public class JobDispatcherTests
     [InlineData(JobDispatcher.AttachVolume, """{"volumeId":"pvc-1","nodeId":""}""")]
     [InlineData(JobDispatcher.AttachVolume, """{"volumeId":"pvc-1","nodeId":42}""")]
     [InlineData(JobDispatcher.AttachVolume, "\"not an object\"")]
+    [InlineData(JobDispatcher.DetachVolume, """{"nodeId":"node-a"}""")]
+    [InlineData(JobDispatcher.DetachVolume, """{"volumeId":"pvc-1"}""")]
+    [InlineData(JobDispatcher.DetachVolume, """{"volumeId":"pvc-1","nodeId":""}""")]
+    [InlineData(JobDispatcher.DetachVolume, "\"not an object\"")]
     public void Resolve_BadRequest_ThrowsBeforeAnyJobExists(string operationType, string payload)
     {
         var vhdx = new RecordingVhdxService();
@@ -83,6 +101,7 @@ public class JobDispatcherTests
         Assert.Null(vhdx.LastCreate);
         Assert.Null(vhdx.LastDelete);
         Assert.Null(attach.LastAttach);
+        Assert.Null(attach.LastDetach);
     }
 
     private static JsonElement Payload(string json) => JsonDocument.Parse(json).RootElement;
@@ -127,11 +146,19 @@ public class JobDispatcherTests
     {
         public (string VolumeId, string NodeId)? LastAttach { get; private set; }
 
+        public (string VolumeId, string NodeId)? LastDetach { get; private set; }
+
         public Task<AttachVolumeResult> AttachAsync(string volumeId, string nodeId, CancellationToken cancellationToken)
         {
             LastAttach = (volumeId, nodeId);
             return Task.FromResult(new AttachVolumeResult(
                 $@"C:\ClusterStorage\Volume1\{volumeId}.vhdx", "controller-guid", 3, AlreadyAttached: false));
+        }
+
+        public Task DetachAsync(string volumeId, string nodeId, CancellationToken cancellationToken)
+        {
+            LastDetach = (volumeId, nodeId);
+            return Task.CompletedTask;
         }
     }
 }

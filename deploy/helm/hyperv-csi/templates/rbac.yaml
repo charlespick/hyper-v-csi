@@ -13,9 +13,9 @@ metadata:
 {{- end }}
 {{- if .Values.rbac.create }}
 ---
-# Scoped to what external-provisioner actually needs. Attachment, resize, and
-# snapshot permissions are deliberately absent: those sidecars aren't deployed,
-# because the RPCs behind them aren't implemented.
+# Scoped to what external-provisioner actually needs. Resize and snapshot
+# permissions are deliberately absent: those sidecars aren't deployed, because
+# the RPCs behind them aren't implemented.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -57,8 +57,51 @@ roleRef:
   name: {{ include "hyperv-csi.fullname" . }}-provisioner
   apiGroup: rbac.authorization.k8s.io
 ---
-# Leader election, so scaling the controller past one replica doesn't mean two
-# provisioners racing on the same PVC.
+# Scoped to what external-attacher needs. It watches VolumeAttachment objects
+# and calls ControllerPublishVolume/ControllerUnpublishVolume for them, so the
+# PV read is how it learns the volume handle and the CSINode read is how it
+# turns a Kubernetes node name into the CSI node ID this driver resolves.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "hyperv-csi.fullname" . }}-attacher
+  labels:
+    {{- include "hyperv-csi.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments/status"]
+    verbs: ["patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "hyperv-csi.fullname" . }}-attacher
+  labels:
+    {{- include "hyperv-csi.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "hyperv-csi.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "hyperv-csi.fullname" . }}-attacher
+  apiGroup: rbac.authorization.k8s.io
+---
+# Leader election, shared by both sidecars, so scaling the controller past one
+# replica doesn't mean two provisioners racing on the same PVC or two attachers
+# on the same VolumeAttachment.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

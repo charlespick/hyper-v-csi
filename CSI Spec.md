@@ -14,8 +14,8 @@ covered by unit tests but has never run against a real failover cluster or Hyper
 | Probe | Both | Health check confirming the plugin is ready to serve requests. | N/A | Stub — always reports ready |
 | CreateVolume | Controller | Provisions a new volume and returns its identifier. | Volume name | Tested — creates a VHDX on disk |
 | DeleteVolume | Controller | Removes a previously provisioned volume. | Volume ID | Tested |
-| ControllerPublishVolume | Controller | Attaches a volume to a specified node. | Volume ID + node ID | Pending testing — not yet reachable from Kubernetes |
-| ControllerUnpublishVolume | Controller | Detaches a volume from a specified node. | Volume ID + node ID | Not started |
+| ControllerPublishVolume | Controller | Attaches a volume to a specified node. | Volume ID + node ID | Pending testing |
+| ControllerUnpublishVolume | Controller | Detaches a volume from a specified node. | Volume ID + node ID | Pending testing |
 | ValidateVolumeCapabilities | Controller | Confirms a volume supports the requested access mode and type. | Volume ID (lookup only) | Not started |
 | ControllerGetCapabilities | Controller | Reports which controller RPCs this plugin implements. | N/A | Over advertising until project is finished |
 | ControllerExpandVolume | Controller | Grows a volume's underlying storage. | Volume ID | Not started |
@@ -39,8 +39,9 @@ running this in a cluster. What each one currently overstates:
 
 - `GetPluginCapabilities` — volume expansion (ONLINE), while both ControllerExpandVolume and
   NodeExpandVolume are stubs. It correctly omits VOLUME_ACCESSIBILITY_CONSTRAINTS.
-- `ControllerGetCapabilities` — PUBLISH_UNPUBLISH_VOLUME, EXPAND_VOLUME, CREATE_DELETE_SNAPSHOT,
-  and LIST_SNAPSHOTS. CREATE_DELETE_VOLUME is the one it does not overstate: both halves are built.
+- `ControllerGetCapabilities` — EXPAND_VOLUME, CREATE_DELETE_SNAPSHOT, and LIST_SNAPSHOTS.
+  CREATE_DELETE_VOLUME and PUBLISH_UNPUBLISH_VOLUME are the two it does not overstate: both halves
+  of each are built.
 - `NodeGetCapabilities` — STAGE_UNSTAGE_VOLUME, EXPAND_VOLUME, and GET_VOLUME_STATS, none of
   which are implemented.
 
@@ -70,19 +71,33 @@ detachment check and must not be mistaken for one*:
   invisible to handle enumeration, and a crashed checkpoint or backup can orphan one after the
   worker process exits. So a sharing violation can outlive any attachment.
 
-So the safety of a reclaim rests entirely on unpublish having run, and right now nothing makes it
-run: `attachRequired` is true and ControllerPublishVolume is built, so a volume can be attached, but
-ControllerUnpublishVolume still returns Unimplemented. **A reclaim can therefore delete a disk that
-is still attached to a VM, exactly as described above, and nothing in the driver prevents it.** The
-StorageClass defaults to `Retain`, which is what keeps that theoretical for now; do not switch it to
-`Delete` until unpublish exists.
+So the safety of a reclaim rests entirely on unpublish having run. That ordering now exists:
+`attachRequired` is true, external-attacher is deployed, and both halves of publish/unpublish are
+built, so Kubernetes creates a VolumeAttachment before first use and clears it before the PV can be
+deleted.
 
-> **The chart is not in a runnable state until ControllerUnpublishVolume lands.** `attachRequired`
-> is true, so Kubernetes creates a VolumeAttachment for every volume before first use — but the
-> external-attacher sidecar is not deployed, so nothing services those objects and a pod would wait
-> at `ContainerCreating` indefinitely. Attach is exercisable by calling the controller's gRPC
-> surface directly; it is not yet exercisable through Kubernetes, and the chart says so rather than
-> pretending otherwise.
+**ControllerUnpublishVolume confirms the detach rather than assuming it.** After removing the disk
+it re-reads the VM's configuration, and reports success only if the disk is really gone. That
+read-back is not defensive habit — it is what the paragraph above is resting on. A detach that
+silently did nothing, reported as success, is precisely the path that ends with a reclaim deleting
+a disk a stopped VM still expects, and nothing downstream would catch it.
+
+**Unpublish is tolerant where publish is strict, deliberately.** A volume ID that could not have
+come from CreateVolume, a volume that was never attached, and a node the cluster no longer knows
+all report success: in each case nothing is attached, which is the state the caller asked for.
+Kubernetes cannot delete a PV or drain a node until the VolumeAttachment clears, so an unpublish
+that failed on something no retry could fix would wedge both. What does *not* report success is a
+VM that exists but cannot be reached or reconfigured — that one may still be holding the disk.
+
+**`node_id` is required, though CSI makes it optional.** An absent node ID means "unpublish from
+every node this volume is published to", which is the reverse-direction question below: no single
+query answers it, so it would mean a scan per cluster node. It is refused with INVALID_ARGUMENT
+rather than answered wrongly. Kubernetes always sets it, so this costs nothing in practice.
+
+**Force-detach from a failed node is not built.** `IClusterService.IsHostLiveAsync` is still
+unimplemented, so an unpublish whose owning host is down fails and is retried rather than fenced.
+That is the safe direction — it never detaches a disk from a VM that might still be running — but
+it does mean a node that stays down blocks its volumes from moving until an operator intervenes.
 
 What an authoritative check would take, if one is ever wanted anyway. The attachment itself lives in
 `Msvm_StorageAllocationSettingData` in `root\virtualization\v2`: match `HostResource[0]` against the
