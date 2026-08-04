@@ -137,17 +137,28 @@ attach and then fails at NodeStageVolume, which is the honest place for it to fa
 reads `VirtualMachineId` out of the guest's Hyper-V key-value pools — the values the host publishes
 through the Data Exchange integration service, which `hv_kvp_daemon` writes to
 `/var/lib/hyperv/.kvp_pool_*` — and reports that GUID as the CSI node ID. kubelet records it in
-`CSINode`, external-attacher hands it to this RPC, and the agent resolves it with one indexed
-lookup:
+`CSINode`, external-attacher hands it to this RPC, and the agent resolves it with one query:
 
 ```
-SELECT Name, OwnerNode FROM MSCluster_VirtualMachine WHERE VmID = '<guid>'
+SELECT * FROM MSCluster_Resource
+WHERE Type = 'Virtual Machine' OR Type = 'Virtual Machine Configuration'
 ```
 
-`MSCluster_VirtualMachine` is the VM resource's private properties surfaced as a class, which is
-what makes `VmID` queryable at all — it is not a property of `MSCluster_Resource`, so a `WHERE`
-against that class could not use it. One query, no enumeration, no fan-out, and the answer is
-CLUSDB's, which every node has a replica of.
+then matches `PrivateProperties.VmID` in memory. **The match cannot be a `WHERE` clause.** `VmID`
+is not a property of `MSCluster_Resource`; it is a member of the embedded `PrivateProperties`
+object, and WQL cannot reach inside an embedded object. So the choice is one round trip plus a
+local scan of the cluster's VM resources, which is what this does, or a per-resource round trip,
+which would be worse on every axis. Either way it stays one call to the provider and no fan-out to
+hosts, answered from the local CLUSDB replica.
+
+Both resource types are asked for because a clustered VM has two — `Virtual Machine <name>` and
+`Virtual Machine Configuration <name>` — and both carry `VmID`. They share a group and therefore an
+`OwnerNode`, which is the only thing read off them, so whichever matches first will do.
+
+A consequence worth noting: the node ID never reaches the query text, so it is compared rather than
+interpolated. The GUID check that used to be the injection guard is now an assertion about the
+request — a node ID that is not a GUID means the node plugin sent something other than its VM ID,
+and matching nothing would misreport that as "no such VM in the cluster".
 
 The same GUID then identifies the VM on its host: `Msvm_ComputerSystem.Name` *is* the VM ID
 (`ElementName` is the display name). So no step in the chain depends on a Kubernetes node, a
