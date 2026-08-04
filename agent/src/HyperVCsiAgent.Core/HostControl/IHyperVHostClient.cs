@@ -18,7 +18,7 @@ public interface IHyperVHostClient
     /// running - the property a file lock notably lacks.
     /// </summary>
     /// <exception cref="VmNotOnHostException">The VM is not registered on this host.</exception>
-    Task<AttachedDisk?> FindAttachedDiskAsync(string hostName, string vmName, string vhdxPath, CancellationToken cancellationToken);
+    Task<AttachedDisk?> FindAttachedDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken);
 
     /// <summary>
     /// Whether the VHDX is in the VM's configuration at all.
@@ -33,22 +33,22 @@ public interface IHyperVHostClient
     /// deletion, and the node's drain all stuck behind it.
     /// </remarks>
     /// <exception cref="VmNotOnHostException">The VM is not registered on this host.</exception>
-    Task<bool> IsDiskAttachedAsync(string hostName, string vmName, string vhdxPath, CancellationToken cancellationToken);
+    Task<bool> IsDiskAttachedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken);
 
     /// <summary>
     /// Finds an unoccupied address on one of the VM's existing SCSI controllers,
     /// or null when every one of them is full.
     /// </summary>
     /// <exception cref="VmNotOnHostException">The VM is not registered on this host.</exception>
-    Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmName, CancellationToken cancellationToken);
+    Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmId, CancellationToken cancellationToken);
 
     /// <summary>
     /// Attaches the VHDX at the given slot.
     /// </summary>
     /// <exception cref="VmNotOnHostException">The VM is not registered on this host.</exception>
-    Task AttachDiskAsync(string hostName, string vmName, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken);
+    Task AttachDiskAsync(string hostName, string vmId, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken);
 
-    Task DetachDiskAsync(string hostName, string vmName, string vhdxPath, CancellationToken cancellationToken);
+    Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken);
 
-    Task ResizeDiskAsync(string hostName, string vmName, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken);
+    Task ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken);
 }

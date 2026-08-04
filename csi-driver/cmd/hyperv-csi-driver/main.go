@@ -20,13 +20,17 @@ import (
 
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/agentclient"
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/driver"
+	"github.com/charlespick/hyper-v-csi/csi-driver/internal/hypervkvp"
 )
 
 func main() {
 	var (
-		endpoint     = flag.String("endpoint", "unix:///csi/csi.sock", "CSI endpoint")
-		mode         = flag.String("mode", "node", "driver mode: controller or node")
-		nodeID       = flag.String("node-id", "", "node ID (required in node mode)")
+		endpoint = flag.String("endpoint", "unix:///csi/csi.sock", "CSI endpoint")
+		mode     = flag.String("mode", "node", "driver mode: controller or node")
+		nodeID   = flag.String("node-id", "",
+			"node ID override. In node mode this is read from the Hyper-V key-value pools when unset, which is the supported configuration")
+		kvpPoolDir = flag.String("kvp-pool-dir", hypervkvp.DefaultPoolDir,
+			"directory holding the Hyper-V key-value pool files hv_kvp_daemon maintains")
 		agentAddress = flag.String("agent-address", "", "hyperv-csi-agent base URL (required in controller mode)")
 
 		agentClientCert = flag.String("agent-client-cert", "",
@@ -47,8 +51,24 @@ func main() {
 			log.Fatal("--agent-address is required in controller mode")
 		}
 	case "node":
+		// The node's identity is its Hyper-V VM ID, which only the guest can
+		// learn and only through the host's key-value pools. Reported verbatim
+		// by NodeGetInfo, recorded by kubelet in the CSINode object, and handed
+		// back to ControllerPublishVolume by external-attacher, which is what
+		// lets the agent resolve a node to a VM by identity rather than by
+		// matching names.
+		//
+		// Fatal rather than falling back to the node name: a fallback would let
+		// a node whose Data Exchange service is off register anyway and attach
+		// against whatever VM happens to share its name.
 		if *nodeID == "" {
-			log.Fatal("--node-id is required in node mode")
+			id, err := hypervkvp.VirtualMachineID(*kvpPoolDir)
+			if err != nil {
+				log.Fatalf("resolving this node's Hyper-V VM ID: %v", err)
+			}
+
+			log.Printf("node identity resolved from the Hyper-V key-value pools: VM %s", id)
+			*nodeID = id
 		}
 	default:
 		log.Fatalf("invalid --mode %q: must be \"controller\" or \"node\"", *mode)

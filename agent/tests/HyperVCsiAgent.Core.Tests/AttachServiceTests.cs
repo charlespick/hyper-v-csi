@@ -424,10 +424,11 @@ public sealed class AttachServiceTests : IDisposable
         public string? NextOwner { get; init; }
 
         /// <summary>
-        /// What the cluster says the VM is called, which is deliberately not the
-        /// node ID: nothing downstream may re-derive one from the other.
+        /// The VM the cluster resolved the node ID to. Deliberately a different
+        /// value from the node ID here, even though in production they are the
+        /// same GUID: nothing downstream may re-derive one from the other.
         /// </summary>
-        public string VmName { get; init; } = "vm-for-" + Node;
+        public string VmId { get; init; } = "vm-for-" + Node;
 
         public int Resolutions { get; private set; }
 
@@ -436,7 +437,7 @@ public sealed class AttachServiceTests : IDisposable
             Resolutions++;
 
             var owner = Resolutions > 1 && NextOwner is not null ? NextOwner : Owner;
-            return Task.FromResult(owner is null ? null : new ClusteredVm(VmName, owner));
+            return Task.FromResult(owner is null ? null : new ClusteredVm(VmId, owner));
         }
 
         public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
@@ -482,9 +483,9 @@ public sealed class AttachServiceTests : IDisposable
         public (string Host, string Vm, string Path)? Detached { get; private set; }
 
         public async Task<AttachedDisk?> FindAttachedDiskAsync(
-            string hostName, string vmName, string vhdxPath, CancellationToken cancellationToken)
+            string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken)
         {
-            Migrated(hostName, vmName);
+            Migrated(hostName, vmId);
             await HangIfAskedTo(cancellationToken).ConfigureAwait(false);
 
             // The read-back after a detach: gone if the detach worked, still
@@ -508,52 +509,52 @@ public sealed class AttachServiceTests : IDisposable
         }
 
         public async Task<bool> IsDiskAttachedAsync(
-            string hostName, string vmName, string vhdxPath, CancellationToken cancellationToken)
+            string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken)
         {
             PathsLookedUp.Add(vhdxPath);
 
             // Deliberately the same underlying state as FindAttachedDiskAsync,
             // minus the address: a fake where the two could disagree would hide
             // the very thing detach relies on them agreeing about.
-            return await FindAttachedDiskAsync(hostName, vmName, vhdxPath, cancellationToken).ConfigureAwait(false) is not null;
+            return await FindAttachedDiskAsync(hostName, vmId, vhdxPath, cancellationToken).ConfigureAwait(false) is not null;
         }
 
-        public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmName, CancellationToken cancellationToken)
+        public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmId, CancellationToken cancellationToken)
         {
-            Migrated(hostName, vmName);
+            Migrated(hostName, vmId);
             FreeSlotQueries++;
             return Task.FromResult(FreeSlot);
         }
 
         public Task AttachDiskAsync(
-            string hostName, string vmName, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken)
+            string hostName, string vmId, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken)
         {
-            Migrated(hostName, vmName);
-            Attached = (hostName, vmName, vhdxPath, slot.Lun);
+            Migrated(hostName, vmId);
+            Attached = (hostName, vmId, vhdxPath, slot.Lun);
             return Task.CompletedTask;
         }
 
-        public Task DetachDiskAsync(string hostName, string vmName, string vhdxPath, CancellationToken cancellationToken)
+        public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken)
         {
-            Migrated(hostName, vmName);
+            Migrated(hostName, vmId);
 
             if (DetachThrows)
             {
                 throw new InvalidOperationException("the host refused to reconfigure the VM");
             }
 
-            Detached = (hostName, vmName, vhdxPath);
+            Detached = (hostName, vmId, vhdxPath);
             return Task.CompletedTask;
         }
 
-        public Task ResizeDiskAsync(string hostName, string vmName, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
+        public Task ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
-        private void Migrated(string hostName, string vmName)
+        private void Migrated(string hostName, string vmId)
         {
             if (AlwaysMigrating || hostName == NotOnHost)
             {
-                throw new VmNotOnHostException(hostName, vmName);
+                throw new VmNotOnHostException(hostName, vmId);
             }
         }
 

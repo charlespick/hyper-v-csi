@@ -93,6 +93,14 @@ node:
 
   kubeletDir: /var/lib/kubelet
 
+  # Where hv_kvp_daemon keeps the Hyper-V key-value pools. The node plugin reads
+  # its own VM ID from these and reports it as the CSI node ID, which is what
+  # lets the agent resolve a node to a VM by identity instead of by name. Every
+  # node therefore needs the hyperv-daemons package installed and the Data
+  # Exchange integration service enabled on its VM; without them the pools are
+  # absent and the node plugin refuses to start.
+  kvpPoolDir: /var/lib/hyperv
+
   resources:
     requests:
       cpu: 10m

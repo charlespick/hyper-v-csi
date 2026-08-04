@@ -33,28 +33,28 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
     private const int AddressesPerController = 64;
 
     public Task<AttachedDisk?> FindAttachedDiskAsync(
-        string hostName, string vmName, string vhdxPath, CancellationToken cancellationToken) =>
+        string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
         Task.Run<AttachedDisk?>(() =>
         {
             var scope = ScopeFor(hostName);
-            using var settings = GetActiveSettings(scope, hostName, vmName);
+            using var settings = GetActiveSettings(scope, hostName, vmId);
             return FindAttachedDisk(scope, settings, vhdxPath, cancellationToken);
         }, cancellationToken);
 
     public Task<bool> IsDiskAttachedAsync(
-        string hostName, string vmName, string vhdxPath, CancellationToken cancellationToken) =>
+        string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
             var scope = ScopeFor(hostName);
-            using var settings = GetActiveSettings(scope, hostName, vmName);
+            using var settings = GetActiveSettings(scope, hostName, vmId);
             return LocateDisk(scope, settings, vhdxPath, cancellationToken) is not null;
         }, cancellationToken);
 
-    public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmName, CancellationToken cancellationToken) =>
+    public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
         Task.Run<DiskSlot?>(() =>
         {
             var scope = ScopeFor(hostName);
-            using var settings = GetActiveSettings(scope, hostName, vmName);
+            using var settings = GetActiveSettings(scope, hostName, vmId);
 
             var occupied = OccupiedAddresses(scope, settings, cancellationToken);
 
@@ -84,12 +84,12 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
         }, cancellationToken);
 
     public Task AttachDiskAsync(
-        string hostName, string vmName, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken) =>
+        string hostName, string vmId, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
             var scope = ScopeFor(hostName);
             using var management = GetManagementService(scope);
-            using var settings = GetActiveSettings(scope, hostName, vmName);
+            using var settings = GetActiveSettings(scope, hostName, vmId);
 
             using var driveTemplate = GetDefaultSettings(
                 scope, "Msvm_ResourceAllocationSettingData", SyntheticDiskDriveSubType);
@@ -109,7 +109,7 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
                 // failed" would leave the LUN occupied by something nobody knows
                 // to look for.
                 ?? throw new InvalidOperationException(
-                    $"added a disk drive to {vmName} at LUN {slot.Lun} but could not find it afterwards; " +
+                    $"added a disk drive to {vmId} at LUN {slot.Lun} but could not find it afterwards; " +
                     "it occupies that address until removed by hand");
 
             try
@@ -128,27 +128,27 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
                 // good: nothing else ever collects one, and every later attach
                 // simply picks the next address until the controller is full of
                 // drives holding no disks.
-                TryRemoveEmptyDrive(scope, management, drivePath, vmName, "a failed attach", CancellationToken.None);
+                TryRemoveEmptyDrive(scope, management, drivePath, vmId, "a failed attach", CancellationToken.None);
                 throw;
             }
 
             logger.LogInformation(
-                "attached {VhdxPath} to {VmName} on {HostName} at LUN {Lun}", vhdxPath, vmName, hostName, slot.Lun);
+                "attached {VhdxPath} to {VmId} on {HostName} at LUN {Lun}", vhdxPath, vmId, hostName, slot.Lun);
         }, cancellationToken);
 
-    public Task DetachDiskAsync(string hostName, string vmName, string vhdxPath, CancellationToken cancellationToken) =>
+    public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
             var scope = ScopeFor(hostName);
             using var management = GetManagementService(scope);
-            using var settings = GetActiveSettings(scope, hostName, vmName);
+            using var settings = GetActiveSettings(scope, hostName, vmId);
 
             var located = LocateDisk(scope, settings, vhdxPath, cancellationToken);
             if (located is null)
             {
                 logger.LogInformation(
-                    "{VhdxPath} is not in {VmName}'s configuration on {HostName}, so there is nothing to detach",
-                    vhdxPath, vmName, hostName);
+                    "{VhdxPath} is not in {VmId}'s configuration on {HostName}, so there is nothing to detach",
+                    vhdxPath, vmId, hostName);
                 return;
             }
 
@@ -169,12 +169,12 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
             // Removing the drive too, not just the disk: an empty drive keeps
             // its address on the controller, so leaving them behind would walk a
             // VM up to its 64-per-controller limit one detach at a time.
-            TryRemoveEmptyDrive(scope, management, located.DrivePath, vmName, "detaching its disk", cancellationToken);
+            TryRemoveEmptyDrive(scope, management, located.DrivePath, vmId, "detaching its disk", cancellationToken);
 
-            logger.LogInformation("detached {VhdxPath} from {VmName} on {HostName}", vhdxPath, vmName, hostName);
+            logger.LogInformation("detached {VhdxPath} from {VmId} on {HostName}", vhdxPath, vmId, hostName);
         }, cancellationToken);
 
-    public Task ResizeDiskAsync(string hostName, string vmName, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
+    public Task ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
         throw new NotSupportedException("ControllerExpandVolume is not implemented yet");
 
     private static ManagementScope ScopeFor(string hostName) =>
@@ -385,7 +385,7 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
         ManagementScope scope,
         ManagementObject management,
         string drivePath,
-        string vmName,
+        string vmId,
         string context,
         CancellationToken waitToken)
     {
@@ -400,27 +400,31 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
         catch (Exception ex)
         {
             logger.LogWarning(ex,
-                "could not remove the empty disk drive left on {VmName} after {Context}; it occupies an address on its controller until removed by hand",
-                vmName, context);
+                "could not remove the empty disk drive left on {VmId} after {Context}; it occupies an address on its controller until removed by hand",
+                vmId, context);
         }
     }
 
-    private static ManagementObject GetActiveSettings(ManagementScope scope, string hostName, string vmName)
+    private static ManagementObject GetActiveSettings(ManagementScope scope, string hostName, string vmId)
     {
-        if (!WqlNames.IsSafe(vmName))
+        if (!WqlNames.IsVmId(vmId))
         {
             // Not VmNotOnHostException: this VM has not migrated anywhere, the
-            // name is unusable. Reporting migration would send the caller off to
-            // re-resolve ownership and try the whole thing again for nothing.
+            // identifier is unusable. Reporting migration would send the caller
+            // off to re-resolve ownership and try the whole thing again for
+            // nothing.
             throw new InvalidOperationException(
-                $"{vmName} is not a usable virtual machine name");
+                $"{vmId} is not a virtual machine GUID");
         }
 
-        // Caption pins this to virtual machines: the host itself is an
-        // Msvm_ComputerSystem too, and a VM named after its host would
-        // otherwise be ambiguous.
+        // Name, not ElementName: on an Msvm_ComputerSystem the former is the
+        // VM's GUID and the latter its display name. Matching on the GUID is
+        // what removes the last naming assumption from the chain - the node
+        // plugin read this exact value out of the guest, and the cluster
+        // confirmed which host holds it, so nothing here depends on a VM, a
+        // cluster group, and a Kubernetes node all being called the same thing.
         using var searcher = new ManagementObjectSearcher(scope, new SelectQuery(
-            $"SELECT * FROM Msvm_ComputerSystem WHERE ElementName = '{vmName}' AND Caption = 'Virtual Machine'"));
+            $"SELECT * FROM Msvm_ComputerSystem WHERE Name = '{vmId}'"));
 
         using var results = searcher.Get();
         foreach (var instance in results)
@@ -437,12 +441,12 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
                 return (ManagementObject)setting;
             }
 
-            throw new InvalidOperationException($"VM {vmName} on {hostName} has no active setting data");
+            throw new InvalidOperationException($"VM {vmId} on {hostName} has no active setting data");
         }
 
         // Not a generic failure: the VM has almost certainly migrated, and the
         // caller re-resolves its owner rather than giving up.
-        throw new VmNotOnHostException(hostName, vmName);
+        throw new VmNotOnHostException(hostName, vmId);
     }
 
     private static ManagementObject GetManagementService(ManagementScope scope)

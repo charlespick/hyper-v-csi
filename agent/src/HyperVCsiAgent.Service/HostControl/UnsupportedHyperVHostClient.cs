@@ -11,24 +11,24 @@ namespace HyperVCsiAgent.Service.HostControl;
 public sealed class UnsupportedHyperVHostClient : IHyperVHostClient
 {
     public Task<AttachedDisk?> FindAttachedDiskAsync(
-        string hostName, string vmName, string vhdxPath, CancellationToken cancellationToken) =>
+        string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
         throw Unsupported();
 
     public Task<bool> IsDiskAttachedAsync(
-        string hostName, string vmName, string vhdxPath, CancellationToken cancellationToken) =>
+        string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
         throw Unsupported();
 
-    public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmName, CancellationToken cancellationToken) =>
+    public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
         throw Unsupported();
 
     public Task AttachDiskAsync(
-        string hostName, string vmName, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken) =>
+        string hostName, string vmId, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken) =>
         throw Unsupported();
 
-    public Task DetachDiskAsync(string hostName, string vmName, string vhdxPath, CancellationToken cancellationToken) =>
+    public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
         throw Unsupported();
 
-    public Task ResizeDiskAsync(string hostName, string vmName, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
+    public Task ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
         throw Unsupported();
 
     private static PlatformNotSupportedException Unsupported() =>

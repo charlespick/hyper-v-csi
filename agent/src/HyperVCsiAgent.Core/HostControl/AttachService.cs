@@ -209,32 +209,32 @@ public sealed class AttachService : IAttachService, IDisposable
             // The whole idempotency story, and it is one forward query on a host
             // we already know - the cheap direction. A replay after a restart
             // finds the disk and changes nothing.
-            var existing = await _host.FindAttachedDiskAsync(vm.OwningHost, vm.VmName, path, attempt.Token).ConfigureAwait(false);
+            var existing = await _host.FindAttachedDiskAsync(vm.OwningHost, vm.VmId, path, attempt.Token).ConfigureAwait(false);
             if (existing is not null)
             {
                 _logger.LogInformation(
-                    "AttachVolume {VolumeId}: already attached to {VmName} on {Host} at controller {Controller} LUN {Lun}",
-                    volumeId, vm.VmName, vm.OwningHost, existing.ControllerInstanceId, existing.Lun);
+                    "AttachVolume {VolumeId}: already attached to {VmId} on {Host} at controller {Controller} LUN {Lun}",
+                    volumeId, vm.VmId, vm.OwningHost, existing.ControllerInstanceId, existing.Lun);
                 return new AttachVolumeResult(path, existing.ControllerInstanceId, existing.Lun, AlreadyAttached: true);
             }
 
-            var slot = await _host.FindFreeSlotAsync(vm.OwningHost, vm.VmName, attempt.Token).ConfigureAwait(false)
+            var slot = await _host.FindFreeSlotAsync(vm.OwningHost, vm.VmId, attempt.Token).ConfigureAwait(false)
                 ?? throw JobFailureException.ResourceExhausted(
-                    $"every SCSI slot on {vm.VmName} is occupied, so volume {volumeId} cannot be attached");
+                    $"every SCSI slot on {vm.VmId} is occupied, so volume {volumeId} cannot be attached");
 
-            await _host.AttachDiskAsync(vm.OwningHost, vm.VmName, path, slot, attempt.Token).ConfigureAwait(false);
+            await _host.AttachDiskAsync(vm.OwningHost, vm.VmId, path, slot, attempt.Token).ConfigureAwait(false);
 
             // Read back rather than trust the slot we asked for: this confirms
             // the change actually landed in the VM's configuration, and the LUN
             // the node plugin is told about is then the one Hyper-V really used.
-            var placed = await _host.FindAttachedDiskAsync(vm.OwningHost, vm.VmName, path, attempt.Token).ConfigureAwait(false)
+            var placed = await _host.FindAttachedDiskAsync(vm.OwningHost, vm.VmId, path, attempt.Token).ConfigureAwait(false)
                 ?? throw new JobFailureException(
                     AgentErrorCodes.Internal,
-                    $"attaching volume {volumeId} to {vm.VmName} reported success but the disk is not in the VM's configuration");
+                    $"attaching volume {volumeId} to {vm.VmId} reported success but the disk is not in the VM's configuration");
 
             _logger.LogInformation(
-                "AttachVolume {VolumeId}: attached to {VmName} on {Host} at controller {Controller} LUN {Lun}",
-                volumeId, vm.VmName, vm.OwningHost, placed.ControllerInstanceId, placed.Lun);
+                "AttachVolume {VolumeId}: attached to {VmId} on {Host} at controller {Controller} LUN {Lun}",
+                volumeId, vm.VmId, vm.OwningHost, placed.ControllerInstanceId, placed.Lun);
             return new AttachVolumeResult(path, placed.ControllerInstanceId, placed.Lun, AlreadyAttached: false);
         }
         finally
@@ -260,32 +260,32 @@ public sealed class AttachService : IAttachService, IDisposable
             // fixes it, with the VolumeAttachment and the PV's deletion stuck
             // behind it. The VM's configuration is still what says whether this
             // needs doing, so a re-drive after a restart finds nothing and stops.
-            var attached = await _host.IsDiskAttachedAsync(vm.OwningHost, vm.VmName, path, attempt.Token).ConfigureAwait(false);
+            var attached = await _host.IsDiskAttachedAsync(vm.OwningHost, vm.VmId, path, attempt.Token).ConfigureAwait(false);
             if (!attached)
             {
                 _logger.LogInformation(
-                    "DetachVolume {VolumeId}: not attached to {VmName} on {Host}, so there is nothing to detach",
-                    volumeId, vm.VmName, vm.OwningHost);
+                    "DetachVolume {VolumeId}: not attached to {VmId} on {Host}, so there is nothing to detach",
+                    volumeId, vm.VmId, vm.OwningHost);
                 return;
             }
 
-            await _host.DetachDiskAsync(vm.OwningHost, vm.VmName, path, attempt.Token).ConfigureAwait(false);
+            await _host.DetachDiskAsync(vm.OwningHost, vm.VmId, path, attempt.Token).ConfigureAwait(false);
 
             // Read back, because everything downstream of this is built on the
             // assumption that a successful unpublish means detached: DeleteVolume
             // reclaims on it, and reporting success while the disk is still in the
             // VM's configuration is exactly how a reclaim comes to delete a disk a
             // stopped VM is still expecting.
-            var stillAttached = await _host.IsDiskAttachedAsync(vm.OwningHost, vm.VmName, path, attempt.Token).ConfigureAwait(false);
+            var stillAttached = await _host.IsDiskAttachedAsync(vm.OwningHost, vm.VmId, path, attempt.Token).ConfigureAwait(false);
             if (stillAttached)
             {
                 throw new JobFailureException(
                     AgentErrorCodes.Internal,
-                    $"detaching volume {volumeId} from {vm.VmName} reported success but the disk is still in the VM's configuration");
+                    $"detaching volume {volumeId} from {vm.VmId} reported success but the disk is still in the VM's configuration");
             }
 
             _logger.LogInformation(
-                "DetachVolume {VolumeId}: detached from {VmName} on {Host}", volumeId, vm.VmName, vm.OwningHost);
+                "DetachVolume {VolumeId}: detached from {VmId} on {Host}", volumeId, vm.VmId, vm.OwningHost);
         }
         finally
         {
@@ -312,7 +312,7 @@ public sealed class AttachService : IAttachService, IDisposable
         {
             throw new JobFailureException(
                 AgentErrorCodes.Internal,
-                $"{verb} volume {volumeId} on {vm.VmName} timed out after {_options.HostOperationTimeout} waiting for one of " +
+                $"{verb} volume {volumeId} on {vm.VmId} timed out after {_options.HostOperationTimeout} waiting for one of " +
                 $"{_options.MaxConcurrentHostOperations} operation slots on {vm.OwningHost}");
         }
 

@@ -49,25 +49,26 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --mode=node
-            # The Kubernetes node name, which kubelet records in the CSINode
-            # object and external-attacher then hands to ControllerPublishVolume.
-            # The agent resolves it by matching a failover cluster group of the
-            # same name, so a node whose VM role is named something else will
-            # fail to attach — see "ControllerPublishVolume identifies a node by
-            # cluster group name" in CSI Spec.md.
-            - --node-id=$(KUBE_NODE_NAME)
+            # No --node-id: the node identifies itself by its Hyper-V VM ID,
+            # read from the key-value pools below. That is the value kubelet
+            # records in CSINode and external-attacher hands to
+            # ControllerPublishVolume, so the agent resolves a node to a VM by
+            # identity rather than by matching names.
             - --endpoint=unix:///csi/csi.sock
-          env:
-            - name: KUBE_NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
+            - --kvp-pool-dir=/var/lib/hyperv
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
             - name: pods-mount-dir
               mountPath: {{ .Values.node.kubeletDir }}/pods
               mountPropagation: Bidirectional
+            # Read-only: the host publishes into these pools and the guest only
+            # reads them. hv_kvp_daemon must be running on the node (the
+            # hyperv-daemons package) or this directory is empty and the plugin
+            # refuses to start rather than guessing at its own identity.
+            - name: hyperv-kvp
+              mountPath: /var/lib/hyperv
+              readOnly: true
           resources:
             {{- toYaml .Values.node.resources | nindent 12 }}
           securityContext:
@@ -86,6 +87,14 @@ spec:
         - name: pods-mount-dir
           hostPath:
             path: {{ .Values.node.kubeletDir }}/pods
+            type: Directory
+        - name: hyperv-kvp
+          hostPath:
+            path: {{ .Values.node.kvpPoolDir }}
+            # Directory, not DirectoryOrCreate: conjuring an empty one would
+            # turn "integration services are not running" into a pod that starts
+            # and then fails to find its VM ID, which is a longer path to the
+            # same answer.
             type: Directory
       {{- with .Values.node.nodeSelector }}
       nodeSelector:

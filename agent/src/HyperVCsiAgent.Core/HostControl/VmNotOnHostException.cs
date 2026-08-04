@@ -7,10 +7,10 @@ namespace HyperVCsiAgent.Core.HostControl;
 /// anticipates rather than treats as a fault. The caller re-resolves ownership
 /// and tries once more.
 /// </summary>
-public sealed class VmNotOnHostException(string hostName, string vmName)
-    : Exception($"VM {vmName} is not registered on {hostName}; it has probably migrated")
+public sealed class VmNotOnHostException(string hostName, string vmId)
+    : Exception($"VM {vmId} is not registered on {hostName}; it has probably migrated")
 {
     public string HostName { get; } = hostName;
 
-    public string VmName { get; } = vmName;
+    public string VmId { get; } = vmId;
 }

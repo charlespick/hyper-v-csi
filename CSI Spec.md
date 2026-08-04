@@ -133,24 +133,41 @@ no attach completes, whatever `attachRequired` is set to — so `node.enabled` b
 silently disable the RPC this section is about. A pod using a PVC therefore reaches a real
 attach and then fails at NodeStageVolume, which is the honest place for it to fail.
 
-**ControllerPublishVolume identifies a node by cluster group name.** The CSI node ID is whatever the
-node plugin reports, which today is the Kubernetes node name. The agent resolves it with one
-`MSCluster_Resource` query for a resource of type `Virtual Machine` whose `OwnerGroup` is exactly
-that name — the *group*, not the resource, because clustering names the group after the VM while the
-resource inside it is `Virtual Machine <name>`. Matching the resource name against the node would
-find nothing, and since a node that resolves to no VM is reported NOT_FOUND (terminal, by design),
-that mistake fails every attach permanently rather than noisily. Exactly, too: never a prefix, never
-a fuzzy match, because a near-miss resolving to a neighbouring VM attaches a disk to the wrong
-machine. Requiring the group to contain a Virtual Machine resource is what stops an unrelated group
-that happens to share a node's name from resolving.
+**ControllerPublishVolume identifies a node by its Hyper-V VM ID, end to end.** The node plugin
+reads `VirtualMachineId` out of the guest's Hyper-V key-value pools — the values the host publishes
+through the Data Exchange integration service, which `hv_kvp_daemon` writes to
+`/var/lib/hyperv/.kvp_pool_*` — and reports that GUID as the CSI node ID. kubelet records it in
+`CSINode`, external-attacher hands it to this RPC, and the agent resolves it with one indexed
+lookup:
 
-The VM's own name then comes back from that query — the resource name with the `Virtual Machine `
-prefix stripped — rather than being re-derived from the node ID downstream. That is not tidiness: it
-is what makes the next paragraph's claim true.
+```
+SELECT Name, OwnerNode FROM MSCluster_VirtualMachine WHERE VmID = '<guid>'
+```
 
-The sturdier identity is one the guest reports about itself — its SMBIOS UUID, which is the VM's
-BIOSGUID — and swapping to it later is cheap by construction rather than by luck. Nothing but
-`IClusterService.ResolveVmAsync` interprets the node ID: the Go controller only concatenates
+`MSCluster_VirtualMachine` is the VM resource's private properties surfaced as a class, which is
+what makes `VmID` queryable at all — it is not a property of `MSCluster_Resource`, so a `WHERE`
+against that class could not use it. One query, no enumeration, no fan-out, and the answer is
+CLUSDB's, which every node has a replica of.
+
+The same GUID then identifies the VM on its host: `Msvm_ComputerSystem.Name` *is* the VM ID
+(`ElementName` is the display name). So no step in the chain depends on a Kubernetes node, a
+cluster group, and a virtual machine all being called the same thing — which the previous
+name-matching scheme did, at three separate points, each of which failed differently when an
+operator renamed something.
+
+Two things this now requires of every node, and both fail loudly rather than silently: the
+`hyperv-daemons` package installed with `hv_kvp_daemon` running, and the Data Exchange integration
+service enabled on the VM. Without either, the pools are absent or lack the key, and the node plugin
+refuses to start rather than falling back to its hostname — a fallback would let a misconfigured node
+register anyway and attach disks against whatever VM happened to share its name.
+
+Not `systemUUID`, which Kubernetes already collects and which would have needed no guest-side work:
+that is the VM's BIOSGUID, a different value from the VM ID, and CLUSDB does not index it. Resolving
+it would mean an `Msvm_VirtualSystemSettingData` query per Hyper-V host — the fan-out this design
+avoids everywhere else — or a cache to be invalidated. The KVP dependency buys the O(1) lookup.
+
+The node ID stays opaque above the resolution, which is what kept this swap local. Nothing but
+`IClusterService.ResolveVmAsync` interprets it: the Go controller only concatenates
 it into an idempotency key and a job target, and no PV field records it, because the driver
 advertises no topology and `VOLUME_ACCESSIBILITY_CONSTRAINTS` would put a node identity into
 `PV.spec.nodeAffinity`, where it is immutable for the life of the volume. The only persisted copy is

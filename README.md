@@ -101,10 +101,17 @@ shapes three defaults worth knowing about:
 
 The node plugin (`node.enabled`) is **on**, even though every `Node*` RPC that does real
 work is still a stub, because attach needs it for a reason unrelated to mounting. The node
-plugin's registration with kubelet is what creates the `CSINode` object, and `CSINode` is
-where external-attacher reads the CSI node ID it passes to `ControllerPublishVolume`.
-Without it there is no node ID to resolve and no attach can complete, whatever
-`attachRequired` says.
+plugin is what reports the node's identity — its Hyper-V VM ID — and its registration with
+kubelet is what puts that into the `CSINode` object, which is where external-attacher reads
+the ID it passes to `ControllerPublishVolume`. Without it there is no node ID to resolve
+and no attach can complete, whatever `attachRequired` says.
+
+**Every node needs `hyperv-daemons` installed with `hv_kvp_daemon` running, and the Data
+Exchange integration service enabled on its VM.** That is how the guest learns its own VM
+ID: the host publishes it into `/var/lib/hyperv/.kvp_pool_*`, which the node plugin mounts
+read-only. Without it the plugin refuses to start rather than falling back to the hostname,
+because a fallback would let a misconfigured node attach disks against whatever VM happened
+to share its name.
 
 So a pod using a PVC now gets as far as a real attach — a `VolumeAttachment`, a
 `ControllerPublishVolume` call, a disk appearing in the VM's configuration — and then

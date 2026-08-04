@@ -3,12 +3,11 @@ namespace HyperVCsiAgent.Core.Cluster;
 /// <summary>
 /// A node's virtual machine, as the cluster database describes it.
 /// </summary>
-/// <param name="VmName">
-/// What the VM is called on its Hyper-V host, for looking it up there. This
-/// comes from the cluster rather than being re-derived from the CSI node ID -
-/// that is what keeps the node ID interpreted in exactly one place, so
-/// replacing name matching with a guest-reported VM identity stays a change to
-/// <see cref="IClusterService"/> and nothing else.
+/// <param name="VmId">
+/// The VM's GUID, which is what identifies it on its Hyper-V host
+/// (<c>Msvm_ComputerSystem.Name</c>). The same value the node plugin read out of
+/// the guest's key-value pools and sent as the CSI node ID, carried through so
+/// that no layer has to match on a name.
 /// </param>
 /// <param name="OwningHost">The host currently running the VM.</param>
-public sealed record ClusteredVm(string VmName, string OwningHost);
+public sealed record ClusteredVm(string VmId, string OwningHost);

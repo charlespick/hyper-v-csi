@@ -3,19 +3,20 @@ using System.Text.RegularExpressions;
 namespace HyperVCsiAgent.Service.Cim;
 
 /// <summary>
-/// Guards the one place caller-supplied text reaches a WQL query: the node ID,
-/// which arrives over the job API and ends up in a WHERE clause.
+/// Guards the one place caller-supplied text reaches a WQL query: the CSI node
+/// ID, which arrives over the job API and ends up in a WHERE clause.
 /// </summary>
 public static partial class WqlNames
 {
     /// <summary>
-    /// A hostname-shaped name, which is what a Kubernetes node ID is. Rejecting
-    /// rather than escaping is deliberate: a name outside this shape cannot be a
-    /// node in this cluster anyway, so there is nothing to gain by carefully
-    /// passing it through to a query that will not match.
+    /// The canonical 8-4-4-4-12 GUID form, which is what a node ID is: the VM's
+    /// ID, read from the guest's key-value pools by the node plugin. Rejecting
+    /// anything else is both the injection guard and a real check - a node ID
+    /// that is not a GUID cannot identify a VM, so there is nothing to gain by
+    /// escaping it and passing it to a query that will not match.
     /// </summary>
-    [GeneratedRegex(@"^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$")]
-    private static partial Regex SafeName { get; }
+    [GeneratedRegex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")]
+    private static partial Regex Guid { get; }
 
-    public static bool IsSafe(string name) => SafeName.IsMatch(name);
+    public static bool IsVmId(string value) => Guid.IsMatch(value);
 }

@@ -16,50 +16,30 @@ public sealed class MsClusterService(ILogger<MsClusterService> logger) : ICluste
 {
     private const string ScopePath = @"\\.\root\MSCluster";
 
-    /// <summary>
-    /// The cluster resource type a clustered VM has. Matching on it keeps a
-    /// resource of another type in the same group - the Virtual Machine
-    /// Configuration resource, most obviously - from being mistaken for the VM.
-    /// </summary>
-    private const string VirtualMachineResourceType = "Virtual Machine";
-
-    /// <summary>
-    /// Clustering names a VM's resource after the VM but does not stop there:
-    /// the resource is "Virtual Machine &lt;name&gt;", while the *group* it lives in
-    /// is named "&lt;name&gt;" alone. So the node ID is matched against the group,
-    /// and the VM's own name is what remains once this prefix is removed.
-    /// </summary>
-    private const string VirtualMachineResourcePrefix = "Virtual Machine ";
-
     public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
         // System.Management is entirely synchronous, so the query runs on a
         // pool thread.
         Task.Run<ClusteredVm?>(() =>
         {
-            // A name outside this shape names no cluster group, and it is the
-            // one piece of caller-supplied text that reaches a WQL query.
-            if (!WqlNames.IsSafe(nodeId))
+            if (!WqlNames.IsVmId(nodeId))
             {
                 // Not null, which this interface reserves for "the cluster has
                 // no such VM" - a claim about the cluster, and we have not asked
-                // it anything. Unreachable for a real Kubernetes node name
-                // (DNS-1123 is a strict subset of this shape), but a caller that
-                // read this as "nothing is attached" would be acting on an
-                // answer nobody gave.
+                // it anything. A node ID that is not a GUID means the node
+                // plugin sent something other than its VM ID.
                 throw new InvalidOperationException(
-                    $"node {nodeId} is not a usable cluster group name, so the cluster cannot be asked about it");
+                    $"node ID {nodeId} is not a virtual machine GUID, so the cluster cannot be asked about it");
             }
 
             var scope = new ManagementScope(ScopePath);
 
-            // Matching on OwnerGroup rather than on the resource's own name is
-            // the whole point: the group is what carries the VM's name, and it
-            // is also what fails over. Requiring the resource inside it to be of
-            // type Virtual Machine means a group that merely shares a node's
-            // name cannot be mistaken for that node's VM.
+            // One indexed lookup, no enumeration and no fan-out. MSCluster_VirtualMachine
+            // is the cluster resource's private properties surfaced as a class, so VmID
+            // is queryable here in a way it is not on MSCluster_Resource - which is what
+            // makes resolving a node by identity as cheap as resolving one by name was,
+            // without the naming assumptions that came with the name.
             var query = new ObjectQuery(
-                "SELECT Name, OwnerNode FROM MSCluster_Resource " +
-                $"WHERE Type = '{VirtualMachineResourceType}' AND OwnerGroup = '{nodeId}'");
+                $"SELECT Name, OwnerNode FROM MSCluster_VirtualMachine WHERE VmID = '{nodeId}'");
 
             using var searcher = new ManagementObjectSearcher(scope, query);
             using var results = searcher.Get();
@@ -81,10 +61,11 @@ public sealed class MsClusterService(ILogger<MsClusterService> logger) : ICluste
                     // is attached", would have a detach report success without
                     // having touched the VM.
                     throw new InvalidOperationException(
-                        $"the cluster reports no owning node for the virtual machine in group {nodeId}, which should not be possible");
+                        $"the cluster reports no owning node for VM {nodeId}, which should not be possible");
                 }
 
-                return new ClusteredVm(VmNameOf(resource, nodeId), owner);
+                logger.LogDebug("VM {VmId} is owned by {OwnerNode}", nodeId, owner);
+                return new ClusteredVm(nodeId, owner);
             }
 
             return null;
@@ -94,29 +75,4 @@ public sealed class MsClusterService(ILogger<MsClusterService> logger) : ICluste
         throw new NotSupportedException(
             "node liveness is only needed for forced detach from a failed node, which is not implemented yet; " +
             "an unpublish whose owning host is down fails and is retried rather than fenced");
-
-    /// <summary>
-    /// The VM's name on its host, taken from the cluster's own record of it
-    /// rather than assumed to be the node ID.
-    /// </summary>
-    /// <remarks>
-    /// Both derivations here are conventions, not guarantees - a resource can be
-    /// renamed. The sturdy version reads the resource's VmID private property
-    /// and has the host look the VM up by GUID, which needs confirming against a
-    /// real cluster before it is worth writing; when it is, it changes this
-    /// method and nothing above it.
-    /// </remarks>
-    private static string VmNameOf(ManagementObject resource, string nodeId)
-    {
-        if (resource["Name"] as string is not { } resourceName || string.IsNullOrWhiteSpace(resourceName))
-        {
-            return nodeId;
-        }
-
-        return resourceName.StartsWith(VirtualMachineResourcePrefix, StringComparison.OrdinalIgnoreCase)
-            ? resourceName[VirtualMachineResourcePrefix.Length..]
-            // Renamed away from the default, so the group name is the better
-            // remaining guess at what the VM is called.
-            : nodeId;
-    }
 }
