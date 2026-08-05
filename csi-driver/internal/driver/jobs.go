@@ -61,15 +61,17 @@ func awaitJob(ctx context.Context, agent *agentclient.Client, jobID string, budg
 			if pollCtx.Err() != nil {
 				return nil, pollStopped(ctx, jobID, lastStatus, budget)
 			}
-			// Otherwise, most often the clustered role is mid-failover.
-			return nil, status.Errorf(codes.Unavailable, "polling job %s: %v", jobID, err)
+			// Otherwise, most often the clustered role is mid-failover - a
+			// brief, tolerable window per design.md. Fall through to the same
+			// backoff-and-retry tail a Pending/Running observation gets,
+			// rather than giving up on the first blip.
 		case job.Status == agentclient.JobSucceeded:
 			return job, nil
 		case job.Status == agentclient.JobFailed:
 			return nil, translateJobFailure(job)
+		default:
+			lastStatus = job.Status
 		}
-
-		lastStatus = job.Status
 
 		select {
 		case <-pollCtx.Done():

@@ -67,6 +67,28 @@ func TestAwaitJobBacksOffInsteadOfSpinning(t *testing.T) {
 	}
 }
 
+func TestAwaitJobRetriesATransientPollError(t *testing.T) {
+	// A GetJob call can fail for reasons that say nothing about the agent
+	// being gone - most often its clustered role is mid-failover, which
+	// design.md calls a tolerable, brief window. That should retry with the
+	// same backoff a Pending/Running observation gets, not fail the whole
+	// call on the first blip.
+	agent := newFakeAgent(t, agentclient.Job{Status: agentclient.JobSucceeded})
+	agent.failPolls = 2
+	client := agentclient.New(agent.URL)
+
+	job, err := awaitJob(context.Background(), client, "job-1", 5*time.Second)
+	if err != nil {
+		t.Fatalf("awaitJob: %v", err)
+	}
+	if job.Status != agentclient.JobSucceeded {
+		t.Errorf("status = %s, want Succeeded", job.Status)
+	}
+	if got := agent.pollCount(); got < 3 {
+		t.Errorf("polled %d times, want it to have retried past the transient errors before succeeding", got)
+	}
+}
+
 func TestAwaitJobStopsWhenTheCallerGivesUp(t *testing.T) {
 	// A cancelled RPC is the caller's own doing, so it comes back as CANCELLED
 	// rather than being reported as the agent being slow or unavailable.

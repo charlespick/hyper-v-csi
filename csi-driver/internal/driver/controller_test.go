@@ -986,6 +986,12 @@ type fakeAgent struct {
 	// forgetAfter makes GET start 404ing once this many polls have happened,
 	// standing in for the agent restarting mid-operation.
 	forgetAfter int
+
+	// failPolls makes the first this-many GETs come back as a transient
+	// non-404 failure before falling through to the normal sequence/forgotten
+	// handling, standing in for a blip like the agent's clustered role
+	// failing over mid-poll.
+	failPolls int
 }
 
 func newFakeAgent(t *testing.T, sequence ...agentclient.Job) *fakeAgent {
@@ -1014,6 +1020,12 @@ func newFakeAgent(t *testing.T, sequence ...agentclient.Job) *fakeAgent {
 
 		id := strings.TrimPrefix(r.URL.Path, "/v1/jobs/")
 		agent.polled = append(agent.polled, id)
+
+		if len(agent.polled) <= agent.failPolls {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, "simulated transient failure")
+			return
+		}
 
 		forgotten := len(agent.sequence) == 0 ||
 			(agent.forgetAfter > 0 && len(agent.polled) > agent.forgetAfter)
