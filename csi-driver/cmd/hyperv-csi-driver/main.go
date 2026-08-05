@@ -69,6 +69,8 @@ func main() {
 
 			log.Printf("node identity resolved from the Hyper-V key-value pools: VM %s", id)
 			*nodeID = id
+		} else {
+			log.Printf("WARNING: --node-id %q was set explicitly, bypassing resolution of this node's identity from the Hyper-V key-value pools", *nodeID)
 		}
 	default:
 		log.Fatalf("invalid --mode %q: must be \"controller\" or \"node\"", *mode)
