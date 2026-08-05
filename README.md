@@ -72,7 +72,7 @@ A Helm chart lives in [deploy/helm/hyperv-csi](deploy/helm/hyperv-csi). Build an
 the driver image first — the chart's default repository is a placeholder:
 
 ```bash
-docker build -t ghcr.io/charlespick/hyperv-csi-driver:0.1.0 csi-driver
+docker build --build-arg VERSION=0.1.0 -t ghcr.io/charlespick/hyperv-csi-driver:0.1.0 csi-driver
 docker push ghcr.io/charlespick/hyperv-csi-driver:0.1.0
 ```
 
