@@ -73,8 +73,11 @@ spec:
             {{- toYaml .Values.node.resources | nindent 12 }}
           securityContext:
             # Staging and publishing a volume means mounting inside the guest,
-            # which needs privilege. Nothing here does that work yet.
-            privileged: true
+            # which needs privilege — but NodeStageVolume/NodePublishVolume are
+            # still stubs, so nothing here does that work yet. Flip this back to
+            # true (or to a narrower capability set, if one turns out to suffice)
+            # when those RPCs actually mount.
+            privileged: false
       volumes:
         - name: socket-dir
           hostPath:
