@@ -124,6 +124,14 @@ public sealed class MsClusterService : IClusterService
                 "is this host a member of a failover cluster and is the cluster service running?");
         }
 
+        // Tracks the first match rather than returning on it, so that a second
+        // match - subkey enumeration order under this key is not meaningful,
+        // GUID-named subkeys - is not silently picked over. Every other
+        // "should not be possible" state below throws rather than guessing;
+        // an ambiguous match should not be the exception.
+        string? firstMatchResourceName = null;
+        string? firstMatchResourceId = null;
+
         foreach (var resourceId in resources.GetSubKeyNames())
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -179,10 +187,18 @@ public sealed class MsClusterService : IClusterService
                     $"cluster VM resource {resourceId} matched VmID {vmId} but has no readable Name value");
             }
 
-            return resourceName;
+            if (firstMatchResourceName is not null)
+            {
+                throw new InvalidOperationException(
+                    $"cluster VM resources {firstMatchResourceName} ({firstMatchResourceId}) and {resourceName} " +
+                    $"({resourceId}) both have VmID {vmId}, which should not be possible");
+            }
+
+            firstMatchResourceName = resourceName;
+            firstMatchResourceId = resourceId;
         }
 
-        return null;
+        return firstMatchResourceName;
     }
 
     /// <summary>
