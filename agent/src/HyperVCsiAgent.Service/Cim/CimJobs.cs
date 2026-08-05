@@ -47,7 +47,8 @@ public static class CimJobs
         CimMethodResult result,
         string methodName,
         CimDeadline deadline,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ILogger logger)
     {
         var returnValue = Convert.ToUInt32(result.ReturnValue.Value);
         if (returnValue == Completed)
@@ -81,6 +82,19 @@ public static class CimJobs
             var state = Convert.ToUInt16(job.CimInstanceProperties["JobState"].Value);
             if (state is JobStateCompleted or JobStateCompletedWithWarnings)
             {
+                if (state == JobStateCompletedWithWarnings)
+                {
+                    // Msvm_ConcreteJob populates ErrorDescription for a job that
+                    // finished with warnings too, not only for outright failures
+                    // - the same property the failure branch below reads.
+                    var warning = job.CimInstanceProperties["ErrorDescription"]?.Value as string;
+                    logger.LogWarning(
+                        "{MethodName} completed with warnings (job state {JobState}): {Warning}",
+                        methodName,
+                        state,
+                        string.IsNullOrWhiteSpace(warning) ? "no warning description" : warning);
+                }
+
                 return false;
             }
 

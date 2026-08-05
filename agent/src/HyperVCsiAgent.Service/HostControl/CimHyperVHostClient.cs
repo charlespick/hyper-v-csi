@@ -125,7 +125,8 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                 settings.Path.Path,
                 drive.GetText(TextFormat.WmiDtd20),
                 deadline,
-                cancellationToken)
+                cancellationToken,
+                _logger)
                 // AddResourceSettings only fills its out parameters when it
                 // answers inline. When it defers to a job, the drive is still
                 // there - find it where we just asked for it to be.
@@ -153,7 +154,8 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                     settings.Path.Path,
                     disk.GetText(TextFormat.WmiDtd20),
                     deadline,
-                    cancellationToken);
+                    cancellationToken,
+                    _logger);
             }
             catch
             {
@@ -197,7 +199,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             // every retry would then find no disk, report success, and leave the
             // drive exactly where it was - so the leak would happen anyway, with
             // a stuck VolumeAttachment on top of it.
-            RemoveResource(hostName, located.DiskPath, "the disk", deadline, cancellationToken);
+            RemoveResource(hostName, located.DiskPath, "the disk", deadline, cancellationToken, _logger);
 
             // Removing the drive too, not just the disk: an empty drive keeps
             // its address on the controller, so leaving them behind would walk a
@@ -379,7 +381,8 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         string settingsPath,
         string resourceSettingsXml,
         CimDeadline deadline,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ILogger logger)
     {
         using var session = CimSession.Create(hostName);
         using var management = GetManagementService(session, deadline, cancellationToken);
@@ -398,7 +401,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             deadline.Options("AddResourceSettings", cancellationToken));
 
         var completedInline = CimJobs.WaitForCompletion(
-            session, NamespaceName, result, "AddResourceSettings", deadline, cancellationToken);
+            session, NamespaceName, result, "AddResourceSettings", deadline, cancellationToken, logger);
 
         if (!completedInline || result.OutParameters["ResultingResourceSettings"]?.Value is not string[] { Length: > 0 } added)
         {
@@ -419,7 +422,8 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         string resourcePath,
         string description,
         CimDeadline deadline,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ILogger logger)
     {
         using var session = CimSession.Create(hostName);
         using var management = GetManagementService(session, deadline, cancellationToken);
@@ -434,7 +438,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             deadline.Options($"RemoveResourceSettings ({description})", cancellationToken));
 
         _ = CimJobs.WaitForCompletion(
-            session, NamespaceName, result, $"RemoveResourceSettings ({description})", deadline, cancellationToken);
+            session, NamespaceName, result, $"RemoveResourceSettings ({description})", deadline, cancellationToken, logger);
     }
 
     /// <summary>
@@ -475,7 +479,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                 deadline.Options("RemoveResourceSettings", attempt.Token));
 
             _ = CimJobs.WaitForCompletion(
-                session, NamespaceName, result, "RemoveResourceSettings", deadline, attempt.Token);
+                session, NamespaceName, result, "RemoveResourceSettings", deadline, attempt.Token, _logger);
         }
         catch (Exception ex)
         {

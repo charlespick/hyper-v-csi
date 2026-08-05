@@ -79,7 +79,7 @@ public sealed class CimVirtualDiskManager : IVirtualDiskManager
                 deadline.Options("CreateVirtualHardDisk", cancellationToken));
 
             _ = CimJobs.WaitForCompletion(
-                session, NamespaceName, result, "CreateVirtualHardDisk", deadline, cancellationToken);
+                session, NamespaceName, result, "CreateVirtualHardDisk", deadline, cancellationToken, _logger);
 
             _logger.LogInformation("created VHDX {Path} at {SizeBytes} bytes", path, maxInternalSizeBytes);
         }, cancellationToken);
@@ -102,7 +102,7 @@ public sealed class CimVirtualDiskManager : IVirtualDiskManager
                 deadline.Options("GetVirtualHardDiskSettingData", cancellationToken));
 
             var completedInline = CimJobs.WaitForCompletion(
-                session, NamespaceName, result, "GetVirtualHardDiskSettingData", deadline, cancellationToken);
+                session, NamespaceName, result, "GetVirtualHardDiskSettingData", deadline, cancellationToken, _logger);
 
             var settingData = result.OutParameters["SettingData"]?.Value as string;
             if (string.IsNullOrEmpty(settingData))
