@@ -101,27 +101,40 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
         // faults (every outcome is caught below), so this is pure sequencing.
         await previous.ConfigureAwait(false);
 
-        job.Status = JobStatus.Running;
+        lock (_gate)
+        {
+            job.Status = JobStatus.Running;
+        }
+
         try
         {
             // Status is what a poller keys off, so it must be the last thing
             // set: run fills in Result, and a reader that saw Succeeded before
             // the result landed would treat a good job as having returned
-            // nothing. Same reasoning for Error/ErrorCode below.
+            // nothing. Same reasoning for Error/ErrorCode below. The lock
+            // around each assignment is for cross-thread visibility, not
+            // ordering - it is never held across the run(...) await, so it
+            // does not serialize job execution.
             await run(job, _shutdown.Token).ConfigureAwait(false);
-            job.Status = JobStatus.Succeeded;
+            lock (_gate)
+            {
+                job.Status = JobStatus.Succeeded;
+            }
         }
         catch (Exception ex)
         {
-            job.Error = ex.Message;
-            job.ErrorCode = ex is JobFailureException failure ? failure.ErrorCode : AgentErrorCodes.Internal;
-            job.Status = JobStatus.Failed;
+            lock (_gate)
+            {
+                job.Error = ex.Message;
+                job.ErrorCode = ex is JobFailureException failure ? failure.ErrorCode : AgentErrorCodes.Internal;
+                job.Status = JobStatus.Failed;
+            }
         }
         finally
         {
-            job.CompletedAt = _clock.GetUtcNow();
             lock (_gate)
             {
+                job.CompletedAt = _clock.GetUtcNow();
                 if (--queue.Pending == 0)
                 {
                     _queues.Remove(target);
