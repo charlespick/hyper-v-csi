@@ -120,13 +120,56 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             drive["Parent"] = slot.ControllerPath;
             drive["AddressOnParent"] = slot.Lun.ToString(CultureInfo.InvariantCulture);
 
-            var drivePath = AddResource(
-                hostName,
-                settings.Path.Path,
-                drive.GetText(TextFormat.WmiDtd20),
-                deadline,
-                cancellationToken,
-                _logger)
+            string? addedDrivePath;
+            try
+            {
+                addedDrivePath = AddResource(
+                    hostName,
+                    settings.Path.Path,
+                    drive.GetText(TextFormat.WmiDtd20),
+                    deadline,
+                    cancellationToken,
+                    _logger);
+            }
+            catch
+            {
+                // AddResourceSettings can throw locally - most plausibly a
+                // TimeoutException from CimDeadline - while the job it
+                // started keeps running on the host and completes anyway;
+                // see CimDeadline's remarks for measurements of RPCs that
+                // outlive a local timeout. FindDrivePath already exists to
+                // find a drive a deferred job finished adding after this
+                // method stopped waiting for it, so it is reused here to
+                // check for exactly that before this failure is reported as
+                // "nothing was added" when something may have been.
+                try
+                {
+                    var leaked = FindDrivePath(scope, settings, slot, deadline, cancellationToken);
+                    if (leaked is not null)
+                    {
+                        TryRemoveEmptyDrive(hostName, leaked, vmId, "a failed attach", CancellationToken.None);
+                    }
+                    else
+                    {
+                        _logger.LogWarning(
+                            "a disk drive may have been added to {VmId} at LUN {Lun} before the attach failed; check by hand",
+                            vmId, slot.Lun);
+                    }
+                }
+                catch (Exception findEx)
+                {
+                    // Only this lookup's own failure is swallowed here - the
+                    // exception that got us into this catch block is what
+                    // must still reach the caller, below.
+                    _logger.LogWarning(findEx,
+                        "could not check whether a disk drive was added to {VmId} at LUN {Lun} before the attach failed; check by hand",
+                        vmId, slot.Lun);
+                }
+
+                throw;
+            }
+
+            var drivePath = addedDrivePath
                 // AddResourceSettings only fills its out parameters when it
                 // answers inline. When it defers to a job, the drive is still
                 // there - find it where we just asked for it to be.
