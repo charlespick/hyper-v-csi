@@ -44,9 +44,11 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     private const int AddressesPerController = 64;
 
     /// <summary>
-    /// How far a differencing chain is followed before it is treated as broken.
-    /// Hyper-V's own supported checkpoint depth is well inside this, so hitting
-    /// it means the walk is not terminating.
+    /// How far a differencing chain is followed before the walk gives up.
+    /// Bounds the work, not the answer: a legitimate chain built up from many
+    /// retained snapshots can reach this depth, so exhausting it is treated as
+    /// "cannot determine" - see <see cref="GuardAgainstDifferencingChain"/> -
+    /// not as proof the chain is unrelated.
     /// </summary>
     private const int MaxDifferencingChainDepth = 64;
 
@@ -150,9 +152,18 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                 // method stopped waiting for it, so it is reused here to
                 // check for exactly that before this failure is reported as
                 // "nothing was added" when something may have been.
+                //
+                // Deliberately not the outer deadline/cancellationToken: in
+                // the most plausible case above, both are already exhausted -
+                // that is what just made AddResourceSettings throw - so
+                // reusing them here would make this lookup fail the same way
+                // every time and never actually check anything. This recovery
+                // step gets its own fresh budget, the same way the cleanup
+                // below it does.
                 try
                 {
-                    var leaked = FindDrivePath(scope, settings, slot, deadline, cancellationToken);
+                    var recoveryDeadline = CimDeadline.After(_hostOperationTimeout);
+                    var leaked = FindDrivePath(scope, settings, slot, recoveryDeadline, CancellationToken.None);
                     if (leaked is not null)
                     {
                         TryRemoveEmptyDrive(hostName, leaked, vmId, "a failed attach", CancellationToken.None);
@@ -412,10 +423,18 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         foreach (var attached in otherDisks)
         {
             var descendant = attached;
+            var depth = 0;
 
             // Bounded because a walk that cannot terminate must not become a
-            // hang, and because a chain this deep is broken however it got there.
-            for (var depth = 0; depth < MaxDifferencingChainDepth; depth++)
+            // hang - but unlike every other loop bound in this file, reaching
+            // it is not itself the answer. Every other "cannot determine"
+            // state in this method throws rather than guessing (see the
+            // remarks above), so exhausting the bound without resolving this
+            // candidate does too: silently treating an unresolved chain as
+            // unrelated would be exactly the fail-open outcome this guard
+            // exists to prevent, and a differencing chain built up over many
+            // retained snapshots can legitimately run deep.
+            for (; depth < MaxDifferencingChainDepth; depth++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
@@ -435,6 +454,14 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                 }
 
                 descendant = parent;
+            }
+
+            if (depth == MaxDifferencingChainDepth)
+            {
+                throw new InvalidOperationException(
+                    $"{attached}'s differencing chain is still {MaxDifferencingChainDepth} disks deep without " +
+                    $"reaching a disk with no parent; cannot determine whether it is built on {vhdxPath}, so " +
+                    "this operation is refusing to guess");
             }
         }
     }
