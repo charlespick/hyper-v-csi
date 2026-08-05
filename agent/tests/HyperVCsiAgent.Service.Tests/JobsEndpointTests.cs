@@ -231,14 +231,14 @@ public sealed class JobsEndpointTests : IDisposable
 
         public int CreateCount { get; private set; }
 
-        public async Task CreateDynamicVhdxAsync(string path, long maxInternalSizeBytes, CancellationToken cancellationToken)
+        public async Task CreateDynamicVhdxAsync(string path, long maxInternalSizeBytes, TimeSpan remainingBudget, CancellationToken cancellationToken)
         {
             CreateCount++;
             await File.WriteAllTextAsync(path, "fake vhdx", cancellationToken);
             _sizes[Path.GetFileName(path)] = maxInternalSizeBytes;
         }
 
-        public Task<long> GetVirtualSizeAsync(string path, CancellationToken cancellationToken)
+        public Task<long> GetVirtualSizeAsync(string path, TimeSpan remainingBudget, CancellationToken cancellationToken)
         {
             // The service renames the disk into place after creating it, so
             // the in-progress name is what got recorded.

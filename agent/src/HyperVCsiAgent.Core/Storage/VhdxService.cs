@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using HyperVCsiAgent.Core.Configuration;
 using HyperVCsiAgent.Core.Jobs;
 using Microsoft.Extensions.Logging;
@@ -95,6 +96,15 @@ public sealed class VhdxService : IVhdxService, IDisposable
         using var attempt = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         attempt.CancelAfter(_options.DiskOperationTimeout);
 
+        // Tracks how much of the outer budget above each call into
+        // _diskManager has already spent, so a provider that needs its own
+        // absolute timeout (CIM cannot be interrupted by a token once a call
+        // is in flight - only its own timeout bounds it) gets what is actually
+        // left rather than a fresh full budget every time. Without this, a slow
+        // existence check could eat most of DiskOperationTimeout and the create
+        // that follows would still get a full second helping of it.
+        var elapsed = Stopwatch.StartNew();
+
         // The concurrency cap covers the existence check too, not just the
         // create: a burst of controller retries is exactly when the CIM
         // provider is least able to absorb a pile of concurrent queries.
@@ -107,7 +117,8 @@ public sealed class VhdxService : IVhdxService, IDisposable
             // never ran) and starts over cleanly.
             if (File.Exists(path))
             {
-                var existingSize = await _diskManager.GetVirtualSizeAsync(path, attempt.Token).ConfigureAwait(false);
+                var existingSize = await _diskManager.GetVirtualSizeAsync(
+                    path, _options.DiskOperationTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
                 if (existingSize >= sizeBytes && existingSize - sizeBytes <= SizeTolerance)
                 {
                     _logger.LogInformation(
@@ -132,8 +143,10 @@ public sealed class VhdxService : IVhdxService, IDisposable
                 File.Delete(inProgressPath);
             }
 
-            await _diskManager.CreateDynamicVhdxAsync(inProgressPath, sizeBytes, attempt.Token).ConfigureAwait(false);
-            var actualSize = await ReadBackSizeAsync(inProgressPath, sizeBytes, attempt.Token).ConfigureAwait(false);
+            await _diskManager.CreateDynamicVhdxAsync(
+                inProgressPath, sizeBytes, _options.DiskOperationTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
+            var actualSize = await ReadBackSizeAsync(
+                inProgressPath, sizeBytes, _options.DiskOperationTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
 
             File.Move(inProgressPath, path);
             _logger.LogInformation(
@@ -224,11 +237,12 @@ public sealed class VhdxService : IVhdxService, IDisposable
     /// size rather than failing - failing here would delete a healthy VHDX and
     /// leave the controller retrying a create that can never report success.
     /// </summary>
-    private async Task<long> ReadBackSizeAsync(string path, long requestedSize, CancellationToken cancellationToken)
+    private async Task<long> ReadBackSizeAsync(
+        string path, long requestedSize, TimeSpan remainingBudget, CancellationToken cancellationToken)
     {
         try
         {
-            return await _diskManager.GetVirtualSizeAsync(path, cancellationToken).ConfigureAwait(false);
+            return await _diskManager.GetVirtualSizeAsync(path, remainingBudget, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

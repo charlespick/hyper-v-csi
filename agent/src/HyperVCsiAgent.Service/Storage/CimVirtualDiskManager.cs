@@ -50,13 +50,13 @@ public sealed class CimVirtualDiskManager : IVirtualDiskManager
         _logger = logger;
     }
 
-    public Task CreateDynamicVhdxAsync(string path, long maxInternalSizeBytes, CancellationToken cancellationToken) =>
+    public Task CreateDynamicVhdxAsync(string path, long maxInternalSizeBytes, TimeSpan remainingBudget, CancellationToken cancellationToken) =>
         // The CIM calls are synchronous, so the exchange runs on a pool thread.
         // The token does not make them interruptible - the deadline does - but
         // it still keeps queued work from starting after a cancellation.
         Task.Run(() =>
         {
-            var deadline = CimDeadline.After(_options.DiskOperationTimeout);
+            var deadline = CimDeadline.After(remainingBudget);
 
             // Built through System.Management because the parameter is a MOF
             // string carrying an embedded instance, and MI refuses to marshal a
@@ -84,10 +84,10 @@ public sealed class CimVirtualDiskManager : IVirtualDiskManager
             _logger.LogInformation("created VHDX {Path} at {SizeBytes} bytes", path, maxInternalSizeBytes);
         }, cancellationToken);
 
-    public Task<long> GetVirtualSizeAsync(string path, CancellationToken cancellationToken) =>
+    public Task<long> GetVirtualSizeAsync(string path, TimeSpan remainingBudget, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
-            var deadline = CimDeadline.After(_options.DiskOperationTimeout);
+            var deadline = CimDeadline.After(remainingBudget);
 
             using var session = CimSession.Create(null);
             using var service = GetImageManagementService(session, deadline, cancellationToken);

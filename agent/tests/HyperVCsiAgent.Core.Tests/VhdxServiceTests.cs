@@ -553,7 +553,7 @@ public sealed class VhdxServiceTests : IDisposable
             }
         }
 
-        public async Task CreateDynamicVhdxAsync(string path, long maxInternalSizeBytes, CancellationToken cancellationToken)
+        public async Task CreateDynamicVhdxAsync(string path, long maxInternalSizeBytes, TimeSpan remainingBudget, CancellationToken cancellationToken)
         {
             Enter();
             try
@@ -584,7 +584,7 @@ public sealed class VhdxServiceTests : IDisposable
             }
         }
 
-        public async Task<long> GetVirtualSizeAsync(string path, CancellationToken cancellationToken)
+        public async Task<long> GetVirtualSizeAsync(string path, TimeSpan remainingBudget, CancellationToken cancellationToken)
         {
             Enter();
             try

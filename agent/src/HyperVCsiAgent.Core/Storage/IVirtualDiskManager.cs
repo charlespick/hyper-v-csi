@@ -14,11 +14,25 @@ public interface IVirtualDiskManager
     /// Creates a dynamically expanding VHDX at <paramref name="path"/>, which
     /// must not already exist.
     /// </summary>
-    Task CreateDynamicVhdxAsync(string path, long maxInternalSizeBytes, CancellationToken cancellationToken);
+    /// <param name="remainingBudget">
+    /// How much of the caller's overall operation budget is left when this call
+    /// is made. A cancellation token is cooperative only - it can stop work that
+    /// has not started yet, but it cannot interrupt a call already blocked
+    /// inside the underlying management protocol - so an implementation that
+    /// talks to something like that has to bound its own request timeout by
+    /// this value instead of assuming it gets a fresh full timeout of its own.
+    /// </param>
+    Task CreateDynamicVhdxAsync(string path, long maxInternalSizeBytes, TimeSpan remainingBudget, CancellationToken cancellationToken);
 
     /// <summary>
     /// Returns the virtual (max internal) size of an existing VHDX, not its
     /// on-disk footprint.
     /// </summary>
-    Task<long> GetVirtualSizeAsync(string path, CancellationToken cancellationToken);
+    /// <param name="remainingBudget">
+    /// How much of the caller's overall operation budget is left when this call
+    /// is made. See <see cref="CreateDynamicVhdxAsync"/> for why this - and not
+    /// just <paramref name="cancellationToken"/> - is what an implementation
+    /// should bound its own request timeout by.
+    /// </param>
+    Task<long> GetVirtualSizeAsync(string path, TimeSpan remainingBudget, CancellationToken cancellationToken);
 }

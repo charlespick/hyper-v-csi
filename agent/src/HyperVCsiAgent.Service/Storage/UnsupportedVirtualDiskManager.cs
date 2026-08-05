@@ -10,10 +10,10 @@ namespace HyperVCsiAgent.Service.Storage;
 /// </summary>
 public sealed class UnsupportedVirtualDiskManager : IVirtualDiskManager
 {
-    public Task CreateDynamicVhdxAsync(string path, long maxInternalSizeBytes, CancellationToken cancellationToken) =>
+    public Task CreateDynamicVhdxAsync(string path, long maxInternalSizeBytes, TimeSpan remainingBudget, CancellationToken cancellationToken) =>
         throw Unsupported();
 
-    public Task<long> GetVirtualSizeAsync(string path, CancellationToken cancellationToken) =>
+    public Task<long> GetVirtualSizeAsync(string path, TimeSpan remainingBudget, CancellationToken cancellationToken) =>
         throw Unsupported();
 
     private static PlatformNotSupportedException Unsupported() =>
