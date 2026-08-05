@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Management;
 using System.Runtime.Versioning;
+using System.Xml.Linq;
 using HyperVCsiAgent.Core.Configuration;
 using HyperVCsiAgent.Core.HostControl;
 using HyperVCsiAgent.Service.Cim;
@@ -42,6 +43,13 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     /// </summary>
     private const int AddressesPerController = 64;
 
+    /// <summary>
+    /// How far a differencing chain is followed before it is treated as broken.
+    /// Hyper-V's own supported checkpoint depth is well inside this, so hitting
+    /// it means the walk is not terminating.
+    /// </summary>
+    private const int MaxDifferencingChainDepth = 64;
+
     private readonly ILogger<CimHyperVHostClient> _logger;
     private readonly TimeSpan _hostOperationTimeout;
 
@@ -58,7 +66,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             var deadline = CimDeadline.After(_hostOperationTimeout);
             var scope = ScopeFor(hostName);
             using var settings = GetActiveSettings(scope, hostName, vmId, deadline, cancellationToken);
-            return FindAttachedDisk(scope, settings, vhdxPath, deadline, cancellationToken);
+            return FindAttachedDisk(scope, settings, vmId, vhdxPath, deadline, cancellationToken);
         }, cancellationToken);
 
     public Task<bool> IsDiskAttachedAsync(
@@ -68,7 +76,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             var deadline = CimDeadline.After(_hostOperationTimeout);
             var scope = ScopeFor(hostName);
             using var settings = GetActiveSettings(scope, hostName, vmId, deadline, cancellationToken);
-            return LocateDisk(scope, settings, vhdxPath, deadline, cancellationToken) is not null;
+            return LocateDisk(scope, settings, vmId, vhdxPath, deadline, cancellationToken) is not null;
         }, cancellationToken);
 
     public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
@@ -221,7 +229,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var settings = GetActiveSettings(scope, hostName, vmId, deadline, cancellationToken);
 
-            var located = LocateDisk(scope, settings, vhdxPath, deadline, cancellationToken);
+            var located = LocateDisk(scope, settings, vmId, vhdxPath, deadline, cancellationToken);
             if (located is null)
             {
                 _logger.LogInformation(
@@ -261,11 +269,12 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     private static AttachedDisk? FindAttachedDisk(
         ManagementScope scope,
         ManagementObject settings,
+        string vmId,
         string vhdxPath,
         CimDeadline deadline,
         CancellationToken cancellationToken)
     {
-        if (LocateDisk(scope, settings, vhdxPath, deadline, cancellationToken) is not { } located)
+        if (LocateDisk(scope, settings, vmId, vhdxPath, deadline, cancellationToken) is not { } located)
         {
             return null;
         }
@@ -295,10 +304,15 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     private static DiskLocation? LocateDisk(
         ManagementScope scope,
         ManagementObject settings,
+        string vmId,
         string vhdxPath,
         CimDeadline deadline,
         CancellationToken cancellationToken)
     {
+        // Every attached disk this traversal rejected, kept so that "not found"
+        // can be checked before it is believed - see the guard below.
+        var otherDisks = new List<string>();
+
         foreach (var disk in DeviceSettings(scope, settings, "Msvm_StorageAllocationSettingData", deadline, cancellationToken))
         {
             using (disk)
@@ -308,8 +322,14 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                     continue;
                 }
 
-                if (disk["HostResource"] is not string[] { Length: > 0 } hostResource || !SamePath(hostResource[0], vhdxPath))
+                if (disk["HostResource"] is not string[] { Length: > 0 } hostResource)
                 {
+                    continue;
+                }
+
+                if (!SamePath(hostResource[0], vhdxPath))
+                {
+                    otherDisks.Add(hostResource[0]);
                     continue;
                 }
 
@@ -346,7 +366,125 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             }
         }
 
+        // "Not attached" is the answer that lets unpublish report success and
+        // DeleteVolume reclaim the file, so it is checked before it is returned.
+        GuardAgainstDifferencingChain(scope, vmId, vhdxPath, otherDisks, deadline, cancellationToken);
         return null;
+    }
+
+    /// <summary>
+    /// Rules out the one way this VM can be using the VHDX under a name that is
+    /// not the VHDX's own, and refuses to answer rather than guess if it cannot
+    /// tell.
+    /// </summary>
+    /// <remarks>
+    /// Taking a checkpoint does not reformat HostResource, it replaces it:
+    /// measured on Hyper-V, <c>Checkpoint-VM</c> rewrites the active setting from
+    /// <c>probe.vhdx</c> to <c>probe_&lt;GUID&gt;.avhdx</c>, and a second
+    /// checkpoint stacks another .avhdx on top of that one. Deleting the
+    /// checkpoint puts the original path back. Nothing about the file name is
+    /// worth matching on - the link that survives is ParentPath, so this walks it.
+    ///
+    /// Without this the path comparison stops matching the moment anyone
+    /// checkpoints the VM - a person, or the backup product that checkpoints it
+    /// nightly - and the driver stops seeing its own volume. Detach would then
+    /// find nothing to detach, report success, and DeleteVolume would delete the
+    /// base of a differencing chain the VM is still built on. That is not
+    /// theoretical: with the VM off, the base VHDX under a checkpoint is not
+    /// locked, so the delete succeeds.
+    ///
+    /// Refusing rather than resolving is the deliberate half. Once the chain is
+    /// found, the disk really is attached, but removing it would detach the whole
+    /// chain and orphan every .avhdx on it, and reclaiming the base afterwards
+    /// would still destroy the checkpoints. Neither outcome is one an operator
+    /// asked for, so the operation stops with a message naming what is in the
+    /// way. Deleting the checkpoint restores the direct match and the retry
+    /// succeeds.
+    /// </remarks>
+    private static void GuardAgainstDifferencingChain(
+        ManagementScope scope,
+        string vmId,
+        string vhdxPath,
+        List<string> otherDisks,
+        CimDeadline deadline,
+        CancellationToken cancellationToken)
+    {
+        foreach (var attached in otherDisks)
+        {
+            var descendant = attached;
+
+            // Bounded because a walk that cannot terminate must not become a
+            // hang, and because a chain this deep is broken however it got there.
+            for (var depth = 0; depth < MaxDifferencingChainDepth; depth++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                // A disk with no parent is not a differencing disk, which ends
+                // this candidate rather than the search.
+                if (ParentPathOf(scope, descendant, deadline, cancellationToken) is not { } parent)
+                {
+                    break;
+                }
+
+                if (SamePath(parent, vhdxPath))
+                {
+                    throw new InvalidOperationException(
+                        $"{vhdxPath} is not attached to {vmId} directly, but {attached} is and its differencing " +
+                        "chain is built on it - the VM has a checkpoint. Detaching or deleting the volume now " +
+                        "would break that chain, so delete the checkpoint first.");
+                }
+
+                descendant = parent;
+            }
+        }
+    }
+
+    /// <summary>
+    /// A VHDX's parent, or null when it has none - which is also how a plain disk
+    /// is told from a differencing one.
+    /// </summary>
+    private static string? ParentPathOf(
+        ManagementScope scope,
+        string vhdxPath,
+        CimDeadline deadline,
+        CancellationToken cancellationToken)
+    {
+        using var searcher = new ManagementObjectSearcher(
+            scope, new SelectQuery("SELECT * FROM Msvm_ImageManagementService"));
+
+        using var services = WithDeadline(
+            deadline, cancellationToken, "locating Msvm_ImageManagementService", searcher.Get);
+
+        using var service = services.Cast<ManagementObject>().FirstOrDefault()
+            ?? throw new InvalidOperationException(
+                $"no Msvm_ImageManagementService in {scope.Path}; is the Hyper-V role installed on that host?");
+
+        using var inParams = service.GetMethodParameters("GetVirtualHardDiskSettingData");
+        inParams["Path"] = vhdxPath;
+
+        using var result = WithDeadline(
+            deadline,
+            cancellationToken,
+            $"reading disk setting data for {vhdxPath}",
+            () => service.InvokeMethod("GetVirtualHardDiskSettingData", inParams, null));
+
+        // This read answers inline - it touches a file, not a VM - so an empty
+        // out parameter means it failed, not that it deferred. Either way the
+        // caller is deciding whether a volume is safe to delete, so an
+        // unanswerable question has to stop it rather than pass for "no parent".
+        if (result["SettingData"] as string is not { Length: > 0 } settingData)
+        {
+            throw new InvalidOperationException(
+                $"could not read the setting data for {vhdxPath}, so whether it has a parent disk is unknown");
+        }
+
+        var parent = XDocument.Parse(settingData)
+            .Descendants("PROPERTY")
+            .FirstOrDefault(property => (string?)property.Attribute("NAME") == "ParentPath")
+            ?.Element("VALUE")
+            ?.Value;
+
+        return string.IsNullOrEmpty(parent) ? null : parent;
     }
 
     /// <param name="Lun">Null when the drive reports no readable address, which each caller decides what to do about.</param>
@@ -702,6 +840,25 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     private static bool SameInstance(string left, string right) =>
         string.Equals(InstanceIdOfPath(left), InstanceIdOfPath(right), StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// Compares two VHDX paths the way the round trip through vmms allows.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately no canonicalization beyond case and surrounding whitespace,
+    /// because measurement says none is needed: vmms stores HostResource exactly
+    /// as it was handed over and never reformats it. Paths written as
+    /// <c>C:\dir\.\d.vhdx</c>, <c>C:\dir\\d.vhdx</c> and <c>\\?\C:\dir\d.vhdx</c>
+    /// all read back byte-for-byte identical, and stay that way across a vmms
+    /// restart and across the VM being started and stopped. Since every path this
+    /// driver writes comes from VolumeNaming.ResolvePath - a pure function of the
+    /// configured root and the volume ID - what attach writes is what detach
+    /// compares against.
+    ///
+    /// Normalizing more would therefore protect against nothing, while making
+    /// this willing to call two different files the same one. What the comparison
+    /// genuinely cannot see is a path vmms replaced rather than reformatted; that
+    /// is what <see cref="GuardAgainstDifferencingChain"/> exists for.
+    /// </remarks>
     private static bool SamePath(string left, string right) =>
         string.Equals(left.Trim(), right.Trim(), StringComparison.OrdinalIgnoreCase);
 
