@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"strconv"
+	"strings"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
@@ -395,7 +396,16 @@ func (s *controllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 // operation is actually about, so a retry for one node doesn't collide with
 // work for the same volume on another.
 func publishKey(volumeID, nodeID string) string {
-	return volumeID + "/" + nodeID
+	return escapeKeyComponent(volumeID) + "/" + escapeKeyComponent(nodeID)
+}
+
+// escapeKeyComponent makes s safe to join with "/" as a delimiter by percent-
+// encoding any "%" or "/" it contains, so no unescaped "/" can appear except
+// the one true delimiter and two different (volumeID, nodeID) pairs can never
+// collide onto the same key.
+func escapeKeyComponent(s string) string {
+	s = strings.ReplaceAll(s, "%", "%25")
+	return strings.ReplaceAll(s, "/", "%2F")
 }
 
 // vmTarget names the resource the agent serializes VM-level work against. Two

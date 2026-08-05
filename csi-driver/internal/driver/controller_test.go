@@ -893,6 +893,12 @@ func TestControllerUnpublishVolumeForgottenJobIsRetryable(t *testing.T) {
 	}
 }
 
+func TestPublishKeyDoesNotCollideAcrossAnEmbeddedSlash(t *testing.T) {
+	if publishKey("a/b", "c") == publishKey("a", "b/c") {
+		t.Fatalf("publishKey(%q, %q) collided with publishKey(%q, %q)", "a/b", "c", "a", "b/c")
+	}
+}
+
 func publishRequest(volumeID, nodeID string) *csi.ControllerPublishVolumeRequest {
 	return &csi.ControllerPublishVolumeRequest{
 		VolumeId: volumeID,
