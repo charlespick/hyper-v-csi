@@ -570,7 +570,13 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
 
         var parameters = new CimMethodParametersCollection
         {
-            CimMethodParameter.Create("AffectedConfiguration", settingsPath, CimType.String, CimFlags.In),
+            // AffectedConfiguration is a REF in this class's schema, not a plain
+            // string - passing the object path as a string trips MI's own type
+            // check ("MI_STRING does not match the expected type ... MI_REFERENCE")
+            // before the call ever reaches vmms. A reference is just the class
+            // name plus key properties, both pulled from the path itself.
+            CimMethodParameter.Create(
+                "AffectedConfiguration", ReferenceToPath(settingsPath), CimType.Reference, CimFlags.In),
 
             // Embedded instances, serialized as WMI XML - the same shape
             // CreateVirtualHardDisk's setting data takes.
@@ -611,7 +617,11 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
 
         var parameters = new CimMethodParametersCollection
         {
-            CimMethodParameter.Create("ResourceSettings", new[] { resourcePath }, CimType.StringArray, CimFlags.In),
+            // Same REF-not-string schema mismatch as AddResourceSettings'
+            // AffectedConfiguration, one level deeper: this one is an array of
+            // references (MI_REFERENCEA), not an array of strings (MI_STRINGA).
+            CimMethodParameter.Create(
+                "ResourceSettings", new[] { ReferenceToPath(resourcePath) }, CimType.ReferenceArray, CimFlags.In),
         };
 
         using var result = session.InvokeMethod(
@@ -652,7 +662,8 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
 
             var parameters = new CimMethodParametersCollection
             {
-                CimMethodParameter.Create("ResourceSettings", new[] { drivePath }, CimType.StringArray, CimFlags.In),
+                CimMethodParameter.Create(
+                    "ResourceSettings", new[] { ReferenceToPath(drivePath) }, CimType.ReferenceArray, CimFlags.In),
             };
 
             using var result = session.InvokeMethod(
@@ -823,6 +834,21 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
 
     private static string InstanceIdOf(ManagementObject device) =>
         device["InstanceID"] as string ?? device.Path.RelativePath;
+
+    /// <summary>
+    /// Builds an MI reference instance - a class name plus key properties, no
+    /// other fields - for a method parameter typed REF (or REF[]) in the class
+    /// schema, from a WMI object path already in hand. Both halves come out of
+    /// the path itself: the class name from <see cref="ManagementPath"/>, the
+    /// InstanceID key from <see cref="InstanceIdOfPath"/> - the same parse
+    /// already used to match a Parent reference to its owning device.
+    /// </summary>
+    private static CimInstance ReferenceToPath(string wmiPath)
+    {
+        var reference = new CimInstance(new ManagementPath(wmiPath).ClassName, NamespaceName);
+        reference.CimInstanceProperties.Add(CimProperty.Create("InstanceID", InstanceIdOfPath(wmiPath), CimFlags.Key));
+        return reference;
+    }
 
     /// <summary>
     /// Pulls the InstanceID out of a Parent reference so a child can be matched

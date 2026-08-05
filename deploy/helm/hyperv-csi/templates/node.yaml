@@ -59,9 +59,12 @@ spec:
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
+            # No mountPropagation: Bidirectional requires a privileged
+            # container, and nothing here mounts anything yet (see
+            # privileged: false below). Add it back alongside privileged: true
+            # when NodeStageVolume/NodePublishVolume actually mount.
             - name: pods-mount-dir
               mountPath: {{ .Values.node.kubeletDir }}/pods
-              mountPropagation: Bidirectional
             # Read-only: the host publishes into these pools and the guest only
             # reads them. hv_kvp_daemon must be running on the node (the
             # hyperv-daemons package) or this directory is empty and the plugin
