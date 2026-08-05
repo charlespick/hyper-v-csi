@@ -149,6 +149,23 @@ func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 			req.GetName(), result.ActualSizeBytes, limit)
 	}
 
+	if required := req.GetCapacityRange().GetRequiredBytes(); required > 0 && result.ActualSizeBytes < required {
+		// A pre-existing disk too small for this request is a name collision
+		// with incompatible parameters, which CSI spells ALREADY_EXISTS.
+		if result.AlreadyPresent {
+			return nil, status.Errorf(codes.AlreadyExists,
+				"volume %s already exists at %d bytes, below the requested minimum of %d",
+				req.GetName(), result.ActualSizeBytes, required)
+		}
+
+		// One we just created should be impossible — the request is at least
+		// the minimum, and Hyper-V only rounds up. Say so rather than hand
+		// back a volume that violates the range that was asked for.
+		return nil, status.Errorf(codes.Internal,
+			"created volume %s at %d bytes, below the requested minimum of %d",
+			req.GetName(), result.ActualSizeBytes, required)
+	}
+
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
 			// The volume ID is the name verbatim, by choice: it makes the CSV

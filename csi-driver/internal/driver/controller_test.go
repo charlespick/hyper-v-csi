@@ -403,6 +403,32 @@ func TestCreateVolumeCreatingAVolumeOverTheLimitIsOurBugNotACollision(t *testing
 	}
 }
 
+func TestCreateVolumeExistingVolumeUnderTheMinimumIsAlreadyExists(t *testing.T) {
+	// A replay for a name whose disk is smaller than this request requires:
+	// the existing volume is incompatible, which CSI spells ALREADY_EXISTS.
+	server := newControllerServer(newFakeAgent(t, succeeded(`{"volumeId":"pvc-1","actualSizeBytes":1073741824,"alreadyPresent":true}`)))
+
+	_, err := server.CreateVolume(context.Background(), createVolumeRequest("pvc-1", 2*gibibyte, 0))
+
+	if got := status.Code(err); got != codes.AlreadyExists {
+		t.Fatalf("code = %s, want AlreadyExists (err: %v)", got, err)
+	}
+}
+
+func TestCreateVolumeCreatingAVolumeUnderTheMinimumIsOurBugNotACollision(t *testing.T) {
+	// Should be impossible — the size handed to the agent is already at least
+	// the minimum, and Hyper-V only rounds up. If it ever happens it's ours to
+	// fix, and reporting AlreadyExists would send the operator hunting for a
+	// colliding volume that doesn't exist.
+	server := newControllerServer(newFakeAgent(t, created(1*gibibyte)))
+
+	_, err := server.CreateVolume(context.Background(), createVolumeRequest("pvc-1", 2*gibibyte, 0))
+
+	if got := status.Code(err); got != codes.Internal {
+		t.Fatalf("code = %s, want Internal (err: %v)", got, err)
+	}
+}
+
 func TestDeleteVolumeEnqueuesUnderTheVolumeIDAsIdempotencyKey(t *testing.T) {
 	agent := newFakeAgent(t, agentclient.Job{Status: agentclient.JobSucceeded})
 	server := newControllerServer(agent)
