@@ -14,8 +14,8 @@ covered by unit tests but has never run against a real failover cluster or Hyper
 | Probe | Both | Health check confirming the plugin is ready to serve requests. | N/A | Stub — always reports ready |
 | CreateVolume | Controller | Provisions a new volume and returns its identifier. | Volume name | Tested — creates a VHDX on disk |
 | DeleteVolume | Controller | Removes a previously provisioned volume. | Volume ID | Tested |
-| ControllerPublishVolume | Controller | Attaches a volume to a specified node. | Volume ID + node ID | Pending testing |
-| ControllerUnpublishVolume | Controller | Detaches a volume from a specified node. | Volume ID + node ID | Pending testing |
+| ControllerPublishVolume | Controller | Attaches a volume to a specified node. | Volume ID + node ID | Tested — attaches against a real cluster |
+| ControllerUnpublishVolume | Controller | Detaches a volume from a specified node. | Volume ID + node ID | Tested — detaches against a real cluster |
 | ValidateVolumeCapabilities | Controller | Confirms a volume supports the requested access mode and type. | Volume ID (lookup only) | Not started |
 | ControllerGetCapabilities | Controller | Reports which controller RPCs this plugin implements. | N/A | Over advertising until project is finished |
 | ControllerExpandVolume | Controller | Grows a volume's underlying storage. | Volume ID | Not started |
@@ -81,6 +81,22 @@ it re-reads the VM's configuration, and reports success only if the disk is real
 read-back is not defensive habit — it is what the paragraph above is resting on. A detach that
 silently did nothing, reported as success, is precisely the path that ends with a reclaim deleting
 a disk a stopped VM still expects, and nothing downstream would catch it.
+
+**A checkpoint is the one way that confirmation could still be fooled, and it's closed too.**
+Checkpointing a VM does not reformat `HostResource`, it replaces it: `Checkpoint-VM` rewrites the
+active setting from `probe.vhdx` to `probe_<GUID>.avhdx`, stacking another `.avhdx` on top for each
+further checkpoint. A bare path comparison would then find nothing under the VHDX's own name and
+report it as not attached — exactly the silent-detach-that-did-nothing failure the paragraph above
+warns about, and with the VM off the base VHDX under a checkpoint isn't even locked, so DeleteVolume
+would go on to reclaim it. `LocateDisk` — shared by the pre-attach check, `IsDiskAttachedAsync`, and
+detach's confirmation — walks the `ParentPath` chain of every other disk in the VM's configuration
+before concluding "not attached," and refuses the operation if one is built on the volume rather
+than guessing, including refusing outright if that walk can't resolve within a bounded number of
+hops (a chain built from many retained snapshots can legitimately run deep, so exhausting the bound
+is treated as "cannot tell," not as proof the chain is unrelated). Nothing here resolves the chain
+automatically: removing the disk would orphan every `.avhdx` built on it, and reclaiming the base
+afterward would destroy the checkpoints regardless. Deleting the checkpoint restores the direct
+match and the retry succeeds.
 
 **Unpublish is tolerant where publish is strict, deliberately.** A volume ID that could not have
 come from CreateVolume, a volume that was never attached, and a node the cluster no longer knows
