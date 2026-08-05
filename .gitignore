@@ -1,8 +1,9 @@
-.DS_Store
-
 # .NET
 agent/**/bin/
 agent/**/obj/
+.vs/
+*.user
+*.suo
 
 # Agent dev default for CsvVolumesRoot (see appsettings.Development.json)
 agent/**/dev-volumes/
