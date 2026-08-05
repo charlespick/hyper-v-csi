@@ -77,27 +77,7 @@ agentOptions.Validate();
 // convenience, never a deployment state. Anything that can reach an unsecured
 // agent can create and delete volumes on the CSV, so refuse to start rather
 // than let a misconfigured deployment come up quietly serving plaintext.
-if (!app.Environment.IsDevelopment())
-{
-    if (!agentOptions.Tls.IsConfigured)
-    {
-        throw new InvalidOperationException(
-            $"{AgentOptions.SectionName}:Tls:SubjectName is required outside Development; the agent must not serve plaintext HTTP");
-    }
-
-    if (!agentOptions.Authentication.IsConfigured)
-    {
-        throw new InvalidOperationException(
-            $"{AgentOptions.SectionName}:Authentication:AllowedClientCertificateThumbprints is required outside Development; " +
-            "an agent without client authentication lets anything that can reach it provision and delete volumes");
-    }
-}
-else if (!agentOptions.Tls.IsConfigured || !agentOptions.Authentication.IsConfigured)
-{
-    app.Logger.LogWarning(
-        "running without {Missing}. This is Development only - any caller that can reach this agent can create and delete volumes",
-        !agentOptions.Tls.IsConfigured ? "TLS" : "client certificate authentication");
-}
+ProductionSecurityGate.Enforce(app.Environment.IsDevelopment(), agentOptions, app.Logger);
 
 // Read the certificate store now rather than at the first handshake. Otherwise
 // a mistyped store or a missing certificate produces a role the cluster happily
