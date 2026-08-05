@@ -1,8 +1,16 @@
 using System.Globalization;
 using System.Management;
 using System.Runtime.Versioning;
+using HyperVCsiAgent.Core.Configuration;
 using HyperVCsiAgent.Core.HostControl;
 using HyperVCsiAgent.Service.Cim;
+using Microsoft.Extensions.Options;
+using Microsoft.Management.Infrastructure;
+using Microsoft.Management.Infrastructure.Generic;
+
+// Both libraries define CimType. System.Management remains for embedded-instance
+// serialization and path parsing; MI is used for bounded cleanup calls.
+using CimType = Microsoft.Management.Infrastructure.CimType;
 
 namespace HyperVCsiAgent.Service.HostControl;
 
@@ -19,8 +27,10 @@ namespace HyperVCsiAgent.Service.HostControl;
 /// order, because the second names the first.
 /// </remarks>
 [SupportedOSPlatform("windows")]
-public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : IHyperVHostClient
+public sealed class CimHyperVHostClient : IHyperVHostClient
 {
+    private const string NamespaceName = @"root\virtualization\v2";
+
     private const string SyntheticScsiControllerSubType = "Microsoft:Hyper-V:Synthetic SCSI Controller";
     private const string SyntheticDiskDriveSubType = "Microsoft:Hyper-V:Synthetic Disk Drive";
     private const string VirtualHardDiskSubType = "Microsoft:Hyper-V:Virtual Hard Disk";
@@ -32,33 +42,46 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
     /// </summary>
     private const int AddressesPerController = 64;
 
+    private readonly ILogger<CimHyperVHostClient> _logger;
+    private readonly TimeSpan _hostOperationTimeout;
+
+    public CimHyperVHostClient(IOptions<AgentOptions> options, ILogger<CimHyperVHostClient> logger)
+    {
+        _logger = logger;
+        _hostOperationTimeout = options.Value.HostOperationTimeout;
+    }
+
     public Task<AttachedDisk?> FindAttachedDiskAsync(
         string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
         Task.Run<AttachedDisk?>(() =>
         {
+            var deadline = CimDeadline.After(_hostOperationTimeout);
             var scope = ScopeFor(hostName);
-            using var settings = GetActiveSettings(scope, hostName, vmId);
-            return FindAttachedDisk(scope, settings, vhdxPath, cancellationToken);
+            using var settings = GetActiveSettings(scope, hostName, vmId, deadline, cancellationToken);
+            return FindAttachedDisk(scope, settings, vhdxPath, deadline, cancellationToken);
         }, cancellationToken);
 
     public Task<bool> IsDiskAttachedAsync(
         string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
+            var deadline = CimDeadline.After(_hostOperationTimeout);
             var scope = ScopeFor(hostName);
-            using var settings = GetActiveSettings(scope, hostName, vmId);
-            return LocateDisk(scope, settings, vhdxPath, cancellationToken) is not null;
+            using var settings = GetActiveSettings(scope, hostName, vmId, deadline, cancellationToken);
+            return LocateDisk(scope, settings, vhdxPath, deadline, cancellationToken) is not null;
         }, cancellationToken);
 
     public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
         Task.Run<DiskSlot?>(() =>
         {
+            var deadline = CimDeadline.After(_hostOperationTimeout);
             var scope = ScopeFor(hostName);
-            using var settings = GetActiveSettings(scope, hostName, vmId);
+            using var settings = GetActiveSettings(scope, hostName, vmId, deadline, cancellationToken);
 
-            var occupied = OccupiedAddresses(scope, settings, cancellationToken);
+            var occupied = OccupiedAddresses(scope, settings, deadline, cancellationToken);
 
-            foreach (var controller in DeviceSettings(scope, settings, "Msvm_ResourceAllocationSettingData", cancellationToken))
+            foreach (var controller in DeviceSettings(
+                scope, settings, "Msvm_ResourceAllocationSettingData", deadline, cancellationToken))
             {
                 using (controller)
                 {
@@ -88,20 +111,25 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
         Task.Run(() =>
         {
             var scope = ScopeFor(hostName);
-            using var management = GetManagementService(scope);
-            using var settings = GetActiveSettings(scope, hostName, vmId);
+            var deadline = CimDeadline.After(_hostOperationTimeout);
+            using var settings = GetActiveSettings(scope, hostName, vmId, deadline, cancellationToken);
 
             using var driveTemplate = GetDefaultSettings(
-                scope, "Msvm_ResourceAllocationSettingData", SyntheticDiskDriveSubType);
+                scope, "Msvm_ResourceAllocationSettingData", SyntheticDiskDriveSubType, deadline, cancellationToken);
             using var drive = (ManagementObject)driveTemplate.Clone();
             drive["Parent"] = slot.ControllerPath;
             drive["AddressOnParent"] = slot.Lun.ToString(CultureInfo.InvariantCulture);
 
-            var drivePath = AddResource(scope, management, settings, drive, cancellationToken)
+            var drivePath = AddResource(
+                hostName,
+                settings.Path.Path,
+                drive.GetText(TextFormat.WmiDtd20),
+                deadline,
+                cancellationToken)
                 // AddResourceSettings only fills its out parameters when it
                 // answers inline. When it defers to a job, the drive is still
                 // there - find it where we just asked for it to be.
-                ?? FindDrivePath(scope, settings, slot, cancellationToken)
+                ?? FindDrivePath(scope, settings, slot, deadline, cancellationToken)
                 // The one leak this class cannot clean up after itself:
                 // RemoveResourceSettings addresses a drive by path, and not
                 // knowing the path is exactly the situation. Say so, with the
@@ -115,12 +143,17 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
             try
             {
                 using var diskTemplate = GetDefaultSettings(
-                    scope, "Msvm_StorageAllocationSettingData", VirtualHardDiskSubType);
+                    scope, "Msvm_StorageAllocationSettingData", VirtualHardDiskSubType, deadline, cancellationToken);
                 using var disk = (ManagementObject)diskTemplate.Clone();
                 disk["Parent"] = drivePath;
                 disk["HostResource"] = new[] { vhdxPath };
 
-                _ = AddResource(scope, management, settings, disk, cancellationToken);
+                _ = AddResource(
+                    hostName,
+                    settings.Path.Path,
+                    disk.GetText(TextFormat.WmiDtd20),
+                    deadline,
+                    cancellationToken);
             }
             catch
             {
@@ -128,11 +161,11 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
                 // good: nothing else ever collects one, and every later attach
                 // simply picks the next address until the controller is full of
                 // drives holding no disks.
-                TryRemoveEmptyDrive(scope, management, drivePath, vmId, "a failed attach", CancellationToken.None);
+                TryRemoveEmptyDrive(hostName, drivePath, vmId, "a failed attach", CancellationToken.None);
                 throw;
             }
 
-            logger.LogInformation(
+            _logger.LogInformation(
                 "attached {VhdxPath} to {VmId} on {HostName} at LUN {Lun}", vhdxPath, vmId, hostName, slot.Lun);
         }, cancellationToken);
 
@@ -140,13 +173,13 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
         Task.Run(() =>
         {
             var scope = ScopeFor(hostName);
-            using var management = GetManagementService(scope);
-            using var settings = GetActiveSettings(scope, hostName, vmId);
+            var deadline = CimDeadline.After(_hostOperationTimeout);
+            using var settings = GetActiveSettings(scope, hostName, vmId, deadline, cancellationToken);
 
-            var located = LocateDisk(scope, settings, vhdxPath, cancellationToken);
+            var located = LocateDisk(scope, settings, vhdxPath, deadline, cancellationToken);
             if (located is null)
             {
-                logger.LogInformation(
+                _logger.LogInformation(
                     "{VhdxPath} is not in {VmId}'s configuration on {HostName}, so there is nothing to detach",
                     vhdxPath, vmId, hostName);
                 return;
@@ -164,14 +197,14 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
             // every retry would then find no disk, report success, and leave the
             // drive exactly where it was - so the leak would happen anyway, with
             // a stuck VolumeAttachment on top of it.
-            RemoveResource(scope, management, located.DiskPath, "the disk", cancellationToken);
+            RemoveResource(hostName, located.DiskPath, "the disk", deadline, cancellationToken);
 
             // Removing the drive too, not just the disk: an empty drive keeps
             // its address on the controller, so leaving them behind would walk a
             // VM up to its 64-per-controller limit one detach at a time.
-            TryRemoveEmptyDrive(scope, management, located.DrivePath, vmId, "detaching its disk", cancellationToken);
+            TryRemoveEmptyDrive(hostName, located.DrivePath, vmId, "detaching its disk", cancellationToken);
 
-            logger.LogInformation("detached {VhdxPath} from {VmId} on {HostName}", vhdxPath, vmId, hostName);
+            _logger.LogInformation("detached {VhdxPath} from {VmId} on {HostName}", vhdxPath, vmId, hostName);
         }, cancellationToken);
 
     public Task ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
@@ -181,15 +214,19 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
         new($@"\\{hostName}\root\virtualization\v2");
 
     private static AttachedDisk? FindAttachedDisk(
-        ManagementScope scope, ManagementObject settings, string vhdxPath, CancellationToken cancellationToken)
+        ManagementScope scope,
+        ManagementObject settings,
+        string vhdxPath,
+        CimDeadline deadline,
+        CancellationToken cancellationToken)
     {
-        if (LocateDisk(scope, settings, vhdxPath, cancellationToken) is not { } located)
+        if (LocateDisk(scope, settings, vhdxPath, deadline, cancellationToken) is not { } located)
         {
             return null;
         }
 
         using var controller = new ManagementObject(scope, new ManagementPath(located.ControllerPath), null);
-        controller.Get();
+        WithDeadline(deadline, cancellationToken, $"reading controller settings for {vhdxPath}", controller.Get);
 
         // Both halves have to be real. Defaulting either one would send the node
         // plugin to a plausible-looking wrong disk - LUN 0 on the first
@@ -211,9 +248,13 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
     /// cannot disagree about what "attached" means.
     /// </summary>
     private static DiskLocation? LocateDisk(
-        ManagementScope scope, ManagementObject settings, string vhdxPath, CancellationToken cancellationToken)
+        ManagementScope scope,
+        ManagementObject settings,
+        string vhdxPath,
+        CimDeadline deadline,
+        CancellationToken cancellationToken)
     {
-        foreach (var disk in DeviceSettings(scope, settings, "Msvm_StorageAllocationSettingData", cancellationToken))
+        foreach (var disk in DeviceSettings(scope, settings, "Msvm_StorageAllocationSettingData", deadline, cancellationToken))
         {
             using (disk)
             {
@@ -244,7 +285,7 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
                 }
 
                 using var drive = new ManagementObject(scope, new ManagementPath(drivePath), null);
-                drive.Get();
+                WithDeadline(deadline, cancellationToken, $"reading drive settings for {vhdxPath}", drive.Get);
 
                 if (drive["Parent"] as string is not { } controllerPath)
                 {
@@ -267,9 +308,14 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
     private sealed record DiskLocation(string DiskPath, string DrivePath, string ControllerPath, int? Lun);
 
     private static string? FindDrivePath(
-        ManagementScope scope, ManagementObject settings, DiskSlot slot, CancellationToken cancellationToken)
+        ManagementScope scope,
+        ManagementObject settings,
+        DiskSlot slot,
+        CimDeadline deadline,
+        CancellationToken cancellationToken)
     {
-        foreach (var drive in DeviceSettings(scope, settings, "Msvm_ResourceAllocationSettingData", cancellationToken))
+        foreach (var drive in DeviceSettings(
+            scope, settings, "Msvm_ResourceAllocationSettingData", deadline, cancellationToken))
         {
             using (drive)
             {
@@ -299,11 +345,15 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
     /// filtering by subtype here would hand out a slot that is taken.
     /// </summary>
     private static HashSet<(string Controller, int Address)> OccupiedAddresses(
-        ManagementScope scope, ManagementObject settings, CancellationToken cancellationToken)
+        ManagementScope scope,
+        ManagementObject settings,
+        CimDeadline deadline,
+        CancellationToken cancellationToken)
     {
         var occupied = new HashSet<(string, int)>();
 
-        foreach (var device in DeviceSettings(scope, settings, "Msvm_ResourceAllocationSettingData", cancellationToken))
+        foreach (var device in DeviceSettings(
+            scope, settings, "Msvm_ResourceAllocationSettingData", deadline, cancellationToken))
         {
             using (device)
             {
@@ -325,22 +375,32 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
     /// parameters.
     /// </summary>
     private static string? AddResource(
-        ManagementScope scope,
-        ManagementObject management,
-        ManagementObject settings,
-        ManagementObject resource,
+        string hostName,
+        string settingsPath,
+        string resourceSettingsXml,
+        CimDeadline deadline,
         CancellationToken cancellationToken)
     {
-        using var inParams = management.GetMethodParameters("AddResourceSettings");
-        inParams["AffectedConfiguration"] = settings.Path.Path;
-        // Embedded instances, serialized as WMI XML - the same shape
-        // CreateVirtualHardDisk's setting data takes.
-        inParams["ResourceSettings"] = new[] { resource.GetText(TextFormat.WmiDtd20) };
+        using var session = CimSession.Create(hostName);
+        using var management = GetManagementService(session, deadline, cancellationToken);
 
-        using var outParams = management.InvokeMethod("AddResourceSettings", inParams, null);
-        var completedInline = CimJobs.WaitForCompletion(scope, outParams, "AddResourceSettings", cancellationToken);
+        var parameters = new CimMethodParametersCollection
+        {
+            CimMethodParameter.Create("AffectedConfiguration", settingsPath, CimType.String, CimFlags.In),
 
-        if (!completedInline || outParams["ResultingResourceSettings"] is not string[] { Length: > 0 } added)
+            // Embedded instances, serialized as WMI XML - the same shape
+            // CreateVirtualHardDisk's setting data takes.
+            CimMethodParameter.Create("ResourceSettings", new[] { resourceSettingsXml }, CimType.StringArray, CimFlags.In),
+        };
+
+        using var result = session.InvokeMethod(
+            NamespaceName, management, "AddResourceSettings", parameters,
+            deadline.Options("AddResourceSettings", cancellationToken));
+
+        var completedInline = CimJobs.WaitForCompletion(
+            session, NamespaceName, result, "AddResourceSettings", deadline, cancellationToken);
+
+        if (!completedInline || result.OutParameters["ResultingResourceSettings"]?.Value is not string[] { Length: > 0 } added)
         {
             return null;
         }
@@ -355,17 +415,26 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
     /// it did.
     /// </summary>
     private static void RemoveResource(
-        ManagementScope scope,
-        ManagementObject management,
+        string hostName,
         string resourcePath,
         string description,
+        CimDeadline deadline,
         CancellationToken cancellationToken)
     {
-        using var inParams = management.GetMethodParameters("RemoveResourceSettings");
-        inParams["ResourceSettings"] = new[] { resourcePath };
+        using var session = CimSession.Create(hostName);
+        using var management = GetManagementService(session, deadline, cancellationToken);
 
-        using var outParams = management.InvokeMethod("RemoveResourceSettings", inParams, null);
-        CimJobs.WaitForCompletion(scope, outParams, $"RemoveResourceSettings ({description})", cancellationToken);
+        var parameters = new CimMethodParametersCollection
+        {
+            CimMethodParameter.Create("ResourceSettings", new[] { resourcePath }, CimType.StringArray, CimFlags.In),
+        };
+
+        using var result = session.InvokeMethod(
+            NamespaceName, management, "RemoveResourceSettings", parameters,
+            deadline.Options($"RemoveResourceSettings ({description})", cancellationToken));
+
+        _ = CimJobs.WaitForCompletion(
+            session, NamespaceName, result, $"RemoveResourceSettings ({description})", deadline, cancellationToken);
     }
 
     /// <summary>
@@ -375,37 +444,53 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
     /// an empty drive left behind is a resource leak to tell an operator about,
     /// not a reason to fail an operation that otherwise did what was asked.
     /// </summary>
-    /// <param name="waitToken">
-    /// The attach rollback passes None deliberately: it runs because the
-    /// caller's token fired, so honouring that token would abandon the cleanup
-    /// immediately. Detach passes its real token, since it is on the success
-    /// path and a drive removal that never settles must not hang the job.
+    /// <param name="callerToken">
+    /// Cancellation remains cooperative only. This path adds an absolute
+    /// per-call deadline too, so cleanup cannot wait forever when RPC does not
+    /// observe cancellation.
     /// </param>
     private void TryRemoveEmptyDrive(
-        ManagementScope scope,
-        ManagementObject management,
+        string hostName,
         string drivePath,
         string vmId,
         string context,
-        CancellationToken waitToken)
+        CancellationToken callerToken)
     {
         try
         {
-            using var inParams = management.GetMethodParameters("RemoveResourceSettings");
-            inParams["ResourceSettings"] = new[] { drivePath };
+            using var attempt = CancellationTokenSource.CreateLinkedTokenSource(callerToken);
+            attempt.CancelAfter(_hostOperationTimeout);
 
-            using var outParams = management.InvokeMethod("RemoveResourceSettings", inParams, null);
-            CimJobs.WaitForCompletion(scope, outParams, "RemoveResourceSettings", waitToken);
+            var deadline = CimDeadline.After(_hostOperationTimeout);
+            using var session = CimSession.Create(hostName);
+            using var management = GetManagementService(session, deadline, attempt.Token);
+
+            var parameters = new CimMethodParametersCollection
+            {
+                CimMethodParameter.Create("ResourceSettings", new[] { drivePath }, CimType.StringArray, CimFlags.In),
+            };
+
+            using var result = session.InvokeMethod(
+                NamespaceName, management, "RemoveResourceSettings", parameters,
+                deadline.Options("RemoveResourceSettings", attempt.Token));
+
+            _ = CimJobs.WaitForCompletion(
+                session, NamespaceName, result, "RemoveResourceSettings", deadline, attempt.Token);
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex,
+            _logger.LogWarning(ex,
                 "could not remove the empty disk drive left on {VmId} after {Context}; it occupies an address on its controller until removed by hand",
                 vmId, context);
         }
     }
 
-    private static ManagementObject GetActiveSettings(ManagementScope scope, string hostName, string vmId)
+    private static ManagementObject GetActiveSettings(
+        ManagementScope scope,
+        string hostName,
+        string vmId,
+        CimDeadline deadline,
+        CancellationToken cancellationToken)
     {
         if (!WqlNames.IsVmId(vmId))
         {
@@ -426,15 +511,22 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
         using var searcher = new ManagementObjectSearcher(scope, new SelectQuery(
             $"SELECT * FROM Msvm_ComputerSystem WHERE Name = '{vmId}'"));
 
-        using var results = searcher.Get();
+        using var results = WithDeadline(
+            deadline,
+            cancellationToken,
+            $"resolving VM {vmId} on {hostName}",
+            searcher.Get);
         foreach (var instance in results)
         {
             using var vm = (ManagementObject)instance;
 
             // The *active* settings, not a snapshot's: Msvm_SettingsDefineState
             // associates a VM with the configuration it is currently running.
-            using var settings = vm.GetRelated(
-                "Msvm_VirtualSystemSettingData", "Msvm_SettingsDefineState", null, null, null, null, false, null);
+            using var settings = WithDeadline(
+                deadline,
+                cancellationToken,
+                $"reading active settings for VM {vmId}",
+                () => vm.GetRelated("Msvm_VirtualSystemSettingData", "Msvm_SettingsDefineState", null, null, null, null, false, null));
 
             foreach (var setting in settings)
             {
@@ -449,31 +541,41 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
         throw new VmNotOnHostException(hostName, vmId);
     }
 
-    private static ManagementObject GetManagementService(ManagementScope scope)
+    private static CimInstance GetManagementService(
+        CimSession session, CimDeadline deadline, CancellationToken cancellationToken)
     {
-        using var searcher = new ManagementObjectSearcher(scope, new SelectQuery("Msvm_VirtualSystemManagementService"));
-        using var results = searcher.Get();
-        foreach (var instance in results)
+        var options = deadline.Options("locating Msvm_VirtualSystemManagementService", cancellationToken);
+        foreach (var instance in session.QueryInstances(
+            NamespaceName, "WQL", "SELECT * FROM Msvm_VirtualSystemManagementService", options))
         {
-            return (ManagementObject)instance;
+            return instance;
         }
 
         throw new InvalidOperationException(
-            $"no Msvm_VirtualSystemManagementService in {scope.Path}; is the Hyper-V role installed on this host?");
+            $"no Msvm_VirtualSystemManagementService in {NamespaceName}; is the Hyper-V role installed on this host?");
     }
 
     /// <summary>
     /// The resource pool's template instance for a device type, which is what a
     /// new resource is cloned from rather than built field by field.
     /// </summary>
-    private static ManagementObject GetDefaultSettings(ManagementScope scope, string className, string resourceSubType)
+    private static ManagementObject GetDefaultSettings(
+        ManagementScope scope,
+        string className,
+        string resourceSubType,
+        CimDeadline deadline,
+        CancellationToken cancellationToken)
     {
         // The backslash is doubled for WQL, which is why this reads as four in
         // source: the InstanceID ends "...\Default".
         using var searcher = new ManagementObjectSearcher(scope, new SelectQuery(
             $"SELECT * FROM {className} WHERE ResourceSubType = '{resourceSubType}' AND InstanceID LIKE '%\\\\Default'"));
 
-        using var results = searcher.Get();
+        using var results = WithDeadline(
+            deadline,
+            cancellationToken,
+            $"reading default {className} template for {resourceSubType}",
+            searcher.Get);
         foreach (var instance in results)
         {
             return (ManagementObject)instance;
@@ -483,10 +585,17 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
     }
 
     private static IEnumerable<ManagementObject> DeviceSettings(
-        ManagementScope scope, ManagementObject settings, string className, CancellationToken cancellationToken)
+        ManagementScope scope,
+        ManagementObject settings,
+        string className,
+        CimDeadline deadline,
+        CancellationToken cancellationToken)
     {
-        using var related = settings.GetRelated(
-            className, "Msvm_VirtualSystemSettingDataComponent", null, null, null, null, false, null);
+        using var related = WithDeadline(
+            deadline,
+            cancellationToken,
+            $"enumerating {className} settings",
+            () => settings.GetRelated(className, "Msvm_VirtualSystemSettingDataComponent", null, null, null, null, false, null));
 
         foreach (var instance in related)
         {
@@ -548,4 +657,36 @@ public sealed class CimHyperVHostClient(ILogger<CimHyperVHostClient> logger) : I
 
     private static bool SamePath(string left, string right) =>
         string.Equals(left.Trim(), right.Trim(), StringComparison.OrdinalIgnoreCase);
+
+    private static T WithDeadline<T>(
+        CimDeadline deadline,
+        CancellationToken cancellationToken,
+        string operation,
+        Func<T> work)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var remaining = deadline.Remaining;
+        if (remaining == TimeSpan.Zero)
+        {
+            throw new TimeoutException(
+                $"the operation's time budget was exhausted before {operation} could be issued");
+        }
+
+        return Task.Run(work, CancellationToken.None)
+            .WaitAsync(remaining, cancellationToken)
+            .GetAwaiter()
+            .GetResult();
+    }
+
+    private static void WithDeadline(
+        CimDeadline deadline,
+        CancellationToken cancellationToken,
+        string operation,
+        Action work) =>
+        _ = WithDeadline(deadline, cancellationToken, operation, () =>
+        {
+            work();
+            return 0;
+        });
 }

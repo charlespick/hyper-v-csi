@@ -88,6 +88,9 @@ all report success: in each case nothing is attached, which is the state the cal
 Kubernetes cannot delete a PV or drain a node until the VolumeAttachment clears, so an unpublish
 that failed on something no retry could fix would wedge both. What does *not* report success is a
 VM that exists but cannot be reached or reconfigured — that one may still be holding the disk.
+Malformed node identity is also treated as an error: if the node cannot be identified reliably, the
+safe posture is to fail and require operator correction rather than risk reporting a detach that did
+not happen.
 
 **`node_id` is required, though CSI makes it optional.** An absent node ID means "unpublish from
 every node this volume is published to", which is the reverse-direction question below: no single
@@ -137,23 +140,19 @@ attach and then fails at NodeStageVolume, which is the honest place for it to fa
 reads `VirtualMachineId` out of the guest's Hyper-V key-value pools — the values the host publishes
 through the Data Exchange integration service, which `hv_kvp_daemon` writes to
 `/var/lib/hyperv/.kvp_pool_*` — and reports that GUID as the CSI node ID. kubelet records it in
-`CSINode`, external-attacher hands it to this RPC, and the agent resolves it with one query:
+`CSINode`, external-attacher hands it to this RPC, and the agent resolves it in two steps:
+
+1. Scan the local CLUSDB mirror under `HKLM\Cluster\Resources` and match `Parameters\VmID`
+  in memory (brace-insensitive and case-insensitive) on resources whose `Type` is
+  `Virtual Machine`.
+2. Once the matching resource name is found, query WMI by key (`Name`) to read `OwnerNode`:
 
 ```
-SELECT * FROM MSCluster_Resource
-WHERE Type = 'Virtual Machine' OR Type = 'Virtual Machine Configuration'
+SELECT Name, OwnerNode FROM MSCluster_Resource WHERE Name = '<resource name>'
 ```
 
-then matches `PrivateProperties.VmID` in memory. **The match cannot be a `WHERE` clause.** `VmID`
-is not a property of `MSCluster_Resource`; it is a member of the embedded `PrivateProperties`
-object, and WQL cannot reach inside an embedded object. So the choice is one round trip plus a
-local scan of the cluster's VM resources, which is what this does, or a per-resource round trip,
-which would be worse on every axis. Either way it stays one call to the provider and no fan-out to
-hosts, answered from the local CLUSDB replica.
-
-Both resource types are asked for because a clustered VM has two — `Virtual Machine <name>` and
-`Virtual Machine Configuration <name>` — and both carry `VmID`. They share a group and therefore an
-`OwnerNode`, which is the only thing read off them, so whichever matches first will do.
+This keeps the expensive "which VM is this node ID" step local and avoids a cluster-wide WMI scan
+for every resolve, while still reading live ownership from WMI.
 
 A consequence worth noting: the node ID never reaches the query text, so it is compared rather than
 interpolated. The GUID check that used to be the injection guard is now an assertion about the

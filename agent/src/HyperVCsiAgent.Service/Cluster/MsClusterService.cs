@@ -1,7 +1,9 @@
-using System.Management;
 using System.Runtime.Versioning;
+using HyperVCsiAgent.Core.Configuration;
 using HyperVCsiAgent.Core.Cluster;
 using HyperVCsiAgent.Service.Cim;
+using Microsoft.Extensions.Options;
+using Microsoft.Management.Infrastructure;
 using Microsoft.Win32;
 
 namespace HyperVCsiAgent.Service.Cluster;
@@ -29,9 +31,10 @@ namespace HyperVCsiAgent.Service.Cluster;
 /// indexed lookup whose cost does not grow with the cluster.
 /// </remarks>
 [SupportedOSPlatform("windows")]
-public sealed class MsClusterService(ILogger<MsClusterService> logger) : IClusterService
+public sealed class MsClusterService : IClusterService
 {
     private const string ScopePath = @"\\.\root\MSCluster";
+    private const string NamespaceName = @"root\MSCluster";
 
     /// <summary>
     /// The cluster database's mirror of the resource table, replicated to every
@@ -48,11 +51,22 @@ public sealed class MsClusterService(ILogger<MsClusterService> logger) : ICluste
     /// </summary>
     private const string VirtualMachineResourceType = "Virtual Machine";
 
+    private readonly ILogger<MsClusterService> _logger;
+    private readonly TimeSpan _hostOperationTimeout;
+
+    public MsClusterService(IOptions<AgentOptions> options, ILogger<MsClusterService> logger)
+    {
+        _logger = logger;
+        _hostOperationTimeout = options.Value.HostOperationTimeout;
+    }
+
     public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
         // System.Management and the registry APIs are entirely synchronous, so
         // the work runs on a pool thread.
         Task.Run<ClusteredVm?>(() =>
         {
+            var deadline = CimDeadline.After(_hostOperationTimeout);
+
             // A node ID that is not a GUID means the node plugin sent something
             // other than its VM ID, and quietly matching nothing would report
             // that as "no such VM in the cluster".
@@ -71,7 +85,7 @@ public sealed class MsClusterService(ILogger<MsClusterService> logger) : ICluste
                 return null;
             }
 
-            var owner = ReadOwnerNode(resourceName);
+            var owner = ReadOwnerNode(resourceName, deadline, cancellationToken);
 
             if (string.IsNullOrWhiteSpace(owner))
             {
@@ -87,7 +101,7 @@ public sealed class MsClusterService(ILogger<MsClusterService> logger) : ICluste
                     "which should not be possible");
             }
 
-            logger.LogDebug("VM {VmId} is resource {Resource}, owned by {OwnerNode}", nodeId, resourceName, owner);
+            _logger.LogDebug("VM {VmId} is resource {Resource}, owned by {OwnerNode}", nodeId, resourceName, owner);
             return new ClusteredVm(nodeId, owner);
         }, cancellationToken);
 
@@ -158,24 +172,20 @@ public sealed class MsClusterService(ILogger<MsClusterService> logger) : ICluste
     /// association traversal - and is live state, which is why it comes from WMI
     /// rather than from the registry that supplied the name.
     /// </summary>
-    private static string? ReadOwnerNode(string resourceName)
+    private static string? ReadOwnerNode(string resourceName, CimDeadline deadline, CancellationToken cancellationToken)
     {
-        var scope = new ManagementScope(ScopePath);
-
         // Keyed on Name, which is MSCluster_Resource's key property, so this
         // does not scan. The name comes from the cluster database rather than
         // from a caller, but it is still escaped: a resource named with an
         // apostrophe would otherwise produce a malformed query.
-        var query = new ObjectQuery(
-            $"SELECT Name, OwnerNode FROM MSCluster_Resource WHERE Name = '{WqlNames.EscapeLiteral(resourceName)}'");
+        var query =
+            $"SELECT Name, OwnerNode FROM MSCluster_Resource WHERE Name = '{WqlNames.EscapeLiteral(resourceName)}'";
 
-        using var searcher = new ManagementObjectSearcher(scope, query);
-        using var results = searcher.Get();
-
-        foreach (var instance in results)
+        using var session = CimSession.Create(null);
+        var options = deadline.Options("reading MSCluster_Resource.OwnerNode", cancellationToken);
+        foreach (var resource in session.QueryInstances(NamespaceName, "WQL", query, options))
         {
-            using var resource = (ManagementObject)instance;
-            return resource["OwnerNode"] as string;
+            return resource.CimInstanceProperties["OwnerNode"]?.Value as string;
         }
 
         return null;

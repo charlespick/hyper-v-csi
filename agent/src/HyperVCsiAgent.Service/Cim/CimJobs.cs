@@ -1,4 +1,3 @@
-using System.Management;
 using System.Runtime.Versioning;
 using Microsoft.Management.Infrastructure;
 
@@ -28,60 +27,6 @@ public static class CimJobs
     private const ushort JobStateCompletedWithWarnings = 32768;
 
     private static readonly TimeSpan JobPollInterval = TimeSpan.FromMilliseconds(500);
-
-    /// <summary>
-    /// The System.Management form, kept only until CimHyperVHostClient is moved
-    /// across. TEMPORARY - delete this overload with the last caller.
-    /// </summary>
-    /// <remarks>
-    /// This is the shape with the defect the migration exists to remove: its
-    /// only bound is the token, and a token cannot interrupt a blocked RPC, so
-    /// the attach rollback's <c>CancellationToken.None</c> makes it unbounded.
-    /// It is left in place so the tree builds and the suite passes at every step
-    /// of the migration rather than only at the end; it is not a design anyone
-    /// should copy.
-    /// </remarks>
-    public static bool WaitForCompletion(
-        ManagementScope scope, ManagementBaseObject outParams, string methodName, CancellationToken cancellationToken)
-    {
-        var returnValue = (uint)outParams["ReturnValue"];
-        if (returnValue == Completed)
-        {
-            return true;
-        }
-
-        if (returnValue != JobStarted)
-        {
-            throw new InvalidOperationException($"{methodName} failed with return value {returnValue}");
-        }
-
-        var jobPath = (string?)outParams["Job"]
-            ?? throw new InvalidOperationException($"{methodName} reported a started job but returned no job reference");
-
-        while (true)
-        {
-            using var job = new ManagementObject(scope, new ManagementPath(jobPath), null);
-            job.Get();
-
-            var state = (ushort)job["JobState"];
-            if (state is JobStateCompleted or JobStateCompletedWithWarnings)
-            {
-                return false;
-            }
-
-            if (state > JobStateCompleted && state <= JobStateException)
-            {
-                var description = job["ErrorDescription"] as string;
-                throw new InvalidOperationException(
-                    $"{methodName} job ended in state {state}: {(string.IsNullOrWhiteSpace(description) ? "no error description" : description)}");
-            }
-
-            if (cancellationToken.WaitHandle.WaitOne(JobPollInterval))
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-            }
-        }
-    }
 
     /// <summary>
     /// Waits for an Msvm method to finish. Returns whether it answered inline,

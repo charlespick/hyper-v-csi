@@ -269,6 +269,19 @@ public sealed class AttachServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task DetachAsync_NodeIdThatIsNotAUsableVmIdentity_Fails()
+    {
+        GivenVolume("pvc-1");
+        var host = new FakeHostClient { Existing = new AttachedDisk("controller-guid", 4), DetachWorks = true };
+        using var service = NewService(host, new FakeClusterService { Owner = Host, RejectInvalidNodeIds = true });
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.DetachAsync("pvc-1", "node-not-a-guid", CancellationToken.None));
+
+        Assert.Null(host.Detached);
+    }
+
+    [Fact]
     public async Task DetachAsync_VolumeIdThatCouldNotBeOurs_Succeeds()
     {
         // Nothing to look up: no volume of that name can exist, so nothing can
@@ -420,6 +433,8 @@ public sealed class AttachServiceTests : IDisposable
     {
         public string? Owner { get; init; }
 
+        public bool RejectInvalidNodeIds { get; init; }
+
         /// <summary>Where the VM is found on the second resolution, standing in for a migration.</summary>
         public string? NextOwner { get; init; }
 
@@ -434,6 +449,11 @@ public sealed class AttachServiceTests : IDisposable
 
         public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken)
         {
+            if (RejectInvalidNodeIds && !Guid.TryParse(nodeId, out _))
+            {
+                throw new InvalidOperationException($"node ID {nodeId} is not a virtual machine GUID");
+            }
+
             Resolutions++;
 
             var owner = Resolutions > 1 && NextOwner is not null ? NextOwner : Owner;
