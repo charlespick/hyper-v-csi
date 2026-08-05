@@ -66,6 +66,16 @@ builder.Services.AddSingleton<IServerCertificateProvider>(
 
 builder.ConfigureHttps(agentOptions);
 
+// appsettings.json's AllowedHosts stays "*" as the safe fallback for
+// Development / before TLS is configured. Once the clustered role's DNS name
+// is known from config, narrow Kestrel's host-header validation to that one
+// name instead of leaving it wide open.
+if (agentOptions.Tls.IsConfigured)
+{
+    builder.Services.Configure<Microsoft.AspNetCore.HostFiltering.HostFilteringOptions>(
+        options => options.AllowedHosts = new[] { agentOptions.Tls.SubjectName });
+}
+
 var app = builder.Build();
 
 // Fail at startup rather than on the first CreateVolume: a missing
