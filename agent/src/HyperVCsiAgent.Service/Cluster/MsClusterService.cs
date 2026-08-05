@@ -138,15 +138,28 @@ public sealed class MsClusterService : IClusterService
             // Checked before the private properties are opened, so that
             // resources which are not VMs cost one value read rather than two
             // key opens. Most of a real cluster's resources are not VMs.
-            if (resource.GetValue("Type") as string != VirtualMachineResourceType)
+            if (resource.GetValue("Type") as string is not { } resourceType)
+            {
+                throw new InvalidOperationException(
+                    $"cluster resource {resourceId} has no readable Type value");
+            }
+
+            if (resourceType != VirtualMachineResourceType)
             {
                 continue;
             }
 
             using var parameters = resource.OpenSubKey("Parameters");
-            if (parameters?.GetValue("VmID") as string is not { } candidate)
+            if (parameters is null)
             {
-                continue;
+                throw new InvalidOperationException(
+                    $"cluster VM resource {resourceId} has no Parameters key");
+            }
+
+            if (parameters.GetValue("VmID") as string is not { } candidate)
+            {
+                throw new InvalidOperationException(
+                    $"cluster VM resource {resourceId} has no readable VmID value");
             }
 
             // Braces are stripped because clustering and the guest's key-value
@@ -160,7 +173,13 @@ public sealed class MsClusterService : IClusterService
                 continue;
             }
 
-            return resource.GetValue("Name") as string;
+            if (resource.GetValue("Name") as string is not { } resourceName || string.IsNullOrWhiteSpace(resourceName))
+            {
+                throw new InvalidOperationException(
+                    $"cluster VM resource {resourceId} matched VmID {vmId} but has no readable Name value");
+            }
+
+            return resourceName;
         }
 
         return null;

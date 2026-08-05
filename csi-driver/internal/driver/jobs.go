@@ -13,11 +13,11 @@ import (
 
 const (
 	// jobPollBudget bounds how long an RPC waits for a job before handing back
-	// a retryable status. It has to stay well under the calling sidecar's own
-	// RPC timeout — external-provisioner's --timeout defaults to 10s (15s on
-	// older releases), not the minute one might assume — otherwise the caller
-	// gives up first and the clean ABORTED below never reaches anyone.
-	jobPollBudget = 6 * time.Second
+	// a retryable status. The caller deadline still wins through
+	// clampToCallerDeadline, so this is a ceiling for longer-lived operations
+	// (for example, an external-attacher timeout of 30s), not a fixed wait for
+	// every call.
+	jobPollBudget = 24 * time.Second
 
 	// When the caller sets a deadline we spend at most this fraction of it
 	// polling. The remainder is headroom for our answer to travel back before

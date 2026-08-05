@@ -183,6 +183,9 @@ advertises no topology and `VOLUME_ACCESSIBILITY_CONSTRAINTS` would put a node i
 `PV.spec.nodeAffinity`, where it is immutable for the life of the volume. The only persisted copy is
 in `CSINode`, which kubelet rewrites whenever the node plugin re-registers. Keep it that way: the day
 something parses the node ID, or a topology key starts carrying it, this stops being a local change.
+That targeting is scoped, not global: create/delete serialize on `volume:<id>`, while attach/detach
+serialize on `vm:<nodeId>`. The VM target is what protects slot allocation from races, but it also
+means there is no agent-side ordering edge between delete and attach for the same volume.
 
 **Attach does not scan the cluster for an existing attachment elsewhere.** That is the reverse
 direction priced above — one `Msvm_StorageAllocationSettingData` query per node — and attach declines

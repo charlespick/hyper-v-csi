@@ -156,11 +156,11 @@ public sealed class AttachServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task AttachAsync_HostThatNeverAnswers_TimesOutAsInternal()
+    public async Task AttachAsync_CooperativeFakeHostHang_TimesOutAsInternal()
     {
-        // The timeout has to arrive as a classified failure naming the volume
-        // and the budget. Left as a bare cancellation it reads "A task was
-        // canceled", which is indistinguishable from the agent shutting down.
+        // Classification test only: this fake hang observes cancellation. It
+        // pins how a timeout is translated, not whether a real host call can be
+        // interrupted mid-RPC.
         GivenVolume("pvc-1");
         var host = new FakeHostClient { HangsForever = true };
         using var service = NewService(host, timeout: TimeSpan.FromMilliseconds(50));
@@ -356,7 +356,7 @@ public sealed class AttachServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task DetachAsync_HostThatNeverAnswers_TimesOutAsInternal()
+    public async Task DetachAsync_CooperativeFakeHostHang_TimesOutAsInternal()
     {
         GivenVolume("pvc-1");
         var host = new FakeHostClient { HangsForever = true };
@@ -579,9 +579,8 @@ public sealed class AttachServiceTests : IDisposable
         }
 
         /// <summary>
-        /// Never answers, so only the caller's timeout ends the wait. Task.Delay
-        /// with the token rather than a real sleep, so the test costs whatever
-        /// budget it configured and nothing more.
+        /// Never answers unless cancelled. This is intentionally cooperative so
+        /// timeout translation paths can be asserted quickly in unit tests.
         /// </summary>
         private Task HangIfAskedTo(CancellationToken cancellationToken) =>
             HangsForever || (HangsAfterMigrating && NotOnHost is not null)
