@@ -106,6 +106,16 @@ func pollStopped(ctx context.Context, jobID string, lastStatus agentclient.JobSt
 		"job %s is still %s after %s; operation in progress, retry", jobID, lastStatus, budget)
 }
 
+// enqueueFailed maps an EnqueueJob error onto a gRPC status, distinguishing
+// the caller's own context ending from the agent actually being unreachable -
+// the same distinction pollStopped makes for a poll that stops mid-flight.
+func enqueueFailed(ctx context.Context, err error, format string, args ...any) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return status.FromContextError(ctxErr).Err()
+	}
+	return status.Errorf(codes.Unavailable, format+": %v", append(args, err)...)
+}
+
 // translateJobFailure maps the agent's coarse error classification onto gRPC
 // codes. Unclassified failures become INTERNAL, which the sidecars retry —
 // the design's default posture, since the agent re-derives what still needs

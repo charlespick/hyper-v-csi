@@ -116,7 +116,7 @@ func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		SizeBytes: sizeBytes,
 	})
 	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "enqueueing CreateVolume for %s: %v", req.GetName(), err)
+		return nil, enqueueFailed(ctx, err, "enqueueing CreateVolume for %s", req.GetName())
 	}
 
 	done, err := awaitJob(ctx, s.driver.Agent, job.ID, jobPollBudget)
@@ -264,7 +264,7 @@ func (s *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 		VolumeID: req.GetVolumeId(),
 	})
 	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "enqueueing DeleteVolume for %s: %v", req.GetVolumeId(), err)
+		return nil, enqueueFailed(ctx, err, "enqueueing DeleteVolume for %s", req.GetVolumeId())
 	}
 
 	if _, err := awaitJob(ctx, s.driver.Agent, job.ID, jobPollBudget); err != nil {
@@ -344,8 +344,8 @@ func (s *controllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			NodeID:   req.GetNodeId(),
 		})
 	if err != nil {
-		return nil, status.Errorf(codes.Unavailable,
-			"enqueueing ControllerPublishVolume for %s on %s: %v", req.GetVolumeId(), req.GetNodeId(), err)
+		return nil, enqueueFailed(ctx, err,
+			"enqueueing ControllerPublishVolume for %s on %s", req.GetVolumeId(), req.GetNodeId())
 	}
 
 	done, err := awaitJob(ctx, s.driver.Agent, job.ID, jobPollBudget)
@@ -434,8 +434,8 @@ func (s *controllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 			NodeID:   req.GetNodeId(),
 		})
 	if err != nil {
-		return nil, status.Errorf(codes.Unavailable,
-			"enqueueing ControllerUnpublishVolume for %s on %s: %v", req.GetVolumeId(), req.GetNodeId(), err)
+		return nil, enqueueFailed(ctx, err,
+			"enqueueing ControllerUnpublishVolume for %s on %s", req.GetVolumeId(), req.GetNodeId())
 	}
 
 	if _, err := awaitJob(ctx, s.driver.Agent, job.ID, jobPollBudget); err != nil {

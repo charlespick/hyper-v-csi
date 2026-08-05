@@ -338,6 +338,23 @@ func TestCreateVolumeUnreachableAgentIsRetryable(t *testing.T) {
 	}
 }
 
+func TestCreateVolumeCanceledCallerContextIsNotUnavailable(t *testing.T) {
+	// The context ending while the enqueue POST is in flight says nothing
+	// about the agent's health, so it must not come back looking like the
+	// agent-unreachable case does.
+	agent := newFakeAgent(t, created(1024))
+	server := newControllerServer(agent)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := server.CreateVolume(ctx, createVolumeRequest("pvc-1", 1024, 0))
+
+	if got := status.Code(err); got != codes.Canceled {
+		t.Fatalf("code = %s, want Canceled (err: %v)", got, err)
+	}
+}
+
 func TestCreateVolumeRejectsAnUnusableResult(t *testing.T) {
 	tests := []struct {
 		name string
