@@ -23,4 +23,10 @@
     <ProjectReference Include="..\..\src\HyperVCsiAgent.Service\HyperVCsiAgent.Service.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Shared with HyperVCsiAgent.Core.Tests rather than duplicated: same
+         attribute, same skip rationale, one source of truth. -->
+    <Compile Include="..\HyperVCsiAgent.Core.Tests\WindowsOnlyFactAttribute.cs" Link="WindowsOnlyFactAttribute.cs" />
+  </ItemGroup>
+
 </Project>
