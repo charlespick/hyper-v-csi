@@ -220,7 +220,10 @@ func TestCreateVolumeAcceptsEverySingleNodeAccessMode(t *testing.T) {
 
 	for _, mode := range modes {
 		t.Run(mode.String(), func(t *testing.T) {
-			server := newControllerServer(newFakeAgent(t, created(1024)))
+			// The size has to satisfy withAccessMode's own required_bytes.
+			// Anything smaller trips CreateVolume's capacity check first, and
+			// the access mode this test is about never gets a verdict.
+			server := newControllerServer(newFakeAgent(t, created(gibibyte)))
 
 			if _, err := server.CreateVolume(context.Background(), withAccessMode(mode)); err != nil {
 				t.Fatalf("CreateVolume with %s: %v", mode, err)
