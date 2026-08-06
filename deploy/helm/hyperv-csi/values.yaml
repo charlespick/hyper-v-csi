@@ -1,11 +1,15 @@
 # hyperv-csi
 #
 # Scoped to what the driver actually implements today: provisioning, reclaim,
-# and attach/detach. Mounting, expanding, and snapshotting are still
-# Unimplemented, so the chart deliberately does not deploy the sidecars that
-# would call them — they would sit in a retry loop against RPCs that cannot
-# succeed. The knobs to turn those on are here, defaulted off, for when the
-# RPCs land.
+# attach/detach, the full mount path, and expansion. Snapshotting is still
+# Unimplemented, so the chart deliberately does not deploy external-snapshotter
+# — it would sit in a retry loop against RPCs that cannot succeed. The knobs to
+# turn that on will go here, defaulted off, when those RPCs land.
+#
+# Implemented is not the same as exercised. Only provisioning, reclaim,
+# attach/detach and staging have run against a real Hyper-V cluster; see the
+# Status column in CSI Spec.md, and the individual defaults below that stay
+# conservative because of it.
 
 image:
   repository: ghcr.io/charlespick/hyperv-csi-driver
@@ -80,19 +84,23 @@ controller:
   affinity: {}
   podAnnotations: {}
 
-# The node plugin stages and mounts volumes in the guest. Every Node* RPC that
-# does real work is still Unimplemented, so it cannot mount anything yet.
+# The node plugin stages and mounts volumes in the guest. Every Node* RPC is
+# now built, so a pod using a PVC runs the whole path: a real attach
+# (VolumeAttachment, ControllerPublishVolume, a disk appearing in the VM's
+# configuration), a real NodeStageVolume format-and-mount, and a real
+# NodePublishVolume bind-mount into the pod — and unwinds it again on teardown.
 #
-# On anyway, because attach needs it for a reason unrelated to mounting: the
-# node plugin's registration is what creates the CSINode object, and CSINode is
-# where external-attacher reads the CSI node ID it passes to
-# ControllerPublishVolume. Without it there is no node ID to resolve and no
-# attach can complete, whatever attachRequired says.
+# Keep it on even if that were not true, because attach needs it for a reason
+# unrelated to mounting: the node plugin's registration is what creates the
+# CSINode object, and CSINode is where external-attacher reads the CSI node ID
+# it passes to ControllerPublishVolume. Without it there is no node ID to
+# resolve and no attach can complete, whatever attachRequired says.
 #
-# So a pod using a PVC now gets as far as a real attach — VolumeAttachment,
-# ControllerPublishVolume, a disk appearing in the VM's configuration — and then
-# fails at NodeStageVolume. That is the intended state: the failure moves to the
-# step that is genuinely unbuilt instead of hanging at one that isn't.
+# Two things the guest must have, and the plugin refuses to start without them
+# rather than falling back to its hostname: the hyperv-daemons package with
+# hv_kvp_daemon running, and the Data Exchange integration service enabled on
+# the VM. That is where the Hyper-V VM ID it reports as the CSI node ID comes
+# from.
 node:
   enabled: true
 
@@ -135,9 +143,12 @@ storageClass:
   # DeleteVolume succeed on your cluster.
   reclaimPolicy: Retain
 
-  # WaitForFirstConsumer would hold the PVC Pending until a pod is scheduled,
-  # and nothing can mount it yet, so binding immediately is what makes
-  # provisioning observable on its own.
+  # WaitForFirstConsumer exists to let a topology-aware driver place the volume
+  # where the pod landed. This one advertises no topology at all — a VHDX on the
+  # CSV is reachable from every node in the failover cluster, and see CSI
+  # Spec.md on why VOLUME_ACCESSIBILITY_CONSTRAINTS is deliberately omitted — so
+  # deferring the bind would buy nothing and only hold the PVC Pending until
+  # something scheduled against it.
   volumeBindingMode: Immediate
 
   # Both halves of an expansion exist now — ControllerExpandVolume grows the
