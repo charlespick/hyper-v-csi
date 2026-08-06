@@ -59,12 +59,24 @@ spec:
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
-            # No mountPropagation: Bidirectional requires a privileged
-            # container, and nothing here mounts anything yet (see
-            # privileged: false below). Add it back alongside privileged: true
-            # when NodeStageVolume/NodePublishVolume actually mount.
-            - name: pods-mount-dir
-              mountPath: {{ .Values.node.kubeletDir }}/pods
+            # Bidirectional: NodeStageVolume mounts under
+            # kubeletDir/plugins/kubernetes.io/csi/<driver>/<volume>/globalmount,
+            # a path kubelet computes and this container does not otherwise
+            # have visibility into. Mounting the whole kubeletDir at the same
+            # path it has on the host, with propagation back out, is what
+            # lets a mount made in here show up in the host's mount table —
+            # which is how kubelet itself finds out the volume is staged.
+            # Requires privileged: true below; Kubernetes rejects
+            # Bidirectional otherwise.
+            - name: kubelet-dir
+              mountPath: {{ .Values.node.kubeletDir }}
+              mountPropagation: Bidirectional
+            # vmbusdisk.Resolve finds the disk under /sys, but the block
+            # device node it resolves to (e.g. /dev/sda) lives in /dev, and a
+            # container's own /dev is a private, minimal one that does not
+            # include host block devices without this.
+            - name: device-dir
+              mountPath: /dev
             # Read-only: the host publishes into these pools and the guest only
             # reads them. hv_kvp_daemon must be running on the node (the
             # hyperv-daemons package) or this directory is empty and the plugin
@@ -75,12 +87,11 @@ spec:
           resources:
             {{- toYaml .Values.node.resources | nindent 12 }}
           securityContext:
-            # Staging and publishing a volume means mounting inside the guest,
-            # which needs privilege — but NodeStageVolume/NodePublishVolume are
-            # still stubs, so nothing here does that work yet. Flip this back to
-            # true (or to a narrower capability set, if one turns out to suffice)
-            # when those RPCs actually mount.
-            privileged: false
+            # NodeStageVolume/NodeUnstageVolume actually mount and unmount
+            # now (format included), which needs CAP_SYS_ADMIN, and is also
+            # what Kubernetes requires to honor the kubelet-dir mount's
+            # mountPropagation: Bidirectional above.
+            privileged: true
       volumes:
         - name: socket-dir
           hostPath:
@@ -90,9 +101,13 @@ spec:
           hostPath:
             path: {{ .Values.node.kubeletDir }}/plugins_registry
             type: Directory
-        - name: pods-mount-dir
+        - name: kubelet-dir
           hostPath:
-            path: {{ .Values.node.kubeletDir }}/pods
+            path: {{ .Values.node.kubeletDir }}
+            type: Directory
+        - name: device-dir
+          hostPath:
+            path: /dev
             type: Directory
         - name: hyperv-kvp
           hostPath:
