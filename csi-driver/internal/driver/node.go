@@ -92,6 +92,13 @@ const (
 	// anyone expects to spend, it is the point at which the filesystem is
 	// wedged and kubelet should be told so rather than left hanging.
 	statsOperationBudget = 10 * time.Second
+
+	// expandOperationBudget bounds NodeExpandVolume, and it is the longest of
+	// these because it is the only one whose work scales with the volume:
+	// resize2fs walks and rewrites metadata across the whole filesystem, so a
+	// large disk legitimately takes a while. Ten seconds would report a
+	// healthy grow as a failure.
+	expandOperationBudget = 60 * time.Second
 )
 
 // validateStagingRequest checks the two fields NodeStageVolume and
@@ -685,6 +692,108 @@ func (s *nodeServer) volumeStats(volumePath string) (fsstats.Stats, error) {
 
 // NodeExpandVolume grows the filesystem after ControllerExpandVolume has
 // grown the underlying VHDX. Idempotency key: volume ID + volume path.
+//
+// Nothing reaches this yet: ControllerExpandVolume is still a stub, so no
+// volume ever gets larger for a filesystem to grow into. That is the next
+// piece of work rather than part of this one — this half is the one that has
+// to exist before the pair can be exercised at all.
+//
+// It resolves the device from the mount table rather than from a publish
+// context, because CSI hands this RPC neither one. That works from either path
+// kubelet might pass: /proc/mounts records the underlying device for a bind
+// mount too, so the pod's target path and the node-wide staging path resolve
+// to the same device, which is the thing being resized.
 func (s *nodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "NodeExpandVolume not implemented")
+	volumeID := req.GetVolumeId()
+	volumePath := req.GetVolumePath()
+	if volumeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume id is required")
+	}
+	if volumePath == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume path is required")
+	}
+
+	// CSI makes volume_capability optional here, so an absent one is not an
+	// error — but a block one still is, for the same reason it is everywhere
+	// else: nothing in this driver handles raw block devices.
+	if capability := req.GetVolumeCapability(); capability != nil {
+		if err := validateVolumeCapabilities([]*csi.VolumeCapability{capability}); err != nil {
+			return nil, err
+		}
+		if capability.GetMount() == nil {
+			return nil, status.Error(codes.InvalidArgument,
+				"only mount volumes are supported; block volumes are not implemented")
+		}
+	}
+
+	unlock, err := s.acquireMountLock("NodeExpandVolume", volumeID, volumePath)
+	if err != nil {
+		return nil, err
+	}
+
+	err = runBounded(ctx, clampToCallerDeadline(ctx, expandOperationBudget), unlock, func() error {
+		return s.expandVolume(volumePath)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// capacity_bytes is deliberately left unset, which CSI permits. The only
+	// number available after a grow is the filesystem's usable total, and that
+	// is always smaller than the block device the CO asked about — metadata,
+	// journal and reserved blocks come off the top. Reporting it would look
+	// like the expansion fell short of what was requested, and a CO that
+	// retries on a shortfall would retry forever against a filesystem that is
+	// already as large as it can be.
+	return &csi.NodeExpandVolumeResponse{}, nil
+}
+
+// expandVolume grows the filesystem mounted at volumePath. Like the other
+// mount-side helpers it is not handed ctx — see runBounded's doc comment for
+// why the goroutine this runs in outlives the RPC.
+func (s *nodeServer) expandVolume(volumePath string) error {
+	notMountPoint, err := mount.IsNotMountPoint(s.mounter, volumePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return status.Errorf(codes.NotFound, "volume path %s does not exist", volumePath)
+		}
+		return status.Errorf(codes.Internal, "checking volume path %s: %v", volumePath, err)
+	}
+	if notMountPoint {
+		return status.Errorf(codes.NotFound,
+			"volume path %s exists but nothing is mounted there", volumePath)
+	}
+
+	devicePath, _, err := mount.GetDeviceNameFromMount(s.mounter, volumePath)
+	if err != nil {
+		return status.Errorf(codes.Internal, "finding the device mounted at %s: %v", volumePath, err)
+	}
+	if devicePath == "" {
+		// IsNotMountPoint just said something is mounted here, so the mount
+		// table disagreeing with itself is the only way to land here. Guessing
+		// a device would mean resizing a filesystem picked at random.
+		return status.Errorf(codes.Internal,
+			"volume path %s is reported mounted but no device is recorded for it", volumePath)
+	}
+
+	// ResizeFs picks the tool from the filesystem it finds on the device:
+	// resize2fs for ext, xfs_growfs for xfs. Only e2fsprogs is in the node
+	// image, which matches defaultFsType — an xfs volume would already have
+	// failed at NodeStageVolume's mkfs, so it cannot reach this and find the
+	// tool missing.
+	resized, err := mount.NewResizeFs(s.mounter.Exec).Resize(devicePath, volumePath)
+	if err != nil {
+		return status.Errorf(codes.Internal,
+			"growing the filesystem on %s mounted at %s: %v", devicePath, volumePath, err)
+	}
+	if !resized {
+		// Resize reports false without an error in exactly one case: it found
+		// no filesystem on the device. Something is mounted at volumePath, so
+		// that means the device the mount table names is not the one that was
+		// staged, and growing anything on the strength of that would be a
+		// guess about which disk.
+		return status.Errorf(codes.FailedPrecondition,
+			"no filesystem found on %s, the device mounted at %s", devicePath, volumePath)
+	}
+	return nil
 }

@@ -27,8 +27,8 @@ covered by unit tests but has never run against a real failover cluster or Hyper
 | NodePublishVolume | Node | Bind-mounts a staged volume into a specific pod's path. | Volume ID + target path | Pending testing |
 | NodeUnpublishVolume | Node | Removes a pod's bind-mount of a volume. | Volume ID + target path | Pending testing |
 | NodeGetVolumeStats | Node | Reports usage and capacity stats for a mounted volume. | Volume ID + volume path (lookup only) | Pending testing |
-| NodeExpandVolume | Node | Grows the filesystem on a node after the underlying volume was expanded. | Volume ID + volume path | Not started |
-| NodeGetCapabilities | Node | Reports which node RPCs this plugin implements. | N/A | Over advertising until project is finished |
+| NodeExpandVolume | Node | Grows the filesystem on a node after the underlying volume was expanded. | Volume ID + volume path | Pending testing — unreachable until ControllerExpandVolume exists |
+| NodeGetCapabilities | Node | Reports which node RPCs this plugin implements. | N/A | Tested — kubelet reads it before every stage |
 | NodeGetInfo | Node | Reports node identity/topology info used for scheduling and attach decisions. | N/A | Tested — reports the Hyper-V VM ID against a real cluster |
 
 **Over advertising until project is finished** means the RPC works — it's a declaration, and
@@ -37,14 +37,15 @@ lists describe the finished driver, not today's code, so the sidecars will call 
 Unimplemented. Either trim each list to what's actually built, or land the missing RPCs, before
 running this in a cluster. What each one currently overstates:
 
-- `GetPluginCapabilities` — volume expansion (ONLINE), while both ControllerExpandVolume and
-  NodeExpandVolume are stubs. It correctly omits VOLUME_ACCESSIBILITY_CONSTRAINTS.
+- `GetPluginCapabilities` — volume expansion (ONLINE), and now only half-overstated:
+  NodeExpandVolume is built, ControllerExpandVolume is still a stub, and an expansion needs both. It
+  correctly omits VOLUME_ACCESSIBILITY_CONSTRAINTS.
 - `ControllerGetCapabilities` — EXPAND_VOLUME, CREATE_DELETE_SNAPSHOT, and LIST_SNAPSHOTS.
   CREATE_DELETE_VOLUME and PUBLISH_UNPUBLISH_VOLUME are the two it does not overstate: both halves
   of each are built.
-- `NodeGetCapabilities` — EXPAND_VOLUME, and only that. STAGE_UNSTAGE_VOLUME and GET_VOLUME_STATS
-  no longer belong on this list: NodeStageVolume, NodeUnstageVolume and NodeGetVolumeStats are all
-  built.
+- `NodeGetCapabilities` — nothing any more. Every RPC it names is built: STAGE_UNSTAGE_VOLUME,
+  GET_VOLUME_STATS and EXPAND_VOLUME. It is the first of the three lists to become honest, and it
+  drops off this section once the node side is signed off in a cluster.
 
 **CreateVolume gaps.** StorageClass `parameters` are ignored rather than consumed or rejected, the
 access *type* (mount vs block) is not validated, and `volume_context` is left empty.
@@ -251,6 +252,30 @@ a Linux image and only runs inside a Linux guest. It is so `go build ./...` and 
 work on the Windows machines this repo is developed on, and so that if the stand-in ever *is* reached,
 the RPC fails loudly instead of reporting an empty disk.
 
+**NodeExpandVolume is built and unreachable, and that is the intended order.** ControllerExpandVolume
+is still a stub, so no VHDX ever gets larger and there is never a filesystem with room to grow into —
+the pair cannot be exercised until the controller half lands, which is the next piece of work rather
+than part of this one. Advertising `EXPAND_VOLUME` on `NodeGetCapabilities` is now honest on its own
+terms; `GetPluginCapabilities`' ONLINE expansion is still not, since that one describes both halves.
+
+It resolves the device from the mount table, not from a publish context, because CSI hands this RPC
+neither one. That is what makes it work from either path kubelet might pass: `/proc/mounts` records
+the underlying device for a bind mount too, so the pod's target path and the node-wide staging path
+resolve to the same device, which is the thing being resized. Two refusals rather than guesses: a path
+that is not a mount point is NOT_FOUND, and a mounted path whose device carries no filesystem is
+FAILED_PRECONDITION — that combination means the mount table names a device that was never staged, and
+growing something anyway would be a guess about which disk.
+
+`capacity_bytes` is deliberately left unset, which CSI permits. The only number available after a grow
+is the filesystem's usable total, and that is always smaller than the block device the CO asked about:
+metadata, journal and reserved blocks come off the top. Reporting it would read as the expansion
+falling short of what was requested, and a CO that retries on a shortfall would retry forever against
+a filesystem already as large as it can be.
+
+Only `e2fsprogs` is in the node image, so `resize2fs` is there and `xfs_growfs` is not. That matches
+`defaultFsType`, and it cannot surprise anyone at expansion time: an xfs volume would already have
+failed at NodeStageVolume's `mkfs.xfs`, so it can never reach a grow and find the tool missing.
+
 **ControllerPublishVolume identifies a node by its Hyper-V VM ID, end to end.** The node plugin
 reads `VirtualMachineId` out of the guest's Hyper-V key-value pools — the values the host publishes
 through the Data Exchange integration service, which `hv_kvp_daemon` writes to
@@ -348,11 +373,13 @@ for CreateVolume — if the call does eventually return, it returns having delet
 what was asked for. A create abandoned the same way could leave a disk nobody expects.
 
 **A wedged mount tool is conceded, not prevented, the same way.** Every node RPC that touches the
-filesystem bounds its wait: `stageOperationBudget`/`unstageOperationBudget` (30s each), and
+filesystem bounds its wait: `stageOperationBudget`/`unstageOperationBudget` (30s each),
 `publishOperationBudget`/`unpublishOperationBudget`/`statsOperationBudget` (10s each — a bind of a
 mount that is already there, its teardown, and a `statfs` all have no device to wait for and no
-filesystem to create, so a longer wait would only be waiting on a wedged syscall). But neither
-`vmbusdisk.Resolve`'s poll nor a
+filesystem to create, so a longer wait would only be waiting on a wedged syscall), and
+`expandOperationBudget` (60s, the longest, because it is the only one whose work scales with the
+volume: `resize2fs` rewrites metadata across the whole filesystem, and ten seconds would report a
+healthy grow of a large disk as a failure). But neither `vmbusdisk.Resolve`'s poll nor a
 mount/unmount syscall has a cancellation token, so the budget elapsing does not stop the work — it
 only stops waiting on it. The `mountPathKey` lock (volume ID + the path that RPC is about) is released
 by the goroutine actually doing the work, once that work returns, not by the RPC handler when the

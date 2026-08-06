@@ -52,28 +52,31 @@ func newTestNodeServer(t *testing.T) (*nodeServer, *mount.FakeMounter, string) {
 // where formatAndMountSensitive skips the fsck step, only consumes the first
 // scripted command.
 func newFakeExecAlreadyFormatted() utilexec.Interface {
-	blkidReportsFormatted := func(cmd string, args ...string) utilexec.Cmd {
-		fakeCmd := &testingexec.FakeCmd{
-			CombinedOutputScript: []testingexec.FakeAction{
-				func() ([]byte, []byte, error) {
-					return []byte("TYPE=" + defaultFsType + "\n"), nil, nil
-				},
-			},
-		}
-		return testingexec.InitFakeCmd(fakeCmd, cmd, args...)
-	}
-	fsckReportsClean := func(cmd string, args ...string) utilexec.Cmd {
-		fakeCmd := &testingexec.FakeCmd{
-			CombinedOutputScript: []testingexec.FakeAction{
-				func() ([]byte, []byte, error) {
-					return nil, nil, nil
-				},
-			},
-		}
-		return testingexec.InitFakeCmd(fakeCmd, cmd, args...)
-	}
 	return &testingexec.FakeExec{
-		CommandScript: []testingexec.FakeCommandAction{blkidReportsFormatted, fsckReportsClean},
+		CommandScript: []testingexec.FakeCommandAction{
+			scriptedCommand(nil, "TYPE="+defaultFsType+"\n", nil), // blkid
+			scriptedCommand(nil, "", nil),                         // fsck
+		},
+	}
+}
+
+// scriptedCommand builds one entry of a FakeExec's script: a command that
+// reports combinedOutput and err, and that appends the command line it was
+// asked to run to *calls when calls is non-nil, so a test can assert what
+// actually ran rather than only what it produced.
+func scriptedCommand(calls *[][]string, combinedOutput string, err error) testingexec.FakeCommandAction {
+	return func(cmd string, args ...string) utilexec.Cmd {
+		if calls != nil {
+			*calls = append(*calls, append([]string{cmd}, args...))
+		}
+		fakeCmd := &testingexec.FakeCmd{
+			CombinedOutputScript: []testingexec.FakeAction{
+				func() ([]byte, []byte, error) {
+					return []byte(combinedOutput), nil, err
+				},
+			},
+		}
+		return testingexec.InitFakeCmd(fakeCmd, cmd, args...)
 	}
 }
 
@@ -1081,6 +1084,189 @@ func TestNodeGetVolumeStatsReturnsAbortedWhenAnotherCallIsAlreadyInProgress(t *t
 	_, err := s.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
 		VolumeId:   "vol-1",
 		VolumePath: target,
+	})
+	if got := grpcCode(t, err); got != codes.Aborted {
+		t.Errorf("code = %s, want Aborted", got)
+	}
+}
+
+// --- NodeExpandVolume ---
+
+// stagedVolumeForResize stages vol-1 and then re-points the mounter's exec at
+// a fresh script covering ResizeFs.Resize's two commands: the blkid it runs to
+// learn the filesystem, then the resize tool for that filesystem. It returns
+// the staging path and the recorded command lines, which is how a test can
+// tell resize2fs was pointed at the device rather than at the mount path.
+func stagedVolumeForResize(t *testing.T, blkidOutput string, resizeErr error) (*nodeServer, string, *[][]string) {
+	t.Helper()
+	s, _, sysRoot := newTestNodeServer(t)
+	staging := stagePublishSource(t, s, sysRoot)
+
+	calls := &[][]string{}
+	s.mounter.Exec = &testingexec.FakeExec{
+		CommandScript: []testingexec.FakeCommandAction{
+			scriptedCommand(calls, blkidOutput, nil),
+			scriptedCommand(calls, "", resizeErr),
+		},
+	}
+	return s, staging, calls
+}
+
+func TestNodeExpandVolumeRejectsMissingVolumeID(t *testing.T) {
+	s, _, _ := newTestNodeServer(t)
+	_, err := s.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
+		VolumePath: t.TempDir(),
+	})
+	if got := grpcCode(t, err); got != codes.InvalidArgument {
+		t.Errorf("code = %s, want InvalidArgument", got)
+	}
+}
+
+func TestNodeExpandVolumeRejectsMissingVolumePath(t *testing.T) {
+	s, _, _ := newTestNodeServer(t)
+	_, err := s.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
+		VolumeId: "vol-1",
+	})
+	if got := grpcCode(t, err); got != codes.InvalidArgument {
+		t.Errorf("code = %s, want InvalidArgument", got)
+	}
+}
+
+func TestNodeExpandVolumeRejectsBlockVolumes(t *testing.T) {
+	// The capability is optional on this RPC, so an absent one is fine — but a
+	// block one is still refused, as everywhere else in this plugin.
+	s, _, _ := newTestNodeServer(t)
+	_, err := s.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
+		VolumeId:   "vol-1",
+		VolumePath: t.TempDir(),
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
+		},
+	})
+	if got := grpcCode(t, err); got != codes.InvalidArgument {
+		t.Errorf("code = %s, want InvalidArgument", got)
+	}
+}
+
+func TestNodeExpandVolumeReturnsNotFoundWhenTheVolumePathDoesNotExist(t *testing.T) {
+	s, _, _ := newTestNodeServer(t)
+	_, err := s.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
+		VolumeId:   "vol-1",
+		VolumePath: filepath.Join(t.TempDir(), "never-created"),
+	})
+	if got := grpcCode(t, err); got != codes.NotFound {
+		t.Errorf("code = %s, want NotFound", got)
+	}
+}
+
+func TestNodeExpandVolumeReturnsNotFoundWhenNothingIsMountedThere(t *testing.T) {
+	s, _, _ := newTestNodeServer(t)
+	_, err := s.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
+		VolumeId:   "vol-1",
+		VolumePath: t.TempDir(),
+	})
+	if got := grpcCode(t, err); got != codes.NotFound {
+		t.Errorf("code = %s, want NotFound", got)
+	}
+}
+
+func TestNodeExpandVolumeGrowsTheFilesystemOnTheMountedDevice(t *testing.T) {
+	s, staging, calls := stagedVolumeForResize(t, "TYPE="+defaultFsType+"\n", nil)
+
+	if _, err := s.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
+		VolumeId:   "vol-1",
+		VolumePath: staging,
+	}); err != nil {
+		t.Fatalf("NodeExpandVolume: %v", err)
+	}
+
+	if len(*calls) != 2 {
+		t.Fatalf("ran %d commands, want blkid then the resize tool: %v", len(*calls), *calls)
+	}
+	resize := (*calls)[1]
+	if resize[0] != "resize2fs" {
+		t.Errorf("resize command = %q, want resize2fs for %s", resize[0], defaultFsType)
+	}
+	// resize2fs takes the device, not the mount path. Passing the mount path
+	// would fail against a real binary, so pin which one is handed over.
+	if len(resize) != 2 || !strings.HasSuffix(resize[1], "sdb") {
+		t.Errorf("resize command = %v, want it pointed at the device .../sdb", resize)
+	}
+}
+
+func TestNodeExpandVolumeWorksFromAPodsBindMountToo(t *testing.T) {
+	// CSI does not say which path kubelet passes, and /proc/mounts records the
+	// underlying device for a bind mount as well, so publishing and then
+	// expanding at the pod's target path has to resolve to the same device.
+	s, _, sysRoot := newTestNodeServer(t)
+	staging := stagePublishSource(t, s, sysRoot)
+	target := filepath.Join(t.TempDir(), "mount")
+	if _, err := s.NodePublishVolume(context.Background(),
+		nodePublishRequest(staging, target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)); err != nil {
+		t.Fatalf("NodePublishVolume: %v", err)
+	}
+
+	calls := &[][]string{}
+	s.mounter.Exec = &testingexec.FakeExec{
+		CommandScript: []testingexec.FakeCommandAction{
+			scriptedCommand(calls, "TYPE="+defaultFsType+"\n", nil),
+			scriptedCommand(calls, "", nil),
+		},
+	}
+
+	if _, err := s.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
+		VolumeId:   "vol-1",
+		VolumePath: target,
+	}); err != nil {
+		t.Fatalf("NodeExpandVolume: %v", err)
+	}
+
+	if len(*calls) != 2 || !strings.HasSuffix((*calls)[1][1], "sdb") {
+		t.Errorf("commands = %v, want the resize pointed at the device .../sdb behind the bind", *calls)
+	}
+}
+
+func TestNodeExpandVolumeReturnsFailedPreconditionWhenTheDeviceHasNoFilesystem(t *testing.T) {
+	// blkid finding nothing means the device the mount table names is not the
+	// one that was staged. Growing something anyway would be a guess at which
+	// disk, so this refuses rather than reporting a no-op as success.
+	s, staging, _ := stagedVolumeForResize(t, "", nil)
+
+	_, err := s.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
+		VolumeId:   "vol-1",
+		VolumePath: staging,
+	})
+	if got := grpcCode(t, err); got != codes.FailedPrecondition {
+		t.Errorf("code = %s, want FailedPrecondition", got)
+	}
+}
+
+func TestNodeExpandVolumeSurfacesAResizeFailure(t *testing.T) {
+	s, staging, _ := stagedVolumeForResize(t, "TYPE="+defaultFsType+"\n", errors.New("resize2fs: bad magic number"))
+
+	_, err := s.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
+		VolumeId:   "vol-1",
+		VolumePath: staging,
+	})
+	if got := grpcCode(t, err); got != codes.Internal {
+		t.Errorf("code = %s, want Internal", got)
+	}
+}
+
+func TestNodeExpandVolumeReturnsAbortedWhenAnotherCallIsAlreadyInProgress(t *testing.T) {
+	s, _, _ := newTestNodeServer(t)
+	volumePath := t.TempDir()
+
+	unlock, ok := s.locks.TryLock(mountPathKey("vol-1", volumePath))
+	if !ok {
+		t.Fatal("TryLock: ok = false, want true")
+	}
+	defer unlock()
+
+	_, err := s.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
+		VolumeId:   "vol-1",
+		VolumePath: volumePath,
 	})
 	if got := grpcCode(t, err); got != codes.Aborted {
 		t.Errorf("code = %s, want Aborted", got)
