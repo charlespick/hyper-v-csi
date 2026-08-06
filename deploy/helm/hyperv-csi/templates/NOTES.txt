@@ -3,11 +3,12 @@ hyperv-csi {{ .Chart.AppVersion }} installed as {{ .Release.Name }} in {{ .Relea
 Driver name: {{ include "hyperv-csi.driverName" . }}
 Agent:       {{ .Values.agent.address }}
 
-What works right now: CreateVolume, DeleteVolume, ControllerPublishVolume, and
-ControllerUnpublishVolume. A PVC will provision, bind, and attach to its node
-VM; a pod that tries to actually mount it will still fail, since
-NodeStageVolume/NodePublishVolume — the guest-side format+mount step — are not
-implemented.
+What works right now: CreateVolume, DeleteVolume, ControllerPublishVolume,
+ControllerUnpublishVolume, and NodeStageVolume/NodeUnstageVolume. A PVC will
+provision, bind, and attach to its node VM, and the node plugin will format
+and mount it at the staging path; a pod that tries to actually use it will
+still fail, since NodePublishVolume — the bind-mount into the pod's path — is
+not implemented.
 
 Watch a volume get provisioned:
 

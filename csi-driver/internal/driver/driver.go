@@ -7,7 +7,10 @@ package driver
 
 import (
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/agentclient"
+	"github.com/charlespick/hyper-v-csi/csi-driver/internal/vmbusdisk"
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	mount "k8s.io/mount-utils"
+	utilexec "k8s.io/utils/exec"
 )
 
 const (
@@ -41,6 +44,14 @@ func (d *Driver) ControllerServer() csi.ControllerServer {
 	return &controllerServer{driver: d}
 }
 
+// NodeServer wires up a real mounter (k8s.io/mount-utils backed by the real
+// mount syscalls and a real exec.Interface) against the guest's actual
+// /sys and /dev, the only sysRoot/devRoot vmbusdisk.Resolve should ever see
+// outside a test.
 func (d *Driver) NodeServer() csi.NodeServer {
-	return &nodeServer{driver: d}
+	mounter := &mount.SafeFormatAndMount{
+		Interface: mount.New(""),
+		Exec:      utilexec.New(),
+	}
+	return newNodeServer(d, mounter, vmbusdisk.DefaultSysRoot, vmbusdisk.DefaultDevRoot)
 }

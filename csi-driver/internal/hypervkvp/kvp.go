@@ -14,8 +14,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strings"
+
+	"github.com/charlespick/hyper-v-csi/csi-driver/internal/guidnorm"
 )
 
 // DefaultPoolDir is where hv_kvp_daemon keeps the pool files.
@@ -33,11 +33,6 @@ const (
 	valueSize  = 2048
 	recordSize = keySize + valueSize
 )
-
-// guid matches the canonical 8-4-4-4-12 form, which is what both Hyper-V and
-// failover clustering use. Enforced here rather than trusted, because this value
-// is interpolated into a WQL query on the agent.
-var guid = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // VirtualMachineID returns the GUID of the VM this process is running inside,
 // normalized to lowercase without braces.
@@ -65,10 +60,10 @@ func VirtualMachineID(poolDir string) (string, error) {
 			continue
 		}
 
-		// The host may or may not brace it depending on version; normalize
-		// rather than depending on which.
-		normalized := strings.ToLower(strings.Trim(value, "{}"))
-		if !guid.MatchString(normalized) {
+		// Enforced as a GUID rather than trusted, because this value is
+		// interpolated into a WQL query on the agent.
+		normalized, err := guidnorm.Normalize(value)
+		if err != nil {
 			return "", fmt.Errorf("%s in %s is %q, which is not a GUID", virtualMachineIDKey, pool, value)
 		}
 

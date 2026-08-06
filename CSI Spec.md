@@ -22,8 +22,8 @@ covered by unit tests but has never run against a real failover cluster or Hyper
 | CreateSnapshot | Controller | Creates a point-in-time snapshot of a volume. | Snapshot name | Not started |
 | DeleteSnapshot | Controller | Removes a previously created snapshot. | Snapshot ID | Not started |
 | ListSnapshots | Controller | Lists existing snapshots known to the plugin. | Snapshot ID or source volume ID (optional filter, lookup only) | Not started |
-| NodeStageVolume | Node | Makes a volume ready for use on a node (format and node-wide mount). | Volume ID + staging target path | Not started |
-| NodeUnstageVolume | Node | Undoes NodeStageVolume, releasing the node-wide mount. | Volume ID + staging target path | Not started |
+| NodeStageVolume | Node | Makes a volume ready for use on a node (format and node-wide mount). | Volume ID + staging target path | Pending testing |
+| NodeUnstageVolume | Node | Undoes NodeStageVolume, releasing the node-wide mount. | Volume ID + staging target path | Pending testing |
 | NodePublishVolume | Node | Bind-mounts a staged volume into a specific pod's path. | Volume ID + target path | Not started |
 | NodeUnpublishVolume | Node | Removes a pod's bind-mount of a volume. | Volume ID + target path | Not started |
 | NodeGetVolumeStats | Node | Reports usage and capacity stats for a mounted volume. | Volume ID + volume path (lookup only) | Not started |
@@ -42,8 +42,9 @@ running this in a cluster. What each one currently overstates:
 - `ControllerGetCapabilities` — EXPAND_VOLUME, CREATE_DELETE_SNAPSHOT, and LIST_SNAPSHOTS.
   CREATE_DELETE_VOLUME and PUBLISH_UNPUBLISH_VOLUME are the two it does not overstate: both halves
   of each are built.
-- `NodeGetCapabilities` — STAGE_UNSTAGE_VOLUME, EXPAND_VOLUME, and GET_VOLUME_STATS, none of
-  which are implemented.
+- `NodeGetCapabilities` — EXPAND_VOLUME and GET_VOLUME_STATS, neither of which is implemented.
+  STAGE_UNSTAGE_VOLUME no longer belongs on this list: both NodeStageVolume and NodeUnstageVolume
+  are built.
 
 **CreateVolume gaps.** StorageClass `parameters` are ignored rather than consumed or rejected, the
 access *type* (mount vs block) is not validated, and `volume_context` is left empty.
@@ -224,12 +225,38 @@ node plugin will be built on and the one piece of this that has not been confirm
 hardware. If it doesn't hold, the fallback is the disk's SCSI page-83 identifier, which would mean
 returning that in the publish context too.
 
+`vmbusdisk.Resolve` is what turns that pair into a device path, and it walks a fixed chain: the VMBus
+channel directory at `/sys/bus/vmbus/devices/<controllerID>` has a single `host<N>` child — the SCSI
+host `hv_storvsc` registers for that channel — and Hyper-V places every disk on a controller at target
+0, so the disk's SCSI address is `<N>:0:0:<lun>`. Once storvsc has scanned that address,
+`/sys/bus/scsi/devices/<N>:0:0:<lun>/block` holds exactly one entry, and that entry's name is the
+device under `/dev`. Because the host and the LUN's block device each get registered asynchronously
+in the guest kernel after the host-side attach, `Resolve` polls (25ms up to 500ms backoff) rather than
+looking once, bounded by its own budget independently of the caller's context, so "not there yet" and
+"the caller gave up" come back as distinguishable errors. Two assumptions in that chain are unverified
+against real hardware, same as the GUID assumption above: that a VMBus channel for a Hyper-V SCSI
+controller registers exactly one `host<N>` child, and that every disk Hyper-V attaches sits at target
+0 rather than varying by anything but LUN. Either one, more than one `host<N>` directory or more than
+one block device under a LUN, is treated as an unresolvable error rather than a guess, since guessing
+wrong would stage the wrong disk.
+
 **A wedged delete is conceded, not prevented.** `File.Delete` takes no cancellation token, so a
 delete stuck on a CSV in redirected mode cannot be called off. The timeout is therefore *observed*
 rather than enforced: the job fails, the volume's job chain drains and its concurrency slot is
 released, but the thread stays in the syscall. Abandoning it is safe here in a way it would not be
 for CreateVolume — if the call does eventually return, it returns having deleted the file, which is
 what was asked for. A create abandoned the same way could leave a disk nobody expects.
+
+**A wedged mount tool is conceded, not prevented, the same way.** `NodeStageVolume` and
+`NodeUnstageVolume` bound their wait with `stageOperationBudget`/`unstageOperationBudget` (30s each),
+but neither `vmbusdisk.Resolve`'s poll nor a mount/unmount syscall has a cancellation token, so the
+budget elapsing does not stop the work — it only stops waiting on it. The `stagingKey` lock (volume ID
++ staging target path) is released by the goroutine actually doing the work, once that work returns,
+not by the RPC handler when the budget runs out; a retry that arrives while the real call is still in
+flight gets ABORTED rather than running alongside it. That closes the double-mount risk a naive
+timeout would open, but it does not shrink the wait: a target wedged on a hung format or a stuck mount
+still holds the lock for as long as the syscall does, budget or no budget, exactly as `File.Delete`
+does for DeleteVolume.
 
 **Other DeleteVolume notes.** A volume ID that could not have come from CreateVolume (one failing
 the safe filename rule) reports success rather than INVALID_ARGUMENT: no such volume can exist, CSI
