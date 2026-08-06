@@ -1,5 +1,7 @@
 using System.Diagnostics;
+using HyperVCsiAgent.Core.Cluster;
 using HyperVCsiAgent.Core.Configuration;
+using HyperVCsiAgent.Core.HostControl;
 using HyperVCsiAgent.Core.Jobs;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -69,13 +71,33 @@ public sealed class VhdxService : IVhdxService, IDisposable
     private const int UserMappedFileHResult = unchecked((int)0x800704C8);
 
     private readonly IVirtualDiskManager _diskManager;
+
+    /// <summary>
+    /// Used only by <see cref="ExpandAsync"/>'s fallback, when a VHDX cannot be
+    /// read locally because a running VM already has it open: there is no
+    /// cheaper way to learn which VM that is, since CSI's ExpandVolume request
+    /// carries no node ID the way ControllerPublishVolume/UnpublishVolume's
+    /// does.
+    /// </summary>
+    private readonly IClusterService _cluster;
+
+    /// <summary>Same fallback as <see cref="_cluster"/>: reads and grows the disk through the VM's own host once it is found.</summary>
+    private readonly IHyperVHostClient _host;
+
     private readonly AgentOptions _options;
     private readonly ILogger<VhdxService> _logger;
     private readonly SemaphoreSlim _concurrency;
 
-    public VhdxService(IVirtualDiskManager diskManager, IOptions<AgentOptions> options, ILogger<VhdxService> logger)
+    public VhdxService(
+        IVirtualDiskManager diskManager,
+        IClusterService cluster,
+        IHyperVHostClient host,
+        IOptions<AgentOptions> options,
+        ILogger<VhdxService> logger)
     {
         _diskManager = diskManager;
+        _cluster = cluster;
+        _host = host;
         _options = options.Value;
         _logger = logger;
         _concurrency = new SemaphoreSlim(_options.MaxConcurrentDiskOperations);
@@ -171,7 +193,7 @@ public sealed class VhdxService : IVhdxService, IDisposable
         }
     }
 
-    public async Task<ExpandVolumeResult> ExpandAsync(string volumeId, long newSizeBytes, CancellationToken cancellationToken)
+    public async Task<ExpandVolumeResult> ExpandAsync(string volumeId, long newSizeBytes, string? nodeId, CancellationToken cancellationToken)
     {
         if (newSizeBytes <= 0)
         {
@@ -205,9 +227,22 @@ public sealed class VhdxService : IVhdxService, IDisposable
 
             // Read first, and this read is what makes the whole operation
             // idempotent: a replay after a successful expand finds the disk
-            // already large enough and returns without a second resize.
-            var currentSize = await _diskManager.GetVirtualSizeAsync(
-                path, _options.DiskOperationTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
+            // already large enough and returns without a second resize. It can
+            // fail with VhdxInUseException rather than answer, though: reading
+            // this way opens the file directly, and a running VM the disk is
+            // attached to already holds it open - which is exactly the volume
+            // ONLINE expansion exists to grow. That is not answered by giving
+            // up here; see ExpandAttachedAsync.
+            long currentSize;
+            try
+            {
+                currentSize = await _diskManager.GetVirtualSizeAsync(
+                    path, _options.DiskOperationTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
+            }
+            catch (VhdxInUseException)
+            {
+                return await ExpandAttachedAsync(volumeId, path, newSizeBytes, nodeId, attempt).ConfigureAwait(false);
+            }
 
             // Only ever grows. Hyper-V will happily shrink a VHDX, and doing so
             // truncates the virtual disk with no regard for what the guest
@@ -250,6 +285,63 @@ public sealed class VhdxService : IVhdxService, IDisposable
         {
             _concurrency.Release();
         }
+    }
+
+    /// <summary>
+    /// ExpandAsync's fallback for a VHDX that could not be read locally because
+    /// something else has it open. Resolves <paramref name="nodeId"/> - the CSI
+    /// node ID the Go driver found via Kubernetes' VolumeAttachment API, the
+    /// same lookup external-attacher itself does to build a node_id - to a VM
+    /// and its owning host, then reads and grows the disk through that host
+    /// instead of locally. IHyperVHostClient does not share
+    /// GetVirtualSizeAsync's limitation: the host actually running the VM can
+    /// read and resize an attached, running disk without opening the file the
+    /// way a peer host's local call does.
+    /// </summary>
+    private async Task<ExpandVolumeResult> ExpandAttachedAsync(
+        string volumeId, string path, long newSizeBytes, string? nodeId, CancellationTokenSource attempt)
+    {
+        if (string.IsNullOrWhiteSpace(nodeId))
+        {
+            // The local read failed because something has the file open, but
+            // the driver found no VolumeAttachment naming a node for it. That
+            // combination is a genuine inconsistency - an unmanaged handle on
+            // the CSV, most plausibly - not a transient state a retry fixes on
+            // its own, so it is reported rather than guessed past.
+            throw new JobFailureException(
+                AgentErrorCodes.Internal,
+                $"volume {volumeId} at {path} could not be read because something has it open, but no node " +
+                "was given to check; check for an unmanaged handle on the CSV");
+        }
+
+        var vm = await _cluster.ResolveVmAsync(nodeId, attempt.Token).ConfigureAwait(false)
+            ?? throw new JobFailureException(
+                AgentErrorCodes.Internal,
+                $"volume {volumeId} at {path} could not be read locally, and node {nodeId} names no clustered " +
+                "virtual machine to try instead");
+
+        _logger.LogInformation(
+            "ExpandVolume {VolumeId}: {Path} could not be read locally; trying {VmId} on {Host}, which node {NodeId} resolves to",
+            volumeId, path, vm.VmId, vm.OwningHost, nodeId);
+
+        var currentSize = await _host.GetDiskSizeAsync(vm.OwningHost, vm.VmId, path, attempt.Token).ConfigureAwait(false);
+
+        // Same never-shrinks guarantee as the local path, on the size now read
+        // through the owning host instead of locally.
+        if (currentSize >= newSizeBytes)
+        {
+            _logger.LogInformation(
+                "ExpandVolume {VolumeId}: {Path} is already {CurrentSize} bytes, satisfying the requested {RequestedSize}",
+                volumeId, path, currentSize, newSizeBytes);
+            return new ExpandVolumeResult(currentSize, AlreadyLargeEnough: true);
+        }
+
+        var actualSize = await _host.ResizeDiskAsync(vm.OwningHost, vm.VmId, path, newSizeBytes, attempt.Token).ConfigureAwait(false);
+
+        _logger.LogInformation(
+            "ExpandVolume {VolumeId}: grew {Path} from {CurrentSize} to {ActualSize} bytes via {VmId} on {Host}",
+            volumeId, path, currentSize, actualSize, vm.VmId, vm.OwningHost);
+        return new ExpandVolumeResult(actualSize, AlreadyLargeEnough: false);
     }
 
     public async Task DeleteAsync(string volumeId, CancellationToken cancellationToken)

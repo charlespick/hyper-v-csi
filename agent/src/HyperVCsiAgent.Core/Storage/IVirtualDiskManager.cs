@@ -53,6 +53,13 @@ public interface IVirtualDiskManager
     /// Returns the virtual (max internal) size of an existing VHDX, not its
     /// on-disk footprint.
     /// </summary>
+    /// <remarks>
+    /// Can throw <see cref="VhdxInUseException"/>: this reads a disk's current
+    /// size by opening the file directly, and a running VM the disk is attached
+    /// to already holds it open. <see cref="ResizeVhdxAsync"/> does not share
+    /// this limitation - see its own remarks - so a caller that cannot read the
+    /// size still has a path forward.
+    /// </remarks>
     /// <param name="remainingBudget">
     /// How much of the caller's overall operation budget is left when this call
     /// is made. See <see cref="CreateDynamicVhdxAsync"/> for why this - and not

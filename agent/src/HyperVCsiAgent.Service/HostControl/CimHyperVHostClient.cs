@@ -271,8 +271,131 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             _logger.LogInformation("detached {VhdxPath} from {VmId} on {HostName}", vhdxPath, vmId, hostName);
         }, cancellationToken);
 
-    public Task ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
-        throw new NotSupportedException("ControllerExpandVolume is not implemented yet");
+    public Task<long> GetDiskSizeAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+        Task.Run(() =>
+        {
+            var deadline = CimDeadline.After(_hostOperationTimeout);
+            using var session = CimSession.Create(hostName);
+            using var service = GetImageManagementService(session, deadline, cancellationToken);
+            return ReadVirtualSize(session, service, vhdxPath, deadline, cancellationToken);
+        }, cancellationToken);
+
+    public Task<long> ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
+        Task.Run(() =>
+        {
+            var deadline = CimDeadline.After(_hostOperationTimeout);
+            using var session = CimSession.Create(hostName);
+            using var service = GetImageManagementService(session, deadline, cancellationToken);
+
+            // Plain parameters naming an existing disk by path, exactly like
+            // CimVirtualDiskManager.ResizeVhdxAsync's local call - the only
+            // difference is the session targets hostName instead of the local
+            // machine, which is what lets this succeed against a disk a running
+            // VM already has open there.
+            var parameters = new CimMethodParametersCollection
+            {
+                CimMethodParameter.Create("Path", vhdxPath, CimType.String, CimFlags.In),
+                CimMethodParameter.Create("MaxInternalSize", (ulong)newSizeBytes, CimType.UInt64, CimFlags.In),
+            };
+
+            using var result = session.InvokeMethod(
+                NamespaceName, service, "ResizeVirtualHardDisk", parameters,
+                deadline.Options("ResizeVirtualHardDisk", cancellationToken));
+
+            _ = CimJobs.WaitForCompletion(
+                session, NamespaceName, result, "ResizeVirtualHardDisk", deadline, cancellationToken, _logger);
+
+            // Read the size back on the same session the resize itself used,
+            // the same trade CimVirtualDiskManager.ResizeVhdxAsync makes: a
+            // failure here does not mean the resize failed - Hyper-V already
+            // committed it above - so this falls back to the requested size
+            // rather than faulting a resize that actually succeeded.
+            long actualSize;
+            try
+            {
+                actualSize = ReadVirtualSize(session, service, vhdxPath, deadline, cancellationToken);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogWarning(ex,
+                    "resized VHDX {Path} for {VmId} on {HostName} but could not read back its size; reporting the requested {SizeBytes} instead",
+                    vhdxPath, vmId, hostName, newSizeBytes);
+                actualSize = newSizeBytes;
+            }
+
+            _logger.LogInformation(
+                "resized VHDX {Path} for {VmId} on {HostName} to {SizeBytes} bytes", vhdxPath, vmId, hostName, actualSize);
+            return actualSize;
+        }, cancellationToken);
+
+    private static CimInstance GetImageManagementService(
+        CimSession session, CimDeadline deadline, CancellationToken cancellationToken)
+    {
+        var options = deadline.Options("locating Msvm_ImageManagementService", cancellationToken);
+        foreach (var instance in session.QueryInstances(
+            NamespaceName, "WQL", "SELECT * FROM Msvm_ImageManagementService", options))
+        {
+            return instance;
+        }
+
+        throw new InvalidOperationException(
+            $"no Msvm_ImageManagementService in {NamespaceName}; is the Hyper-V role installed on this host?");
+    }
+
+    /// <summary>
+    /// Reads a VHDX's current virtual size using an already-open session and
+    /// service instance, shared by <see cref="GetDiskSizeAsync"/> (which opens
+    /// both just for this) and <see cref="ResizeDiskAsync"/> (which reuses the
+    /// ones its resize call already opened) - the same split
+    /// CimVirtualDiskManager.ReadVirtualSize makes for the local case.
+    /// </summary>
+    private long ReadVirtualSize(
+        CimSession session, CimInstance service, string path, CimDeadline deadline, CancellationToken cancellationToken)
+    {
+        var parameters = new CimMethodParametersCollection
+        {
+            CimMethodParameter.Create("Path", path, CimType.String, CimFlags.In),
+        };
+
+        using var result = session.InvokeMethod(
+            NamespaceName, service, "GetVirtualHardDiskSettingData", parameters,
+            deadline.Options("GetVirtualHardDiskSettingData", cancellationToken));
+
+        var completedInline = CimJobs.WaitForCompletion(
+            session, NamespaceName, result, "GetVirtualHardDiskSettingData", deadline, cancellationToken, _logger);
+
+        var settingData = result.OutParameters["SettingData"]?.Value as string;
+        if (string.IsNullOrEmpty(settingData))
+        {
+            throw new InvalidOperationException(completedInline
+                ? $"GetVirtualHardDiskSettingData returned no setting data for {path}"
+                : $"GetVirtualHardDiskSettingData for {path} deferred to a job, which does not populate its out parameters");
+        }
+
+        return ReadMaxInternalSize(settingData, path);
+    }
+
+    /// <summary>
+    /// The setting data comes back as an embedded instance in WMI XML, so the
+    /// property has to be read out of the document rather than off an object -
+    /// the same shape CimVirtualDiskManager.ReadMaxInternalSize parses for the
+    /// local case.
+    /// </summary>
+    private static long ReadMaxInternalSize(string settingDataXml, string path)
+    {
+        var value = XDocument.Parse(settingDataXml)
+            .Descendants("PROPERTY")
+            .FirstOrDefault(property => (string?)property.Attribute("NAME") == "MaxInternalSize")
+            ?.Element("VALUE")
+            ?.Value;
+
+        if (!ulong.TryParse(value, CultureInfo.InvariantCulture, out var maxInternalSize))
+        {
+            throw new InvalidOperationException($"could not read MaxInternalSize for {path} from its setting data");
+        }
+
+        return checked((long)maxInternalSize);
+    }
 
     private static ManagementScope ScopeFor(string hostName) =>
         new($@"\\{hostName}\root\virtualization\v2");

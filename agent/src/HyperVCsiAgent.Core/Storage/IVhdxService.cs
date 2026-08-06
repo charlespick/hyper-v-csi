@@ -32,12 +32,19 @@ public interface IVhdxService
     /// filesystem has written up there, and CSI has no way to ask for one
     /// anyway - external-resizer only ever raises a PVC's request.
     /// </remarks>
+    /// <param name="nodeId">
+    /// The CSI node ID of the VM currently holding the volume attached, if the
+    /// Go driver found one - see <see cref="ExpandVolumePayload.NodeId"/>. Only
+    /// consulted when the disk cannot be read locally because something else
+    /// has it open: the local path is tried first regardless, since it is
+    /// correct and cheaper whenever it works.
+    /// </param>
     /// <exception cref="Jobs.JobFailureException">
     /// NotFound if no VHDX exists for this volume ID. Unlike DeleteAsync,
     /// absence is not success here - there is nothing to grow, and no retry
     /// will bring the disk into existence.
     /// </exception>
-    Task<ExpandVolumeResult> ExpandAsync(string volumeId, long newSizeBytes, CancellationToken cancellationToken);
+    Task<ExpandVolumeResult> ExpandAsync(string volumeId, long newSizeBytes, string? nodeId, CancellationToken cancellationToken);
 
     /// <summary>
     /// Deletes the volume's VHDX. Succeeds when there is nothing to delete,

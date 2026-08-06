@@ -25,7 +25,7 @@ func TestGetPluginInfoReportsTheDriverIdentity(t *testing.T) {
 	// CSIDriver object and every StorageClass's provisioner, and changing it
 	// once volumes exist orphans their PersistentVolumes. Pinned here so a
 	// rename has to be a deliberate edit to this test.
-	server := &identityServer{driver: New("", nil)}
+	server := &identityServer{driver: New("", nil, nil)}
 
 	resp, err := server.GetPluginInfo(context.Background(), &csi.GetPluginInfoRequest{})
 	if err != nil {

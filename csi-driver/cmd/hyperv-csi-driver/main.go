@@ -17,6 +17,8 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/agentclient"
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/driver"
@@ -89,7 +91,24 @@ func main() {
 		}
 	}
 
-	d := driver.New(*nodeID, agent)
+	// Only controller mode needs it: ControllerExpandVolume is the one RPC
+	// that has to ask Kubernetes something CSI's own request does not carry,
+	// which node (if any) currently has a volume attached. In-cluster config
+	// is what a pod running under its own ServiceAccount uses, the same way
+	// every sidecar in this chart already talks to the API server.
+	var kubeClient kubernetes.Interface
+	if *mode == "controller" {
+		config, err := rest.InClusterConfig()
+		if err != nil {
+			log.Fatalf("building in-cluster Kubernetes config: %v", err)
+		}
+		kubeClient, err = kubernetes.NewForConfig(config)
+		if err != nil {
+			log.Fatalf("building Kubernetes client: %v", err)
+		}
+	}
+
+	d := driver.New(*nodeID, agent, kubeClient)
 
 	listener, err := listen(*endpoint)
 	if err != nil {

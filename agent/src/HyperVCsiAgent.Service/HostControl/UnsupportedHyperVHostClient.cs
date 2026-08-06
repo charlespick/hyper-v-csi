@@ -28,7 +28,10 @@ public sealed class UnsupportedHyperVHostClient : IHyperVHostClient
     public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
         throw Unsupported();
 
-    public Task ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
+    public Task<long> GetDiskSizeAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+        throw Unsupported();
+
+    public Task<long> ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
         throw Unsupported();
 
     private static PlatformNotSupportedException Unsupported() =>

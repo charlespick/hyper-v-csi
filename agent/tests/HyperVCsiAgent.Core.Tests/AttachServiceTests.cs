@@ -606,7 +606,10 @@ public sealed class AttachServiceTests : IDisposable
             return Task.CompletedTask;
         }
 
-        public Task ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
+        public Task<long> GetDiskSizeAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<long> ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
         private void Migrated(string hostName, string vmId)

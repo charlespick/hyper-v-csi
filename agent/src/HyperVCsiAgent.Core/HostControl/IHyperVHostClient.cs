@@ -50,5 +50,26 @@ public interface IHyperVHostClient
 
     Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken);
 
-    Task ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken);
+    /// <summary>
+    /// Reads a VHDX's current virtual size through the host running the VM
+    /// it's attached to, rather than opening the file locally - the local open
+    /// is exactly what the running VM's own exclusive hold on the file defeats,
+    /// per <see cref="Storage.VhdxInUseException"/>. <paramref name="vmId"/>
+    /// names nothing the underlying call needs - it operates on the path alone
+    /// - and is carried through only so a failure can be logged against the VM
+    /// it concerns, the same reason every other method on this interface takes
+    /// it.
+    /// </summary>
+    Task<long> GetDiskSizeAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Grows a VHDX through the host running the VM it's attached to, and
+    /// returns the size it actually ended up at. Msvm_ImageManagementService
+    /// supports this against an attached, running disk - that capability is the
+    /// entire basis for CSI's ONLINE expansion claim - but only when asked from
+    /// the host actually running the VM; the same call issued from a peer host
+    /// collides with that VM's exclusive hold on the file, exactly as
+    /// <see cref="GetDiskSizeAsync"/> does.
+    /// </summary>
+    Task<long> ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken);
 }

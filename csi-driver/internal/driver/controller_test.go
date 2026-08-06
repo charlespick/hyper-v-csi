@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,9 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/apimachinery/pkg/runtime"
+	fake "k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/agentclient"
 )
@@ -938,6 +942,55 @@ func TestControllerExpandVolumeEnqueuesUnderTheVolumeIDAsIdempotencyKeyAndTarget
 	if enqueued.Payload.VolumeID != "pvc-1" || enqueued.Payload.SizeBytes != 4*gibibyte {
 		t.Errorf("payload = %+v, want volumeId pvc-1 and sizeBytes %d", enqueued.Payload, 4*gibibyte)
 	}
+	if enqueued.Payload.NodeID != "" {
+		t.Errorf("nodeId = %q, want empty: nothing attaches this volume in the fake cluster", enqueued.Payload.NodeID)
+	}
+}
+
+func TestControllerExpandVolumeIncludesTheAttachedNodeWhenOneHoldsTheVolume(t *testing.T) {
+	// The whole point of the lookup: the agent's own local read fails on an
+	// attached, running disk, and this is the hint that lets it recover
+	// without a cluster-wide search of its own.
+	agent := newFakeAgent(t, expanded(4*gibibyte, false))
+	server := &controllerServer{driver: New("", agentclient.New(agent.URL),
+		fake.NewSimpleClientset(
+			volumeAttachment(DriverName, "pvc-1", "csidevnode01"),
+			csiNode("csidevnode01", DriverName, "7a446141-becd-4c7e-968a-65257139f98c"),
+		))}
+
+	if _, err := server.ControllerExpandVolume(context.Background(),
+		expandRequest("pvc-1", 4*gibibyte, 0)); err != nil {
+		t.Fatalf("ControllerExpandVolume: %v", err)
+	}
+
+	enqueued := agent.onlyEnqueued(t)
+	if enqueued.Payload.NodeID != "7a446141-becd-4c7e-968a-65257139f98c" {
+		t.Errorf("nodeId = %q, want the attached VM's ID", enqueued.Payload.NodeID)
+	}
+}
+
+func TestControllerExpandVolumeFailsRatherThanSilentlyDroppingAKubernetesLookupError(t *testing.T) {
+	// A Kubernetes API the driver cannot reach is indistinguishable from
+	// "nothing attached" if the error is swallowed - and reporting an
+	// attached volume as unattached is exactly the state that would send the
+	// agent's local read into a sharing violation with no hint to recover
+	// from. Failing the RPC costs a CSI retry, which is cheap; guessing wrong
+	// does not recover.
+	client := fake.NewSimpleClientset()
+	client.PrependReactor("list", "volumeattachments", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("connection refused")
+	})
+	agent := newFakeAgent(t, expanded(4*gibibyte, false))
+	server := &controllerServer{driver: New("", agentclient.New(agent.URL), client)}
+
+	_, err := server.ControllerExpandVolume(context.Background(), expandRequest("pvc-1", 4*gibibyte, 0))
+
+	if got := status.Code(err); got != codes.Internal {
+		t.Fatalf("code = %s, want Internal (err: %v)", got, err)
+	}
+	if len(agent.enqueued) != 0 {
+		t.Error("expected no job to be enqueued once the node lookup failed")
+	}
 }
 
 func TestControllerExpandVolumeAlreadyLargeEnoughIsStillASuccess(t *testing.T) {
@@ -1126,7 +1179,7 @@ func attached(controllerID string, lun int) agentclient.Job {
 }
 
 func newControllerServer(agent *fakeAgent) *controllerServer {
-	return &controllerServer{driver: New("", agentclient.New(agent.URL))}
+	return &controllerServer{driver: New("", agentclient.New(agent.URL), fake.NewSimpleClientset())}
 }
 
 func createVolumeRequest(name string, requiredBytes, limitBytes int64) *csi.CreateVolumeRequest {

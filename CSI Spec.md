@@ -18,15 +18,15 @@ covered by unit tests but has never run against a real failover cluster or Hyper
 | ControllerUnpublishVolume | Controller | Detaches a volume from a specified node. | Volume ID + node ID | Tested — detaches against a real cluster |
 | ValidateVolumeCapabilities | Controller | Confirms a volume supports the requested access mode and type. | Volume ID (lookup only) | Not started |
 | ControllerGetCapabilities | Controller | Reports which controller RPCs this plugin implements. | N/A | Over advertising until project is finished |
-| ControllerExpandVolume | Controller | Grows a volume's underlying storage. | Volume ID | Pending testing |
+| ControllerExpandVolume | Controller | Grows a volume's underlying storage. | Volume ID | Tested — grows a volume attached to a running VM, via that VM's own host |
 | CreateSnapshot | Controller | Creates a point-in-time snapshot of a volume. | Snapshot name | Not started |
 | DeleteSnapshot | Controller | Removes a previously created snapshot. | Snapshot ID | Not started |
 | ListSnapshots | Controller | Lists existing snapshots known to the plugin. | Snapshot ID or source volume ID (optional filter, lookup only) | Not started |
 | NodeStageVolume | Node | Makes a volume ready for use on a node (format and node-wide mount). | Volume ID + staging target path | Tested — formats and mounts against a real cluster |
 | NodeUnstageVolume | Node | Undoes NodeStageVolume, releasing the node-wide mount. | Volume ID + staging target path | Tested — unmounts against a real cluster |
-| NodePublishVolume | Node | Bind-mounts a staged volume into a specific pod's path. | Volume ID + target path | Pending testing |
-| NodeUnpublishVolume | Node | Removes a pod's bind-mount of a volume. | Volume ID + target path | Pending testing |
-| NodeGetVolumeStats | Node | Reports usage and capacity stats for a mounted volume. | Volume ID + volume path (lookup only) | Pending testing |
+| NodePublishVolume | Node | Bind-mounts a staged volume into a specific pod's path. | Volume ID + target path | Tested — bind-mounts against a real cluster |
+| NodeUnpublishVolume | Node | Removes a pod's bind-mount of a volume. | Volume ID + target path | Tested — unmounts against a real cluster |
+| NodeGetVolumeStats | Node | Reports usage and capacity stats for a mounted volume. | Volume ID + volume path (lookup only) | Tested — kubelet's kubelet_volume_stats_* metrics read real numbers back |
 | NodeExpandVolume | Node | Grows the filesystem on a node after the underlying volume was expanded. | Volume ID + volume path | Pending testing |
 | NodeGetCapabilities | Node | Reports which node RPCs this plugin implements. | N/A | Tested — kubelet reads it before every stage |
 | NodeGetInfo | Node | Reports node identity/topology info used for scheduling and attach decisions. | N/A | Tested — reports the Hyper-V VM ID against a real cluster |
@@ -313,8 +313,43 @@ controller can be grown while the guest runs, which is what licenses the ONLINE 
 `GetPluginCapabilities`. `Msvm_ImageManagementService.ResizeVirtualHardDisk` is the call, and it is the
 one of the three CIM methods most likely to defer to a job, since growing an attached disk means vmms
 coordinating with the running worker process. Waiting for job completion is therefore load-bearing
-here, not bookkeeping. None of this has been exercised against a real cluster yet, which is what the
-"Pending testing" on both rows means.
+here, not bookkeeping.
+
+**Real-cluster testing first found that ControllerExpandVolume never reached `ResizeVirtualHardDisk` at
+all on an attached volume, and the fix is why this RPC now talks to Kubernetes.**
+`VhdxService.ExpandAsync`'s read-before-write idempotency check — `GetVirtualSizeAsync`, which calls
+`GetVirtualHardDiskSettingData` — opens the VHDX file directly, the same way `ResizeVirtualHardDisk`
+itself does, and that open fails with a sharing violation ("The process cannot access the file because
+it is being used by another process") whenever a running VM already has the disk open. That is
+precisely the case this feature exists for: a pod is using the volume, the PVC is edited, and
+`--handle-volume-inuse-error=false` is what lets external-resizer even try.
+
+The fix is not "open the file a different way" — a real cluster test confirmed
+`GetVirtualHardDiskSettingData` and `ResizeVirtualHardDisk` both work fine against an attached, running
+disk, but only when issued from the host actually running the VM. `CimVirtualDiskManager` always used a
+purely local CIM session, on whichever host happens to own the agent role, which is a different host
+from the VM's the moment the two aren't the same node. So `ExpandAsync` now tries the local read first —
+correct and cheaper whenever it works — and only on `VhdxInUseException` falls back to
+`IHyperVHostClient.GetDiskSizeAsync`/`ResizeDiskAsync`, new host-targeted methods that read and grow the
+disk through the VM's own host instead.
+
+That fallback needs to know which VM has the disk attached, and CSI's `ControllerExpandVolumeRequest`
+carries no node ID the way `ControllerPublishVolume`/`UnpublishVolume`'s does. Rather than have the agent
+search the cluster for it — the "reverse" query this document already prices as expensive, a fan-out this
+RPC has no cheaper reason to pay than DeleteVolume does — the Go driver looks it up itself before
+enqueueing the job: a `VolumeAttachment` names the Kubernetes node, and `CSINode` is where that node's own
+CSI node ID (this driver's Hyper-V VM ID) is recorded, the same two lookups external-attacher itself makes
+to build the node ID it hands `ControllerPublishVolume`. A lookup that finds nothing (the common case: an
+unattached or not-yet-attached volume) leaves the hint empty and changes nothing — the local read already
+handles that case. A lookup that errors fails the RPC outright rather than guessing "unattached", since a
+Kubernetes API this driver cannot reach is indistinguishable from "nothing attached" if the error is
+swallowed, and reporting an attached volume as unattached is exactly the state that would send the
+agent's local read into a sharing violation with no hint left to recover from.
+
+Confirmed end to end against a real cluster, through the unmodified PVC-edit path: a volume attached to
+a running VM on a different host than the one running the agent grew from 1 GiB to 2 GiB, with the agent
+log showing the local read fail, the fallback resolve the hinted node, and the resize land on that VM's
+own host.
 
 **external-resizer is deployed, and `allowVolumeExpansion` now defaults to true.** Without the sidecar
 this RPC has no caller — the same relationship external-attacher has to ControllerPublishVolume — and

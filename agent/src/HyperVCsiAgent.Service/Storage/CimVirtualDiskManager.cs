@@ -155,6 +155,15 @@ public sealed class CimVirtualDiskManager : IVirtualDiskManager
     /// opens both just for this) and <see cref="ResizeVhdxAsync"/> (which
     /// reuses the ones its resize call already opened).
     /// </summary>
+    /// <exception cref="VhdxInUseException">
+    /// GetVirtualHardDiskSettingData opens the file directly, unlike
+    /// ResizeVirtualHardDisk, which vmms can coordinate against an attached
+    /// disk without opening the file itself - so this fails with a sharing
+    /// violation whenever a running VM already has the file open. Reported here
+    /// as a distinct type, rather than left to surface as the generic job
+    /// failure below, so <see cref="HyperVCsiAgent.Core.Storage.VhdxService.ExpandAsync"/>
+    /// can tell "the disk is in use" apart from every other way this can fail.
+    /// </exception>
     private long ReadVirtualSize(
         CimSession session, CimInstance service, string path, CimDeadline deadline, CancellationToken cancellationToken)
     {
@@ -167,8 +176,16 @@ public sealed class CimVirtualDiskManager : IVirtualDiskManager
             NamespaceName, service, "GetVirtualHardDiskSettingData", parameters,
             deadline.Options("GetVirtualHardDiskSettingData", cancellationToken));
 
-        var completedInline = CimJobs.WaitForCompletion(
-            session, NamespaceName, result, "GetVirtualHardDiskSettingData", deadline, cancellationToken, _logger);
+        bool completedInline;
+        try
+        {
+            completedInline = CimJobs.WaitForCompletion(
+                session, NamespaceName, result, "GetVirtualHardDiskSettingData", deadline, cancellationToken, _logger);
+        }
+        catch (InvalidOperationException ex) when (IsFileInUseFailure(ex))
+        {
+            throw new VhdxInUseException(path, ex);
+        }
 
         var settingData = result.OutParameters["SettingData"]?.Value as string;
         if (string.IsNullOrEmpty(settingData))
@@ -185,6 +202,20 @@ public sealed class CimVirtualDiskManager : IVirtualDiskManager
 
         return ReadMaxInternalSize(settingData, path);
     }
+
+    /// <summary>
+    /// Recognizes the one CIM job failure <see cref="ReadVirtualSize"/> treats
+    /// specially: ERROR_SHARING_VIOLATION's own text, surfaced through
+    /// <c>Msvm_ConcreteJob.ErrorDescription</c> rather than as a structured
+    /// error code - the job protocol in <see cref="CimJobs"/> does not expose
+    /// one, so this is what there is to match on. It is Hyper-V's own message,
+    /// stable across the Windows Server versions this targets, and observed
+    /// verbatim against a real cluster: "Failed to open attachment '...'.
+    /// Error: 'The process cannot access the file because it is being used by
+    /// another process.'".
+    /// </summary>
+    private static bool IsFileInUseFailure(InvalidOperationException ex) =>
+        ex.Message.Contains("used by another process", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// Serializes the disk's settings the way the MOF wants them: an embedded

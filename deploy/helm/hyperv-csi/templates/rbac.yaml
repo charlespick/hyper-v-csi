@@ -13,6 +13,44 @@ metadata:
 {{- end }}
 {{- if .Values.rbac.create }}
 ---
+# Scoped to what the driver container itself needs, independent of any
+# sidecar: ControllerExpandVolume looks up which node (if any) currently has
+# a volume attached, since CSI's own request carries no node ID the way
+# ControllerPublishVolume/UnpublishVolume's does. The VolumeAttachment read is
+# the same one external-attacher makes to find a volume's node, and the
+# CSINode read is the same one it makes to turn that node into this driver's
+# own node ID - both already permitted by the attacher role below, but
+# declared again here because this need is the driver's own and does not
+# depend on external-attacher being deployed.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "hyperv-csi.fullname" . }}-driver
+  labels:
+    {{- include "hyperv-csi.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csinodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "hyperv-csi.fullname" . }}-driver
+  labels:
+    {{- include "hyperv-csi.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "hyperv-csi.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "hyperv-csi.fullname" . }}-driver
+  apiGroup: rbac.authorization.k8s.io
+---
 # Scoped to what external-provisioner actually needs. Snapshot permissions are
 # deliberately absent: that sidecar isn't deployed, because the RPCs behind it
 # aren't implemented. Resize has its own role below.

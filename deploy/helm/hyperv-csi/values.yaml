@@ -154,8 +154,9 @@ storageClass:
   # Both halves of an expansion exist now — ControllerExpandVolume grows the
   # VHDX, NodeExpandVolume grows the filesystem in it — so editing a PVC's
   # request is accepted rather than silently rejected by the API server.
-  # Neither half has run against a real cluster yet; set this back to false to
-  # take the option away until it has.
+  # ControllerExpandVolume has run against a real cluster, including against a
+  # volume attached to a running VM; NodeExpandVolume has not yet. Set this
+  # back to false to take the option away until it has.
   allowVolumeExpansion: true
   parameters: {}
 

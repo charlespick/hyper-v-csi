@@ -19,4 +19,16 @@ public sealed class ExpandVolumePayload
     /// a request that would shrink one is refused rather than honoured.
     /// </summary>
     public long SizeBytes { get; init; }
+
+    /// <summary>
+    /// The CSI node ID of the VM currently holding this volume attached, when
+    /// the Go driver found one via the Kubernetes VolumeAttachment API - null
+    /// otherwise, which covers the common case of an unattached or
+    /// not-yet-attached volume. ControllerExpandVolume's own CSI request
+    /// carries nothing like it, unlike publish/unpublish's node_id, so this is
+    /// the driver's own lookup, passed through rather than re-derived here.
+    /// Used only as a fallback: see <see cref="IVhdxService.ExpandAsync"/> for
+    /// when it actually gets consulted.
+    /// </summary>
+    public string? NodeId { get; init; }
 }

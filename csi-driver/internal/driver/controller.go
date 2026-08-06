@@ -508,6 +508,15 @@ func (s *controllerServer) ValidateVolumeCapabilities(ctx context.Context, req *
 type expandVolumePayload struct {
 	VolumeID  string `json:"volumeId"`
 	SizeBytes int64  `json:"sizeBytes"`
+	// NodeID is the CSI node ID of the VM currently holding this volume
+	// attached, when one does - empty otherwise, which covers the common case
+	// of an unattached or not-yet-attached volume. CSI's own request carries
+	// nothing like it, unlike ControllerPublishVolume/UnpublishVolume's, so
+	// this driver finds it itself via findAttachedNode before enqueueing. The
+	// agent's own local read already handles the unattached case without it;
+	// this only matters when a running VM has the disk open, which is exactly
+	// the case ONLINE expansion exists to grow.
+	NodeID string `json:"nodeId,omitempty"`
 }
 
 type expandVolumeResult struct {
@@ -549,9 +558,23 @@ func (s *controllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 		return nil, err
 	}
 
+	// Errors here fail the RPC rather than degrading to "no hint": Kubernetes
+	// is the only place that knows which node has this volume attached, so an
+	// API server this driver cannot reach is indistinguishable from "nothing
+	// attached" if silently swallowed - and reporting the volume falsely
+	// unattached is exactly the state that sends the agent's own local read
+	// into a sharing violation it has no hint left to recover from. CSI
+	// retries this RPC, so failing loudly on a transient API server blip costs
+	// a retry, not correctness.
+	nodeID, err := findAttachedNode(ctx, s.driver.KubeClient, req.GetVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "finding which node has %s attached: %v", req.GetVolumeId(), err)
+	}
+
 	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetVolumeId(), operationExpandVolume, volumeTarget(req.GetVolumeId()), expandVolumePayload{
 		VolumeID:  req.GetVolumeId(),
 		SizeBytes: sizeBytes,
+		NodeID:    nodeID,
 	})
 	if err != nil {
 		return nil, enqueueFailed(ctx, err, "enqueueing ControllerExpandVolume for %s", req.GetVolumeId())

@@ -69,7 +69,7 @@ public sealed class JobDispatcher(IVhdxService vhdxService, IAttachService attac
                 }
 
                 return async (job, cancellationToken) =>
-                    job.Result = await vhdxService.ExpandAsync(expandRequest.VolumeId, expandRequest.SizeBytes, cancellationToken)
+                    job.Result = await vhdxService.ExpandAsync(expandRequest.VolumeId, expandRequest.SizeBytes, expandRequest.NodeId, cancellationToken)
                         .ConfigureAwait(false);
 
             case AttachVolume:

@@ -49,10 +49,26 @@ public class JobDispatcherTests
         var job = NewJob();
         await run(job, CancellationToken.None);
 
-        Assert.Equal(("pvc-1", 4096L), vhdx.LastExpand);
+        Assert.Equal(("pvc-1", 4096L, (string?)null), vhdx.LastExpand);
         // Unlike a delete, this one does carry a result: CSI requires
         // ControllerExpandVolume to report the capacity the volume ended up with.
         Assert.Equal(new ExpandVolumeResult(4096, AlreadyLargeEnough: false), job.Result);
+    }
+
+    [Fact]
+    public async Task Resolve_ExpandVolume_PassesTheAttachedNodeHintThrough()
+    {
+        // The driver's own lookup, not re-derived here - see
+        // VhdxService.ExpandAsync for when it actually gets consulted.
+        var vhdx = new RecordingVhdxService();
+        var run = new JobDispatcher(vhdx, new RecordingAttachService()).Resolve(
+            JobDispatcher.ExpandVolume,
+            Payload("""{"volumeId":"pvc-1","sizeBytes":4096,"nodeId":"7a446141-becd-4c7e-968a-65257139f98c"}"""),
+            WireOptions);
+
+        await run(NewJob(), CancellationToken.None);
+
+        Assert.Equal(("pvc-1", 4096L, "7a446141-becd-4c7e-968a-65257139f98c"), vhdx.LastExpand);
     }
 
     [Fact]
@@ -141,7 +157,7 @@ public class JobDispatcherTests
     {
         public (string VolumeName, long SizeBytes)? LastCreate { get; private set; }
 
-        public (string VolumeId, long SizeBytes)? LastExpand { get; private set; }
+        public (string VolumeId, long SizeBytes, string? NodeId)? LastExpand { get; private set; }
 
         public string? LastDelete { get; private set; }
 
@@ -151,9 +167,9 @@ public class JobDispatcherTests
             return Task.FromResult(new CreateVolumeResult(volumeName, sizeBytes, AlreadyPresent: false));
         }
 
-        public Task<ExpandVolumeResult> ExpandAsync(string volumeId, long newSizeBytes, CancellationToken cancellationToken)
+        public Task<ExpandVolumeResult> ExpandAsync(string volumeId, long newSizeBytes, string? nodeId, CancellationToken cancellationToken)
         {
-            LastExpand = (volumeId, newSizeBytes);
+            LastExpand = (volumeId, newSizeBytes, nodeId);
             return Task.FromResult(new ExpandVolumeResult(newSizeBytes, AlreadyLargeEnough: false));
         }
 
