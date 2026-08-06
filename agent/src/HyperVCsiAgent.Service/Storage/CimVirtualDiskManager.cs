@@ -84,6 +84,38 @@ public sealed class CimVirtualDiskManager : IVirtualDiskManager
             _logger.LogInformation("created VHDX {Path} at {SizeBytes} bytes", path, maxInternalSizeBytes);
         }, cancellationToken);
 
+    public Task ResizeVhdxAsync(string path, long maxInternalSizeBytes, TimeSpan remainingBudget, CancellationToken cancellationToken) =>
+        Task.Run(() =>
+        {
+            var deadline = CimDeadline.After(remainingBudget);
+
+            using var session = CimSession.Create(null);
+            using var service = GetImageManagementService(session, deadline, cancellationToken);
+
+            // Plain parameters, no embedded instance: unlike creation, a resize
+            // names an existing disk by path and gives it one new number, so
+            // there is no Msvm_VirtualHardDiskSettingData to serialize and none
+            // of the System.Management detour BuildSettingsXml needs.
+            var parameters = new CimMethodParametersCollection
+            {
+                CimMethodParameter.Create("Path", path, CimType.String, CimFlags.In),
+                CimMethodParameter.Create("MaxInternalSize", (ulong)maxInternalSizeBytes, CimType.UInt64, CimFlags.In),
+            };
+
+            using var result = session.InvokeMethod(
+                NamespaceName, service, "ResizeVirtualHardDisk", parameters,
+                deadline.Options("ResizeVirtualHardDisk", cancellationToken));
+
+            // This is the call most likely of the three to defer to a job:
+            // growing a disk attached to a running VM means vmms coordinating
+            // with the worker process, so waiting for completion is not
+            // optional bookkeeping here.
+            _ = CimJobs.WaitForCompletion(
+                session, NamespaceName, result, "ResizeVirtualHardDisk", deadline, cancellationToken, _logger);
+
+            _logger.LogInformation("resized VHDX {Path} to {SizeBytes} bytes", path, maxInternalSizeBytes);
+        }, cancellationToken);
+
     public Task<long> GetVirtualSizeAsync(string path, TimeSpan remainingBudget, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {

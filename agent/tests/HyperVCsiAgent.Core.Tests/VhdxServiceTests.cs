@@ -265,6 +265,162 @@ public sealed class VhdxServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task ExpandAsync_GrowsTheDiskAndReportsItsNewSize()
+    {
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks);
+        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+
+        var result = await service.ExpandAsync("pvc-1", 4096, CancellationToken.None);
+
+        Assert.Equal(4096, result.ActualSizeBytes);
+        Assert.False(result.AlreadyLargeEnough);
+        var resized = Assert.Single(disks.Resized);
+        Assert.Equal(VolumePath("pvc-1"), resized.Path);
+        Assert.Equal(4096, resized.SizeBytes);
+    }
+
+    [Fact]
+    public async Task ExpandAsync_ReportsTheSizeTheDiskActuallyGot()
+    {
+        // Hyper-V rounds a resize to its own granularity exactly as it rounds a
+        // create, and CSI requires ControllerExpandVolume to report the capacity
+        // the volume actually has.
+        var disks = new FakeVirtualDiskManager { RoundUpTo = 4096 };
+        using var service = NewService(disks);
+        await service.CreateAsync("pvc-1", 4096, CancellationToken.None);
+
+        var result = await service.ExpandAsync("pvc-1", 5000, CancellationToken.None);
+
+        Assert.Equal(8192, result.ActualSizeBytes);
+    }
+
+    [Fact]
+    public async Task ExpandAsync_WhenTheDiskIsAlreadyLargeEnough_ChangesNothing()
+    {
+        // This is what a replay of a finished expand looks like: the controller
+        // re-drives after the agent forgets the job, and the answer has to come
+        // from the disk rather than from any remembered state.
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks);
+        await service.CreateAsync("pvc-1", 4096, CancellationToken.None);
+
+        var result = await service.ExpandAsync("pvc-1", 4096, CancellationToken.None);
+
+        Assert.Equal(4096, result.ActualSizeBytes);
+        Assert.True(result.AlreadyLargeEnough);
+        Assert.Empty(disks.Resized);
+    }
+
+    [Fact]
+    public async Task ExpandAsync_NeverShrinksADiskThatIsAlreadyBigger()
+    {
+        // A VHDX shrink truncates the virtual disk regardless of what the guest
+        // filesystem wrote up there. CSI cannot ask for one, so a request that
+        // would is read as "make it at least this big" - which it already is.
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks);
+        await service.CreateAsync("pvc-1", 1L << 30, CancellationToken.None);
+
+        var result = await service.ExpandAsync("pvc-1", 4096, CancellationToken.None);
+
+        Assert.Equal(1L << 30, result.ActualSizeBytes);
+        Assert.True(result.AlreadyLargeEnough);
+        Assert.Empty(disks.Resized);
+    }
+
+    [Fact]
+    public async Task ExpandAsync_VolumeThatIsNotThere_FailsAsNotFound()
+    {
+        // Unlike a delete, absence is not success: there is nothing to grow, and
+        // no retry brings the disk into existence.
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => service.ExpandAsync("pvc-1", 4096, CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.NotFound, failure.ErrorCode);
+    }
+
+    [Theory]
+    [InlineData("../escape")]
+    [InlineData("has space")]
+    public async Task ExpandAsync_VolumeIdThatCouldNotHaveBeenCreated_FailsAsNotFound(string volumeId)
+    {
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => service.ExpandAsync(volumeId, 4096, CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.NotFound, failure.ErrorCode);
+        Assert.Empty(disks.Resized);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public async Task ExpandAsync_NonPositiveSize_FailsAsInvalidArgument(long sizeBytes)
+    {
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks);
+        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => service.ExpandAsync("pvc-1", sizeBytes, CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.InvalidArgument, failure.ErrorCode);
+    }
+
+    [Fact]
+    public async Task ExpandAsync_WhenTheResizeFails_LeavesTheDiskInPlace()
+    {
+        // Nothing to unwind, unlike a failed create: a resize either took or it
+        // did not, and the disk is still a perfectly good disk either way. A
+        // re-drive re-reads the size and picks up from what actually happened.
+        var disks = new FakeVirtualDiskManager { FailNextResize = true };
+        using var service = NewService(disks);
+        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.ExpandAsync("pvc-1", 4096, CancellationToken.None));
+
+        Assert.True(File.Exists(VolumePath("pvc-1")));
+        var stillThere = await service.ExpandAsync("pvc-1", 4096, CancellationToken.None);
+        Assert.Equal(4096, stillThere.ActualSizeBytes);
+    }
+
+    [Fact]
+    public async Task ExpandAsync_NeverExceedsTheConfiguredConcurrencyLimit()
+    {
+        // Expands count against the same cap as creates and deletes: a resize on
+        // a CSV in redirected mode funnels through the coordinator node just as
+        // they do.
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks, maxConcurrentDiskOperations: 2);
+        for (var i = 0; i < 5; i++)
+        {
+            await service.CreateAsync($"pvc-{i}", 1024, CancellationToken.None);
+        }
+
+        using var release = new SemaphoreSlim(0);
+        disks.ResetPeak();
+        disks.BeforeResize = token => release.WaitAsync(token);
+
+        var expands = Enumerable.Range(0, 5)
+            .Select(i => service.ExpandAsync($"pvc-{i}", 4096, CancellationToken.None))
+            .ToArray();
+
+        await WaitFor(() => disks.InFlightPeak >= 2);
+        await Task.Delay(50);
+        Assert.Equal(2, disks.InFlightPeak);
+
+        release.Release(5);
+        await Task.WhenAll(expands);
+    }
+
+    [Fact]
     public async Task DeleteAsync_RemovesTheVolumesVhdx()
     {
         var disks = new FakeVirtualDiskManager();
@@ -532,7 +688,12 @@ public sealed class VhdxServiceTests : IDisposable
 
         public List<string> Created { get; } = [];
 
+        /// <summary>Every resize that reached the CIM seam, with the size it asked for.</summary>
+        public List<(string Path, long SizeBytes)> Resized { get; } = [];
+
         public bool FailNextCreate { get; set; }
+
+        public bool FailNextResize { get; set; }
 
         public bool FailSizeReads { get; set; }
 
@@ -540,6 +701,8 @@ public sealed class VhdxServiceTests : IDisposable
         public long RoundUpTo { get; set; } = 1;
 
         public Func<CancellationToken, Task>? BeforeCreate { get; set; }
+
+        public Func<CancellationToken, Task>? BeforeResize { get; set; }
 
         public Func<CancellationToken, Task>? BeforeGetSize { get; set; }
 
@@ -584,6 +747,40 @@ public sealed class VhdxServiceTests : IDisposable
             }
         }
 
+        public async Task ResizeVhdxAsync(string path, long maxInternalSizeBytes, TimeSpan remainingBudget, CancellationToken cancellationToken)
+        {
+            Enter();
+            try
+            {
+                if (BeforeResize is not null)
+                {
+                    await BeforeResize(cancellationToken);
+                }
+
+                if (FailNextResize)
+                {
+                    FailNextResize = false;
+                    throw new InvalidOperationException("CIM said no");
+                }
+
+                var rounded = (maxInternalSizeBytes + RoundUpTo - 1) / RoundUpTo * RoundUpTo;
+                lock (_gate)
+                {
+                    if (RecordedName(path) is not { } name)
+                    {
+                        throw new InvalidOperationException($"no such disk: {path}");
+                    }
+
+                    Resized.Add((path, maxInternalSizeBytes));
+                    _sizes[name] = rounded;
+                }
+            }
+            finally
+            {
+                Exit();
+            }
+        }
+
         public async Task<long> GetVirtualSizeAsync(string path, TimeSpan remainingBudget, CancellationToken cancellationToken)
         {
             Enter();
@@ -599,15 +796,11 @@ public sealed class VhdxServiceTests : IDisposable
                     throw new InvalidOperationException("CIM would not say");
                 }
 
-                // The service renames the disk into place after creating it,
-                // so the in-progress name is what got recorded.
-                var name = Path.GetFileName(path);
                 lock (_gate)
                 {
-                    if (_sizes.TryGetValue(name, out var size)
-                        || _sizes.TryGetValue(name.Replace(".vhdx", "~creating.vhdx"), out size))
+                    if (RecordedName(path) is { } name)
                     {
-                        return size;
+                        return _sizes[name];
                     }
                 }
 
@@ -617,6 +810,24 @@ public sealed class VhdxServiceTests : IDisposable
             {
                 Exit();
             }
+        }
+
+        /// <summary>
+        /// The key <paramref name="path"/>'s size is filed under, or null when
+        /// no such disk was ever created. The service renames a disk into place
+        /// only after creating it, so a size recorded during a create is still
+        /// under the in-progress name. Callers must hold <see cref="_gate"/>.
+        /// </summary>
+        private string? RecordedName(string path)
+        {
+            var name = Path.GetFileName(path);
+            if (_sizes.ContainsKey(name))
+            {
+                return name;
+            }
+
+            var inProgress = name.Replace(".vhdx", "~creating.vhdx");
+            return _sizes.ContainsKey(inProgress) ? inProgress : null;
         }
 
         private void Enter()

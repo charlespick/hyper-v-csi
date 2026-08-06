@@ -19,6 +19,10 @@ const operationCreateVolume = "CreateVolume"
 // match JobDispatcher.DeleteVolume on the .NET side.
 const operationDeleteVolume = "DeleteVolume"
 
+// operationExpandVolume is the operationType the agent dispatches on; it must
+// match JobDispatcher.ExpandVolume on the .NET side.
+const operationExpandVolume = "ExpandVolume"
+
 // operationAttachVolume is the operationType the agent dispatches on; it must
 // match JobDispatcher.AttachVolume on the .NET side.
 const operationAttachVolume = "AttachVolume"
@@ -481,9 +485,116 @@ func (s *controllerServer) ValidateVolumeCapabilities(ctx context.Context, req *
 	return nil, status.Error(codes.Unimplemented, "ValidateVolumeCapabilities not implemented")
 }
 
+// expandVolumePayload and expandVolumeResult are the operation-specific halves
+// of the agent's job envelope, matching ExpandVolumePayload and
+// ExpandVolumeResult on the .NET side.
+type expandVolumePayload struct {
+	VolumeID  string `json:"volumeId"`
+	SizeBytes int64  `json:"sizeBytes"`
+}
+
+type expandVolumeResult struct {
+	ActualSizeBytes int64 `json:"actualSizeBytes"`
+	// AlreadyLargeEnough distinguishes a disk this call grew from one that was
+	// already at or above the requested size. Nothing branches on it today; it
+	// is here because the agent knows the difference and a log line that says
+	// "nothing to do" is worth more than one that implies work happened.
+	AlreadyLargeEnough bool `json:"alreadyLargeEnough"`
+}
+
 // ControllerExpandVolume grows the VHDX. Idempotency key: volume ID.
+//
+// The volume is also the target, as it is for create and delete: what must not
+// interleave is two operations on one disk, and an expand racing a delete of
+// the same volume is exactly the pair that ordering exists to separate.
+//
+// This is only half of an expansion. The VHDX gets bigger here; the filesystem
+// inside it does not, which is why the response sets node_expansion_required
+// and kubelet follows up with NodeExpandVolume.
 func (s *controllerServer) ControllerExpandVolume(ctx context.Context, req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "ControllerExpandVolume not implemented")
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume id is required")
+	}
+
+	if capability := req.GetVolumeCapability(); capability != nil {
+		// CSI makes it optional here. A block one is still refused, since
+		// nothing in this driver handles raw block devices.
+		if err := validateVolumeCapabilities([]*csi.VolumeCapability{capability}); err != nil {
+			return nil, err
+		}
+		if capability.GetMount() == nil {
+			return nil, status.Error(codes.InvalidArgument,
+				"only mount volumes are supported; block volumes are not implemented")
+		}
+	}
+
+	sizeBytes, err := pickExpandSize(req.GetCapacityRange())
+	if err != nil {
+		return nil, err
+	}
+
+	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetVolumeId(), operationExpandVolume, volumeTarget(req.GetVolumeId()), expandVolumePayload{
+		VolumeID:  req.GetVolumeId(),
+		SizeBytes: sizeBytes,
+	})
+	if err != nil {
+		return nil, enqueueFailed(ctx, err, "enqueueing ControllerExpandVolume for %s", req.GetVolumeId())
+	}
+
+	done, err := awaitJob(ctx, s.driver.Agent, job.ID, jobPollBudget)
+	if err != nil {
+		return nil, err
+	}
+
+	var result expandVolumeResult
+	if err := json.Unmarshal(done.Result, &result); err != nil {
+		return nil, status.Errorf(codes.Internal,
+			"decoding ControllerExpandVolume result for %s: %v", req.GetVolumeId(), err)
+	}
+	if result.ActualSizeBytes <= 0 {
+		// capacity_bytes is mandatory in this response, so there is nothing
+		// honest to send without it.
+		return nil, status.Errorf(codes.Internal,
+			"agent expanded %s but reported no capacity", req.GetVolumeId())
+	}
+	if result.ActualSizeBytes < sizeBytes {
+		// The agent only ever grows, and reads the size back from the disk
+		// afterwards, so a shortfall means the resize silently did less than it
+		// said. Reporting it as success would have Kubernetes record a PVC
+		// capacity the volume does not have.
+		return nil, status.Errorf(codes.Internal,
+			"agent expanded %s to %d bytes, below the requested %d",
+			req.GetVolumeId(), result.ActualSizeBytes, sizeBytes)
+	}
+
+	return &csi.ControllerExpandVolumeResponse{
+		CapacityBytes: result.ActualSizeBytes,
+		// Always true: every volume this driver serves is a filesystem volume,
+		// and a bigger block device does nothing for a pod until the filesystem
+		// on it is grown to match.
+		NodeExpansionRequired: true,
+	}, nil
+}
+
+// pickExpandSize resolves the capacity range for an expansion. Unlike
+// CreateVolume's, the range is not optional here — CSI requires it, and there
+// is no sensible default: falling back to defaultVolumeSizeBytes would ask for
+// a disk smaller than most volumes already are, which the agent would then
+// (correctly) treat as "already large enough" and report as a successful expand
+// that grew nothing.
+func pickExpandSize(capacityRange *csi.CapacityRange) (int64, error) {
+	if capacityRange == nil {
+		return 0, status.Error(codes.InvalidArgument, "capacity range is required")
+	}
+	if capacityRange.GetRequiredBytes() <= 0 {
+		return 0, status.Errorf(codes.InvalidArgument,
+			"required_bytes must be positive for an expansion, got %d", capacityRange.GetRequiredBytes())
+	}
+
+	// Everything else — the limit, the negative and inverted checks, and the
+	// sector alignment that keeps Hyper-V's round-up from breaching a limit —
+	// is the same arithmetic a create does, so it is the same function.
+	return pickVolumeSize(capacityRange)
 }
 
 // CreateSnapshot creates a point-in-time checkpoint of a volume. Idempotency

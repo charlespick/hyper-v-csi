@@ -896,6 +896,192 @@ func TestControllerUnpublishVolumeForgottenJobIsRetryable(t *testing.T) {
 	}
 }
 
+func TestControllerExpandVolumeReturnsTheNewCapacityAndAsksForANodeExpansion(t *testing.T) {
+	server := newControllerServer(newFakeAgent(t, expanded(4*gibibyte, false)))
+
+	resp, err := server.ControllerExpandVolume(context.Background(), expandRequest("pvc-1", 4*gibibyte, 0))
+	if err != nil {
+		t.Fatalf("ControllerExpandVolume: %v", err)
+	}
+
+	if resp.GetCapacityBytes() != 4*gibibyte {
+		t.Errorf("capacity = %d, want %d", resp.GetCapacityBytes(), 4*gibibyte)
+	}
+	// A bigger block device does nothing for a pod until the filesystem on it
+	// grows to match, and that is NodeExpandVolume's half.
+	if !resp.GetNodeExpansionRequired() {
+		t.Error("node_expansion_required = false, want true for a filesystem volume")
+	}
+}
+
+func TestControllerExpandVolumeEnqueuesUnderTheVolumeIDAsIdempotencyKeyAndTarget(t *testing.T) {
+	agent := newFakeAgent(t, expanded(4*gibibyte, false))
+	server := newControllerServer(agent)
+
+	if _, err := server.ControllerExpandVolume(context.Background(),
+		expandRequest("pvc-1", 4*gibibyte, 0)); err != nil {
+		t.Fatalf("ControllerExpandVolume: %v", err)
+	}
+
+	enqueued := agent.onlyEnqueued(t)
+	if enqueued.OperationType != operationExpandVolume {
+		t.Errorf("operationType = %q, want %q", enqueued.OperationType, operationExpandVolume)
+	}
+	if enqueued.IdempotencyKey != "pvc-1" {
+		t.Errorf("idempotencyKey = %q, want the volume ID", enqueued.IdempotencyKey)
+	}
+	// The volume, not a VM: what must not interleave is two operations on one
+	// disk, and an expand racing a delete is exactly that pair.
+	if enqueued.Target != "volume:pvc-1" {
+		t.Errorf("target = %q, want volume:pvc-1", enqueued.Target)
+	}
+	if enqueued.Payload.VolumeID != "pvc-1" || enqueued.Payload.SizeBytes != 4*gibibyte {
+		t.Errorf("payload = %+v, want volumeId pvc-1 and sizeBytes %d", enqueued.Payload, 4*gibibyte)
+	}
+}
+
+func TestControllerExpandVolumeAlreadyLargeEnoughIsStillASuccess(t *testing.T) {
+	// A replay of a finished expand, or a volume that already outgrew the
+	// request. Either way the caller got what it asked for.
+	server := newControllerServer(newFakeAgent(t, expanded(10*gibibyte, true)))
+
+	resp, err := server.ControllerExpandVolume(context.Background(), expandRequest("pvc-1", 4*gibibyte, 0))
+	if err != nil {
+		t.Fatalf("ControllerExpandVolume: %v", err)
+	}
+	if resp.GetCapacityBytes() != 10*gibibyte {
+		t.Errorf("capacity = %d, want the disk's actual %d", resp.GetCapacityBytes(), 10*gibibyte)
+	}
+}
+
+func TestControllerExpandVolumeRejectsUnusableRequests(t *testing.T) {
+	tests := []struct {
+		name    string
+		request *csi.ControllerExpandVolumeRequest
+		want    codes.Code
+	}{
+		{
+			name:    "no volume id",
+			request: expandRequest("", 4*gibibyte, 0),
+			want:    codes.InvalidArgument,
+		},
+		{
+			name: "no capacity range",
+			// CSI requires one here. There is no sensible default: falling back
+			// to the create default would ask for a disk smaller than most
+			// volumes already are, and the agent would correctly report that as
+			// an expand that grew nothing.
+			request: &csi.ControllerExpandVolumeRequest{VolumeId: "pvc-1"},
+			want:    codes.InvalidArgument,
+		},
+		{
+			name:    "no required bytes",
+			request: expandRequest("pvc-1", 0, 4*gibibyte),
+			want:    codes.InvalidArgument,
+		},
+		{
+			name:    "required above the limit",
+			request: expandRequest("pvc-1", 4*gibibyte, 2*gibibyte),
+			want:    codes.OutOfRange,
+		},
+		{
+			name: "block access type",
+			request: func() *csi.ControllerExpandVolumeRequest {
+				req := expandRequest("pvc-1", 4*gibibyte, 0)
+				req.VolumeCapability = &csi.VolumeCapability{
+					AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+					AccessMode: &csi.VolumeCapability_AccessMode{
+						Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+					},
+				}
+				return req
+			}(),
+			want: codes.InvalidArgument,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			agent := newFakeAgent(t, expanded(4*gibibyte, false))
+			server := newControllerServer(agent)
+
+			_, err := server.ControllerExpandVolume(context.Background(), test.request)
+
+			if got := status.Code(err); got != test.want {
+				t.Fatalf("code = %s, want %s (err: %v)", got, test.want, err)
+			}
+			// Validation has to happen before the agent is touched, so a bad
+			// request never leaves a job behind.
+			if n := agent.enqueueCount(); n != 0 {
+				t.Errorf("enqueued %d jobs, want none", n)
+			}
+		})
+	}
+}
+
+func TestControllerExpandVolumeRejectsAnUnusableResult(t *testing.T) {
+	tests := []struct {
+		name string
+		job  agentclient.Job
+	}{
+		{
+			// capacity_bytes is mandatory in this response, so there is nothing
+			// honest to send without it.
+			name: "no capacity at all",
+			job:  succeeded(`{"alreadyLargeEnough":false}`),
+		},
+		{
+			// The agent only grows and reads the size back afterwards, so a
+			// shortfall means the resize quietly did less than it reported.
+			// Passing it on would have Kubernetes record a PVC capacity the
+			// volume does not have.
+			name: "smaller than what was asked for",
+			job:  expanded(2*gibibyte, false),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := newControllerServer(newFakeAgent(t, test.job))
+
+			_, err := server.ControllerExpandVolume(context.Background(), expandRequest("pvc-1", 4*gibibyte, 0))
+
+			if got := status.Code(err); got != codes.Internal {
+				t.Fatalf("code = %s, want Internal (err: %v)", got, err)
+			}
+		})
+	}
+}
+
+func TestControllerExpandVolumeTranslatesAgentFailures(t *testing.T) {
+	// A volume with no VHDX is the one that matters here: NotFound is terminal,
+	// so the sidecar stops rather than retrying a grow of a disk that is not
+	// there.
+	server := newControllerServer(newFakeAgent(t, agentclient.Job{
+		Status:    agentclient.JobFailed,
+		Error:     "volume pvc-1 has no disk to expand",
+		ErrorCode: agentclient.ErrorCodeNotFound,
+	}))
+
+	_, err := server.ControllerExpandVolume(context.Background(), expandRequest("pvc-1", 4*gibibyte, 0))
+
+	if got := status.Code(err); got != codes.NotFound {
+		t.Fatalf("code = %s, want NotFound (err: %v)", got, err)
+	}
+}
+
+func TestControllerExpandVolumeForgottenJobIsRetryable(t *testing.T) {
+	// The agent restarted mid-expand. Re-driving is safe: it re-reads the
+	// disk's size and grows only what still needs growing.
+	server := newControllerServer(newFakeAgent(t))
+
+	_, err := server.ControllerExpandVolume(context.Background(), expandRequest("pvc-1", 4*gibibyte, 0))
+
+	if got := status.Code(err); got != codes.Aborted {
+		t.Fatalf("code = %s, want Aborted (err: %v)", got, err)
+	}
+}
+
 func TestPublishKeyDoesNotCollideAcrossAnEmbeddedSlash(t *testing.T) {
 	if publishKey("a/b", "c") == publishKey("a", "b/c") {
 		t.Fatalf("publishKey(%q, %q) collided with publishKey(%q, %q)", "a/b", "c", "a", "b/c")
@@ -913,6 +1099,23 @@ func publishRequest(volumeID, nodeID string) *csi.ControllerPublishVolumeRequest
 			},
 		},
 	}
+}
+
+func expandRequest(volumeID string, requiredBytes, limitBytes int64) *csi.ControllerExpandVolumeRequest {
+	return &csi.ControllerExpandVolumeRequest{
+		VolumeId: volumeID,
+		CapacityRange: &csi.CapacityRange{
+			RequiredBytes: requiredBytes,
+			LimitBytes:    limitBytes,
+		},
+	}
+}
+
+// expanded is a job that grew the disk to the given size, or found it already
+// at least that big.
+func expanded(actualSizeBytes int64, alreadyLargeEnough bool) agentclient.Job {
+	return succeeded(fmt.Sprintf(
+		`{"actualSizeBytes":%d,"alreadyLargeEnough":%t}`, actualSizeBytes, alreadyLargeEnough))
 }
 
 // attached is a job that put the disk on a VM at the given address.

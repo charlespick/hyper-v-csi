@@ -18,7 +18,7 @@ covered by unit tests but has never run against a real failover cluster or Hyper
 | ControllerUnpublishVolume | Controller | Detaches a volume from a specified node. | Volume ID + node ID | Tested — detaches against a real cluster |
 | ValidateVolumeCapabilities | Controller | Confirms a volume supports the requested access mode and type. | Volume ID (lookup only) | Not started |
 | ControllerGetCapabilities | Controller | Reports which controller RPCs this plugin implements. | N/A | Over advertising until project is finished |
-| ControllerExpandVolume | Controller | Grows a volume's underlying storage. | Volume ID | Not started |
+| ControllerExpandVolume | Controller | Grows a volume's underlying storage. | Volume ID | Pending testing |
 | CreateSnapshot | Controller | Creates a point-in-time snapshot of a volume. | Snapshot name | Not started |
 | DeleteSnapshot | Controller | Removes a previously created snapshot. | Snapshot ID | Not started |
 | ListSnapshots | Controller | Lists existing snapshots known to the plugin. | Snapshot ID or source volume ID (optional filter, lookup only) | Not started |
@@ -27,7 +27,7 @@ covered by unit tests but has never run against a real failover cluster or Hyper
 | NodePublishVolume | Node | Bind-mounts a staged volume into a specific pod's path. | Volume ID + target path | Pending testing |
 | NodeUnpublishVolume | Node | Removes a pod's bind-mount of a volume. | Volume ID + target path | Pending testing |
 | NodeGetVolumeStats | Node | Reports usage and capacity stats for a mounted volume. | Volume ID + volume path (lookup only) | Pending testing |
-| NodeExpandVolume | Node | Grows the filesystem on a node after the underlying volume was expanded. | Volume ID + volume path | Pending testing — unreachable until ControllerExpandVolume exists |
+| NodeExpandVolume | Node | Grows the filesystem on a node after the underlying volume was expanded. | Volume ID + volume path | Pending testing |
 | NodeGetCapabilities | Node | Reports which node RPCs this plugin implements. | N/A | Tested — kubelet reads it before every stage |
 | NodeGetInfo | Node | Reports node identity/topology info used for scheduling and attach decisions. | N/A | Tested — reports the Hyper-V VM ID against a real cluster |
 
@@ -37,15 +37,17 @@ lists describe the finished driver, not today's code, so the sidecars will call 
 Unimplemented. Either trim each list to what's actually built, or land the missing RPCs, before
 running this in a cluster. What each one currently overstates:
 
-- `GetPluginCapabilities` — volume expansion (ONLINE), and now only half-overstated:
-  NodeExpandVolume is built, ControllerExpandVolume is still a stub, and an expansion needs both. It
-  correctly omits VOLUME_ACCESSIBILITY_CONSTRAINTS.
-- `ControllerGetCapabilities` — EXPAND_VOLUME, CREATE_DELETE_SNAPSHOT, and LIST_SNAPSHOTS.
-  CREATE_DELETE_VOLUME and PUBLISH_UNPUBLISH_VOLUME are the two it does not overstate: both halves
-  of each are built.
+- `GetPluginCapabilities` — nothing any more. Volume expansion (ONLINE) is the only thing it claims,
+  and both halves of one are now built. It correctly omits VOLUME_ACCESSIBILITY_CONSTRAINTS.
+- `ControllerGetCapabilities` — CREATE_DELETE_SNAPSHOT and LIST_SNAPSHOTS, and only those.
+  CREATE_DELETE_VOLUME, PUBLISH_UNPUBLISH_VOLUME and EXPAND_VOLUME are the three it does not
+  overstate: both halves of each are built.
 - `NodeGetCapabilities` — nothing any more. Every RPC it names is built: STAGE_UNSTAGE_VOLUME,
-  GET_VOLUME_STATS and EXPAND_VOLUME. It is the first of the three lists to become honest, and it
-  drops off this section once the node side is signed off in a cluster.
+  GET_VOLUME_STATS and EXPAND_VOLUME.
+
+Two of the three lists are now honest. They stay in this section rather than dropping out of it
+because "honest" is not "exercised" — everything in them past attach and stage is still
+Pending testing, and this section exists to stop a list quietly outrunning the code again.
 
 **CreateVolume gaps.** StorageClass `parameters` are ignored rather than consumed or rejected, the
 access *type* (mount vs block) is not validated, and `volume_context` is left empty.
@@ -252,14 +254,13 @@ a Linux image and only runs inside a Linux guest. It is so `go build ./...` and 
 work on the Windows machines this repo is developed on, and so that if the stand-in ever *is* reached,
 the RPC fails loudly instead of reporting an empty disk.
 
-**NodeExpandVolume is built and unreachable, and that is the intended order.** ControllerExpandVolume
-is still a stub, so no VHDX ever gets larger and there is never a filesystem with room to grow into —
-the pair cannot be exercised until the controller half lands, which is the next piece of work rather
-than part of this one. Advertising `EXPAND_VOLUME` on `NodeGetCapabilities` is now honest on its own
-terms; `GetPluginCapabilities`' ONLINE expansion is still not, since that one describes both halves.
+**An expansion is two RPCs, and this is the guest half.** ControllerExpandVolume grows the VHDX;
+NodeExpandVolume grows the filesystem inside it. Kubernetes runs them in that order off one PVC edit,
+which is why the controller half sets `node_expansion_required` and why neither is any use alone.
 
-It resolves the device from the mount table, not from a publish context, because CSI hands this RPC
-neither one. That is what makes it work from either path kubelet might pass: `/proc/mounts` records
+**NodeExpandVolume resolves the device from the mount table**, not from a publish context, because CSI
+hands this RPC neither one. That is what makes it work from either path kubelet might pass:
+`/proc/mounts` records
 the underlying device for a bind mount too, so the pod's target path and the node-wide staging path
 resolve to the same device, which is the thing being resized. Two refusals rather than guesses: a path
 that is not a mount point is NOT_FOUND, and a mounted path whose device carries no filesystem is
@@ -275,6 +276,54 @@ a filesystem already as large as it can be.
 Only `e2fsprogs` is in the node image, so `resize2fs` is there and `xfs_growfs` is not. That matches
 `defaultFsType`, and it cannot surprise anyone at expansion time: an xfs volume would already have
 failed at NodeStageVolume's `mkfs.xfs`, so it can never reach a grow and find the tool missing.
+
+**ControllerExpandVolume only ever grows, and that is a safety property rather than a limitation.**
+Hyper-V will shrink a VHDX perfectly happily, and doing so truncates the virtual disk with no regard
+for what the guest filesystem has written up there. So a request smaller than the disk's current size
+is satisfied by reporting the current size, never by resizing: CSI cannot ask for a shrink anyway —
+external-resizer only ever raises a PVC's request — so anything arriving that way is a bug above, and
+the safe reading of "make this volume at least this big" is that it already is.
+
+That same read-before-write is what makes the operation idempotent. The agent reads the disk's virtual
+size first, and a replay after a successful expand finds it already large enough and returns without a
+second resize — the same "answer it from the CSV, never from remembered job state" rule create and
+delete follow, and the reason a re-drive after an agent restart is safe here too. A failed resize needs
+no unwind for the same reason: unlike a create there is no in-progress file, the disk is still a
+perfectly good disk, and the next attempt re-reads the size and picks up from whatever actually
+happened.
+
+The size is read back afterwards rather than echoed. Hyper-V rounds a resize up to a sector multiple
+exactly as it rounds a create, and `capacity_bytes` is *mandatory* in this response — unlike
+NodeExpandVolume's, where it is omitted on purpose. The controller refuses a result that reports less
+than was asked for: the agent only grows and reads back from the disk, so a shortfall means the resize
+quietly did less than it claimed, and passing it on would have Kubernetes record a PVC capacity the
+volume does not have.
+
+A volume with no VHDX is NOT_FOUND, not success. That is the opposite of DeleteVolume's tolerance, and
+for a reason that does not transfer: a delete of something that cannot exist has already achieved what
+the caller wanted, while an expand of it has not and no retry will bring the disk into being. A volume
+ID that could not have come from CreateVolume is treated the same way.
+
+The job targets the volume, as create and delete do rather than as attach and detach do. What must not
+interleave is two operations on one disk, and an expand racing a delete of the same volume is exactly
+the pair that ordering exists to separate.
+
+**Whether the VM has to be off is Hyper-V's problem, and the answer is no** — a VHDX on a SCSI
+controller can be grown while the guest runs, which is what licenses the ONLINE claim in
+`GetPluginCapabilities`. `Msvm_ImageManagementService.ResizeVirtualHardDisk` is the call, and it is the
+one of the three CIM methods most likely to defer to a job, since growing an attached disk means vmms
+coordinating with the running worker process. Waiting for job completion is therefore load-bearing
+here, not bookkeeping. None of this has been exercised against a real cluster yet, which is what the
+"Pending testing" on both rows means.
+
+**external-resizer is deployed, and `allowVolumeExpansion` now defaults to true.** Without the sidecar
+this RPC has no caller — the same relationship external-attacher has to ControllerPublishVolume — and
+without the StorageClass flag the API server rejects the PVC edit before any of it runs. The sidecar
+gets `--handle-volume-inuse-error=false`, because the interesting case is precisely a volume a pod is
+using: that is the one where kubelet follows up with NodeExpandVolume, and the default would confine
+expansion to volumes nothing has mounted. Its RBAC needs one permission the provisioner's role does not
+already carry, `persistentvolumeclaims/status` patch, which is how the new capacity gets written back,
+plus a pods read for the in-use check.
 
 **ControllerPublishVolume identifies a node by its Hyper-V VM ID, end to end.** The node plugin
 reads `VirtualMachineId` out of the guest's Hyper-V key-value pools — the values the host publishes

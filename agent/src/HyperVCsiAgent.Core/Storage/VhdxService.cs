@@ -171,8 +171,88 @@ public sealed class VhdxService : IVhdxService, IDisposable
         }
     }
 
-    public Task ExpandAsync(string volumeId, long newSizeBytes, CancellationToken cancellationToken) =>
-        throw new NotSupportedException("ControllerExpandVolume is not implemented yet");
+    public async Task<ExpandVolumeResult> ExpandAsync(string volumeId, long newSizeBytes, CancellationToken cancellationToken)
+    {
+        if (newSizeBytes <= 0)
+        {
+            throw JobFailureException.InvalidArgument($"size must be positive, got {newSizeBytes}");
+        }
+
+        // Unlike DeleteAsync, an ID that could not have come from CreateAsync is
+        // an error rather than a quiet success: a delete of something that
+        // cannot exist has already achieved what the caller wanted, while an
+        // expand of it has not and never will.
+        if (!VolumeNaming.IsSafeName(volumeId))
+        {
+            throw JobFailureException.NotFound(
+                $"volume {volumeId} is not a name this agent could have created, so there is no disk to expand");
+        }
+
+        var path = ResolveVolumePath(volumeId);
+
+        using var attempt = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        attempt.CancelAfter(_options.DiskOperationTimeout);
+
+        var elapsed = Stopwatch.StartNew();
+
+        await AcquireSlotAsync(attempt, cancellationToken, "expanding", volumeId).ConfigureAwait(false);
+        try
+        {
+            if (!File.Exists(path))
+            {
+                throw JobFailureException.NotFound($"volume {volumeId} has no disk at {path} to expand");
+            }
+
+            // Read first, and this read is what makes the whole operation
+            // idempotent: a replay after a successful expand finds the disk
+            // already large enough and returns without a second resize.
+            var currentSize = await _diskManager.GetVirtualSizeAsync(
+                path, _options.DiskOperationTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
+
+            // Only ever grows. Hyper-V will happily shrink a VHDX, and doing so
+            // truncates the virtual disk with no regard for what the guest
+            // filesystem has written up there. CSI cannot ask for one - a PVC's
+            // request only ever goes up - so anything landing here asking to
+            // shrink is a bug somewhere above, and the safe reading of "make
+            // the volume at least this big" is that it already is.
+            if (currentSize >= newSizeBytes)
+            {
+                _logger.LogInformation(
+                    "ExpandVolume {VolumeId}: {Path} is already {CurrentSize} bytes, satisfying the requested {RequestedSize}",
+                    volumeId, path, currentSize, newSizeBytes);
+                return new ExpandVolumeResult(currentSize, AlreadyLargeEnough: true);
+            }
+
+            await _diskManager.ResizeVhdxAsync(
+                path, newSizeBytes, _options.DiskOperationTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
+
+            // Read back rather than reporting what was asked for: Hyper-V
+            // rounds a resize up to a sector multiple exactly as it rounds a
+            // create, and CSI requires ControllerExpandVolume to report the
+            // capacity the volume actually has.
+            var actualSize = await ReadBackSizeAsync(
+                path, newSizeBytes, _options.DiskOperationTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
+
+            _logger.LogInformation(
+                "ExpandVolume {VolumeId}: grew {Path} from {CurrentSize} to {ActualSize} bytes",
+                volumeId, path, currentSize, actualSize);
+            return new ExpandVolumeResult(actualSize, AlreadyLargeEnough: false);
+        }
+        catch (OperationCanceledException) when (attempt.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            // Nothing to clean up, unlike a failed create: a resize either took
+            // or it didn't, and there is no in-progress file either way. A
+            // re-drive re-reads the size and picks up from whatever actually
+            // happened.
+            throw new JobFailureException(
+                AgentErrorCodes.Internal,
+                $"expanding volume {volumeId} timed out after {_options.DiskOperationTimeout}");
+        }
+        finally
+        {
+            _concurrency.Release();
+        }
+    }
 
     public async Task DeleteAsync(string volumeId, CancellationToken cancellationToken)
     {

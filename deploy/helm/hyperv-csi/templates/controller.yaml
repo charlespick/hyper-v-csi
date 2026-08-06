@@ -92,6 +92,40 @@ spec:
             capabilities:
               drop: ["ALL"]
 
+        - name: csi-resizer
+          image: {{ .Values.controller.resizer.image }}
+          args:
+            - --csi-address=$(ADDRESS)
+            # Bounds ControllerExpandVolume the same way the other two sidecars
+            # bound theirs: the driver clamps its job polling to a fraction of
+            # whatever deadline arrives, so it answers with a retryable status
+            # before this expires.
+            - --timeout={{ .Values.controller.resizer.timeout }}
+            # Growing the filesystem inside the disk is NodeExpandVolume's half,
+            # and it can only run on a node the volume is staged on. Without
+            # this the resizer would only ever expand volumes nothing is using.
+            - --handle-volume-inuse-error=false
+            - --leader-election
+            - --leader-election-namespace=$(NAMESPACE)
+            {{- range .Values.controller.resizer.extraArgs }}
+            - {{ . }}
+            {{- end }}
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
         - name: hyperv-csi-driver
           image: {{ include "hyperv-csi.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -121,7 +155,7 @@ spec:
             capabilities:
               drop: ["ALL"]
       volumes:
-        # The CSI socket is shared between the driver and both sidecars and lives
+        # The CSI socket is shared between the driver and every sidecar and lives
         # only as long as the pod; nothing about it needs to survive a restart.
         - name: socket-dir
           emptyDir: {}

@@ -238,6 +238,12 @@ public sealed class JobsEndpointTests : IDisposable
             _sizes[Path.GetFileName(path)] = maxInternalSizeBytes;
         }
 
+        public Task ResizeVhdxAsync(string path, long maxInternalSizeBytes, TimeSpan remainingBudget, CancellationToken cancellationToken)
+        {
+            _sizes[Path.GetFileName(path)] = maxInternalSizeBytes;
+            return Task.CompletedTask;
+        }
+
         public Task<long> GetVirtualSizeAsync(string path, TimeSpan remainingBudget, CancellationToken cancellationToken)
         {
             // The service renames the disk into place after creating it, so

@@ -46,10 +46,10 @@ clientCertificate:
 controller:
   replicaCount: 1
 
-  # external-provisioner and external-attacher are the sidecars whose RPCs
-  # exist. Each --timeout bounds how long the sidecar waits for one call; the
-  # driver clamps its own job polling to a fraction of whatever deadline
-  # arrives, so these stay consistent automatically.
+  # external-provisioner, external-attacher and external-resizer are the
+  # sidecars whose RPCs exist. Each --timeout bounds how long the sidecar waits
+  # for one call; the driver clamps its own job polling to a fraction of
+  # whatever deadline arrives, so these stay consistent automatically.
   provisioner:
     image: registry.k8s.io/sig-storage/csi-provisioner:v5.1.0
     timeout: 30s
@@ -58,6 +58,14 @@ controller:
   attacher:
     image: registry.k8s.io/sig-storage/csi-attacher:v4.7.0
     timeout: 30s
+    extraArgs: []
+
+  resizer:
+    image: registry.k8s.io/sig-storage/csi-resizer:v1.12.0
+    # Longer than the other two: growing a VHDX is the one controller operation
+    # whose work scales with the disk, and the agent's own budget for it is
+    # DiskOperationTimeout.
+    timeout: 60s
     extraArgs: []
 
   resources:
@@ -132,7 +140,12 @@ storageClass:
   # provisioning observable on its own.
   volumeBindingMode: Immediate
 
-  allowVolumeExpansion: false
+  # Both halves of an expansion exist now — ControllerExpandVolume grows the
+  # VHDX, NodeExpandVolume grows the filesystem in it — so editing a PVC's
+  # request is accepted rather than silently rejected by the API server.
+  # Neither half has run against a real cluster yet; set this back to false to
+  # take the option away until it has.
+  allowVolumeExpansion: true
   parameters: {}
 
 rbac:

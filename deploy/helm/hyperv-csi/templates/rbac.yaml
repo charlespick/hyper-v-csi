@@ -13,9 +13,9 @@ metadata:
 {{- end }}
 {{- if .Values.rbac.create }}
 ---
-# Scoped to what external-provisioner actually needs. Resize and snapshot
-# permissions are deliberately absent: those sidecars aren't deployed, because
-# the RPCs behind them aren't implemented.
+# Scoped to what external-provisioner actually needs. Snapshot permissions are
+# deliberately absent: that sidecar isn't deployed, because the RPCs behind it
+# aren't implemented. Resize has its own role below.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -99,9 +99,56 @@ roleRef:
   name: {{ include "hyperv-csi.fullname" . }}-attacher
   apiGroup: rbac.authorization.k8s.io
 ---
-# Leader election, shared by both sidecars, so scaling the controller past one
-# replica doesn't mean two provisioners racing on the same PVC or two attachers
-# on the same VolumeAttachment.
+# Scoped to what external-resizer needs. It watches PVCs whose request has grown
+# past their status, calls ControllerExpandVolume, and writes the new capacity
+# back — hence the claim status write, which is the one permission the
+# provisioner's role does not already cover. The pods read is for the in-use
+# check: an expansion of a mounted volume has to be followed by
+# NodeExpandVolume, so the resizer has to know which pods are using the claim.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "hyperv-csi.fullname" . }}-resizer
+  labels:
+    {{- include "hyperv-csi.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims/status"]
+    verbs: ["patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "hyperv-csi.fullname" . }}-resizer
+  labels:
+    {{- include "hyperv-csi.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "hyperv-csi.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "hyperv-csi.fullname" . }}-resizer
+  apiGroup: rbac.authorization.k8s.io
+---
+# Leader election, shared by every sidecar, so scaling the controller past one
+# replica doesn't mean two provisioners racing on the same PVC, two attachers
+# on the same VolumeAttachment, or two resizers on the same expansion.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

@@ -40,6 +40,22 @@ public class JobDispatcherTests
     }
 
     [Fact]
+    public async Task Resolve_ExpandVolume_RunsTheExpandAndPublishesTheNewCapacity()
+    {
+        var vhdx = new RecordingVhdxService();
+        var run = new JobDispatcher(vhdx, new RecordingAttachService()).Resolve(
+            JobDispatcher.ExpandVolume, Payload("""{"volumeId":"pvc-1","sizeBytes":4096}"""), WireOptions);
+
+        var job = NewJob();
+        await run(job, CancellationToken.None);
+
+        Assert.Equal(("pvc-1", 4096L), vhdx.LastExpand);
+        // Unlike a delete, this one does carry a result: CSI requires
+        // ControllerExpandVolume to report the capacity the volume ended up with.
+        Assert.Equal(new ExpandVolumeResult(4096, AlreadyLargeEnough: false), job.Result);
+    }
+
+    [Fact]
     public async Task Resolve_AttachVolume_RunsTheAttachAndPublishesWhereItLanded()
     {
         var attach = new RecordingAttachService();
@@ -81,6 +97,12 @@ public class JobDispatcherTests
     [InlineData(JobDispatcher.DeleteVolume, """{"volumeId":""}""")]
     [InlineData(JobDispatcher.DeleteVolume, """{"volumeId":42}""")]
     [InlineData(JobDispatcher.DeleteVolume, "\"not an object\"")]
+    [InlineData(JobDispatcher.ExpandVolume, """{"sizeBytes":4096}""")]
+    [InlineData(JobDispatcher.ExpandVolume, """{"volumeId":"pvc-1"}""")]
+    [InlineData(JobDispatcher.ExpandVolume, """{"volumeId":"pvc-1","sizeBytes":0}""")]
+    [InlineData(JobDispatcher.ExpandVolume, """{"volumeId":"pvc-1","sizeBytes":-1}""")]
+    [InlineData(JobDispatcher.ExpandVolume, """{"volumeId":"pvc-1","sizeBytes":"big"}""")]
+    [InlineData(JobDispatcher.ExpandVolume, "\"not an object\"")]
     [InlineData(JobDispatcher.AttachVolume, """{"nodeId":"node-a"}""")]
     [InlineData(JobDispatcher.AttachVolume, """{"volumeId":"pvc-1"}""")]
     [InlineData(JobDispatcher.AttachVolume, """{"volumeId":"pvc-1","nodeId":""}""")]
@@ -99,6 +121,7 @@ public class JobDispatcherTests
             () => new JobDispatcher(vhdx, attach).Resolve(operationType, Payload(payload), WireOptions));
 
         Assert.Null(vhdx.LastCreate);
+        Assert.Null(vhdx.LastExpand);
         Assert.Null(vhdx.LastDelete);
         Assert.Null(attach.LastAttach);
         Assert.Null(attach.LastDetach);
@@ -118,6 +141,8 @@ public class JobDispatcherTests
     {
         public (string VolumeName, long SizeBytes)? LastCreate { get; private set; }
 
+        public (string VolumeId, long SizeBytes)? LastExpand { get; private set; }
+
         public string? LastDelete { get; private set; }
 
         public Task<CreateVolumeResult> CreateAsync(string volumeName, long sizeBytes, CancellationToken cancellationToken)
@@ -126,8 +151,11 @@ public class JobDispatcherTests
             return Task.FromResult(new CreateVolumeResult(volumeName, sizeBytes, AlreadyPresent: false));
         }
 
-        public Task ExpandAsync(string volumeId, long newSizeBytes, CancellationToken cancellationToken) =>
-            throw new NotSupportedException();
+        public Task<ExpandVolumeResult> ExpandAsync(string volumeId, long newSizeBytes, CancellationToken cancellationToken)
+        {
+            LastExpand = (volumeId, newSizeBytes);
+            return Task.FromResult(new ExpandVolumeResult(newSizeBytes, AlreadyLargeEnough: false));
+        }
 
         public Task DeleteAsync(string volumeId, CancellationToken cancellationToken)
         {

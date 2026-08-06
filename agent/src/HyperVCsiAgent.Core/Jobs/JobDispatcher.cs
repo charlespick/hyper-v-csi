@@ -16,6 +16,8 @@ public sealed class JobDispatcher(IVhdxService vhdxService, IAttachService attac
 
     public const string DeleteVolume = "DeleteVolume";
 
+    public const string ExpandVolume = "ExpandVolume";
+
     public const string AttachVolume = "AttachVolume";
 
     public const string DetachVolume = "DetachVolume";
@@ -53,6 +55,22 @@ public sealed class JobDispatcher(IVhdxService vhdxService, IAttachService attac
                 // No job.Result: a deleted volume has nothing left to describe,
                 // so the controller reads only the status.
                 return (_, cancellationToken) => vhdxService.DeleteAsync(deleteRequest.VolumeId, cancellationToken);
+
+            case ExpandVolume:
+                var expandRequest = Decode<ExpandVolumePayload>(payload, jsonOptions);
+                if (string.IsNullOrWhiteSpace(expandRequest.VolumeId))
+                {
+                    throw new InvalidJobRequestException("payload.volumeId is required");
+                }
+
+                if (expandRequest.SizeBytes <= 0)
+                {
+                    throw new InvalidJobRequestException("payload.sizeBytes must be positive");
+                }
+
+                return async (job, cancellationToken) =>
+                    job.Result = await vhdxService.ExpandAsync(expandRequest.VolumeId, expandRequest.SizeBytes, cancellationToken)
+                        .ConfigureAwait(false);
 
             case AttachVolume:
                 var attachRequest = Decode<AttachVolumePayload>(payload, jsonOptions);

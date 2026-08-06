@@ -25,6 +25,25 @@ public interface IVirtualDiskManager
     Task CreateDynamicVhdxAsync(string path, long maxInternalSizeBytes, TimeSpan remainingBudget, CancellationToken cancellationToken);
 
     /// <summary>
+    /// Grows an existing VHDX to <paramref name="maxInternalSizeBytes"/>.
+    /// </summary>
+    /// <remarks>
+    /// Whether the disk is attached to a running VM is Hyper-V's problem, not
+    /// this seam's: a VHDX on a SCSI controller can be grown while the VM runs,
+    /// which is the whole reason the driver advertises ONLINE expansion. The
+    /// caller has already established that this is a grow and not a shrink -
+    /// see <see cref="IVhdxService.ExpandAsync"/> - so nothing here re-checks
+    /// it.
+    /// </remarks>
+    /// <param name="remainingBudget">
+    /// How much of the caller's overall operation budget is left when this call
+    /// is made. See <see cref="CreateDynamicVhdxAsync"/> for why this - and not
+    /// just <paramref name="cancellationToken"/> - is what an implementation
+    /// should bound its own request timeout by.
+    /// </param>
+    Task ResizeVhdxAsync(string path, long maxInternalSizeBytes, TimeSpan remainingBudget, CancellationToken cancellationToken);
+
+    /// <summary>
     /// Returns the virtual (max internal) size of an existing VHDX, not its
     /// on-disk footprint.
     /// </summary>
