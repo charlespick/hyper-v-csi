@@ -147,13 +147,9 @@ func (s *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolu
 	if err := validateVolumeCapabilities([]*csi.VolumeCapability{capability}); err != nil {
 		return nil, err
 	}
-	mountVolume := capability.GetMount()
-	if mountVolume == nil {
-		// Either the block access type, or no access type at all. Nothing
-		// here formats or mounts a raw block device; per CLAUDE.md that is
-		// separate follow-on work, not folded into this one.
-		return nil, status.Error(codes.InvalidArgument,
-			"only mount volumes are supported; block volumes are not implemented")
+	mountVolume, err := requireMountVolume(capability)
+	if err != nil {
+		return nil, err
 	}
 	readOnly := capability.GetAccessMode().GetMode() == csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY
 
@@ -253,37 +249,14 @@ func safeWork(work func() error) (err error) {
 // vmbusdisk.Resolve with its own budget (stageOperationBudget) rather than a
 // context that may already be cancelled by the time this returns.
 func (s *nodeServer) stageVolume(controllerID string, lun int32, target, fsType string, options []string, readOnly bool) error {
-	notMountPoint, err := mount.IsNotMountPoint(s.mounter, target)
+	// Checked before vmbusdisk.Resolve, not after: an idempotent replay
+	// against an already-correctly-staged volume has no reason to pay
+	// Resolve's up-to-30s poll at all.
+	alreadyMounted, err := s.alreadyMountedCompatibly(target, "staging target", readOnly)
 	if err != nil {
-		if os.IsNotExist(err) {
-			if mkdirErr := os.MkdirAll(target, 0o750); mkdirErr != nil {
-				return status.Errorf(codes.Internal, "creating staging target %s: %v", target, mkdirErr)
-			}
-			notMountPoint = true
-		} else {
-			return status.Errorf(codes.Internal, "checking staging target %s: %v", target, err)
-		}
+		return err
 	}
-
-	if !notMountPoint {
-		// Already mounted: NodeStageVolume for the same (volume, target) is
-		// expected to be idempotent, but only if what's already there is
-		// compatible with what was just asked for. The comparison is ro/rw
-		// only — per CLAUDE.md's narrow-scope convention, nothing here
-		// confirms the mounted device is even this volume's; that gap is
-		// worth naming once rather than building a fuller check into this
-		// change. Checked before vmbusdisk.Resolve, not after: an idempotent
-		// replay against an already-correctly-staged volume has no reason to
-		// pay Resolve's up-to-30s poll at all.
-		alreadyReadOnly, err := s.targetIsReadOnly(target)
-		if err != nil {
-			return status.Errorf(codes.Internal, "reading existing mount options for %s: %v", target, err)
-		}
-		if alreadyReadOnly != readOnly {
-			return status.Errorf(codes.AlreadyExists,
-				"staging target %s is already mounted %s, which is incompatible with the requested %s",
-				target, readWriteLabel(alreadyReadOnly), readWriteLabel(readOnly))
-		}
+	if alreadyMounted {
 		return nil
 	}
 
@@ -339,6 +312,44 @@ func (s *nodeServer) targetIsReadOnly(target string) (bool, error) {
 	return false, fmt.Errorf(
 		"%s (resolved %s) is reported mounted but has no matching entry in the mount table",
 		target, resolvedTarget)
+}
+
+// alreadyMountedCompatibly reports whether target is already mounted with the
+// requested ro/rw mode, creating target first if it does not exist yet — the
+// idempotency check NodeStageVolume and NodePublishVolume both need for a
+// repeat call against the same (volume, target). ok is false, with no error,
+// when target needs mounting; the caller does that and returns. label names
+// target in the ALREADY_EXISTS message ("staging target" or "target"), since
+// that is the one thing the two callers' wording differs on.
+//
+// The comparison is ro/rw only — per CLAUDE.md's narrow-scope convention,
+// nothing here confirms the mounted device is even this volume's; that gap is
+// worth naming once rather than building a fuller check into this change.
+func (s *nodeServer) alreadyMountedCompatibly(target, label string, readOnly bool) (ok bool, err error) {
+	notMountPoint, err := mount.IsNotMountPoint(s.mounter, target)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if mkdirErr := os.MkdirAll(target, 0o750); mkdirErr != nil {
+				return false, status.Errorf(codes.Internal, "creating %s %s: %v", label, target, mkdirErr)
+			}
+			return false, nil
+		}
+		return false, status.Errorf(codes.Internal, "checking %s %s: %v", label, target, err)
+	}
+	if notMountPoint {
+		return false, nil
+	}
+
+	alreadyReadOnly, err := s.targetIsReadOnly(target)
+	if err != nil {
+		return false, status.Errorf(codes.Internal, "reading existing mount options for %s: %v", target, err)
+	}
+	if alreadyReadOnly != readOnly {
+		return false, status.Errorf(codes.AlreadyExists,
+			"%s %s is already mounted %s, which is incompatible with the requested %s",
+			label, target, readWriteLabel(alreadyReadOnly), readWriteLabel(readOnly))
+	}
+	return true, nil
 }
 
 // readWriteLabel renders readOnly for the ALREADY_EXISTS messages above.
@@ -449,11 +460,9 @@ func (s *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 	if err := validateVolumeCapabilities([]*csi.VolumeCapability{capability}); err != nil {
 		return nil, err
 	}
-	mountVolume := capability.GetMount()
-	if mountVolume == nil {
-		// Same as NodeStageVolume: block volumes are separate follow-on work.
-		return nil, status.Error(codes.InvalidArgument,
-			"only mount volumes are supported; block volumes are not implemented")
+	mountVolume, err := requireMountVolume(capability)
+	if err != nil {
+		return nil, err
 	}
 
 	// Two independent sources of read-only, and either one is sufficient.
@@ -515,35 +524,16 @@ func (s *nodeServer) publishVolume(stagingTarget, target string, options []strin
 			stagingTarget)
 	}
 
-	notMountPoint, err := mount.IsNotMountPoint(s.mounter, target)
+	// Already published: a repeat call for the same (volume, target) has to
+	// succeed, but only if what is already mounted matches what was asked
+	// for — the same check stageVolume makes against its own target, and with
+	// the same gap named there: nothing confirms the mount at target is a
+	// bind of this volume's staging mount rather than something else's.
+	alreadyMounted, err := s.alreadyMountedCompatibly(target, "target", readOnly)
 	if err != nil {
-		if os.IsNotExist(err) {
-			// CSI makes creating the target path the plugin's job, and kubelet
-			// only guarantees its parent.
-			if mkdirErr := os.MkdirAll(target, 0o750); mkdirErr != nil {
-				return status.Errorf(codes.Internal, "creating target %s: %v", target, mkdirErr)
-			}
-			notMountPoint = true
-		} else {
-			return status.Errorf(codes.Internal, "checking target %s: %v", target, err)
-		}
+		return err
 	}
-
-	if !notMountPoint {
-		// Already published: a repeat call for the same (volume, target) has to
-		// succeed, but only if what is already mounted matches what was asked
-		// for. Same ro/rw-only comparison stageVolume makes, and with the same
-		// gap named there — nothing confirms the mount at target is a bind of
-		// this volume's staging mount rather than something else's.
-		alreadyReadOnly, err := s.targetIsReadOnly(target)
-		if err != nil {
-			return status.Errorf(codes.Internal, "reading existing mount options for %s: %v", target, err)
-		}
-		if alreadyReadOnly != readOnly {
-			return status.Errorf(codes.AlreadyExists,
-				"target %s is already mounted %s, which is incompatible with the requested %s",
-				target, readWriteLabel(alreadyReadOnly), readWriteLabel(readOnly))
-		}
+	if alreadyMounted {
 		return nil
 	}
 
@@ -658,6 +648,27 @@ func (s *nodeServer) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVol
 	}, nil
 }
 
+// confirmMounted fails with NOT_FOUND — the code CSI specifies for a volume
+// path that isn't there — unless volumePath both exists and is a mount point.
+// It creates nothing, unlike alreadyMountedCompatibly: volumeStats and
+// expandVolume are read-only lookups against a path CSI has already told the
+// plugin is published, not a target this RPC is responsible for bringing
+// into existence.
+func (s *nodeServer) confirmMounted(volumePath string) error {
+	notMountPoint, err := mount.IsNotMountPoint(s.mounter, volumePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return status.Errorf(codes.NotFound, "volume path %s does not exist", volumePath)
+		}
+		return status.Errorf(codes.Internal, "checking volume path %s: %v", volumePath, err)
+	}
+	if notMountPoint {
+		return status.Errorf(codes.NotFound,
+			"volume path %s exists but nothing is mounted there", volumePath)
+	}
+	return nil
+}
+
 // volumeStats confirms volumePath really is a mount before measuring it. Like
 // stageVolume and publishVolume it is not handed ctx — see runBounded's doc
 // comment for why the goroutine this runs in outlives the RPC.
@@ -667,19 +678,10 @@ func (s *nodeServer) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVol
 // produce an error — it produces the node root filesystem's numbers, reported
 // as the volume's. A PVC that appears to have hundreds of gigabytes free
 // because it is quietly measuring the node's disk is worse than one that
-// reports nothing, so this fails with NOT_FOUND instead, which is the code CSI
-// specifies for a volume path that isn't there.
+// reports nothing.
 func (s *nodeServer) volumeStats(volumePath string) (fsstats.Stats, error) {
-	notMountPoint, err := mount.IsNotMountPoint(s.mounter, volumePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return fsstats.Stats{}, status.Errorf(codes.NotFound, "volume path %s does not exist", volumePath)
-		}
-		return fsstats.Stats{}, status.Errorf(codes.Internal, "checking volume path %s: %v", volumePath, err)
-	}
-	if notMountPoint {
-		return fsstats.Stats{}, status.Errorf(codes.NotFound,
-			"volume path %s exists but nothing is mounted there", volumePath)
+	if err := s.confirmMounted(volumePath); err != nil {
+		return fsstats.Stats{}, err
 	}
 
 	stats, err := s.statfs(volumePath)
@@ -692,11 +694,6 @@ func (s *nodeServer) volumeStats(volumePath string) (fsstats.Stats, error) {
 
 // NodeExpandVolume grows the filesystem after ControllerExpandVolume has
 // grown the underlying VHDX. Idempotency key: volume ID + volume path.
-//
-// Nothing reaches this yet: ControllerExpandVolume is still a stub, so no
-// volume ever gets larger for a filesystem to grow into. That is the next
-// piece of work rather than part of this one — this half is the one that has
-// to exist before the pair can be exercised at all.
 //
 // It resolves the device from the mount table rather than from a publish
 // context, because CSI hands this RPC neither one. That works from either path
@@ -720,9 +717,8 @@ func (s *nodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVo
 		if err := validateVolumeCapabilities([]*csi.VolumeCapability{capability}); err != nil {
 			return nil, err
 		}
-		if capability.GetMount() == nil {
-			return nil, status.Error(codes.InvalidArgument,
-				"only mount volumes are supported; block volumes are not implemented")
+		if _, err := requireMountVolume(capability); err != nil {
+			return nil, err
 		}
 	}
 
@@ -752,16 +748,8 @@ func (s *nodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVo
 // mount-side helpers it is not handed ctx — see runBounded's doc comment for
 // why the goroutine this runs in outlives the RPC.
 func (s *nodeServer) expandVolume(volumePath string) error {
-	notMountPoint, err := mount.IsNotMountPoint(s.mounter, volumePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return status.Errorf(codes.NotFound, "volume path %s does not exist", volumePath)
-		}
-		return status.Errorf(codes.Internal, "checking volume path %s: %v", volumePath, err)
-	}
-	if notMountPoint {
-		return status.Errorf(codes.NotFound,
-			"volume path %s exists but nothing is mounted there", volumePath)
+	if err := s.confirmMounted(volumePath); err != nil {
+		return err
 	}
 
 	devicePath, _, err := mount.GetDeviceNameFromMount(s.mounter, volumePath)

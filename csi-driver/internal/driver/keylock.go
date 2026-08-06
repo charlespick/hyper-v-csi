@@ -15,12 +15,24 @@ import "sync"
 // jobs.go already reports "operation in progress" for the controller side.
 type keyLock struct {
 	mu    sync.Mutex
-	locks map[string]*sync.Mutex
+	locks map[string]*lockEntry
+}
+
+// lockEntry is one key's mutex plus a count of how many callers currently
+// hold a reference to it — either about to TryLock it or already holding it.
+// refs, not the mutex's own locked/unlocked state, is what TryLock and
+// release use to decide when it is safe to drop the map entry: an entry with
+// refs == 0 has no caller anywhere that still knows about this *lockEntry, so
+// nothing is left to end up on it after a fresh one replaces it for the same
+// key.
+type lockEntry struct {
+	mu   sync.Mutex
+	refs int
 }
 
 // newKeyLock returns an empty keyLock ready to use.
 func newKeyLock() *keyLock {
-	return &keyLock{locks: make(map[string]*sync.Mutex)}
+	return &keyLock{locks: make(map[string]*lockEntry)}
 }
 
 // TryLock attempts to acquire key without blocking. On success it returns an
@@ -28,29 +40,49 @@ func newKeyLock() *keyLock {
 // failure (ok is false), some other in-flight call already holds key; the
 // returned unlock is nil and the caller holds nothing.
 //
-// Per-key entries are never removed once created, by design: deleting a
-// map entry while its *sync.Mutex might still be held (or about to be
-// TryLock'd by a caller that fetched it a moment earlier) would let two
-// callers end up on two different mutexes for what CSI considers the same
-// key, defeating the exclusion entirely. The alternative is one leaked
-// *sync.Mutex per distinct key for the life of the process, which is cheap
-// here: a mountPathKey is (volume ID, mount path), so the number of distinct
-// keys a node ever sees is bounded by the volumes it stages and the pods it
-// runs over its uptime, not by call volume.
+// The map entry for key is removed once this call is the last one holding a
+// reference to it (see lockEntry), so a node's lock map is bounded by keys
+// currently in flight rather than by every (volume ID, path) pair the node
+// has ever seen over its uptime — mountPathKey covers a pod's own target path
+// as well as the node-wide staging path, so that history only grows with pod
+// churn, not with concurrently mounted volumes.
 func (l *keyLock) TryLock(key string) (unlock func(), ok bool) {
 	l.mu.Lock()
-	m, exists := l.locks[key]
+	entry, exists := l.locks[key]
 	if !exists {
-		m = &sync.Mutex{}
-		l.locks[key] = m
+		entry = &lockEntry{}
+		l.locks[key] = entry
 	}
+	entry.refs++
 	l.mu.Unlock()
 
-	if !m.TryLock() {
+	if !entry.mu.TryLock() {
+		l.release(key, entry)
 		return nil, false
 	}
 
-	return m.Unlock, true
+	return func() {
+		entry.mu.Unlock()
+		l.release(key, entry)
+	}, true
+}
+
+// release drops this caller's reference to entry, taken by TryLock whether or
+// not it went on to acquire entry.mu, and deletes key from the map once
+// nothing references entry anymore. The decrement and the delete happen
+// under l.mu, the same lock TryLock takes to hand out entry in the first
+// place, so a delete here can never race a fetch of the very entry it is
+// removing: by the time refs reaches 0, every earlier TryLock(key) has either
+// already recorded its own reference (and not yet released it, in which case
+// refs would still be positive) or has yet to run at all — either way it
+// takes l.mu itself, sees the entry gone, and starts a fresh one.
+func (l *keyLock) release(key string, entry *lockEntry) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	entry.refs--
+	if entry.refs == 0 {
+		delete(l.locks, key)
+	}
 }
 
 // mountPathKey is the idempotency and concurrency key for the node RPCs that

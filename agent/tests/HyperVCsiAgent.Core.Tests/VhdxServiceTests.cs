@@ -747,7 +747,7 @@ public sealed class VhdxServiceTests : IDisposable
             }
         }
 
-        public async Task ResizeVhdxAsync(string path, long maxInternalSizeBytes, TimeSpan remainingBudget, CancellationToken cancellationToken)
+        public async Task<long> ResizeVhdxAsync(string path, long maxInternalSizeBytes, TimeSpan remainingBudget, CancellationToken cancellationToken)
         {
             Enter();
             try
@@ -774,6 +774,11 @@ public sealed class VhdxServiceTests : IDisposable
                     Resized.Add((path, maxInternalSizeBytes));
                     _sizes[name] = rounded;
                 }
+
+                // Mirrors CimVirtualDiskManager.ResizeVhdxAsync: the resize
+                // above already committed, so a read-back failure falls back
+                // to the requested size instead of failing the whole call.
+                return FailSizeReads ? maxInternalSizeBytes : rounded;
             }
             finally
             {

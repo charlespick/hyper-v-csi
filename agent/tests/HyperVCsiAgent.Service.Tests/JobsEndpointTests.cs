@@ -238,10 +238,10 @@ public sealed class JobsEndpointTests : IDisposable
             _sizes[Path.GetFileName(path)] = maxInternalSizeBytes;
         }
 
-        public Task ResizeVhdxAsync(string path, long maxInternalSizeBytes, TimeSpan remainingBudget, CancellationToken cancellationToken)
+        public Task<long> ResizeVhdxAsync(string path, long maxInternalSizeBytes, TimeSpan remainingBudget, CancellationToken cancellationToken)
         {
             _sizes[Path.GetFileName(path)] = maxInternalSizeBytes;
-            return Task.CompletedTask;
+            return Task.FromResult(maxInternalSizeBytes);
         }
 
         public Task<long> GetVirtualSizeAsync(string path, TimeSpan remainingBudget, CancellationToken cancellationToken)

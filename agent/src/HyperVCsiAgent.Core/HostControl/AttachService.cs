@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
 using HyperVCsiAgent.Core.Cluster;
 using HyperVCsiAgent.Core.Configuration;
 using HyperVCsiAgent.Core.Jobs;
@@ -121,31 +122,7 @@ public sealed class AttachService : IAttachService, IDisposable
             var vm = await _cluster.ResolveVmAsync(nodeId, attempt.Token).ConfigureAwait(false);
             if (vm is null)
             {
-                // Not "nothing to detach". Un-clustering a VM does not delete
-                // it: Remove-ClusterGroup leaves it registered on its host,
-                // running, still holding every disk it had. So a node the
-                // cluster cannot resolve is a VM this agent cannot see, which is
-                // indistinguishable from here from a VM that is genuinely gone.
-                //
-                // Reporting success on that would be the one fail-open in a
-                // design that otherwise verifies everything: the
-                // VolumeAttachment clears, DeleteVolume reclaims on the
-                // guarantee unpublish is supposed to provide, and with the VM
-                // stopped its base VHDX is not locked - so the file goes away
-                // under a VM that still expects it.
-                //
-                // Failing is also what CSI asks for. It permits OK for an
-                // unknown node only when the volume "can be safely regarded as
-                // ControllerUnpublished", and requires an error when the plugin
-                // does not know whether the operation completed. This does not
-                // know. Deregistering the node from Kubernetes before deleting
-                // or moving its VM is what keeps this state from arising; being
-                // in it means that did not happen, and an operator has to
-                // reconcile it rather than have the driver guess.
-                throw new JobFailureException(
-                    AgentErrorCodes.Internal,
-                    $"node {nodeId} names no clustered virtual machine, so volume {volumeId} cannot be confirmed " +
-                    "detached; an un-clustered VM still holds its disks, so this is not treated as nothing to do");
+                ThrowUnresolvedNode(nodeId, volumeId, reResolved: false);
             }
 
             try
@@ -163,10 +140,7 @@ public sealed class AttachService : IAttachService, IDisposable
                 var current = await _cluster.ResolveVmAsync(nodeId, attempt.Token).ConfigureAwait(false);
                 if (current is null)
                 {
-                    throw new JobFailureException(
-                        AgentErrorCodes.Internal,
-                        $"node {nodeId} stopped naming a clustered virtual machine while detaching volume {volumeId}, " +
-                        "so the detach cannot be confirmed");
+                    ThrowUnresolvedNode(nodeId, volumeId, reResolved: true);
                 }
 
                 await DetachOnHostAsync(current, volumeId, path, attempt, cancellationToken).ConfigureAwait(false);
@@ -178,6 +152,42 @@ public sealed class AttachService : IAttachService, IDisposable
                 AgentErrorCodes.Internal,
                 $"detaching volume {volumeId} from {nodeId} timed out after {_options.HostOperationTimeout}");
         }
+    }
+
+    /// <summary>
+    /// Fails DetachVolume for a node the cluster cannot resolve, whether that
+    /// is the first lookup or a re-resolve after the VM moved mid-detach.
+    /// </summary>
+    /// <remarks>
+    /// Not "nothing to detach". Un-clustering a VM does not delete it:
+    /// Remove-ClusterGroup leaves it registered on its host, running, still
+    /// holding every disk it had. So a node the cluster cannot resolve is a VM
+    /// this agent cannot see, which is indistinguishable from here from a VM
+    /// that is genuinely gone.
+    ///
+    /// Reporting success on that would be the one fail-open in a design that
+    /// otherwise verifies everything: the VolumeAttachment clears, DeleteVolume
+    /// reclaims on the guarantee unpublish is supposed to provide, and with the
+    /// VM stopped its base VHDX is not locked - so the file goes away under a
+    /// VM that still expects it.
+    ///
+    /// Failing is also what CSI asks for. It permits OK for an unknown node
+    /// only when the volume "can be safely regarded as ControllerUnpublished",
+    /// and requires an error when the plugin does not know whether the
+    /// operation completed. This does not know. Deregistering the node from
+    /// Kubernetes before deleting or moving its VM is what keeps this state
+    /// from arising; being in it means that did not happen, and an operator
+    /// has to reconcile it rather than have the driver guess.
+    /// </remarks>
+    [DoesNotReturn]
+    private static void ThrowUnresolvedNode(string nodeId, string volumeId, bool reResolved)
+    {
+        var detail = reResolved
+            ? $"node {nodeId} stopped naming a clustered virtual machine while detaching volume {volumeId}, " +
+              "so the detach cannot be confirmed"
+            : $"node {nodeId} names no clustered virtual machine, so volume {volumeId} cannot be confirmed " +
+              "detached; an un-clustered VM still holds its disks, so this is not treated as nothing to do";
+        throw new JobFailureException(AgentErrorCodes.Internal, detail);
     }
 
     /// <summary>

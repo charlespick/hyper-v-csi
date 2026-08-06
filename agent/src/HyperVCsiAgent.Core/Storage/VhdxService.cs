@@ -223,14 +223,12 @@ public sealed class VhdxService : IVhdxService, IDisposable
                 return new ExpandVolumeResult(currentSize, AlreadyLargeEnough: true);
             }
 
-            await _diskManager.ResizeVhdxAsync(
-                path, newSizeBytes, _options.DiskOperationTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
-
-            // Read back rather than reporting what was asked for: Hyper-V
-            // rounds a resize up to a sector multiple exactly as it rounds a
-            // create, and CSI requires ControllerExpandVolume to report the
-            // capacity the volume actually has.
-            var actualSize = await ReadBackSizeAsync(
+            // Reports the actual (post-rounding) size back rather than this
+            // call reporting what was asked for: Hyper-V rounds a resize up to
+            // a sector multiple exactly as it rounds a create, and CSI
+            // requires ControllerExpandVolume to report the capacity the
+            // volume actually has.
+            var actualSize = await _diskManager.ResizeVhdxAsync(
                 path, newSizeBytes, _options.DiskOperationTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
 
             _logger.LogInformation(

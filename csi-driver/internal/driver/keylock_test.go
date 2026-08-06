@@ -119,12 +119,14 @@ func TestKeyLockIsSafeForConcurrentCallers(t *testing.T) {
 	}
 }
 
-func TestKeyLockUnlockDoesNotDeleteTheMapEntry(t *testing.T) {
-	// Regression guard for the documented reason entries are never removed:
-	// if unlock deleted the map entry, a caller that fetched the *sync.Mutex
-	// a moment before the delete could end up on a stale mutex distinct from
-	// the one a later TryLock creates for the same key, and the two would no
-	// longer exclude each other.
+func TestKeyLockUnlockRemovesTheMapEntryOnceUnreferenced(t *testing.T) {
+	// The map must not grow with every (volume ID, path) pair a node has ever
+	// seen — mountPathKey covers a pod's own target path, so that history
+	// grows with pod churn over the node's uptime, not with volumes currently
+	// mounted. Once the only caller that knew about a key's entry has
+	// released it, nothing is left to end up on a stale entry a later TryLock
+	// might otherwise collide with, so it is safe — and necessary for the
+	// map to stay bounded — to remove it.
 	l := newKeyLock()
 
 	unlock, ok := l.TryLock("a")
@@ -136,8 +138,8 @@ func TestKeyLockUnlockDoesNotDeleteTheMapEntry(t *testing.T) {
 	l.mu.Lock()
 	_, exists := l.locks["a"]
 	l.mu.Unlock()
-	if !exists {
-		t.Fatal("map entry for a released key was removed, want it retained")
+	if exists {
+		t.Fatal("map entry for a released key was retained, want it removed")
 	}
 }
 

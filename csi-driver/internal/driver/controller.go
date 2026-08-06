@@ -210,6 +210,23 @@ func validateVolumeCapabilities(capabilities []*csi.VolumeCapability) error {
 	return nil
 }
 
+// requireMountVolume rejects a capability that is not a mount volume — the
+// block access type, or none at all — with the InvalidArgument every RPC that
+// only supports mount volumes shares: nothing in this driver formats or
+// mounts a raw block device, which per CLAUDE.md is separate follow-on work
+// rather than something to fold into whichever RPC happens to touch this
+// check next. A caller that needs the underlying MountVolume (to read its
+// FsType/MountFlags) gets it back; a caller that only needs the check
+// discards it.
+func requireMountVolume(capability *csi.VolumeCapability) (*csi.VolumeCapability_MountVolume, error) {
+	mountVolume := capability.GetMount()
+	if mountVolume == nil {
+		return nil, status.Error(codes.InvalidArgument,
+			"only mount volumes are supported; block volumes are not implemented")
+	}
+	return mountVolume, nil
+}
+
 // pickVolumeSize resolves the CSI capacity range to the single number the
 // agent needs. An unsatisfiable range is OUT_OF_RANGE, which is what the CSI
 // spec's CreateVolume error table calls for — INVALID_ARGUMENT is for a
@@ -522,9 +539,8 @@ func (s *controllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 		if err := validateVolumeCapabilities([]*csi.VolumeCapability{capability}); err != nil {
 			return nil, err
 		}
-		if capability.GetMount() == nil {
-			return nil, status.Error(codes.InvalidArgument,
-				"only mount volumes are supported; block volumes are not implemented")
+		if _, err := requireMountVolume(capability); err != nil {
+			return nil, err
 		}
 	}
 
