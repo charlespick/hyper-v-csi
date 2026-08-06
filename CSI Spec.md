@@ -24,7 +24,7 @@ covered by unit tests but has never run against a real failover cluster or Hyper
 | ListSnapshots | Controller | Lists existing snapshots known to the plugin. | Snapshot ID or source volume ID (optional filter, lookup only) | Not started |
 | NodeStageVolume | Node | Makes a volume ready for use on a node (format and node-wide mount). | Volume ID + staging target path | Tested — formats and mounts against a real cluster |
 | NodeUnstageVolume | Node | Undoes NodeStageVolume, releasing the node-wide mount. | Volume ID + staging target path | Tested — unmounts against a real cluster |
-| NodePublishVolume | Node | Bind-mounts a staged volume into a specific pod's path. | Volume ID + target path | Not started |
+| NodePublishVolume | Node | Bind-mounts a staged volume into a specific pod's path. | Volume ID + target path | Pending testing |
 | NodeUnpublishVolume | Node | Removes a pod's bind-mount of a volume. | Volume ID + target path | Not started |
 | NodeGetVolumeStats | Node | Reports usage and capacity stats for a mounted volume. | Volume ID + volume path (lookup only) | Not started |
 | NodeExpandVolume | Node | Grows the filesystem on a node after the underlying volume was expanded. | Volume ID + volume path | Not started |
@@ -169,17 +169,46 @@ So the shape is two steps, and which way you traverse them decides the cost:
 `Get-VHD` is not a substitute for any of it: its `Attached` property and its documented "in use"
 error on shared storage are both about open handles, the same signal with the same blind spot.
 
-**The node plugin is deployed even though it cannot publish.** Its registration with kubelet
-is what creates the `CSINode` object, and `CSINode` is where external-attacher reads the CSI
+**The node plugin's kubelet registration is load-bearing for the controller, not just the node.**
+It is what creates the `CSINode` object, and `CSINode` is where external-attacher reads the CSI
 node ID it passes to ControllerPublishVolume. Without it there is no node ID to resolve and
 no attach completes, whatever `attachRequired` is set to — so `node.enabled` being off would
-silently disable the RPC this section is about. A pod using a PVC therefore reaches a real
-attach, a real NodeStageVolume format-and-mount, and then fails at NodePublishVolume, which is
-now the honest place for it to fail. That required giving the node DaemonSet what actual
-mounting needs — `privileged: true`, a `mountPropagation: Bidirectional` mount of the whole
-kubelet directory (so a mount made inside the container is visible in the host's own mount
-table), a `/dev` mount, and a runtime image with `blkid`/`mkfs`/`mount`/`umount` on it, none of
-which the original stub-era DaemonSet had.
+silently disable the RPC this section is about. A pod using a PVC now reaches a real attach, a
+real NodeStageVolume format-and-mount, and a real NodePublishVolume bind-mount: it starts, with
+its VHDX under its mount path. What it cannot yet do is stop cleanly — NodeUnpublishVolume is
+still a stub, so kubelet's teardown fails there and the pod stays terminating until that lands.
+All of it required giving the node DaemonSet what actual mounting needs — `privileged: true`, a
+`mountPropagation: Bidirectional` mount of the whole kubelet directory (so a mount made inside
+the container is visible in the host's own mount table), a `/dev` mount, and a runtime image
+with `blkid`/`mkfs`/`mount`/`umount` on it, none of which the original stub-era DaemonSet had.
+
+**NodePublishVolume binds; it does not resolve.** By the time it runs, NodeStageVolume has already
+resolved the disk, formatted it and mounted it once for the whole node, so publish needs neither the
+publish context nor `vmbusdisk.Resolve` — it makes that one mount visible at the path kubelet gave for
+this pod, and that is all it does. Two things it does check, both for the reason everything else here
+fails loudly rather than quietly:
+
+- **The staging mount has to actually be there.** A staging directory that exists but carries no mount
+  is exactly what a stage that never ran, or silently failed, leaves behind — and Linux is perfectly
+  happy to bind an ordinary directory, so the publish would *succeed*. The pod then starts with an
+  empty directory backed by the node's root filesystem, and every write lands there instead of on the
+  VHDX, invisibly, until something goes looking for the data. So a staging target that is not a mount
+  point is FAILED_PRECONDITION and the pod does not start. That costs a pod start; not checking it
+  costs the writes.
+- **Read-only comes from two independent places and either one is sufficient.** `readonly` on the
+  request is kubelet's own field, set from the pod's or the PV's `readOnly` flag, and it says nothing
+  about the access mode: mounting a `SINGLE_NODE_WRITER` volume read-only into one pod is an ordinary
+  thing to ask for. `"ro"` is passed alongside `"bind"`, which mount-utils turns into the
+  mount-then-remount pair Linux requires — the kernel ignores every option but `bind` on the first
+  call, so a single bind carrying `"ro"` would come back read-write with nothing to say so.
+
+A repeat call for the same (volume, target) succeeds if what is already mounted matches the ro/rw the
+request asked for, and is ALREADY_EXISTS if it does not — the same comparison as NodeStageVolume's,
+with the same gap named there: nothing confirms the mount already at the target is a bind of *this*
+volume's staging mount rather than something else's. Nor does anything refuse a read-write publish of
+a staging mount that was staged read-only; the bind inherits the read-only-ness, since Linux will not
+upgrade one, and writes fail with EROFS at runtime. Kubernetes hands stage and publish the same PV
+capability, so that mismatch does not arise from Kubernetes — it would take a different CO to produce.
 
 **ControllerPublishVolume identifies a node by its Hyper-V VM ID, end to end.** The node plugin
 reads `VirtualMachineId` out of the guest's Hyper-V key-value pools — the values the host publishes
@@ -277,16 +306,18 @@ released, but the thread stays in the syscall. Abandoning it is safe here in a w
 for CreateVolume — if the call does eventually return, it returns having deleted the file, which is
 what was asked for. A create abandoned the same way could leave a disk nobody expects.
 
-**A wedged mount tool is conceded, not prevented, the same way.** `NodeStageVolume` and
-`NodeUnstageVolume` bound their wait with `stageOperationBudget`/`unstageOperationBudget` (30s each),
-but neither `vmbusdisk.Resolve`'s poll nor a mount/unmount syscall has a cancellation token, so the
-budget elapsing does not stop the work — it only stops waiting on it. The `stagingKey` lock (volume ID
-+ staging target path) is released by the goroutine actually doing the work, once that work returns,
-not by the RPC handler when the budget runs out; a retry that arrives while the real call is still in
-flight gets ABORTED rather than running alongside it. That closes the double-mount risk a naive
-timeout would open, but it does not shrink the wait: a target wedged on a hung format or a stuck mount
-still holds the lock for as long as the syscall does, budget or no budget, exactly as `File.Delete`
-does for DeleteVolume.
+**A wedged mount tool is conceded, not prevented, the same way.** `NodeStageVolume`,
+`NodeUnstageVolume` and `NodePublishVolume` bound their wait with
+`stageOperationBudget`/`unstageOperationBudget` (30s each) and `publishOperationBudget` (10s — a bind
+of a mount that is already there has no device to wait for and no filesystem to create, so a longer
+wait would only be waiting on a wedged syscall), but neither `vmbusdisk.Resolve`'s poll nor a
+mount/unmount syscall has a cancellation token, so the budget elapsing does not stop the work — it
+only stops waiting on it. The `mountPathKey` lock (volume ID + the path that RPC is about) is released
+by the goroutine actually doing the work, once that work returns, not by the RPC handler when the
+budget runs out; a retry that arrives while the real call is still in flight gets ABORTED rather than
+running alongside it. That closes the double-mount risk a naive timeout would open, but it does not
+shrink the wait: a target wedged on a hung format or a stuck mount still holds the lock for as long as
+the syscall does, budget or no budget, exactly as `File.Delete` does for DeleteVolume.
 
 **Other DeleteVolume notes.** A volume ID that could not have come from CreateVolume (one failing
 the safe filename rule) reports success rather than INVALID_ARGUMENT: no such volume can exist, CSI

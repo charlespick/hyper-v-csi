@@ -164,23 +164,23 @@ func TestKeyLockTryLockDoesNotBlock(t *testing.T) {
 }
 
 func TestStagingKeyJoinsEscapedComponents(t *testing.T) {
-	got := stagingKey("vol-1", "/var/lib/kubelet/plugins/kubernetes.io/csi/pv/pv-1/globalmount")
+	got := mountPathKey("vol-1", "/var/lib/kubelet/plugins/kubernetes.io/csi/pv/pv-1/globalmount")
 	want := escapeKeyComponent("vol-1") + "/" + escapeKeyComponent("/var/lib/kubelet/plugins/kubernetes.io/csi/pv/pv-1/globalmount")
 
 	if got != want {
-		t.Errorf("stagingKey = %q, want %q", got, want)
+		t.Errorf("mountPathKey = %q, want %q", got, want)
 	}
 }
 
 func TestStagingKeyDoesNotCollideAcrossTheBoundary(t *testing.T) {
 	// Without escaping, ("a/b", "c") and ("a", "b/c") would both join to
 	// "a/b/c" — the same collision publishKey guards against in
-	// controller.go, and stagingKey reuses the same escapeKeyComponent to
+	// controller.go, and mountPathKey reuses the same escapeKeyComponent to
 	// close it here too.
-	a := stagingKey("a/b", "c")
-	b := stagingKey("a", "b/c")
+	a := mountPathKey("a/b", "c")
+	b := mountPathKey("a", "b/c")
 
 	if a == b {
-		t.Errorf("stagingKey(%q, %q) collided with stagingKey(%q, %q): both = %q", "a/b", "c", "a", "b/c", a)
+		t.Errorf("mountPathKey(%q, %q) collided with mountPathKey(%q, %q): both = %q", "a/b", "c", "a", "b/c", a)
 	}
 }

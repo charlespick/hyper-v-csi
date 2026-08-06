@@ -6,14 +6,13 @@ import "sync"
 // immediately whether some other call already holds the key, rather than
 // queuing behind it.
 //
-// NodeStageVolume and NodeUnstageVolume are node-local — unlike the
-// controller RPCs in controller.go, there is no agent job to serialize
-// concurrent calls for the same key on, since staging never leaves the guest.
-// A keyLock keyed on stagingKey is what stands in for that: a second call for
-// the same (volume ID, staging target path) while the first is still running
-// gets rejected with ABORTED instead of running alongside it or blocking on
-// it, matching how jobs.go already reports "operation in progress" for the
-// controller side.
+// The node RPCs that mount and unmount are node-local — unlike the controller
+// RPCs in controller.go, there is no agent job to serialize concurrent calls
+// for the same key on, since none of that work leaves the guest. A keyLock
+// keyed on mountPathKey is what stands in for that: a second call for the same
+// (volume ID, path) while the first is still running gets rejected with
+// ABORTED instead of running alongside it or blocking on it, matching how
+// jobs.go already reports "operation in progress" for the controller side.
 type keyLock struct {
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex
@@ -35,9 +34,9 @@ func newKeyLock() *keyLock {
 // callers end up on two different mutexes for what CSI considers the same
 // key, defeating the exclusion entirely. The alternative is one leaked
 // *sync.Mutex per distinct key for the life of the process, which is cheap
-// here: a stagingKey is (volume ID, staging target path), so the number of
-// distinct keys a node ever sees is bounded by the volumes it stages over its
-// uptime, not by call volume.
+// here: a mountPathKey is (volume ID, mount path), so the number of distinct
+// keys a node ever sees is bounded by the volumes it stages and the pods it
+// runs over its uptime, not by call volume.
 func (l *keyLock) TryLock(key string) (unlock func(), ok bool) {
 	l.mu.Lock()
 	m, exists := l.locks[key]
@@ -54,11 +53,12 @@ func (l *keyLock) TryLock(key string) (unlock func(), ok bool) {
 	return m.Unlock, true
 }
 
-// stagingKey is the idempotency and concurrency key for NodeStageVolume and
-// NodeUnstageVolume per CSI Spec.md: volume ID + staging target path. Reuses
-// escapeKeyComponent from controller.go so the same guarantee publishKey
-// relies on holds here too — two distinct (volumeID, stagingTargetPath) pairs
-// can never collide onto the same key.
-func stagingKey(volumeID, stagingTargetPath string) string {
-	return escapeKeyComponent(volumeID) + "/" + escapeKeyComponent(stagingTargetPath)
+// mountPathKey is the idempotency and concurrency key for the node RPCs that
+// mount and unmount, per CSI Spec.md: volume ID + the path the RPC is about —
+// the staging target path for NodeStageVolume/NodeUnstageVolume, the pod's
+// target path for NodePublishVolume. Reuses escapeKeyComponent from
+// controller.go so the same guarantee publishKey relies on holds here too —
+// two distinct (volumeID, path) pairs can never collide onto the same key.
+func mountPathKey(volumeID, path string) string {
+	return escapeKeyComponent(volumeID) + "/" + escapeKeyComponent(path)
 }

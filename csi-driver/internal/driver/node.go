@@ -52,7 +52,7 @@ const (
 	// — a mount syscall has no cancellation token, the same limit CSI
 	// Spec.md notes for DeleteVolume's File.Delete — so giving up on the
 	// wait does not stop the work. It keeps running in a goroutine that
-	// holds the stagingKey lock until it finishes, so a retry that arrives
+	// holds the mountPathKey lock until it finishes, so a retry that arrives
 	// first gets ABORTED rather than running alongside it or blocking on it.
 	stageOperationBudget = 30 * time.Second
 
@@ -60,6 +60,14 @@ const (
 	// NodeUnstageVolume, bounding CleanupMountPoint's unmount instead of
 	// device resolution and format-and-mount.
 	unstageOperationBudget = 30 * time.Second
+
+	// publishOperationBudget is the same for NodePublishVolume. It is shorter
+	// than the other two because the work is: a bind mount of a mount that is
+	// already there. There is no device to wait for — NodeStageVolume paid
+	// that cost already — and no filesystem to create, so anything beyond a
+	// few seconds here means the mount syscall itself is wedged, which the
+	// budget cannot fix (see runBounded) and only reports.
+	publishOperationBudget = 10 * time.Second
 )
 
 // validateStagingRequest checks the two fields NodeStageVolume and
@@ -75,12 +83,16 @@ func validateStagingRequest(volumeID, target string) error {
 	return nil
 }
 
-// acquireStagingLock TryLocks the (volumeID, target) staging key on behalf of
-// rpcName, the shared concurrency guard NodeStageVolume and NodeUnstageVolume
-// both need: a call for the same key already in flight is rejected with
-// ABORTED rather than run alongside it or blocked on it.
-func (s *nodeServer) acquireStagingLock(rpcName, volumeID, target string) (func(), error) {
-	unlock, acquired := s.locks.TryLock(stagingKey(volumeID, target))
+// acquireMountLock TryLocks the (volumeID, target) mount key on behalf of
+// rpcName, the shared concurrency guard every node RPC that mounts or unmounts
+// needs: a call for the same key already in flight is rejected with ABORTED
+// rather than run alongside it or blocked on it. target is the staging target
+// path for NodeStageVolume/NodeUnstageVolume and the pod's target path for
+// NodePublishVolume, which is what CSI Spec.md lists as each one's idempotency
+// key; the two never collide, because kubelet gives a pod a different path
+// from the node-wide staging directory.
+func (s *nodeServer) acquireMountLock(rpcName, volumeID, target string) (func(), error) {
+	unlock, acquired := s.locks.TryLock(mountPathKey(volumeID, target))
 	if !acquired {
 		return nil, status.Errorf(codes.Aborted,
 			"%s for volume %s at %s is already in progress", rpcName, volumeID, target)
@@ -132,7 +144,7 @@ func (s *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolu
 			"publish context %q is %q, which is not a non-negative integer", publishContextLun, lunValue)
 	}
 
-	unlock, err := s.acquireStagingLock("NodeStageVolume", volumeID, target)
+	unlock, err := s.acquireMountLock("NodeStageVolume", volumeID, target)
 	if err != nil {
 		return nil, err
 	}
@@ -161,7 +173,7 @@ func (s *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolu
 // the same limit CSI Spec.md notes for DeleteVolume's uncancellable
 // File.Delete. unlock is called exactly once, by the goroutine running work,
 // once work actually returns — not when this function returns — so the
-// stagingKey stays held for as long as the real operation is still running,
+// mountPathKey stays held for as long as the real operation is still running,
 // and a retry that arrives first gets ABORTED from keyLock.TryLock rather
 // than running alongside it.
 //
@@ -294,11 +306,11 @@ func (s *nodeServer) targetIsReadOnly(target string) (bool, error) {
 	// "read-write" and proceeding could silently accept a volume mounted with
 	// the wrong ro/rw mode, so this fails closed instead of defaulting.
 	return false, fmt.Errorf(
-		"staging target %s (resolved %s) is reported mounted but has no matching entry in the mount table",
+		"%s (resolved %s) is reported mounted but has no matching entry in the mount table",
 		target, resolvedTarget)
 }
 
-// readWriteLabel renders readOnly for the ALREADY_EXISTS message below.
+// readWriteLabel renders readOnly for the ALREADY_EXISTS messages above.
 func readWriteLabel(readOnly bool) string {
 	if readOnly {
 		return "read-only"
@@ -327,7 +339,7 @@ func (s *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstage
 		return nil, err
 	}
 
-	unlock, err := s.acquireStagingLock("NodeUnstageVolume", volumeID, target)
+	unlock, err := s.acquireMountLock("NodeUnstageVolume", volumeID, target)
 	if err != nil {
 		return nil, err
 	}
@@ -377,8 +389,140 @@ func (s *nodeServer) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoReques
 }
 
 // NodePublishVolume bind-mounts a staged volume into a pod's path. Idempotency key: volume ID + target path.
+//
+// Nothing here touches a device. NodeStageVolume already resolved the disk,
+// formatted it and mounted it once for the whole node; this makes that one
+// mount visible at the path kubelet gave for this pod, which is why it needs
+// neither the publish context nor vmbusdisk.Resolve.
 func (s *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "NodePublishVolume not implemented")
+	volumeID := req.GetVolumeId()
+	target := req.GetTargetPath()
+	stagingTarget := req.GetStagingTargetPath()
+	if volumeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume id is required")
+	}
+	if target == "" {
+		return nil, status.Error(codes.InvalidArgument, "target path is required")
+	}
+	if stagingTarget == "" {
+		// CSI only requires this field from a plugin advertising
+		// STAGE_UNSTAGE_VOLUME. This one does, so kubelet always stages first
+		// and always sets it, and there is nothing to bind without it.
+		return nil, status.Error(codes.InvalidArgument, "staging target path is required")
+	}
+
+	capability := req.GetVolumeCapability()
+	if capability == nil {
+		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
+	}
+	if err := validateVolumeCapabilities([]*csi.VolumeCapability{capability}); err != nil {
+		return nil, err
+	}
+	mountVolume := capability.GetMount()
+	if mountVolume == nil {
+		// Same as NodeStageVolume: block volumes are separate follow-on work.
+		return nil, status.Error(codes.InvalidArgument,
+			"only mount volumes are supported; block volumes are not implemented")
+	}
+
+	// Two independent sources of read-only, and either one is sufficient.
+	// req.readonly is what kubelet sets from the pod's or the PV's own
+	// readOnly flag, and it can ask for a read-only mount of a volume whose
+	// access mode is perfectly writable.
+	readOnly := req.GetReadonly() ||
+		capability.GetAccessMode().GetMode() == csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY
+
+	unlock, err := s.acquireMountLock("NodePublishVolume", volumeID, target)
+	if err != nil {
+		return nil, err
+	}
+
+	options := bindMountOptions(mountVolume.GetMountFlags(), readOnly)
+
+	err = runBounded(ctx, clampToCallerDeadline(ctx, publishOperationBudget), unlock, func() error {
+		return s.publishVolume(stagingTarget, target, options, readOnly)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &csi.NodePublishVolumeResponse{}, nil
+}
+
+// bindMountOptions builds the option list the pod-facing mount receives: the
+// same options a stage would get, plus "bind" — which is what makes this a
+// second view of the staging mount rather than a fresh mount of a device.
+// mount-utils' Mounter turns a bind carrying any other option into the
+// mount-then-remount pair Linux requires, since the kernel ignores everything
+// but "bind" on the first call; "ro" in particular does nothing without it.
+func bindMountOptions(mountFlags []string, readOnly bool) []string {
+	return append([]string{"bind"}, mountOptions(mountFlags, readOnly)...)
+}
+
+// publishVolume does the actual bind-mount work. Like stageVolume it is
+// deliberately not handed ctx — see runBounded's doc comment for why the
+// goroutine this runs in outlives the RPC.
+func (s *nodeServer) publishVolume(stagingTarget, target string, options []string, readOnly bool) error {
+	// Confirm the staging mount is really there before binding it anywhere.
+	// A directory that exists but carries no mount is exactly what an
+	// unstaged (or silently failed) stage leaves behind, and bind-mounting it
+	// would hand the pod an empty directory backed by the node's root
+	// filesystem while reporting success — the pod starts, writes land on the
+	// node's disk instead of the VHDX, and nothing surfaces that until
+	// something goes looking for the data. Failing here costs a pod start;
+	// not failing here costs the writes.
+	stagingNotMountPoint, err := mount.IsNotMountPoint(s.mounter, stagingTarget)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return status.Errorf(codes.FailedPrecondition,
+				"staging target %s does not exist; NodeStageVolume has not run for this volume", stagingTarget)
+		}
+		return status.Errorf(codes.Internal, "checking staging target %s: %v", stagingTarget, err)
+	}
+	if stagingNotMountPoint {
+		return status.Errorf(codes.FailedPrecondition,
+			"staging target %s exists but nothing is mounted there; NodeStageVolume has not run for this volume",
+			stagingTarget)
+	}
+
+	notMountPoint, err := mount.IsNotMountPoint(s.mounter, target)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// CSI makes creating the target path the plugin's job, and kubelet
+			// only guarantees its parent.
+			if mkdirErr := os.MkdirAll(target, 0o750); mkdirErr != nil {
+				return status.Errorf(codes.Internal, "creating target %s: %v", target, mkdirErr)
+			}
+			notMountPoint = true
+		} else {
+			return status.Errorf(codes.Internal, "checking target %s: %v", target, err)
+		}
+	}
+
+	if !notMountPoint {
+		// Already published: a repeat call for the same (volume, target) has to
+		// succeed, but only if what is already mounted matches what was asked
+		// for. Same ro/rw-only comparison stageVolume makes, and with the same
+		// gap named there — nothing confirms the mount at target is a bind of
+		// this volume's staging mount rather than something else's.
+		alreadyReadOnly, err := s.targetIsReadOnly(target)
+		if err != nil {
+			return status.Errorf(codes.Internal, "reading existing mount options for %s: %v", target, err)
+		}
+		if alreadyReadOnly != readOnly {
+			return status.Errorf(codes.AlreadyExists,
+				"target %s is already mounted %s, which is incompatible with the requested %s",
+				target, readWriteLabel(alreadyReadOnly), readWriteLabel(readOnly))
+		}
+		return nil
+	}
+
+	// Empty fsType: a bind mount inherits the filesystem of the mount it binds,
+	// so naming one here would at best be redundant and at worst disagree with
+	// whatever NodeStageVolume actually formatted.
+	if err := s.mounter.Mount(stagingTarget, target, "", options); err != nil {
+		return status.Errorf(codes.Internal, "bind-mounting %s at %s: %v", stagingTarget, target, err)
+	}
+	return nil
 }
 
 // NodeUnpublishVolume removes a pod's bind-mount. Idempotency key: volume ID + target path.

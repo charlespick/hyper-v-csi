@@ -380,7 +380,7 @@ func TestNodeStageVolumeReturnsAbortedWhenAnotherCallIsAlreadyInProgress(t *test
 	s, _, _ := newTestNodeServer(t)
 	target := t.TempDir()
 
-	unlock, ok := s.locks.TryLock(stagingKey("vol-1", target))
+	unlock, ok := s.locks.TryLock(mountPathKey("vol-1", target))
 	if !ok {
 		t.Fatal("TryLock: ok = false, want true")
 	}
@@ -399,7 +399,7 @@ func TestNodeStageVolumeReturnsAbortedWhenAnotherCallIsAlreadyInProgress(t *test
 
 func TestNodeStageVolumeReleasesTheLockOnceTheBackgroundWorkFinishes(t *testing.T) {
 	// A caller whose own ctx ends first gets an error back immediately, but
-	// the stagingKey must not stay held forever: once the background
+	// the mountPathKey must not stay held forever: once the background
 	// goroutine actually finishes (here, quickly — the device is already in
 	// place), a later retry for the same (volume, target) has to be able to
 	// get in. The device is staged so the background work completes in well
@@ -427,11 +427,11 @@ func TestNodeStageVolumeReleasesTheLockOnceTheBackgroundWorkFinishes(t *testing.
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		if _, ok := s.locks.TryLock(stagingKey("vol-1", target)); ok {
+		if _, ok := s.locks.TryLock(mountPathKey("vol-1", target)); ok {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("stagingKey lock was never released after the background work finished")
+			t.Fatal("mountPathKey lock was never released after the background work finished")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -512,7 +512,7 @@ func TestNodeUnstageVolumeReturnsAbortedWhenAnotherCallIsAlreadyInProgress(t *te
 	s, _, _ := newTestNodeServer(t)
 	target := t.TempDir()
 
-	unlock, ok := s.locks.TryLock(stagingKey("vol-1", target))
+	unlock, ok := s.locks.TryLock(mountPathKey("vol-1", target))
 	if !ok {
 		t.Fatal("TryLock: ok = false, want true")
 	}
@@ -522,6 +522,287 @@ func TestNodeUnstageVolumeReturnsAbortedWhenAnotherCallIsAlreadyInProgress(t *te
 		VolumeId:          "vol-1",
 		StagingTargetPath: target,
 	})
+	if got := grpcCode(t, err); got != codes.Aborted {
+		t.Errorf("code = %s, want Aborted", got)
+	}
+}
+
+// --- NodePublishVolume ---
+
+// stagePublishSource runs a real NodeStageVolume so the staging target a
+// publish binds is genuinely a mount point in the fake mounter's table, which
+// is what publishVolume's precondition check reads. It returns that path.
+func stagePublishSource(t *testing.T, s *nodeServer, sysRoot string) string {
+	t.Helper()
+	putDevice(t, sysRoot, testControllerID, 3, 7, "sdb")
+	staging := filepath.Join(t.TempDir(), "globalmount")
+	mkdirAllT(t, staging)
+
+	if _, err := s.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+		VolumeId:          "vol-1",
+		StagingTargetPath: staging,
+		VolumeCapability:  mountVolumeCapability("", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
+		PublishContext:    publishContext(testControllerID, 7),
+	}); err != nil {
+		t.Fatalf("NodeStageVolume: %v", err)
+	}
+	return staging
+}
+
+func nodePublishRequest(staging, target string, mode csi.VolumeCapability_AccessMode_Mode) *csi.NodePublishVolumeRequest {
+	return &csi.NodePublishVolumeRequest{
+		VolumeId:          "vol-1",
+		StagingTargetPath: staging,
+		TargetPath:        target,
+		VolumeCapability:  mountVolumeCapability("", mode),
+	}
+}
+
+// mountPointAt returns the fake mounter's entry for path, or fails the test.
+func mountPointAt(t *testing.T, fakeMounter *mount.FakeMounter, path string) mount.MountPoint {
+	t.Helper()
+	mountPoints, err := fakeMounter.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	for _, mp := range mountPoints {
+		if mp.Path == path {
+			return mp
+		}
+	}
+	t.Fatalf("no mount point at %s; mount table: %+v", path, mountPoints)
+	return mount.MountPoint{}
+}
+
+func TestNodePublishVolumeRejectsMissingVolumeID(t *testing.T) {
+	s, _, _ := newTestNodeServer(t)
+	_, err := s.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+		StagingTargetPath: t.TempDir(),
+		TargetPath:        t.TempDir(),
+		VolumeCapability:  mountVolumeCapability("", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
+	})
+	if got := grpcCode(t, err); got != codes.InvalidArgument {
+		t.Errorf("code = %s, want InvalidArgument", got)
+	}
+}
+
+func TestNodePublishVolumeRejectsMissingTargetPath(t *testing.T) {
+	s, _, _ := newTestNodeServer(t)
+	_, err := s.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+		VolumeId:          "vol-1",
+		StagingTargetPath: t.TempDir(),
+		VolumeCapability:  mountVolumeCapability("", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
+	})
+	if got := grpcCode(t, err); got != codes.InvalidArgument {
+		t.Errorf("code = %s, want InvalidArgument", got)
+	}
+}
+
+func TestNodePublishVolumeRejectsMissingStagingTargetPath(t *testing.T) {
+	// STAGE_UNSTAGE_VOLUME is advertised, so kubelet always sets this; without
+	// it there is no mount to bind and nothing here would resolve a device.
+	s, _, _ := newTestNodeServer(t)
+	_, err := s.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+		VolumeId:         "vol-1",
+		TargetPath:       t.TempDir(),
+		VolumeCapability: mountVolumeCapability("", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
+	})
+	if got := grpcCode(t, err); got != codes.InvalidArgument {
+		t.Errorf("code = %s, want InvalidArgument", got)
+	}
+}
+
+func TestNodePublishVolumeRejectsMissingCapability(t *testing.T) {
+	s, _, _ := newTestNodeServer(t)
+	_, err := s.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+		VolumeId:          "vol-1",
+		StagingTargetPath: t.TempDir(),
+		TargetPath:        t.TempDir(),
+	})
+	if got := grpcCode(t, err); got != codes.InvalidArgument {
+		t.Errorf("code = %s, want InvalidArgument", got)
+	}
+}
+
+func TestNodePublishVolumeRejectsUnsupportedAccessMode(t *testing.T) {
+	s, _, _ := newTestNodeServer(t)
+	_, err := s.NodePublishVolume(context.Background(),
+		nodePublishRequest(t.TempDir(), t.TempDir(), csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER))
+	if got := grpcCode(t, err); got != codes.InvalidArgument {
+		t.Errorf("code = %s, want InvalidArgument", got)
+	}
+}
+
+func TestNodePublishVolumeRejectsBlockVolumes(t *testing.T) {
+	s, _, _ := newTestNodeServer(t)
+	_, err := s.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+		VolumeId:          "vol-1",
+		StagingTargetPath: t.TempDir(),
+		TargetPath:        t.TempDir(),
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
+		},
+	})
+	if got := grpcCode(t, err); got != codes.InvalidArgument {
+		t.Errorf("code = %s, want InvalidArgument", got)
+	}
+}
+
+func TestNodePublishVolumeRefusesToBindAStagingTargetThatIsNotMounted(t *testing.T) {
+	// The directory exists but carries no mount, which is what an unstaged (or
+	// silently failed) stage leaves behind. Binding it would give the pod an
+	// empty directory on the node's root filesystem and report success, so
+	// this has to fail instead — and leave nothing mounted behind.
+	s, fakeMounter, _ := newTestNodeServer(t)
+	staging := t.TempDir()
+	target := filepath.Join(t.TempDir(), "mount")
+
+	_, err := s.NodePublishVolume(context.Background(),
+		nodePublishRequest(staging, target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER))
+	if got := grpcCode(t, err); got != codes.FailedPrecondition {
+		t.Errorf("code = %s, want FailedPrecondition", got)
+	}
+
+	mountPoints, listErr := fakeMounter.List()
+	if listErr != nil {
+		t.Fatalf("List: %v", listErr)
+	}
+	if len(mountPoints) != 0 {
+		t.Errorf("got %d mount points, want 0: %+v", len(mountPoints), mountPoints)
+	}
+}
+
+func TestNodePublishVolumeRefusesAStagingTargetThatDoesNotExist(t *testing.T) {
+	s, _, _ := newTestNodeServer(t)
+	staging := filepath.Join(t.TempDir(), "never-created")
+	target := filepath.Join(t.TempDir(), "mount")
+
+	_, err := s.NodePublishVolume(context.Background(),
+		nodePublishRequest(staging, target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER))
+	if got := grpcCode(t, err); got != codes.FailedPrecondition {
+		t.Errorf("code = %s, want FailedPrecondition", got)
+	}
+}
+
+func TestNodePublishVolumeBindMountsTheStagedVolume(t *testing.T) {
+	s, fakeMounter, sysRoot := newTestNodeServer(t)
+	staging := stagePublishSource(t, s, sysRoot)
+	// Deliberately not created up front: CSI makes creating the target path
+	// the plugin's job, and kubelet only guarantees its parent.
+	target := filepath.Join(t.TempDir(), "mount")
+
+	if _, err := s.NodePublishVolume(context.Background(),
+		nodePublishRequest(staging, target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)); err != nil {
+		t.Fatalf("NodePublishVolume: %v", err)
+	}
+
+	published := mountPointAt(t, fakeMounter, target)
+	if !slicesContain(published.Opts, "bind") {
+		t.Errorf("mount options = %v, want \"bind\" among them", published.Opts)
+	}
+	if slicesContain(published.Opts, "ro") {
+		t.Errorf("mount options = %v, want no \"ro\" for a read-write publish", published.Opts)
+	}
+	// A bind mount reports the underlying device, not the path it bound, which
+	// is the same thing /proc/mounts shows for a real one.
+	if !strings.HasSuffix(published.Device, "sdb") {
+		t.Errorf("published device = %q, want it to resolve to .../sdb", published.Device)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Errorf("target was not created: %v", err)
+	}
+}
+
+func TestNodePublishVolumeIsIdempotentOnAMatchingRepeatCall(t *testing.T) {
+	s, fakeMounter, sysRoot := newTestNodeServer(t)
+	staging := stagePublishSource(t, s, sysRoot)
+	target := filepath.Join(t.TempDir(), "mount")
+	req := nodePublishRequest(staging, target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)
+
+	if _, err := s.NodePublishVolume(context.Background(), req); err != nil {
+		t.Fatalf("first NodePublishVolume: %v", err)
+	}
+	if _, err := s.NodePublishVolume(context.Background(), req); err != nil {
+		t.Fatalf("second (idempotent) NodePublishVolume: %v", err)
+	}
+
+	mountPoints, err := fakeMounter.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	// One staging mount plus one bind, not two binds.
+	if len(mountPoints) != 2 {
+		t.Fatalf("got %d mount points after two idempotent publish calls, want 2: %+v", len(mountPoints), mountPoints)
+	}
+}
+
+func TestNodePublishVolumeReturnsAlreadyExistsOnAMismatchedReadOnlyFlag(t *testing.T) {
+	s, _, sysRoot := newTestNodeServer(t)
+	staging := stagePublishSource(t, s, sysRoot)
+	target := filepath.Join(t.TempDir(), "mount")
+
+	rw := nodePublishRequest(staging, target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)
+	if _, err := s.NodePublishVolume(context.Background(), rw); err != nil {
+		t.Fatalf("first (rw) NodePublishVolume: %v", err)
+	}
+
+	ro := nodePublishRequest(staging, target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)
+	ro.Readonly = true
+	_, err := s.NodePublishVolume(context.Background(), ro)
+	if got := grpcCode(t, err); got != codes.AlreadyExists {
+		t.Errorf("code = %s, want AlreadyExists", got)
+	}
+}
+
+func TestNodePublishVolumeHonoursTheRequestReadonlyFlag(t *testing.T) {
+	// readonly is kubelet's own field, set from the pod's or the PV's readOnly
+	// flag, and it is independent of the access mode: a SINGLE_NODE_WRITER
+	// volume mounted read-only into one pod is an ordinary thing to ask for.
+	s, fakeMounter, sysRoot := newTestNodeServer(t)
+	staging := stagePublishSource(t, s, sysRoot)
+	target := filepath.Join(t.TempDir(), "mount")
+
+	req := nodePublishRequest(staging, target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)
+	req.Readonly = true
+	if _, err := s.NodePublishVolume(context.Background(), req); err != nil {
+		t.Fatalf("NodePublishVolume: %v", err)
+	}
+
+	published := mountPointAt(t, fakeMounter, target)
+	if !slicesContain(published.Opts, "ro") {
+		t.Errorf("mount options = %v, want \"ro\" among them", published.Opts)
+	}
+}
+
+func TestNodePublishVolumeHonoursAReadOnlyAccessMode(t *testing.T) {
+	s, fakeMounter, sysRoot := newTestNodeServer(t)
+	staging := stagePublishSource(t, s, sysRoot)
+	target := filepath.Join(t.TempDir(), "mount")
+
+	if _, err := s.NodePublishVolume(context.Background(),
+		nodePublishRequest(staging, target, csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY)); err != nil {
+		t.Fatalf("NodePublishVolume: %v", err)
+	}
+
+	published := mountPointAt(t, fakeMounter, target)
+	if !slicesContain(published.Opts, "ro") {
+		t.Errorf("mount options = %v, want \"ro\" among them", published.Opts)
+	}
+}
+
+func TestNodePublishVolumeReturnsAbortedWhenAnotherCallIsAlreadyInProgress(t *testing.T) {
+	s, _, _ := newTestNodeServer(t)
+	target := t.TempDir()
+
+	unlock, ok := s.locks.TryLock(mountPathKey("vol-1", target))
+	if !ok {
+		t.Fatal("TryLock: ok = false, want true")
+	}
+	defer unlock()
+
+	_, err := s.NodePublishVolume(context.Background(),
+		nodePublishRequest(t.TempDir(), target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER))
 	if got := grpcCode(t, err); got != codes.Aborted {
 		t.Errorf("code = %s, want Aborted", got)
 	}
