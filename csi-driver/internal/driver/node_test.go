@@ -16,6 +16,8 @@ import (
 	mount "k8s.io/mount-utils"
 	utilexec "k8s.io/utils/exec"
 	testingexec "k8s.io/utils/exec/testing"
+
+	"github.com/charlespick/hyper-v-csi/csi-driver/internal/fsstats"
 )
 
 const testControllerID = "7c2a4e1b-3d9f-4a52-8b61-0e5d7c3a9f24"
@@ -916,6 +918,169 @@ func TestNodeUnpublishVolumeReturnsAbortedWhenAnotherCallIsAlreadyInProgress(t *
 	_, err := s.NodeUnpublishVolume(context.Background(), &csi.NodeUnpublishVolumeRequest{
 		VolumeId:   "vol-1",
 		TargetPath: target,
+	})
+	if got := grpcCode(t, err); got != codes.Aborted {
+		t.Errorf("code = %s, want Aborted", got)
+	}
+}
+
+// --- NodeGetVolumeStats ---
+
+// fakeStats is what a healthy 10 GiB ext4 volume with a little written to it
+// would report. The numbers are arbitrary but distinct from each other, so a
+// field crossed over in the response is visible rather than coincidentally
+// equal.
+var fakeStats = fsstats.Stats{
+	TotalBytes:     10 << 30,
+	UsedBytes:      3 << 30,
+	AvailableBytes: 6 << 30,
+	TotalInodes:    655360,
+	UsedInodes:     1200,
+	FreeInodes:     654160,
+}
+
+// mountedVolumeServer returns a node server with vol-1 published at the
+// returned path and s.statfs scripted to report fakeStats, the fixture every
+// happy-path stats test needs: a FakeMounter's mount table is not backed by a
+// real filesystem, so a real statfs(2) would measure the node running the
+// test rather than anything this staged.
+func mountedVolumeServer(t *testing.T) (*nodeServer, string) {
+	t.Helper()
+	s, _, sysRoot := newTestNodeServer(t)
+	staging := stagePublishSource(t, s, sysRoot)
+	target := filepath.Join(t.TempDir(), "mount")
+
+	if _, err := s.NodePublishVolume(context.Background(),
+		nodePublishRequest(staging, target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)); err != nil {
+		t.Fatalf("NodePublishVolume: %v", err)
+	}
+
+	s.statfs = func(string) (fsstats.Stats, error) { return fakeStats, nil }
+	return s, target
+}
+
+func TestNodeGetVolumeStatsRejectsMissingVolumeID(t *testing.T) {
+	s, _, _ := newTestNodeServer(t)
+	_, err := s.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumePath: t.TempDir(),
+	})
+	if got := grpcCode(t, err); got != codes.InvalidArgument {
+		t.Errorf("code = %s, want InvalidArgument", got)
+	}
+}
+
+func TestNodeGetVolumeStatsRejectsMissingVolumePath(t *testing.T) {
+	s, _, _ := newTestNodeServer(t)
+	_, err := s.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId: "vol-1",
+	})
+	if got := grpcCode(t, err); got != codes.InvalidArgument {
+		t.Errorf("code = %s, want InvalidArgument", got)
+	}
+}
+
+func TestNodeGetVolumeStatsReturnsNotFoundWhenTheVolumePathDoesNotExist(t *testing.T) {
+	s, _, _ := newTestNodeServer(t)
+	_, err := s.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId:   "vol-1",
+		VolumePath: filepath.Join(t.TempDir(), "never-created"),
+	})
+	if got := grpcCode(t, err); got != codes.NotFound {
+		t.Errorf("code = %s, want NotFound", got)
+	}
+}
+
+func TestNodeGetVolumeStatsReturnsNotFoundWhenNothingIsMountedThere(t *testing.T) {
+	// statfs on an unmounted directory does not fail — it reports whatever
+	// filesystem backs the path, which here is the node's own root. Handing
+	// those numbers back as the volume's would show a PVC with the node's free
+	// space, so the mount check has to catch this before statfs is reached.
+	s, _, _ := newTestNodeServer(t)
+	s.statfs = func(string) (fsstats.Stats, error) {
+		t.Error("statfs was called for a path with nothing mounted on it")
+		return fsstats.Stats{}, nil
+	}
+
+	_, err := s.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId:   "vol-1",
+		VolumePath: t.TempDir(),
+	})
+	if got := grpcCode(t, err); got != codes.NotFound {
+		t.Errorf("code = %s, want NotFound", got)
+	}
+}
+
+func TestNodeGetVolumeStatsReportsBytesAndInodes(t *testing.T) {
+	s, target := mountedVolumeServer(t)
+
+	resp, err := s.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId:   "vol-1",
+		VolumePath: target,
+	})
+	if err != nil {
+		t.Fatalf("NodeGetVolumeStats: %v", err)
+	}
+
+	byUnit := map[csi.VolumeUsage_Unit]*csi.VolumeUsage{}
+	for _, usage := range resp.GetUsage() {
+		if _, seen := byUnit[usage.GetUnit()]; seen {
+			t.Fatalf("unit %s reported twice: %+v", usage.GetUnit(), resp.GetUsage())
+		}
+		byUnit[usage.GetUnit()] = usage
+	}
+
+	bytes, ok := byUnit[csi.VolumeUsage_BYTES]
+	if !ok {
+		t.Fatalf("no BYTES usage in %+v", resp.GetUsage())
+	}
+	if bytes.GetTotal() != fakeStats.TotalBytes ||
+		bytes.GetUsed() != fakeStats.UsedBytes ||
+		bytes.GetAvailable() != fakeStats.AvailableBytes {
+		t.Errorf("bytes usage = %+v, want total/used/available %d/%d/%d",
+			bytes, fakeStats.TotalBytes, fakeStats.UsedBytes, fakeStats.AvailableBytes)
+	}
+
+	inodes, ok := byUnit[csi.VolumeUsage_INODES]
+	if !ok {
+		t.Fatalf("no INODES usage in %+v", resp.GetUsage())
+	}
+	if inodes.GetTotal() != fakeStats.TotalInodes ||
+		inodes.GetUsed() != fakeStats.UsedInodes ||
+		inodes.GetAvailable() != fakeStats.FreeInodes {
+		t.Errorf("inode usage = %+v, want total/used/free %d/%d/%d",
+			inodes, fakeStats.TotalInodes, fakeStats.UsedInodes, fakeStats.FreeInodes)
+	}
+}
+
+func TestNodeGetVolumeStatsSurfacesAStatfsFailure(t *testing.T) {
+	s, target := mountedVolumeServer(t)
+	s.statfs = func(string) (fsstats.Stats, error) { return fsstats.Stats{}, errors.New("statfs: input/output error") }
+
+	_, err := s.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId:   "vol-1",
+		VolumePath: target,
+	})
+	if got := grpcCode(t, err); got != codes.Internal {
+		t.Errorf("code = %s, want Internal", got)
+	}
+}
+
+func TestNodeGetVolumeStatsReturnsAbortedWhenAnotherCallIsAlreadyInProgress(t *testing.T) {
+	// kubelet polls this on a timer, so a statfs wedged on a sick filesystem
+	// would otherwise accumulate one goroutine per poll for as long as it
+	// stays sick.
+	s, _, _ := newTestNodeServer(t)
+	target := t.TempDir()
+
+	unlock, ok := s.locks.TryLock(mountPathKey("vol-1", target))
+	if !ok {
+		t.Fatal("TryLock: ok = false, want true")
+	}
+	defer unlock()
+
+	_, err := s.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId:   "vol-1",
+		VolumePath: target,
 	})
 	if got := grpcCode(t, err); got != codes.Aborted {
 		t.Errorf("code = %s, want Aborted", got)

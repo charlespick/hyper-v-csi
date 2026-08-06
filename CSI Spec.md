@@ -26,7 +26,7 @@ covered by unit tests but has never run against a real failover cluster or Hyper
 | NodeUnstageVolume | Node | Undoes NodeStageVolume, releasing the node-wide mount. | Volume ID + staging target path | Tested — unmounts against a real cluster |
 | NodePublishVolume | Node | Bind-mounts a staged volume into a specific pod's path. | Volume ID + target path | Pending testing |
 | NodeUnpublishVolume | Node | Removes a pod's bind-mount of a volume. | Volume ID + target path | Pending testing |
-| NodeGetVolumeStats | Node | Reports usage and capacity stats for a mounted volume. | Volume ID + volume path (lookup only) | Not started |
+| NodeGetVolumeStats | Node | Reports usage and capacity stats for a mounted volume. | Volume ID + volume path (lookup only) | Pending testing |
 | NodeExpandVolume | Node | Grows the filesystem on a node after the underlying volume was expanded. | Volume ID + volume path | Not started |
 | NodeGetCapabilities | Node | Reports which node RPCs this plugin implements. | N/A | Over advertising until project is finished |
 | NodeGetInfo | Node | Reports node identity/topology info used for scheduling and attach decisions. | N/A | Tested — reports the Hyper-V VM ID against a real cluster |
@@ -42,9 +42,9 @@ running this in a cluster. What each one currently overstates:
 - `ControllerGetCapabilities` — EXPAND_VOLUME, CREATE_DELETE_SNAPSHOT, and LIST_SNAPSHOTS.
   CREATE_DELETE_VOLUME and PUBLISH_UNPUBLISH_VOLUME are the two it does not overstate: both halves
   of each are built.
-- `NodeGetCapabilities` — EXPAND_VOLUME and GET_VOLUME_STATS, neither of which is implemented.
-  STAGE_UNSTAGE_VOLUME no longer belongs on this list: both NodeStageVolume and NodeUnstageVolume
-  are built.
+- `NodeGetCapabilities` — EXPAND_VOLUME, and only that. STAGE_UNSTAGE_VOLUME and GET_VOLUME_STATS
+  no longer belong on this list: NodeStageVolume, NodeUnstageVolume and NodeGetVolumeStats are all
+  built.
 
 **CreateVolume gaps.** StorageClass `parameters` are ignored rather than consumed or rejected, the
 access *type* (mount vs block) is not validated, and `volume_context` is left empty.
@@ -226,6 +226,31 @@ it does not skip removing the target directory — `CleanupMountPoint` unmounts 
 kubelet does not consider a pod's volume torn down while the directory remains, so leaving it would
 wedge the pod in Terminating exactly as the missing RPC used to.
 
+**NodeGetVolumeStats is a `statfs(2)`, and the mount check in front of it is the whole point.**
+statfs answers for whichever filesystem backs the path it is handed. It does not fail on a directory
+that isn't a mount point — it reports the *node's root filesystem* instead, and those numbers are
+perfectly plausible, which is what makes them dangerous. A PVC that appears to have hundreds of
+gigabytes free because it is quietly measuring the node's disk is worse than one reporting nothing:
+these values feed kubelet's `kubelet_volume_stats_*` metrics, and through them the space alerts an
+operator relies on to *not* fire. So the path is confirmed mounted first, and a path that isn't is
+NOT_FOUND, which is the code CSI specifies for a volume path that isn't there.
+
+Used and available do not sum to total, and that is `df`'s convention rather than an arithmetic slip:
+available excludes the blocks reserved for root, used counts them as consumed. Reconciling the two
+would mean choosing one of them to misreport.
+
+This is the one node RPC that changes nothing, and it still takes the `mountPathKey` lock. kubelet
+polls it on a timer for every mounted volume on the node, so a statfs wedged on a sick filesystem
+would otherwise pile up a fresh goroutine per poll — `runBounded`'s work cannot be cancelled, only
+stopped waiting on — for as long as it stayed sick. Holding the key turns the second poll into an
+ABORTED, and it serializes a stats read against an unpublish of the same path.
+
+The syscall lives in `internal/fsstats` behind a `//go:build linux` tag, with a non-Linux stand-in
+that returns an error rather than zeroes. That is not portability ambition — the node plugin ships in
+a Linux image and only runs inside a Linux guest. It is so `go build ./...` and `go vet ./...` still
+work on the Windows machines this repo is developed on, and so that if the stand-in ever *is* reached,
+the RPC fails loudly instead of reporting an empty disk.
+
 **ControllerPublishVolume identifies a node by its Hyper-V VM ID, end to end.** The node plugin
 reads `VirtualMachineId` out of the guest's Hyper-V key-value pools — the values the host publishes
 through the Data Exchange integration service, which `hv_kvp_daemon` writes to
@@ -322,11 +347,12 @@ released, but the thread stays in the syscall. Abandoning it is safe here in a w
 for CreateVolume — if the call does eventually return, it returns having deleted the file, which is
 what was asked for. A create abandoned the same way could leave a disk nobody expects.
 
-**A wedged mount tool is conceded, not prevented, the same way.** Every node RPC that mounts or
-unmounts bounds its wait: `stageOperationBudget`/`unstageOperationBudget` (30s each) and
-`publishOperationBudget`/`unpublishOperationBudget` (10s each — a bind of a mount that is already
-there, and its teardown, have no device to wait for and no filesystem to create, so a longer wait
-would only be waiting on a wedged syscall). But neither `vmbusdisk.Resolve`'s poll nor a
+**A wedged mount tool is conceded, not prevented, the same way.** Every node RPC that touches the
+filesystem bounds its wait: `stageOperationBudget`/`unstageOperationBudget` (30s each), and
+`publishOperationBudget`/`unpublishOperationBudget`/`statsOperationBudget` (10s each — a bind of a
+mount that is already there, its teardown, and a `statfs` all have no device to wait for and no
+filesystem to create, so a longer wait would only be waiting on a wedged syscall). But neither
+`vmbusdisk.Resolve`'s poll nor a
 mount/unmount syscall has a cancellation token, so the budget elapsing does not stop the work — it
 only stops waiting on it. The `mountPathKey` lock (volume ID + the path that RPC is about) is released
 by the goroutine actually doing the work, once that work returns, not by the RPC handler when the

@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 	mount "k8s.io/mount-utils"
 
+	"github.com/charlespick/hyper-v-csi/csi-driver/internal/fsstats"
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/vmbusdisk"
 )
 
@@ -28,6 +29,11 @@ type nodeServer struct {
 	sysRoot string
 	devRoot string
 	locks   *keyLock
+	// statfs is fsstats.Statfs in production. It is a field rather than a
+	// direct call for the same reason mounter is injected: a FakeMounter's
+	// mount table is not backed by a real filesystem, so a test that stages a
+	// volume has nothing for a real statfs(2) to measure.
+	statfs func(path string) (fsstats.Stats, error)
 }
 
 // newNodeServer builds a nodeServer against an injected mounter and sysfs/dev
@@ -36,7 +42,14 @@ type nodeServer struct {
 // temporary directory tree, without touching a real guest's mount table or
 // /sys. Driver.NodeServer is production's only caller.
 func newNodeServer(driver *Driver, mounter *mount.SafeFormatAndMount, sysRoot, devRoot string) *nodeServer {
-	return &nodeServer{driver: driver, mounter: mounter, sysRoot: sysRoot, devRoot: devRoot, locks: newKeyLock()}
+	return &nodeServer{
+		driver:  driver,
+		mounter: mounter,
+		sysRoot: sysRoot,
+		devRoot: devRoot,
+		locks:   newKeyLock(),
+		statfs:  fsstats.Statfs,
+	}
 }
 
 const (
@@ -73,6 +86,12 @@ const (
 	// NodeUnpublishVolume, and it is the same length for the same reason:
 	// tearing down a bind mount touches no device and no filesystem.
 	unpublishOperationBudget = 10 * time.Second
+
+	// statsOperationBudget bounds NodeGetVolumeStats. statfs(2) on a healthy
+	// local filesystem returns in microseconds; ten seconds is not a wait
+	// anyone expects to spend, it is the point at which the filesystem is
+	// wedged and kubelet should be told so rather than left hanging.
+	statsOperationBudget = 10 * time.Second
 )
 
 // validateStagingRequest checks the two fields NodeStageVolume and
@@ -577,8 +596,91 @@ func (s *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpub
 }
 
 // NodeGetVolumeStats reports usage and capacity stats. Lookup only.
+//
+// This is what fills kubelet's kubelet_volume_stats_* metrics and, through
+// them, the PVC space alerts an operator actually watches. It reads; it
+// changes nothing.
+//
+// It still takes the mount lock, unlike a lookup that could be left
+// unsynchronised. kubelet polls this on a timer for every mounted volume on
+// the node, so a statfs wedged on a sick filesystem would otherwise pile up a
+// fresh goroutine per poll — runBounded's work cannot be cancelled, only
+// stopped waiting on — for as long as it stays sick. Holding the key means the
+// second poll gets ABORTED instead, and it serializes stats against an
+// unpublish of the same path, which is a race worth not having.
 func (s *nodeServer) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "NodeGetVolumeStats not implemented")
+	volumeID := req.GetVolumeId()
+	volumePath := req.GetVolumePath()
+	if volumeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume id is required")
+	}
+	if volumePath == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume path is required")
+	}
+
+	unlock, err := s.acquireMountLock("NodeGetVolumeStats", volumeID, volumePath)
+	if err != nil {
+		return nil, err
+	}
+
+	var stats fsstats.Stats
+	err = runBounded(ctx, clampToCallerDeadline(ctx, statsOperationBudget), unlock, func() error {
+		var statsErr error
+		stats, statsErr = s.volumeStats(volumePath)
+		return statsErr
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &csi.NodeGetVolumeStatsResponse{
+		Usage: []*csi.VolumeUsage{
+			{
+				Unit:      csi.VolumeUsage_BYTES,
+				Total:     stats.TotalBytes,
+				Used:      stats.UsedBytes,
+				Available: stats.AvailableBytes,
+			},
+			{
+				Unit:      csi.VolumeUsage_INODES,
+				Total:     stats.TotalInodes,
+				Used:      stats.UsedInodes,
+				Available: stats.FreeInodes,
+			},
+		},
+	}, nil
+}
+
+// volumeStats confirms volumePath really is a mount before measuring it. Like
+// stageVolume and publishVolume it is not handed ctx — see runBounded's doc
+// comment for why the goroutine this runs in outlives the RPC.
+//
+// The mount check is not a formality. statfs(2) answers for whichever
+// filesystem backs the path it is given, so an unmounted directory does not
+// produce an error — it produces the node root filesystem's numbers, reported
+// as the volume's. A PVC that appears to have hundreds of gigabytes free
+// because it is quietly measuring the node's disk is worse than one that
+// reports nothing, so this fails with NOT_FOUND instead, which is the code CSI
+// specifies for a volume path that isn't there.
+func (s *nodeServer) volumeStats(volumePath string) (fsstats.Stats, error) {
+	notMountPoint, err := mount.IsNotMountPoint(s.mounter, volumePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fsstats.Stats{}, status.Errorf(codes.NotFound, "volume path %s does not exist", volumePath)
+		}
+		return fsstats.Stats{}, status.Errorf(codes.Internal, "checking volume path %s: %v", volumePath, err)
+	}
+	if notMountPoint {
+		return fsstats.Stats{}, status.Errorf(codes.NotFound,
+			"volume path %s exists but nothing is mounted there", volumePath)
+	}
+
+	stats, err := s.statfs(volumePath)
+	if err != nil {
+		return fsstats.Stats{}, status.Errorf(codes.Internal,
+			"reading filesystem statistics for %s: %v", volumePath, err)
+	}
+	return stats, nil
 }
 
 // NodeExpandVolume grows the filesystem after ControllerExpandVolume has
