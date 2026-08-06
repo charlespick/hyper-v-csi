@@ -25,13 +25,22 @@ public interface IAttachService
     /// caller asked for.
     /// </summary>
     /// <remarks>
-    /// Tolerant where attach is strict, and deliberately so - this is the RPC
-    /// that has to be able to finish. A volume ID that could not have come from
-    /// CreateVolume, or a node the cluster no longer knows about, both report
-    /// success: in each case nothing is attached, and failing instead would
-    /// leave a VolumeAttachment that no retry could ever clear, blocking the
-    /// PV's deletion and the node's drain behind it. What does NOT report
-    /// success is a VM that exists but cannot be reached or reconfigured, since
+    /// Tolerant where attach is strict, but only where nothing can be attached:
+    /// a volume ID that could not have come from CreateVolume names a volume
+    /// that cannot exist, and a volume absent from the VM's configuration is
+    /// already in the state the caller asked for. Both report success.
+    /// <para>
+    /// A node the cluster cannot resolve is NOT one of those cases, even though
+    /// failing on it leaves a VolumeAttachment no retry can clear and blocks the
+    /// PV's deletion and the node's drain behind it. Un-clustering a VM does not
+    /// delete it - it stays registered on its host holding every disk it had -
+    /// so "not in the cluster" and "has nothing attached" are different claims,
+    /// and only the second one licenses the reclaim that DeleteVolume performs
+    /// on the strength of this call. CSI agrees: it permits OK for an unknown
+    /// node only where the volume can be safely regarded as unpublished, and
+    /// requires an error where the plugin cannot tell.
+    /// </para>
+    /// Nor does a VM that exists but cannot be reached or reconfigured, since
     /// that one may well still be holding the disk.
     /// </remarks>
     Task DetachAsync(string volumeId, string nodeId, CancellationToken cancellationToken);

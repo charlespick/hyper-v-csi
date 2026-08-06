@@ -121,16 +121,31 @@ public sealed class AttachService : IAttachService, IDisposable
             var vm = await _cluster.ResolveVmAsync(nodeId, attempt.Token).ConfigureAwait(false);
             if (vm is null)
             {
-                // Where attach reports NotFound, this reports success. A node
-                // the cluster no longer has is a VM that no longer exists, and
-                // its attachments went with it - there is nothing left to
-                // detach from. Failing here would strand the VolumeAttachment
-                // and block the PV's deletion behind a retry that can never
-                // succeed.
-                _logger.LogWarning(
-                    "DetachVolume {VolumeId}: node {NodeId} names no clustered virtual machine, so nothing is attached to it",
-                    volumeId, nodeId);
-                return;
+                // Not "nothing to detach". Un-clustering a VM does not delete
+                // it: Remove-ClusterGroup leaves it registered on its host,
+                // running, still holding every disk it had. So a node the
+                // cluster cannot resolve is a VM this agent cannot see, which is
+                // indistinguishable from here from a VM that is genuinely gone.
+                //
+                // Reporting success on that would be the one fail-open in a
+                // design that otherwise verifies everything: the
+                // VolumeAttachment clears, DeleteVolume reclaims on the
+                // guarantee unpublish is supposed to provide, and with the VM
+                // stopped its base VHDX is not locked - so the file goes away
+                // under a VM that still expects it.
+                //
+                // Failing is also what CSI asks for. It permits OK for an
+                // unknown node only when the volume "can be safely regarded as
+                // ControllerUnpublished", and requires an error when the plugin
+                // does not know whether the operation completed. This does not
+                // know. Deregistering the node from Kubernetes before deleting
+                // or moving its VM is what keeps this state from arising; being
+                // in it means that did not happen, and an operator has to
+                // reconcile it rather than have the driver guess.
+                throw new JobFailureException(
+                    AgentErrorCodes.Internal,
+                    $"node {nodeId} names no clustered virtual machine, so volume {volumeId} cannot be confirmed " +
+                    "detached; an un-clustered VM still holds its disks, so this is not treated as nothing to do");
             }
 
             try
@@ -142,15 +157,16 @@ public sealed class AttachService : IAttachService, IDisposable
                 _logger.LogInformation(
                     "DetachVolume {VolumeId}: {Message}; re-resolving its owner and retrying once", volumeId, ex.Message);
 
-                // Re-resolved as tolerantly as the first lookup: a VM that has
-                // gone away between the two is one with nothing left attached.
+                // Re-resolved as strictly as the first lookup, for the same
+                // reason: a VM that stopped being resolvable between the two has
+                // disks that are now unaccounted for, not disks it does not have.
                 var current = await _cluster.ResolveVmAsync(nodeId, attempt.Token).ConfigureAwait(false);
                 if (current is null)
                 {
-                    _logger.LogWarning(
-                        "DetachVolume {VolumeId}: node {NodeId} disappeared from the cluster mid-detach, so nothing is attached to it",
-                        volumeId, nodeId);
-                    return;
+                    throw new JobFailureException(
+                        AgentErrorCodes.Internal,
+                        $"node {nodeId} stopped naming a clustered virtual machine while detaching volume {volumeId}, " +
+                        "so the detach cannot be confirmed");
                 }
 
                 await DetachOnHostAsync(current, volumeId, path, attempt, cancellationToken).ConfigureAwait(false);

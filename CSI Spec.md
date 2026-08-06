@@ -99,15 +99,38 @@ automatically: removing the disk would orphan every `.avhdx` built on it, and re
 afterward would destroy the checkpoints regardless. Deleting the checkpoint restores the direct
 match and the retry succeeds.
 
-**Unpublish is tolerant where publish is strict, deliberately.** A volume ID that could not have
-come from CreateVolume, a volume that was never attached, and a node the cluster no longer knows
-all report success: in each case nothing is attached, which is the state the caller asked for.
-Kubernetes cannot delete a PV or drain a node until the VolumeAttachment clears, so an unpublish
-that failed on something no retry could fix would wedge both. What does *not* report success is a
-VM that exists but cannot be reached or reconfigured — that one may still be holding the disk.
-Malformed node identity is also treated as an error: if the node cannot be identified reliably, the
-safe posture is to fail and require operator correction rather than risk reporting a detach that did
-not happen.
+**Unpublish is tolerant where publish is strict, but only where tolerance is provably safe.** A
+volume ID that could not have come from CreateVolume, and a volume that was never attached, both
+report success: in each case nothing is attached, which is the state the caller asked for. What does
+*not* report success is a VM that exists but cannot be reached or reconfigured — that one may still
+be holding the disk. Malformed node identity is also treated as an error: if the node cannot be
+identified reliably, the safe posture is to fail and require operator correction rather than risk
+reporting a detach that did not happen.
+
+**A node the cluster cannot resolve is an error too, and this is the one place the tolerance was
+wrong.** It used to report success on the reasoning that a node the cluster no longer has is a VM
+that no longer exists. That reasoning does not hold on Hyper-V: `Remove-ClusterGroup` un-clusters a
+VM without deleting it, leaving it registered on its host, possibly running, still holding every
+disk it had. "Not in the cluster" and "has nothing attached" are different claims, and only the
+second one licenses the reclaim DeleteVolume performs on the strength of this call. Reporting
+success there was the single fail-open in a design that verifies everywhere else — the
+VolumeAttachment clears, the PV deletes, and with the VM stopped its base VHDX isn't locked, so the
+file goes away under a VM that still expects it.
+
+It now fails as Internal and is retried. CSI licenses exactly this: OK for an unknown node is
+permitted only where the volume "can be safely regarded as ControllerUnpublished from the node", and
+an error is *required* where the plugin does not know whether the operation completed. This does not
+know. Both resolution points fail the same way — the initial lookup and the re-resolve after a
+live-migration retry — since a VM that stops resolving mid-detach has disks that are now
+unaccounted for, not disks it does not have.
+
+The cost is real and is accepted deliberately: a node VM that genuinely was deleted without the
+operator draining and deregistering the node first now wedges its VolumeAttachment, and the PV
+behind it, until someone reconciles it. That is the intended direction. The correct operator
+sequence — drain the node, delete it from Kubernetes, *then* delete or un-cluster the VM — never
+reaches this state, and a cluster migration should have updated the node's membership before the VM
+moved. Arriving here means either that sequence was not followed or something reached an invalid
+state on its own; both are worth stopping for rather than proceeding into an irreversible delete.
 
 **`node_id` is required, though CSI makes it optional.** An absent node ID means "unpublish from
 every node this volume is published to", which is the reverse-direction question below: no single

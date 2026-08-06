@@ -431,10 +431,13 @@ type detachVolumePayload struct {
 // — so the agent confirms the disk is really gone from the VM's configuration
 // before reporting success, rather than trusting that the call it made worked.
 //
-// Tolerant where publish is strict: a volume that was never attached, or a node
-// the cluster no longer knows, both report success. Kubernetes cannot delete a
-// PV or drain a node until its VolumeAttachment clears, so an unpublish that
-// fails on something no retry can fix wedges both.
+// Tolerant where publish is strict, but only where tolerance is provably safe:
+// a volume ID that could not have come from CreateVolume, and a volume that was
+// never attached, both report success, because in each case nothing is attached.
+// A node the cluster cannot resolve does not qualify — un-clustering a VM leaves
+// it holding its disks — so that one fails and is retried until an operator
+// reconciles it, even though the stuck VolumeAttachment blocks the PV's deletion
+// and the node's drain while it does.
 func (s *controllerServer) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume id is required")

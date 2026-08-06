@@ -253,18 +253,21 @@ public sealed class AttachServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task DetachAsync_UnknownNode_Succeeds()
+    public async Task DetachAsync_UnknownNode_IsInternal()
     {
-        // Where attach reports NotFound, detach reports success: a node the
-        // cluster no longer has is a VM that no longer exists, so nothing is
-        // attached to it. Failing would strand the VolumeAttachment and block
-        // the PV's deletion and the node's drain behind it forever.
+        // A node the cluster cannot resolve is NOT a VM with nothing attached:
+        // un-clustering a VM leaves it registered on its host still holding its
+        // disks. Reporting success here would clear the VolumeAttachment and let
+        // DeleteVolume reclaim a VHDX that VM is still built on, so this fails
+        // and is retried until an operator reconciles the cluster.
         GivenVolume("pvc-1");
         var host = new FakeHostClient();
         using var service = NewService(host, new FakeClusterService { Owner = null });
 
-        await service.DetachAsync("pvc-1", "node-gone", CancellationToken.None);
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => service.DetachAsync("pvc-1", "node-gone", CancellationToken.None));
 
+        Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
         Assert.Null(host.Detached);
     }
 
@@ -405,6 +408,31 @@ public sealed class AttachServiceTests : IDisposable
         Assert.Equal("hv-02", host.Detached?.Host);
     }
 
+    [Fact]
+    public async Task DetachAsync_VmUnclusteredMidDetach_IsInternal()
+    {
+        // The migration retry's re-resolve is as strict as the first lookup. A
+        // VM that stops resolving between the two still has whatever disks it
+        // had; treating the second null as "nothing attached" would reopen the
+        // same hole on the rarer path.
+        GivenVolume("pvc-1");
+        var cluster = new FakeClusterService { Owner = Host, VanishesAfterFirstResolution = true };
+        var host = new FakeHostClient
+        {
+            NotOnHost = Host,
+            Existing = new AttachedDisk("controller-guid", 4),
+            DetachWorks = true,
+        };
+        using var service = NewService(host, cluster);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => service.DetachAsync("pvc-1", Node, CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
+        Assert.Equal(2, cluster.Resolutions);
+        Assert.Null(host.Detached);
+    }
+
     private string GivenVolume(string volumeName)
     {
         Directory.CreateDirectory(_root);
@@ -439,6 +467,12 @@ public sealed class AttachServiceTests : IDisposable
         public string? NextOwner { get; init; }
 
         /// <summary>
+        /// Stops resolving after the first lookup, standing in for a VM that is
+        /// un-clustered (or whose cluster group is deleted) mid-operation.
+        /// </summary>
+        public bool VanishesAfterFirstResolution { get; init; }
+
+        /// <summary>
         /// The VM the cluster resolved the node ID to. Deliberately a different
         /// value from the node ID here, even though in production they are the
         /// same GUID: nothing downstream may re-derive one from the other.
@@ -455,6 +489,11 @@ public sealed class AttachServiceTests : IDisposable
             }
 
             Resolutions++;
+
+            if (VanishesAfterFirstResolution && Resolutions > 1)
+            {
+                return Task.FromResult<ClusteredVm?>(null);
+            }
 
             var owner = Resolutions > 1 && NextOwner is not null ? NextOwner : Owner;
             return Task.FromResult(owner is null ? null : new ClusteredVm(VmId, owner));
