@@ -22,14 +22,14 @@ covered by unit tests but has never run against a real failover cluster or Hyper
 | CreateSnapshot | Controller | Creates a point-in-time snapshot of a volume. | Snapshot name | Not started |
 | DeleteSnapshot | Controller | Removes a previously created snapshot. | Snapshot ID | Not started |
 | ListSnapshots | Controller | Lists existing snapshots known to the plugin. | Snapshot ID or source volume ID (optional filter, lookup only) | Not started |
-| NodeStageVolume | Node | Makes a volume ready for use on a node (format and node-wide mount). | Volume ID + staging target path | Pending testing |
-| NodeUnstageVolume | Node | Undoes NodeStageVolume, releasing the node-wide mount. | Volume ID + staging target path | Pending testing |
+| NodeStageVolume | Node | Makes a volume ready for use on a node (format and node-wide mount). | Volume ID + staging target path | Tested — formats and mounts against a real cluster |
+| NodeUnstageVolume | Node | Undoes NodeStageVolume, releasing the node-wide mount. | Volume ID + staging target path | Tested — unmounts against a real cluster |
 | NodePublishVolume | Node | Bind-mounts a staged volume into a specific pod's path. | Volume ID + target path | Not started |
 | NodeUnpublishVolume | Node | Removes a pod's bind-mount of a volume. | Volume ID + target path | Not started |
 | NodeGetVolumeStats | Node | Reports usage and capacity stats for a mounted volume. | Volume ID + volume path (lookup only) | Not started |
 | NodeExpandVolume | Node | Grows the filesystem on a node after the underlying volume was expanded. | Volume ID + volume path | Not started |
 | NodeGetCapabilities | Node | Reports which node RPCs this plugin implements. | N/A | Over advertising until project is finished |
-| NodeGetInfo | Node | Reports node identity/topology info used for scheduling and attach decisions. | N/A | Pending testing |
+| NodeGetInfo | Node | Reports node identity/topology info used for scheduling and attach decisions. | N/A | Tested — reports the Hyper-V VM ID against a real cluster |
 
 **Over advertising until project is finished** means the RPC works — it's a declaration, and
 declarations are just constants — but it announces capabilities whose RPCs are still stubs. The
@@ -146,12 +146,17 @@ So the shape is two steps, and which way you traverse them decides the cost:
 `Get-VHD` is not a substitute for any of it: its `Attached` property and its documented "in use"
 error on shared storage are both about open handles, the same signal with the same blind spot.
 
-**The node plugin is deployed even though it cannot mount.** Its registration with kubelet
+**The node plugin is deployed even though it cannot publish.** Its registration with kubelet
 is what creates the `CSINode` object, and `CSINode` is where external-attacher reads the CSI
 node ID it passes to ControllerPublishVolume. Without it there is no node ID to resolve and
 no attach completes, whatever `attachRequired` is set to — so `node.enabled` being off would
 silently disable the RPC this section is about. A pod using a PVC therefore reaches a real
-attach and then fails at NodeStageVolume, which is the honest place for it to fail.
+attach, a real NodeStageVolume format-and-mount, and then fails at NodePublishVolume, which is
+now the honest place for it to fail. That required giving the node DaemonSet what actual
+mounting needs — `privileged: true`, a `mountPropagation: Bidirectional` mount of the whole
+kubelet directory (so a mount made inside the container is visible in the host's own mount
+table), a `/dev` mount, and a runtime image with `blkid`/`mkfs`/`mount`/`umount` on it, none of
+which the original stub-era DaemonSet had.
 
 **ControllerPublishVolume identifies a node by its Hyper-V VM ID, end to end.** The node plugin
 reads `VirtualMachineId` out of the guest's Hyper-V key-value pools — the values the host publishes
@@ -217,12 +222,13 @@ already in *this* VM's configuration, the existing controller and LUN come back 
 changed. That is what makes a re-drive after an agent restart free, and it is one query, not a
 fan-out.
 
-**The publish context is load-bearing, and its guest half is unverified.** Attach returns the SCSI
+**The publish context is load-bearing, and its guest half is now confirmed.** Attach returns the SCSI
 controller's VMBus instance GUID and the LUN, because that pair is the only thing telling
 NodeStageVolume which of the guest's block devices this volume is — the CSV path means nothing inside
 the VM. A Linux guest sees the same GUID under `/sys/bus/vmbus/devices`, which is the assumption the
-node plugin will be built on and the one piece of this that has not been confirmed against real
-hardware. If it doesn't hold, the fallback is the disk's SCSI page-83 identifier, which would mean
+node plugin is built on; a real attach-then-stage against `csidevnode01` resolved it correctly to
+`/dev/sdb`, confirming the assumption on that guest. If it ever turns out not to hold on some other
+kernel or Hyper-V version, the fallback is the disk's SCSI page-83 identifier, which would mean
 returning that in the publish context too.
 
 `vmbusdisk.Resolve` is what turns that pair into a device path, and it walks a fixed chain: the VMBus
@@ -233,12 +239,13 @@ host `hv_storvsc` registers for that channel — and Hyper-V places every disk o
 device under `/dev`. Because the host and the LUN's block device each get registered asynchronously
 in the guest kernel after the host-side attach, `Resolve` polls (25ms up to 500ms backoff) rather than
 looking once, bounded by its own budget independently of the caller's context, so "not there yet" and
-"the caller gave up" come back as distinguishable errors. Two assumptions in that chain are unverified
-against real hardware, same as the GUID assumption above: that a VMBus channel for a Hyper-V SCSI
-controller registers exactly one `host<N>` child, and that every disk Hyper-V attaches sits at target
-0 rather than varying by anything but LUN. Either one, more than one `host<N>` directory or more than
-one block device under a LUN, is treated as an unresolvable error rather than a guess, since guessing
-wrong would stage the wrong disk.
+"the caller gave up" come back as distinguishable errors. The same real attach also confirmed the
+chain's other two assumptions, same guest as the GUID assumption above: that a VMBus channel for a
+Hyper-V SCSI controller registers exactly one `host<N>` child, and that every disk Hyper-V attaches
+sits at target 0 rather than varying by anything but LUN. Either one, more than one `host<N>` directory
+or more than one block device under a LUN, is treated as an unresolvable error rather than a guess,
+since guessing wrong would stage the wrong disk — that path remains exercised only by unit tests, not
+real hardware, since it did not come up on the one guest tested so far.
 
 **A wedged delete is conceded, not prevented.** `File.Delete` takes no cancellation token, so a
 delete stuck on a CSV in redirected mode cannot be called off. The timeout is therefore *observed*
