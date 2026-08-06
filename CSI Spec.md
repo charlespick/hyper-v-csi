@@ -9,7 +9,7 @@ covered by unit tests but has never run against a real failover cluster or Hyper
 
 | CSI Surface Call | Implementation Spot | Description | Idempotency Key | Status |
 |---|---|---|---|---|
-| GetPluginInfo | Both | Returns the plugin's name and version so Kubernetes can identify it. | N/A | Pending testing |
+| GetPluginInfo | Both | Returns the plugin's name and version so Kubernetes can identify it. | N/A | Tested — returns the correct name and version against a real deployment |
 | GetPluginCapabilities | Both | Reports which optional CSI features this plugin supports. | N/A | Over advertising until project is finished |
 | Probe | Both | Health check confirming the plugin is ready to serve requests. | N/A | Stub — always reports ready |
 | CreateVolume | Controller | Provisions a new volume and returns its identifier. | Volume name | Tested — creates a VHDX on disk |
@@ -27,7 +27,7 @@ covered by unit tests but has never run against a real failover cluster or Hyper
 | NodePublishVolume | Node | Bind-mounts a staged volume into a specific pod's path. | Volume ID + target path | Tested — bind-mounts against a real cluster |
 | NodeUnpublishVolume | Node | Removes a pod's bind-mount of a volume. | Volume ID + target path | Tested — unmounts against a real cluster |
 | NodeGetVolumeStats | Node | Reports usage and capacity stats for a mounted volume. | Volume ID + volume path (lookup only) | Tested — kubelet's kubelet_volume_stats_* metrics read real numbers back |
-| NodeExpandVolume | Node | Grows the filesystem on a node after the underlying volume was expanded. | Volume ID + volume path | Pending testing |
+| NodeExpandVolume | Node | Grows the filesystem on a node after the underlying volume was expanded. | Volume ID + volume path | Tested — grows ext4 online against a real cluster, without restarting the pod |
 | NodeGetCapabilities | Node | Reports which node RPCs this plugin implements. | N/A | Tested — kubelet reads it before every stage |
 | NodeGetInfo | Node | Reports node identity/topology info used for scheduling and attach decisions. | N/A | Tested — reports the Hyper-V VM ID against a real cluster |
 
