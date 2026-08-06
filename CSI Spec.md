@@ -25,7 +25,7 @@ covered by unit tests but has never run against a real failover cluster or Hyper
 | NodeStageVolume | Node | Makes a volume ready for use on a node (format and node-wide mount). | Volume ID + staging target path | Tested — formats and mounts against a real cluster |
 | NodeUnstageVolume | Node | Undoes NodeStageVolume, releasing the node-wide mount. | Volume ID + staging target path | Tested — unmounts against a real cluster |
 | NodePublishVolume | Node | Bind-mounts a staged volume into a specific pod's path. | Volume ID + target path | Pending testing |
-| NodeUnpublishVolume | Node | Removes a pod's bind-mount of a volume. | Volume ID + target path | Not started |
+| NodeUnpublishVolume | Node | Removes a pod's bind-mount of a volume. | Volume ID + target path | Pending testing |
 | NodeGetVolumeStats | Node | Reports usage and capacity stats for a mounted volume. | Volume ID + volume path (lookup only) | Not started |
 | NodeExpandVolume | Node | Grows the filesystem on a node after the underlying volume was expanded. | Volume ID + volume path | Not started |
 | NodeGetCapabilities | Node | Reports which node RPCs this plugin implements. | N/A | Over advertising until project is finished |
@@ -175,8 +175,10 @@ node ID it passes to ControllerPublishVolume. Without it there is no node ID to 
 no attach completes, whatever `attachRequired` is set to — so `node.enabled` being off would
 silently disable the RPC this section is about. A pod using a PVC now reaches a real attach, a
 real NodeStageVolume format-and-mount, and a real NodePublishVolume bind-mount: it starts, with
-its VHDX under its mount path. What it cannot yet do is stop cleanly — NodeUnpublishVolume is
-still a stub, so kubelet's teardown fails there and the pod stays terminating until that lands.
+its VHDX under its mount path. It also stops: NodeUnpublishVolume removes the bind, kubelet then
+calls NodeUnstageVolume, external-attacher clears the VolumeAttachment, and the disk is detached.
+The pod lifecycle is closed end to end in code, though only the attach and stage halves have been
+run against real hardware.
 All of it required giving the node DaemonSet what actual mounting needs — `privileged: true`, a
 `mountPropagation: Bidirectional` mount of the whole kubelet directory (so a mount made inside
 the container is visible in the host's own mount table), a `/dev` mount, and a runtime image
@@ -209,6 +211,20 @@ volume's staging mount rather than something else's. Nor does anything refuse a 
 a staging mount that was staged read-only; the bind inherits the read-only-ness, since Linux will not
 upgrade one, and writes fail with EROFS at runtime. Kubernetes hands stage and publish the same PV
 capability, so that mismatch does not arise from Kubernetes — it would take a different CO to produce.
+
+**NodeUnpublishVolume is the short one, and the asymmetry is CSI's, not an omission here.** It takes
+no volume capability, because undoing a mount needs to know nothing about what was mounted: no ro/rw
+comparison, no mount-versus-block branch, nothing that could fail on a volume whose capability changed
+underneath it. It is the same `CleanupMountPoint` call NodeUnstageVolume makes, with the same
+`extensiveMountPointCheck`, and it inherits the same idempotency — a target that isn't there, or isn't
+a mount point, is success, which is what a retry of a finished unpublish looks like.
+
+Two things it deliberately does not do. It does not touch the staging mount: that one is
+NodeUnstageVolume's, kubelet calls it once the last pod on the node has been unpublished, and
+unmounting it here would pull the volume out from under any other pod still holding a bind of it. And
+it does not skip removing the target directory — `CleanupMountPoint` unmounts *and* removes, and
+kubelet does not consider a pod's volume torn down while the directory remains, so leaving it would
+wedge the pod in Terminating exactly as the missing RPC used to.
 
 **ControllerPublishVolume identifies a node by its Hyper-V VM ID, end to end.** The node plugin
 reads `VirtualMachineId` out of the guest's Hyper-V key-value pools — the values the host publishes
@@ -306,11 +322,11 @@ released, but the thread stays in the syscall. Abandoning it is safe here in a w
 for CreateVolume — if the call does eventually return, it returns having deleted the file, which is
 what was asked for. A create abandoned the same way could leave a disk nobody expects.
 
-**A wedged mount tool is conceded, not prevented, the same way.** `NodeStageVolume`,
-`NodeUnstageVolume` and `NodePublishVolume` bound their wait with
-`stageOperationBudget`/`unstageOperationBudget` (30s each) and `publishOperationBudget` (10s — a bind
-of a mount that is already there has no device to wait for and no filesystem to create, so a longer
-wait would only be waiting on a wedged syscall), but neither `vmbusdisk.Resolve`'s poll nor a
+**A wedged mount tool is conceded, not prevented, the same way.** Every node RPC that mounts or
+unmounts bounds its wait: `stageOperationBudget`/`unstageOperationBudget` (30s each) and
+`publishOperationBudget`/`unpublishOperationBudget` (10s each — a bind of a mount that is already
+there, and its teardown, have no device to wait for and no filesystem to create, so a longer wait
+would only be waiting on a wedged syscall). But neither `vmbusdisk.Resolve`'s poll nor a
 mount/unmount syscall has a cancellation token, so the budget elapsing does not stop the work — it
 only stops waiting on it. The `mountPathKey` lock (volume ID + the path that RPC is about) is released
 by the goroutine actually doing the work, once that work returns, not by the RPC handler when the

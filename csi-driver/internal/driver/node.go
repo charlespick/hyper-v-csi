@@ -68,6 +68,11 @@ const (
 	// few seconds here means the mount syscall itself is wedged, which the
 	// budget cannot fix (see runBounded) and only reports.
 	publishOperationBudget = 10 * time.Second
+
+	// unpublishOperationBudget is publishOperationBudget's counterpart for
+	// NodeUnpublishVolume, and it is the same length for the same reason:
+	// tearing down a bind mount touches no device and no filesystem.
+	unpublishOperationBudget = 10 * time.Second
 )
 
 // validateStagingRequest checks the two fields NodeStageVolume and
@@ -526,8 +531,49 @@ func (s *nodeServer) publishVolume(stagingTarget, target string, options []strin
 }
 
 // NodeUnpublishVolume removes a pod's bind-mount. Idempotency key: volume ID + target path.
+//
+// It takes no volume capability, which is not an oversight in CSI: undoing a
+// mount needs to know nothing about what was mounted. So there is no ro/rw
+// comparison to make here, no block-versus-mount branch, and nothing that
+// would fail on a volume whose capability has since changed — the counterpart
+// asymmetry to NodePublishVolume's checks.
+//
+// The staging mount is deliberately left alone. NodeUnstageVolume owns that
+// one, kubelet calls it once the last pod on this node has been unpublished,
+// and unmounting it from here would pull the volume out from under any other
+// pod still holding a bind of it.
 func (s *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "NodeUnpublishVolume not implemented")
+	volumeID := req.GetVolumeId()
+	target := req.GetTargetPath()
+	if volumeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume id is required")
+	}
+	if target == "" {
+		return nil, status.Error(codes.InvalidArgument, "target path is required")
+	}
+
+	unlock, err := s.acquireMountLock("NodeUnpublishVolume", volumeID, target)
+	if err != nil {
+		return nil, err
+	}
+
+	err = runBounded(ctx, clampToCallerDeadline(ctx, unpublishOperationBudget), unlock, func() error {
+		// Same call, and the same extensiveMountPointCheck=true, as
+		// NodeUnstageVolume: it unmounts and removes the directory, and it
+		// treats a target that isn't there, or isn't a mount point, as
+		// success — the idempotency this RPC needs for a pod whose unpublish
+		// already ran. Removing the directory matters more here than it does
+		// for a staging path, since kubelet will not consider the pod's
+		// volume torn down while it remains.
+		if err := mount.CleanupMountPoint(target, s.mounter, true); err != nil {
+			return status.Errorf(codes.Internal, "unpublishing volume %s at %s: %v", volumeID, target, err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
 // NodeGetVolumeStats reports usage and capacity stats. Lookup only.

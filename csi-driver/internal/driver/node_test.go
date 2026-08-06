@@ -808,6 +808,120 @@ func TestNodePublishVolumeReturnsAbortedWhenAnotherCallIsAlreadyInProgress(t *te
 	}
 }
 
+// --- NodeUnpublishVolume ---
+
+func TestNodeUnpublishVolumeRejectsMissingVolumeID(t *testing.T) {
+	s, _, _ := newTestNodeServer(t)
+	_, err := s.NodeUnpublishVolume(context.Background(), &csi.NodeUnpublishVolumeRequest{
+		TargetPath: t.TempDir(),
+	})
+	if got := grpcCode(t, err); got != codes.InvalidArgument {
+		t.Errorf("code = %s, want InvalidArgument", got)
+	}
+}
+
+func TestNodeUnpublishVolumeRejectsMissingTargetPath(t *testing.T) {
+	s, _, _ := newTestNodeServer(t)
+	_, err := s.NodeUnpublishVolume(context.Background(), &csi.NodeUnpublishVolumeRequest{
+		VolumeId: "vol-1",
+	})
+	if got := grpcCode(t, err); got != codes.InvalidArgument {
+		t.Errorf("code = %s, want InvalidArgument", got)
+	}
+}
+
+func TestNodeUnpublishVolumeIsIdempotentWhenNothingIsThere(t *testing.T) {
+	// CSI requires unpublishing an already-unpublished (or never-published)
+	// target to report success; CleanupMountPoint's own PathExists check is
+	// what delivers that here, the same as for NodeUnstageVolume.
+	s, _, _ := newTestNodeServer(t)
+	target := filepath.Join(t.TempDir(), "never-created")
+
+	if _, err := s.NodeUnpublishVolume(context.Background(), &csi.NodeUnpublishVolumeRequest{
+		VolumeId:   "vol-1",
+		TargetPath: target,
+	}); err != nil {
+		t.Fatalf("NodeUnpublishVolume on an unpublished target: %v", err)
+	}
+}
+
+func TestNodeUnpublishVolumeUndoesNodePublishVolumeAndLeavesTheStagingMount(t *testing.T) {
+	// The staging mount is NodeUnstageVolume's to remove, and kubelet only
+	// calls that once the last pod on this node is unpublished. Taking it down
+	// from here would pull the volume out from under any other pod still
+	// holding a bind of it.
+	s, fakeMounter, sysRoot := newTestNodeServer(t)
+	staging := stagePublishSource(t, s, sysRoot)
+	target := filepath.Join(t.TempDir(), "mount")
+
+	if _, err := s.NodePublishVolume(context.Background(),
+		nodePublishRequest(staging, target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)); err != nil {
+		t.Fatalf("NodePublishVolume: %v", err)
+	}
+
+	if _, err := s.NodeUnpublishVolume(context.Background(), &csi.NodeUnpublishVolumeRequest{
+		VolumeId:   "vol-1",
+		TargetPath: target,
+	}); err != nil {
+		t.Fatalf("NodeUnpublishVolume: %v", err)
+	}
+
+	mountPoints, err := fakeMounter.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(mountPoints) != 1 {
+		t.Fatalf("got %d mount points after unpublish, want just the staging mount: %+v", len(mountPoints), mountPoints)
+	}
+	if mountPoints[0].Path != staging {
+		t.Errorf("remaining mount is at %q, want the staging mount at %q", mountPoints[0].Path, staging)
+	}
+}
+
+func TestNodeUnpublishVolumeRemovesTheTargetDirectory(t *testing.T) {
+	// kubelet does not consider a pod's volume torn down while its target
+	// directory is still there, so CleanupMountPoint's os.Remove matters more
+	// here than it does for a staging path.
+	s, _, sysRoot := newTestNodeServer(t)
+	staging := stagePublishSource(t, s, sysRoot)
+	target := filepath.Join(t.TempDir(), "mount")
+
+	if _, err := s.NodePublishVolume(context.Background(),
+		nodePublishRequest(staging, target, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)); err != nil {
+		t.Fatalf("NodePublishVolume: %v", err)
+	}
+
+	if _, err := s.NodeUnpublishVolume(context.Background(), &csi.NodeUnpublishVolumeRequest{
+		VolumeId:   "vol-1",
+		TargetPath: target,
+	}); err != nil {
+		t.Fatalf("NodeUnpublishVolume: %v", err)
+	}
+
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Errorf("target still exists after unpublish (stat error = %v)", err)
+	}
+}
+
+func TestNodeUnpublishVolumeReturnsAbortedWhenAnotherCallIsAlreadyInProgress(t *testing.T) {
+	s, _, _ := newTestNodeServer(t)
+	target := t.TempDir()
+
+	unlock, ok := s.locks.TryLock(mountPathKey("vol-1", target))
+	if !ok {
+		t.Fatal("TryLock: ok = false, want true")
+	}
+	defer unlock()
+
+	_, err := s.NodeUnpublishVolume(context.Background(), &csi.NodeUnpublishVolumeRequest{
+		VolumeId:   "vol-1",
+		TargetPath: target,
+	})
+	if got := grpcCode(t, err); got != codes.Aborted {
+		t.Errorf("code = %s, want Aborted", got)
+	}
+}
+
 // --- targetIsReadOnly ---
 
 func TestTargetIsReadOnlyResolvesSymlinksBeforeMatching(t *testing.T) {
