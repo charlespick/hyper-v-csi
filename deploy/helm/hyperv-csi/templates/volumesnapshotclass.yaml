@@ -1,0 +1,23 @@
+{{- if .Values.controller.snapshotter.enabled }}
+# Gated on the sidecar rather than on a create flag of its own. Two reasons:
+# without external-snapshotter nothing ever acts on a VolumeSnapshot pointed at
+# this class, and on a cluster that has never run external-snapshotter the
+# snapshot.storage.k8s.io CRDs do not exist at all — so an unconditional
+# VolumeSnapshotClass would fail `helm install` with "no matches for kind"
+# for every user who does not want snapshots.
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: {{ .Values.volumeSnapshotClass.name }}
+  labels:
+    {{- include "hyperv-csi.labels" . | nindent 4 }}
+driver: {{ include "hyperv-csi.driverName" . }}
+# Delete by default, and worth understanding before the first snapshot the same
+# way the chart's StorageClass reclaimPolicy is: under Delete, removing a
+# VolumeSnapshot removes the snapshot on the Hyper-V side for real, through
+# DeleteSnapshot, and it is not recoverable. Retain keeps both the
+# VolumeSnapshotContent and the underlying snapshot, at the cost of leaking
+# both — see volumeSnapshotClass.deletionPolicy in values.yaml for why Delete
+# is nonetheless the default here while the StorageClass stays on Retain.
+deletionPolicy: {{ .Values.volumeSnapshotClass.deletionPolicy }}
+{{- end }}

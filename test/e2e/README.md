@@ -17,5 +17,11 @@ suite selects its own tests from that.
 Read [testing.md](../../testing.md) before the first run against a real cluster.
 Two things in particular: the StorageClass here reclaims with `Delete`, so every
 volume a run provisions is deleted for real, and the list of what is
-deliberately not tested — snapshots, stress, and node failover — is there rather
-than here.
+deliberately not tested — stress and node failover — is there rather than here.
+
+Snapshots are tested now. The suite creates and deletes real snapshots, the same
+way it creates and deletes real volumes, and that needs three things on the
+cluster that no other part of the run does: the `snapshot.storage.k8s.io` CRDs,
+the cluster-wide snapshot-controller, and the chart's own external-snapshotter
+sidecar, which is off by default (`controller.snapshotter.enabled`). Without
+them the snapshot tests fail rather than skip.

@@ -1,15 +1,18 @@
 # hyperv-csi
 #
 # Scoped to what the driver actually implements today: provisioning, reclaim,
-# attach/detach, the full mount path, and expansion. Snapshotting is still
-# Unimplemented, so the chart deliberately does not deploy external-snapshotter
-# — it would sit in a retry loop against RPCs that cannot succeed. The knobs to
-# turn that on will go here, defaulted off, when those RPCs land.
+# attach/detach, the full mount path, expansion, and snapshotting. The snapshot
+# RPCs — CreateSnapshot, DeleteSnapshot, ListSnapshots, and restore through
+# CreateVolume's VolumeContentSource — are implemented now, so external-
+# snapshotter would no longer sit in a retry loop against RPCs that cannot
+# succeed. Its knobs are here as promised, under controller.snapshotter and
+# volumeSnapshotClass, and they are defaulted off.
 #
 # Implemented is not the same as exercised. Only provisioning, reclaim,
 # attach/detach and staging have run against a real Hyper-V cluster; see the
 # Status column in CSI Spec.md, and the individual defaults below that stay
-# conservative because of it.
+# conservative because of it — snapshotting being the newest and least
+# exercised of them.
 
 image:
   repository: ghcr.io/charlespick/hyperv-csi-driver
@@ -68,9 +71,10 @@ controller:
   replicaCount: 1
 
   # external-provisioner, external-attacher and external-resizer are the
-  # sidecars whose RPCs exist. Each --timeout bounds how long the sidecar waits
-  # for one call; the driver clamps its own job polling to a fraction of
-  # whatever deadline arrives, so these stay consistent automatically.
+  # sidecars deployed unconditionally; external-snapshotter, below, is the one
+  # that is opt-in. Each --timeout bounds how long the sidecar waits for one
+  # call; the driver clamps its own job polling to a fraction of whatever
+  # deadline arrives, so these stay consistent automatically.
   provisioner:
     image: registry.k8s.io/sig-storage/csi-provisioner:v5.1.0
     timeout: 30s
@@ -87,6 +91,41 @@ controller:
     # whose work scales with the disk, and the agent's own budget for it is
     # DiskOperationTimeout.
     timeout: 60s
+    extraArgs: []
+
+  # external-snapshotter. Off by default, and this is the implemented-versus-
+  # exercised line rather than an implemented-or-not one: CreateSnapshot,
+  # DeleteSnapshot and ListSnapshots exist, so the sidecar would do real work
+  # instead of retrying against Unimplemented — but none of them has yet run
+  # against a real Hyper-V cluster. Turning this on is what makes a
+  # VolumeSnapshot delete reach DeleteSnapshot, and under the default Delete
+  # deletion policy below the first time that ever runs would destroy a real
+  # checkpoint. Same caution, and the same fix, as storageClass.reclaimPolicy:
+  # watch the snapshot path work on your own hosts, then enable it.
+  #
+  # Two things have to be true of the cluster first, and neither is this
+  # chart's to install: the snapshot.storage.k8s.io CRDs and the cluster-wide
+  # snapshot-controller. Both ship with external-snapshotter and are shared by
+  # every CSI driver on the cluster, so a per-driver chart installing them
+  # would fight whichever driver got there first. Without them the sidecar
+  # starts and finds nothing to watch, and the VolumeSnapshotClass this chart
+  # renders fails to apply for want of its CRD.
+  snapshotter:
+    enabled: false
+
+    # Newer than the other three sidecars, which are all pinned to the same
+    # older release wave. Sidecars version independently — each one speaks CSI
+    # to the driver and the Kubernetes API to the cluster, not to each other —
+    # and there is no reason to introduce a new one at a release upstream no
+    # longer supports.
+    image: registry.k8s.io/sig-storage/csi-snapshotter:v8.6.0
+
+    # Bounds CreateSnapshot and DeleteSnapshot the same way the sidecars above
+    # bound theirs. 30s matches the provisioner and attacher rather than the
+    # resizer: a Hyper-V checkpoint is a metadata operation whose cost does not
+    # scale with the size of the disk, so it has no reason to need the longer
+    # budget an expansion does.
+    timeout: 30s
     extraArgs: []
 
   resources:
@@ -175,6 +214,25 @@ storageClass:
   # VM, and the guest filesystem growing online with no pod restart.
   allowVolumeExpansion: true
   parameters: {}
+
+# The VolumeSnapshotClass that points VolumeSnapshots at this driver. Rendered
+# only when controller.snapshotter.enabled is set — the class is inert without
+# the sidecar, and its CRD is not installed on a cluster that has never had
+# external-snapshotter on it, so creating it unconditionally would fail the
+# install for everyone who does not want snapshots.
+volumeSnapshotClass:
+  name: hyperv-csi
+
+  # Delete, unlike storageClass.reclaimPolicy above, and the consequence is the
+  # same one that entry describes: deleting a VolumeSnapshot calls
+  # DeleteSnapshot and destroys the snapshot on the Hyper-V side for real. It
+  # defaults to Delete anyway because Retain is the worse trade here — a
+  # retained snapshot leaves both a VolumeSnapshotContent object and its
+  # on-cluster snapshot behind with nothing referencing them, which accumulates
+  # invisibly rather than as a leftover PV somebody notices. The safety comes
+  # from the whole feature being off by default: nobody reaches this line
+  # without having opted in above.
+  deletionPolicy: Delete
 
 rbac:
   create: true

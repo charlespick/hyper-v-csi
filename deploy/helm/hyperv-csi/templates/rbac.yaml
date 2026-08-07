@@ -51,9 +51,13 @@ roleRef:
   name: {{ include "hyperv-csi.fullname" . }}-driver
   apiGroup: rbac.authorization.k8s.io
 ---
-# Scoped to what external-provisioner actually needs. Snapshot permissions are
-# deliberately absent: that sidecar isn't deployed, because the RPCs behind it
-# aren't implemented. Resize has its own role below.
+# Scoped to what external-provisioner actually needs. Resize has its own role
+# below. The snapshot reads at the end are what restore-from-snapshot costs the
+# provisioner — given a PVC with a VolumeSnapshot dataSource it reads the
+# snapshot and then its VolumeSnapshotContent to find the snapshot handle to
+# pass as CreateVolume's VolumeContentSource — so they are tied to the same
+# controller.snapshotter.enabled switch as the sidecar itself and are absent
+# when it is off. They are reads only; nothing here writes a snapshot object.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -79,6 +83,14 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
+  {{- if .Values.controller.snapshotter.enabled }}
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots"]
+    verbs: ["get", "list"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotcontents"]
+    verbs: ["get", "list"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -183,10 +195,73 @@ roleRef:
   kind: ClusterRole
   name: {{ include "hyperv-csi.fullname" . }}-resizer
   apiGroup: rbac.authorization.k8s.io
+{{- if .Values.controller.snapshotter.enabled }}
+---
+# Scoped to what external-snapshotter needs, and rendered only when that
+# sidecar is deployed — an unbound role granting rights over CRDs the cluster
+# may not even have is noise on every install that hasn't opted in.
+#
+# Its work is on the content side of the snapshot split: the cluster-wide
+# snapshot-controller (not deployed by this chart) turns a user's
+# VolumeSnapshot into a VolumeSnapshotContent, and this sidecar is what turns
+# that content object into a CreateSnapshot or DeleteSnapshot call and writes
+# the result — handle, size, readiness — back onto it. Hence read on the class
+# it resolves parameters from, read and write on contents and their status, and
+# read on the VolumeSnapshot the content is bound to.
+#
+# Nothing here mentions groupsnapshot.storage.k8s.io: upstream's own role
+# covers VolumeGroupSnapshots too, but the driver has no GET_VOLUME_GROUP_SNAPSHOT
+# capability, so those rules would grant rights over an API this driver can
+# never serve.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "hyperv-csi.fullname" . }}-snapshotter
+  labels:
+    {{- include "hyperv-csi.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotcontents"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotcontents/status"]
+    verbs: ["update", "patch"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots/status"]
+    verbs: ["update", "patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "hyperv-csi.fullname" . }}-snapshotter
+  labels:
+    {{- include "hyperv-csi.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "hyperv-csi.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "hyperv-csi.fullname" . }}-snapshotter
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
 ---
 # Leader election, shared by every sidecar, so scaling the controller past one
 # replica doesn't mean two provisioners racing on the same PVC, two attachers
-# on the same VolumeAttachment, or two resizers on the same expansion.
+# on the same VolumeAttachment, two resizers on the same expansion, or — when
+# external-snapshotter is enabled — two snapshotters on the same
+# VolumeSnapshotContent. Every sidecar runs with the same ServiceAccount, so
+# the snapshotter is covered by this binding as soon as it is deployed; there
+# is nothing to switch on here.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

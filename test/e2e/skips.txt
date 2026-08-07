@@ -20,20 +20,35 @@
 \[Disruptive\]
 
 # Everything behind a Kubernetes feature gate or an environment this cluster is
-# not. Skipping the whole family is what upstream's own README recommends. For
-# this driver it hides, in descending order of count:
+# not. Upstream's own README recommends skipping the whole [Feature: family,
+# and this was that one-prefix skip until CreateSnapshot landed. It is now an
+# enumeration of the family minus one branch, because
+# [Feature:VolumeSnapshotDataSource] is the one this driver can finally be held
+# to. Each alternative is still a prefix, not a whole tag, so it catches the
+# longer real tag names too — [Feature:SELinuxMountReadWriteOncePod] and the
+# like. What stays hidden, in descending order of count:
 #   [Feature:Windows]                 — Windows worker nodes. Ours are Linux.
-#   [Feature:VolumeSnapshotDataSource]— snapshots. Not implemented; also off via
-#                                       the snapshotDataSource capability. This
-#                                       is the one line expected to be narrowed
-#                                       when CreateSnapshot lands.
 #   [Feature:VolumeAttributesClass]   — mutable volume attributes. Not implemented.
 #   [Feature:VolumeSourceXFS]         — xfs. The node image has only e2fsprogs.
 #   [Feature:SELinux]                 — SELinux mount options. Not implemented.
-#   [Feature:volumegroupsnapshot]     — group snapshots. Not implemented.
+#   [Feature:volumegroupsnapshot]     — group snapshots. Not implemented; also
+#                                       off via the groupSnapshot capability.
 #   [Feature:snapshotmetadata]        — snapshot metadata. Not implemented.
 #   [Feature:OffByDefault]            — gates disabled on a default cluster.
-\[Feature:
+#
+# What is deliberately no longer hidden is [Feature:VolumeSnapshotDataSource]:
+# CreateSnapshot, DeleteSnapshot and ListSnapshots are implemented and
+# snapshotDataSource is true in testdriver.yaml, so these are the tests that
+# exercise them. They need three things on the cluster or they fail rather than
+# skip — the snapshot.storage.k8s.io CRDs, the cluster-wide snapshot-controller,
+# and the chart's own external-snapshotter sidecar
+# (controller.snapshotter.enabled, off by default).
+#
+# Enumerating rather than matching the whole family costs one thing: a feature
+# tag upstream adds later now runs instead of being silenced. That is the right
+# way round — a new tag deserves a look — but it ties this list to the e2e.test
+# version, so reread it when that moves.
+\[Feature:(Windows|VolumeAttributesClass|VolumeSourceXFS|SELinux|volumegroupsnapshot|snapshotmetadata|OffByDefault)
 
 # Upstream's own acknowledged flakes. A failure here says nothing about this
 # driver.

@@ -13,6 +13,26 @@ StorageClass:
   # root of this repository.
   FromFile: test/e2e/storageclass.yaml
 
+# Required for the snapshot tests, and not implied by the snapshotDataSource
+# capability below: GetSnapshotClass skips every snapshot test outright unless
+# one of FromName, FromFile or FromExistingClassName is set here, so flipping
+# the capability without this would silently change nothing.
+#
+# FromName, rather than a file of our own or the chart's class: it has the
+# framework generate a VolumeSnapshotClass named after the driver with empty
+# parameters and deletionPolicy Delete, created and deleted per test the same
+# way it copies the StorageClass above. Nothing here depends on the chart
+# having created its own class, and nothing outlives the run. CreateSnapshot
+# ignores snapshot class parameters anyway, so there is nothing to put in a
+# file.
+#
+# The cluster still needs the snapshot.storage.k8s.io CRDs and the
+# snapshot-controller installed, and the chart's own external-snapshotter
+# sidecar enabled (controller.snapshotter.enabled), or every snapshot test
+# fails rather than skips.
+SnapshotClass:
+  FromName: true
+
 DriverInfo:
   # Must match DriverName in csi-driver/internal/driver/driver.go and the
   # provisioner of storageclass.yaml. It is also what the focus regex in the
@@ -54,13 +74,26 @@ DriverInfo:
     offlineExpansion: true
     readWriteOncePod: true     # SINGLE_NODE_SINGLE_WRITER is accepted
 
+    # --- Supported, and this suite is the first exercise ----------------
+    # Implemented but never yet run against a real Hyper-V cluster, unlike
+    # everything above. Turning them on is deliberate: an unexercised RPC is
+    # exactly what a test run is for, and leaving them false would hide the
+    # snapshot path from the only thing that can tell us it works. Expect the
+    # first run with these on to be where snapshot failures surface.
+    #
+    snapshotDataSource: true   # CreateSnapshot, DeleteSnapshot, ListSnapshots
+
     # --- Not supported: the driver rejects these outright ---------------
     block: false               # requireMountVolume rejects block volumes
     RWX: false                 # a VHDX attaches to one VM at a time
     capReadOnlyMany: false     # ROX maps to MULTI_NODE_READER_ONLY, rejected
-    snapshotDataSource: false  # CreateSnapshot is Unimplemented
-    groupSnapshot: false
-    pvcDataSource: false       # CreateVolume rejects a volume content source
+    groupSnapshot: false        # no GET_VOLUME_GROUP_SNAPSHOT capability
+    # PVC-to-PVC cloning, which is a different capability from restoring a
+    # snapshot: it needs CLONE_VOLUME in ControllerGetCapabilities and a
+    # CreateVolume that accepts a *volume* as its content source. Only the
+    # snapshot content source is being built, so this stays off - turning it
+    # on would fail the clone tests rather than skip them.
+    pvcDataSource: false
     topology: false            # NodeGetInfo reports no accessible topology
     capacity: false            # GetCapacity is not implemented
     volumeLimits: false        # NodeGetInfo reports no max_volumes_per_node

@@ -138,6 +138,43 @@ spec:
             capabilities:
               drop: ["ALL"]
 
+        {{- if .Values.controller.snapshotter.enabled }}
+        # Opt-in, unlike the three above: the snapshot RPCs are implemented but
+        # have not been exercised against a real Hyper-V cluster. See
+        # controller.snapshotter in values.yaml, and note that this sidecar
+        # needs the snapshot.storage.k8s.io CRDs and the cluster-wide
+        # snapshot-controller, neither of which this chart installs.
+        - name: csi-snapshotter
+          image: {{ .Values.controller.snapshotter.image }}
+          args:
+            - --csi-address=$(ADDRESS)
+            # Bounds CreateSnapshot and DeleteSnapshot the same way the other
+            # sidecars bound theirs: the driver clamps its job polling to a
+            # fraction of whatever deadline arrives, so it answers with a
+            # retryable status before this expires.
+            - --timeout={{ .Values.controller.snapshotter.timeout }}
+            - --leader-election
+            - --leader-election-namespace=$(NAMESPACE)
+            {{- range .Values.controller.snapshotter.extraArgs }}
+            - {{ . }}
+            {{- end }}
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+        {{- end }}
+
         - name: hyperv-csi-driver
           image: {{ include "hyperv-csi.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
