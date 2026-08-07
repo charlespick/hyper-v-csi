@@ -109,6 +109,14 @@ spec:
             # and it can only run on a node the volume is staged on. Without
             # this the resizer would only ever expand volumes nothing is using.
             - --handle-volume-inuse-error=false
+            # Without this, alpha in this sidecar version, the resizer never
+            # writes PVC status.allocatedResources/allocatedResourceStatuses at
+            # all - not a permission error, not logged anywhere, it just skips
+            # that part of its job silently. Confirmed against a real resize:
+            # off, the fields are simply absent from the PVC's status; on, they
+            # populate correctly (allocatedResources.storage, then
+            # allocatedResourceStatuses.storage: NodeResizePending).
+            - --feature-gates=RecoverVolumeExpansionFailure=true
             - --leader-election
             - --leader-election-namespace=$(NAMESPACE)
             {{- range .Values.controller.resizer.extraArgs }}
