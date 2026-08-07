@@ -10,11 +10,12 @@ online expansion through ControllerExpandVolume/NodeExpandVolume,
 NodeGetVolumeStats, and ValidateVolumeCapabilities. A PVC will provision, bind,
 attach to its node VM, get formatted and mounted, and serve a pod that uses it.
 
-Snapshots are built — CreateSnapshot, DeleteSnapshot and ListSnapshots — but
-external-snapshotter is only deployed when controller.snapshotter.enabled is
-set, and that path has not been exercised against a real Hyper-V cluster.
-Restoring a volume from a snapshot is not implemented: CreateVolume rejects a
-VolumeContentSource.
+Snapshots are built — CreateSnapshot, DeleteSnapshot, ListSnapshots, and
+restoring a volume from a snapshot through CreateVolume's VolumeContentSource
+— but external-snapshotter is only deployed when
+controller.snapshotter.enabled is set, and none of this, restore included,
+has been exercised against a real Hyper-V cluster. Restoring from another
+volume (cloning a PVC) is not implemented and is not advertised.
 
 Watch a volume get provisioned:
 
