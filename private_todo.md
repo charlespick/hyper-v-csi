@@ -8,3 +8,11 @@
 * squash and move to new repo
 * integration testing - there's a csi testing package apparently
 * pivot to full copy ("copy" on refs) for snapshots and implement snapshots
+* consider agent installation and distributed config instead of putting it on the CSV - mirror sql clustering and consider what's possible for leveraging the windows cluster apis - installer that registers with the cluster, saves it's config directly into cluster db, that would be cool
+
+failure scenario testing/to think about (some of these should be impossible if deployed according to the project requirements)
+* volume attachment on a node that we can't find the VM for
+* agent not responding
+* agent cannot contact another node the cluster says is online
+* brainstorm more with claude
+
