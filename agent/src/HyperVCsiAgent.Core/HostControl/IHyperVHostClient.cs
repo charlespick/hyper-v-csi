@@ -76,9 +76,14 @@ public interface IHyperVHostClient
     /// <summary>
     /// Classifies how <paramref name="vhdxPath"/> relates to the VM's current
     /// configuration - whether it is not referenced at all, is the VM's live
-    /// disk directly, or sits behind a differencing chain, and if so whether
-    /// that chain is rooted in a checkpoint this driver tagged (found by
-    /// <paramref name="ownedCheckpointElementNamePrefix"/>) or a foreign one.
+    /// disk directly, or sits behind a differencing chain, and if so which of
+    /// three things is true about the checkpoint at that chain's root: it is
+    /// this exact snapshot's own (an exact match against
+    /// <paramref name="thisSnapshotElementName"/> - see
+    /// <see cref="CheckpointMatching.FindExact"/>), it is this driver's but
+    /// some *other* snapshot's (<see cref="CheckpointMatching.FindAnyOwned"/>,
+    /// tried only once the exact match has already failed), or it is
+    /// genuinely foreign.
     /// </summary>
     /// <remarks>
     /// Deliberately separate from <see cref="IsDiskAttachedAsync"/> rather than
@@ -86,19 +91,31 @@ public interface IHyperVHostClient
     /// correct to treat any unresolved chain as a hard failure requiring an
     /// operator, and must keep doing so. Only a snapshot of an attached volume
     /// has a legitimate reason to find its own prior, incomplete attempt sitting
-    /// on the VM and resume past it instead.
+    /// on the VM and resume past it instead - or to find a *sibling* volume's
+    /// checkpoint in the way and wait rather than fail hard, since a checkpoint
+    /// is VM-wide and taking one for any one volume re-points every other disk
+    /// on the same VM too.
     /// </remarks>
+    /// <param name="thisSnapshotElementName">
+    /// The fully-qualified identity of the checkpoint *this* snapshot attempt
+    /// would take - matched exactly, never as a prefix. Prefix matching this
+    /// against every checkpoint's <c>ElementName</c> is what previously let a
+    /// snapshot named e.g. <c>snap</c> adopt, and later destroy, a checkpoint
+    /// actually standing for a different snapshot named <c>snap-2</c>.
+    /// </param>
     /// <exception cref="VmNotOnHostException">The VM is not registered on this host.</exception>
     /// <exception cref="InvalidOperationException">
-    /// The VHDX sits behind a differencing chain that is not rooted in a
-    /// checkpoint carrying <paramref name="ownedCheckpointElementNamePrefix"/> -
-    /// a foreign checkpoint, a backup product's recovery point, or a chain this
-    /// method could not walk to a conclusion within its depth bound. Refused
-    /// rather than guessed past, on <c>GuardAgainstDifferencingChain</c>'s own
-    /// reasoning.
+    /// The VHDX sits behind a differencing chain that is not rooted in any
+    /// checkpoint this driver tagged at all - a foreign checkpoint, a backup
+    /// product's recovery point, or a chain this method could not walk to a
+    /// conclusion within its depth bound. Refused rather than guessed past, on
+    /// <c>GuardAgainstDifferencingChain</c>'s own reasoning. A chain rooted in
+    /// a checkpoint this driver tagged for a *different* snapshot does not
+    /// throw this - see <see cref="VolumeAttachment"/>'s
+    /// <c>BehindOtherSnapshotsCheckpoint</c>.
     /// </exception>
     Task<VolumeAttachment> ClassifyAttachmentAsync(
-        string hostName, string vmId, string vhdxPath, string ownedCheckpointElementNamePrefix, CancellationToken cancellationToken);
+        string hostName, string vmId, string vhdxPath, string thisSnapshotElementName, CancellationToken cancellationToken);
 
     /// <summary>
     /// Takes a disk-only checkpoint of the whole VM - Hyper-V has no notion of
@@ -129,9 +146,14 @@ public interface IHyperVHostClient
     /// </remarks>
     /// <param name="elementName">
     /// This checkpoint's identity, conventionally
-    /// <c>hyperv-csi/&lt;driverInstance&gt;/&lt;volumeId&gt;/&lt;snapshotName&gt;</c> -
-    /// what <see cref="FindOwnedCheckpointAsync"/> and
-    /// <see cref="ClassifyAttachmentAsync"/> match against later.
+    /// <c>hyperv-csi/&lt;volumeId&gt;/&lt;snapshotName&gt;</c> - see
+    /// <see cref="CheckpointMatching"/> for the driver-level prefix half of
+    /// that convention, and <see cref="FindOwnedCheckpointAsync"/> and
+    /// <see cref="ClassifyAttachmentAsync"/> for how each half is matched
+    /// again later. Supporting more than one deployment of this driver on one
+    /// cluster - which would need a segment identifying which deployment
+    /// took a given checkpoint - is not in scope: this convention names
+    /// nothing beyond the volume and the snapshot.
     /// </param>
     /// <param name="notesJson">Freeform detail carried on the checkpoint alongside its identity, opaque to this seam.</param>
     /// <exception cref="CheckpointsNotConfiguredException">
@@ -145,20 +167,34 @@ public interface IHyperVHostClient
         string hostName, string vmId, string elementName, string notesJson, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Finds this driver's own checkpoint on the VM, by <c>ElementName</c>
-    /// prefix, or null if there is none. The only way anything here learns
-    /// about a checkpoint a previous attempt left behind - nothing persists a
-    /// <see cref="Checkpoint"/> across a call boundary, so recovery re-derives
-    /// it exactly the way every other piece of state in this design does.
+    /// Finds this driver's own checkpoint for *this exact* (volume, snapshot)
+    /// pair - an exact match on <paramref name="elementName"/>, see
+    /// <see cref="CheckpointMatching.FindExact"/>, never a prefix - or null if
+    /// there is none. The only way anything here learns about a checkpoint a
+    /// previous attempt left behind - nothing persists a <see cref="Checkpoint"/>
+    /// across a call boundary, so recovery re-derives it exactly the way every
+    /// other piece of state in this design does.
     /// </summary>
+    /// <remarks>
+    /// Deliberately exact-only rather than also exposing
+    /// <see cref="CheckpointMatching.FindAnyOwned"/>'s driver-wide prefix
+    /// match: every caller of this method - <c>SnapshotService</c>'s
+    /// re-check under its per-VM checkpoint lock - already has the exact
+    /// per-snapshot name in hand, and the one caller that genuinely needs the
+    /// "is anything of ours standing at all" question,
+    /// <c>CimHyperVHostClient.ClassifyAttachment</c>, asks it internally
+    /// rather than through the interface. Keeping that second mode out of the
+    /// public seam entirely is what keeps it narrow.
+    /// </remarks>
     /// <exception cref="VmNotOnHostException">The VM is not registered on this host.</exception>
     /// <exception cref="InvalidOperationException">
-    /// More than one checkpoint carries this prefix, which should be impossible
-    /// under the per-VM job serialization every caller relies on and is refused
-    /// rather than guessed past.
+    /// More than one checkpoint carries this exact name, which should be
+    /// impossible under the per-VM job serialization every caller relies on
+    /// combined with <paramref name="elementName"/> being unique per (volume,
+    /// snapshot) pair, and is refused rather than guessed past.
     /// </exception>
     Task<Checkpoint?> FindOwnedCheckpointAsync(
-        string hostName, string vmId, string elementNamePrefix, CancellationToken cancellationToken);
+        string hostName, string vmId, string elementName, CancellationToken cancellationToken);
 
     /// <summary>
     /// Starts merging the checkpoint back into its base and returns once the

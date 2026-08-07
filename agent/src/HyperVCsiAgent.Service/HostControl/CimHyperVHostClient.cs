@@ -379,7 +379,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         }, cancellationToken);
 
     public Task<VolumeAttachment> ClassifyAttachmentAsync(
-        string hostName, string vmId, string vhdxPath, string ownedCheckpointElementNamePrefix, CancellationToken cancellationToken) =>
+        string hostName, string vmId, string vhdxPath, string thisSnapshotElementName, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
             var deadline = CimDeadline.After(_hostOperationTimeout);
@@ -397,13 +397,20 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             // the VM's own disk configuration, not an association's
             // eventual consistency, and a stale settings snapshot would
             // never show that.
+            //
+            // Only the genuinely-ambiguous case retries here. A chain rooted
+            // in a checkpoint this driver tagged for a *different* snapshot
+            // is not ambiguous - a checkpoint was found and positively
+            // identified - so ClassifyAttachment returns that answer
+            // immediately rather than throwing AmbiguousChainException, and
+            // this loop never sees it.
             for (var attempt = 0; ; attempt++)
             {
                 using var settings = GetActiveSettings(scope, hostName, vmId, deadline, cancellationToken);
                 try
                 {
                     return ClassifyAttachment(
-                        scope, settings, hostName, vmId, vhdxPath, ownedCheckpointElementNamePrefix, deadline, cancellationToken);
+                        scope, settings, hostName, vmId, vhdxPath, thisSnapshotElementName, deadline, cancellationToken);
                 }
                 catch (AmbiguousChainException) when (attempt < MaxAttachmentClassificationAttempts - 1)
                 {
@@ -457,13 +464,13 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         }, cancellationToken);
 
     public Task<Checkpoint?> FindOwnedCheckpointAsync(
-        string hostName, string vmId, string elementNamePrefix, CancellationToken cancellationToken) =>
+        string hostName, string vmId, string elementName, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
             var deadline = CimDeadline.After(_hostOperationTimeout);
             var scope = ScopeFor(hostName);
             using var vm = GetComputerSystem(scope, hostName, vmId, deadline, cancellationToken);
-            return FindOwnedCheckpoint(vm, elementNamePrefix, deadline, cancellationToken);
+            return CheckpointMatching.FindExact(ReadCheckpointIdentities(vm, deadline, cancellationToken), elementName);
         }, cancellationToken);
 
     public Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
@@ -515,7 +522,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         string hostName,
         string vmId,
         string vhdxPath,
-        string ownedCheckpointElementNamePrefix,
+        string thisSnapshotElementName,
         CimDeadline deadline,
         CancellationToken cancellationToken)
     {
@@ -561,10 +568,40 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                 if (SamePath(parent, vhdxPath))
                 {
                     using var vm = GetComputerSystem(scope, hostName, vmId, deadline, cancellationToken);
-                    var owned = FindOwnedCheckpoint(vm, ownedCheckpointElementNamePrefix, deadline, cancellationToken);
-                    if (owned is not null)
+
+                    // One CIM enumeration, fed to both match modes below,
+                    // rather than one query per mode: what has to agree is
+                    // the two questions' answers about a single snapshot of
+                    // the VM's checkpoints, not two separately-fetched views
+                    // that could disagree if something changed on the host
+                    // between them.
+                    var checkpoints = ReadCheckpointIdentities(vm, deadline, cancellationToken);
+
+                    // Exact match first: is the checkpoint at this chain's
+                    // root *this* snapshot's own, to resume past? A prefix
+                    // match here is exactly the bug this replaced - it let a
+                    // snapshot named e.g. "snap" adopt, and later destroy, a
+                    // checkpoint actually standing for a sibling snapshot
+                    // named "snap-2".
+                    if (CheckpointMatching.FindExact(checkpoints, thisSnapshotElementName) is { } owned)
                     {
                         return new VolumeAttachment(VolumeAttachmentKind.BehindOwnedCheckpoint, owned);
+                    }
+
+                    // Not this snapshot's. Before concluding the chain is
+                    // foreign, ask the driver-level question instead of the
+                    // per-snapshot one: is *any* checkpoint here one this
+                    // driver tagged, just for a different (volume, snapshot)
+                    // attempt? A checkpoint is VM-wide, so a sibling volume's
+                    // checkpoint re-points this chain exactly as this
+                    // snapshot's own would - see VolumeAttachmentKind's own
+                    // remarks. Returned immediately rather than through the
+                    // AmbiguousChainException retry below: a checkpoint was
+                    // found and positively identified, so there is nothing
+                    // ambiguous left to wait out.
+                    if (CheckpointMatching.FindAnyOwned(checkpoints) is { } other)
+                    {
+                        return new VolumeAttachment(VolumeAttachmentKind.BehindOtherSnapshotsCheckpoint, other);
                     }
 
                     // Ambiguous rather than definitely foreign: the checkpoint
@@ -734,33 +771,32 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         return checkpointSettings.Path.Path;
     }
 
-    private static Checkpoint? FindOwnedCheckpoint(
-        ManagementObject vm, string elementNamePrefix, CimDeadline deadline, CancellationToken cancellationToken)
+    /// <summary>
+    /// Every checkpoint on the VM, reduced to just the identity
+    /// <see cref="CheckpointMatching"/>'s two match modes need to decide
+    /// anything against. Materialized into a list rather than matched
+    /// inline, so both modes - one tried, then the other, in
+    /// <see cref="ClassifyAttachment"/> - read the same snapshot of the VM's
+    /// checkpoints instead of two separate CIM round trips that could
+    /// disagree if something changed on the host in between.
+    /// </summary>
+    private static List<Checkpoint> ReadCheckpointIdentities(
+        ManagementObject vm, CimDeadline deadline, CancellationToken cancellationToken)
     {
-        Checkpoint? found = null;
+        var checkpoints = new List<Checkpoint>();
 
         foreach (var checkpoint in CheckpointSettings(vm, deadline, cancellationToken))
         {
             using (checkpoint)
             {
-                if (checkpoint["ElementName"] is not string { Length: > 0 } elementName
-                    || !elementName.StartsWith(elementNamePrefix, StringComparison.Ordinal))
+                if (checkpoint["ElementName"] is string { Length: > 0 } elementName)
                 {
-                    continue;
+                    checkpoints.Add(new Checkpoint(checkpoint.Path.Path, elementName));
                 }
-
-                if (found is not null)
-                {
-                    throw new InvalidOperationException(
-                        $"{vm["Name"]} has more than one checkpoint tagged {elementNamePrefix}*, which should be " +
-                        "impossible under this driver's per-VM job serialization");
-                }
-
-                found = new Checkpoint(checkpoint.Path.Path, elementName);
             }
         }
 
-        return found;
+        return checkpoints;
     }
 
     /// <summary>

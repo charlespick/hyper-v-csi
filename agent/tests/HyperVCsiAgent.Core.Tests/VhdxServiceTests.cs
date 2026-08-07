@@ -1375,7 +1375,7 @@ public sealed class VhdxServiceTests : IDisposable
         }
 
         public Task<VolumeAttachment> ClassifyAttachmentAsync(
-            string hostName, string vmId, string vhdxPath, string ownedCheckpointElementNamePrefix, CancellationToken cancellationToken) =>
+            string hostName, string vmId, string vhdxPath, string thisSnapshotElementName, CancellationToken cancellationToken) =>
             throw new NotSupportedException("ExpandAsync's fallback never checkpoints anything");
 
         public Task<Checkpoint> CreateCheckpointAsync(
@@ -1383,7 +1383,7 @@ public sealed class VhdxServiceTests : IDisposable
             throw new NotSupportedException("ExpandAsync's fallback never checkpoints anything");
 
         public Task<Checkpoint?> FindOwnedCheckpointAsync(
-            string hostName, string vmId, string elementNamePrefix, CancellationToken cancellationToken) =>
+            string hostName, string vmId, string elementName, CancellationToken cancellationToken) =>
             throw new NotSupportedException("ExpandAsync's fallback never checkpoints anything");
 
         public Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
@@ -1430,7 +1430,7 @@ public sealed class VhdxServiceTests : IDisposable
             throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
 
         public Task<VolumeAttachment> ClassifyAttachmentAsync(
-            string hostName, string vmId, string vhdxPath, string ownedCheckpointElementNamePrefix, CancellationToken cancellationToken) =>
+            string hostName, string vmId, string vhdxPath, string thisSnapshotElementName, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
 
         public Task<Checkpoint> CreateCheckpointAsync(
@@ -1438,7 +1438,7 @@ public sealed class VhdxServiceTests : IDisposable
             throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
 
         public Task<Checkpoint?> FindOwnedCheckpointAsync(
-            string hostName, string vmId, string elementNamePrefix, CancellationToken cancellationToken) =>
+            string hostName, string vmId, string elementName, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
 
         public Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>

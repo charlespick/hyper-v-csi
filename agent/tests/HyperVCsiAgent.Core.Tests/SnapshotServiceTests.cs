@@ -467,7 +467,7 @@ public sealed class SnapshotServiceTests : IDisposable
         var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
         var host = new FakeHostClient();
         var snapshotPublishedBeforeDestroy = true;
-        host.DuringDestroy = () => snapshotPublishedBeforeDestroy = File.Exists(SnapshotPath("pvc-1~snapshot-abc"));
+        host.DuringDestroy = _ => snapshotPublishedBeforeDestroy = File.Exists(SnapshotPath("pvc-1~snapshot-abc"));
         var harness = NewHarness(cluster: cluster, host: host);
         WriteVolume("pvc-1", 4096);
 
@@ -532,6 +532,60 @@ public sealed class SnapshotServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateAsync_SiblingVolumeBehindAnotherSnapshotsCheckpoint_FailsRetryablyWithoutTouchingAnything()
+    {
+        // Finding A: a checkpoint is VM-wide. pvc-1's own checkpoint - taken
+        // for a snapshot of pvc-1 that is still copying - re-points every
+        // disk on the VM, pvc-2 included, so pvc-2's own CreateSnapshot must
+        // not read that as a foreign checkpoint to be hand-deleted. It has to
+        // wait, not fail hard: pvc-1's checkpoint clears on its own once
+        // pvc-1's copy finishes.
+        var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient();
+        await host.CreateCheckpointAsync("host-1", "vm-1", "hyperv-csi/pvc-1/snapA", "{}", CancellationToken.None);
+        var harness = NewHarness(cluster: cluster, host: host);
+        WriteVolume("pvc-2", 4096);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => harness.Service.CreateAsync("pvc-2", "snapB", "node-a", CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
+        // Only the pre-seeded pvc-1 checkpoint exists - CreateCheckpointAsync
+        // was never called for pvc-2, and nothing was destroyed or copied.
+        Assert.Single(host.CreatedCheckpointElementNames);
+        Assert.Empty(host.DestroyedCheckpointElementNames);
+        Assert.Empty(harness.Copier.Destinations);
+    }
+
+    [Fact]
+    public async Task CreateAsync_AnotherSnapshotsCheckpointThatHappensToShareANamePrefix_IsNotAdoptedOrDestroyed()
+    {
+        // Finding B: hyperv-csi/pvc-1/snap-2 is standing (snap-2's copy is
+        // still reading through it) when a request for "snap" - a
+        // *different* snapshot of the same volume, whose full element name
+        // is a string prefix of snap-2's - comes in. Prefix-matching the
+        // whole element name, as this driver used to, would treat snap-2's
+        // checkpoint as snap's own: snap would "resume" through it, and once
+        // snap's copy finished, destroy snap-2's checkpoint out from under
+        // snap-2's still-running copy.
+        var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient();
+        await host.CreateCheckpointAsync("host-1", "vm-1", "hyperv-csi/pvc-1/snap-2", "{}", CancellationToken.None);
+        var harness = NewHarness(cluster: cluster, host: host);
+        WriteVolume("pvc-1", 4096);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => harness.Service.CreateAsync("pvc-1", "snap", "node-a", CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
+        // snap-2's checkpoint is untouched: not adopted, and above all not
+        // destroyed on behalf of a copy that was never really its own.
+        Assert.DoesNotContain("hyperv-csi/pvc-1/snap-2", host.DestroyedCheckpointElementNames);
+        Assert.Single(host.CreatedCheckpointElementNames);
+        Assert.Empty(harness.Copier.Destinations);
+    }
+
+    [Fact]
     public async Task CreateAsync_AttachedVolumeWithNoRoomForTheCopy_FailsWithoutStrandingACheckpoint()
     {
         // The bug this pins: taking the checkpoint before every precondition
@@ -582,15 +636,28 @@ public sealed class SnapshotServiceTests : IDisposable
     public async Task DestroyOwnedCheckpointAsync_WhenTheMergeCannotEvenBeStarted_StillPublishesAndOrphansTheCheckpoint()
     {
         // Pins the fix to DestroyOwnedCheckpointAsync's dead exception filter.
-        // pvc-2 already has an owned checkpoint - a resumed snapshot - so its
-        // CreateSnapshot call never touches the VM's checkpoint slot; only its
-        // copy job does, once it tries to start the merge. Meanwhile pvc-1's
-        // own CreateSnapshot call (a fresh checkpoint, on the same VM) is
-        // deliberately held inside CreateCheckpointAsync - which holds the
-        // slot the whole time, since CreateOwnedCheckpointAsync releases it
-        // only once that call returns - for far longer than pvc-2's own
-        // SnapshotCopyTimeout. pvc-2's copy job is therefore guaranteed to
-        // still be waiting for the slot when its own cancellation fires,
+        //
+        // Both pvc-1 and pvc-2 already have their own owned checkpoint -
+        // each a resumed snapshot - pre-seeded directly on the fake rather
+        // than taken through CreateAsync: a checkpoint is VM-wide, and this
+        // driver now refuses to take a *second* one while a first still
+        // stands on the same VM (see VolumeAttachmentKind.BehindOtherSnapshotsCheckpoint),
+        // so two independently-owned checkpoints coexisting here models a
+        // state left behind by an agent that crashed and restarted between
+        // taking each one - not a state this driver's own logic would walk
+        // into on a live run. Either way, neither CreateAsync call below
+        // touches the VM's checkpoint slot at all: each finds its own exact
+        // checkpoint by ClassifyAttachment's exact match and resumes past
+        // it, so only the copy job each one starts - specifically the merge
+        // each starts once its copy has read everything - ever reaches
+        // DestroyOwnedCheckpointAsync.
+        //
+        // pvc-1's merge is deliberately held inside DestroyCheckpointAsync -
+        // which holds the VM's checkpoint slot the whole time, since
+        // DestroyOwnedCheckpointAsync releases it only once that call
+        // returns - for far longer than pvc-2's own SnapshotCopyTimeout.
+        // pvc-2's own merge attempt is therefore guaranteed to still be
+        // waiting for the same slot when its own cancellation fires,
         // deterministically reaching the fix rather than racing for it.
         //
         // That must not throw pvc-2's job or discard the copy it already
@@ -601,31 +668,36 @@ public sealed class SnapshotServiceTests : IDisposable
             Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") },
         };
         var host = new FakeHostClient();
+        await host.CreateCheckpointAsync("host-1", "vm-1", "hyperv-csi/pvc-1/snapshot-a", "{}", CancellationToken.None);
         await host.CreateCheckpointAsync("host-1", "vm-1", "hyperv-csi/pvc-2/snapshot-b", "{}", CancellationToken.None);
 
         var slotHeld = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var releaseSlot = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        host.DuringCreate = () =>
+        host.DuringDestroy = checkpoint =>
         {
-            slotHeld.TrySetResult();
-            releaseSlot.Task.Wait(TimeSpan.FromSeconds(10));
+            if (checkpoint.ElementName == "hyperv-csi/pvc-1/snapshot-a")
+            {
+                slotHeld.TrySetResult();
+                releaseSlot.Task.Wait(TimeSpan.FromSeconds(10));
+            }
         };
 
         var harness = NewHarness(cluster: cluster, host: host, snapshotCopyTimeout: TimeSpan.FromMilliseconds(200));
         WriteVolume("pvc-1", 4096);
         WriteVolume("pvc-2", 4096);
 
-        // pvc-1 has no checkpoint yet, so its fast CreateSnapshot call is the
-        // one that takes - and, via the hook above, holds - the VM's slot.
+        // pvc-1 resumes past its own checkpoint, and its copy job's eventual
+        // merge attempt is what takes - and, via the hook above, holds - the
+        // VM's slot.
         var creatingPvc1 = Task.Run(
             () => harness.Service.CreateAsync("pvc-1", "snapshot-a", "node-a", CancellationToken.None));
         await slotHeld.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         try
         {
-            // pvc-2's own checkpoint already exists, so this never touches
-            // the slot itself - only the copy job it starts does, once it
-            // tries to merge.
+            // pvc-2 resumes past its own checkpoint too, so this never
+            // touches the slot itself - only the copy job it starts does,
+            // once it tries to merge.
             var result = await harness.Service.CreateAsync("pvc-2", "snapshot-b", "node-a", CancellationToken.None);
             Assert.Equal("pvc-2~snapshot-b", result.SnapshotId);
 
@@ -642,6 +714,9 @@ public sealed class SnapshotServiceTests : IDisposable
         }
 
         await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-a")));
+        // pvc-1's own merge was only delayed, not abandoned: once the hook
+        // released it, its checkpoint went too.
+        await WaitForAsync(() => host.DestroyedCheckpointElementNames.Contains("hyperv-csi/pvc-1/snapshot-a"));
     }
 
     [Fact]
@@ -1537,8 +1612,13 @@ public sealed class SnapshotServiceTests : IDisposable
 
         public bool FailNextDestroy { get; set; }
 
-        /// <summary>Runs synchronously inside DestroyCheckpointAsync, before it records the call - lets a test observe what else is (or isn't) true at that exact moment.</summary>
-        public Action? DuringDestroy { get; set; }
+        /// <summary>
+        /// Runs synchronously inside DestroyCheckpointAsync, before it
+        /// records the call - lets a test observe what else is (or isn't)
+        /// true at that exact moment, or block only while a particular
+        /// checkpoint is the one being destroyed.
+        /// </summary>
+        public Action<Checkpoint>? DuringDestroy { get; set; }
 
         /// <summary>Runs synchronously inside CreateCheckpointAsync, before it records the call - the VM's checkpoint slot is held for as long as this blocks, since CreateOwnedCheckpointAsync releases it only after this call returns.</summary>
         public Action? DuringCreate { get; set; }
@@ -1548,7 +1628,7 @@ public sealed class SnapshotServiceTests : IDisposable
         public List<string> DestroyedCheckpointElementNames { get; } = [];
 
         public Task<VolumeAttachment> ClassifyAttachmentAsync(
-            string hostName, string vmId, string vhdxPath, string ownedCheckpointElementNamePrefix, CancellationToken cancellationToken)
+            string hostName, string vmId, string vhdxPath, string thisSnapshotElementName, CancellationToken cancellationToken)
         {
             if (ForeignChainInTheWay)
             {
@@ -1556,9 +1636,25 @@ public sealed class SnapshotServiceTests : IDisposable
                     $"{vhdxPath} sits behind a foreign checkpoint this driver did not tag");
             }
 
-            if (_checkpointsByElementName.TryGetValue(ownedCheckpointElementNamePrefix, out var owned))
+            // Routed through the exact same two pure functions
+            // CimHyperVHostClient.ClassifyAttachment calls against a real
+            // VM's checkpoints, rather than a hand-rolled equivalent: that is
+            // what makes "a test cannot get the two seams to disagree" (see
+            // this class's own doc comment) true of the *matching rules*
+            // too, not just of the one dictionary both read from. A fake with
+            // its own, looser copy of these rules is exactly how the
+            // sibling-volume and prefix-collision bugs this pins shipped in
+            // the first place.
+            var checkpoints = _checkpointsByElementName.Values;
+
+            if (CheckpointMatching.FindExact(checkpoints, thisSnapshotElementName) is { } exact)
             {
-                return Task.FromResult(new VolumeAttachment(VolumeAttachmentKind.BehindOwnedCheckpoint, owned));
+                return Task.FromResult(new VolumeAttachment(VolumeAttachmentKind.BehindOwnedCheckpoint, exact));
+            }
+
+            if (CheckpointMatching.FindAnyOwned(checkpoints) is { } other)
+            {
+                return Task.FromResult(new VolumeAttachment(VolumeAttachmentKind.BehindOtherSnapshotsCheckpoint, other));
             }
 
             return Task.FromResult(new VolumeAttachment(AttachmentKind, null));
@@ -1587,12 +1683,12 @@ public sealed class SnapshotServiceTests : IDisposable
         }
 
         public Task<Checkpoint?> FindOwnedCheckpointAsync(
-            string hostName, string vmId, string elementNamePrefix, CancellationToken cancellationToken) =>
-            Task.FromResult(_checkpointsByElementName.TryGetValue(elementNamePrefix, out var checkpoint) ? checkpoint : null);
+            string hostName, string vmId, string elementName, CancellationToken cancellationToken) =>
+            Task.FromResult(CheckpointMatching.FindExact(_checkpointsByElementName.Values, elementName));
 
         public Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken)
         {
-            DuringDestroy?.Invoke();
+            DuringDestroy?.Invoke(checkpoint);
 
             if (FailNextDestroy)
             {

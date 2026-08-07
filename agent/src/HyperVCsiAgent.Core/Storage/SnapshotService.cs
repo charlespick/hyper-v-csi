@@ -661,9 +661,12 @@ public sealed class SnapshotService : ISnapshotService
     /// With a node hint, this asks Hyper-V directly instead of guessing from a
     /// local open - <see cref="IHyperVHostClient.ClassifyAttachmentAsync"/>
     /// tells the difference between not attached, attached with nothing in the
-    /// way, and attached behind a checkpoint this driver already took for this
-    /// exact snapshot. The last one is a resume, not a fresh start: its
-    /// checkpoint is reused rather than a new one taken. Being read-only, this
+    /// way, attached behind a checkpoint this driver already took for this
+    /// exact snapshot, and attached behind one this driver took for a
+    /// different snapshot entirely - a checkpoint is VM-wide, so a sibling
+    /// volume's snapshot can put this one behind a chain too. The
+    /// this-exact-snapshot case is a resume, not a fresh start: its checkpoint
+    /// is reused rather than a new one taken. Being read-only, this
     /// classification is safe to run this early regardless of which case it
     /// turns out to be - unlike taking a checkpoint, it cannot itself strand
     /// anything. Both attached cases measure with <see cref="FileInfo.Length"/>
@@ -734,6 +737,27 @@ public sealed class SnapshotService : ISnapshotService
                 var resumedBytes = new FileInfo(sourcePath).Length;
                 return new SourceInspection(resumedBytes, vm, attachment.OwnedCheckpoint, false);
 
+            case VolumeAttachmentKind.BehindOtherSnapshotsCheckpoint:
+                // Ours, but a different (volume, snapshot) attempt's - see
+                // VolumeAttachmentKind's own remarks for why a checkpoint
+                // being VM-wide makes this reachable for a perfectly innocent
+                // sibling volume, not just a stuck retry of this one.
+                // Retryable rather than FailedPrecondition: nothing here is
+                // broken, and there is nothing an operator should delete -
+                // the checkpoint in the way belongs to that other attempt's
+                // copy job and clears on its own, via that job's own
+                // DestroyOwnedCheckpointAsync call, once its copy finishes.
+                // Naming it and saying so is what keeps an operator from
+                // reading this the way the old single "foreign checkpoint"
+                // message would have had them read it: as an instruction to
+                // go delete something that is not foreign at all.
+                throw new JobFailureException(
+                    AgentErrorCodes.Internal,
+                    $"snapshot {snapshotId} cannot be taken yet: {sourcePath} sits behind checkpoint " +
+                    $"{attachment.OwnedCheckpoint!.ElementName}, which this driver took for a different " +
+                    "snapshot that is still copying; this will clear on its own once that snapshot's copy " +
+                    "finishes and its checkpoint merges back - no action needed");
+
             case VolumeAttachmentKind.Direct:
                 // Nothing frozen yet, and nothing taken here: nothing about
                 // this measurement needs a checkpoint, so taking one is left
@@ -798,7 +822,7 @@ public sealed class SnapshotService : ISnapshotService
     /// never a different attempt's.
     /// </summary>
     private static string CheckpointElementName(string sourceVolumeId, string snapshotName) =>
-        $"hyperv-csi/{sourceVolumeId}/{snapshotName}";
+        $"{CheckpointMatching.OwnedPrefix}{sourceVolumeId}/{snapshotName}";
 
     private static string BuildCheckpointNotes(string sourceVolumeId, string snapshotName) =>
         JsonSerializer.Serialize(new

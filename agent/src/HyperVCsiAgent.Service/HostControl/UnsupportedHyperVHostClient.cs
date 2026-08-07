@@ -35,7 +35,7 @@ public sealed class UnsupportedHyperVHostClient : IHyperVHostClient
         throw Unsupported();
 
     public Task<VolumeAttachment> ClassifyAttachmentAsync(
-        string hostName, string vmId, string vhdxPath, string ownedCheckpointElementNamePrefix, CancellationToken cancellationToken) =>
+        string hostName, string vmId, string vhdxPath, string thisSnapshotElementName, CancellationToken cancellationToken) =>
         throw Unsupported();
 
     public Task<Checkpoint> CreateCheckpointAsync(
@@ -43,7 +43,7 @@ public sealed class UnsupportedHyperVHostClient : IHyperVHostClient
         throw Unsupported();
 
     public Task<Checkpoint?> FindOwnedCheckpointAsync(
-        string hostName, string vmId, string elementNamePrefix, CancellationToken cancellationToken) =>
+        string hostName, string vmId, string elementName, CancellationToken cancellationToken) =>
         throw Unsupported();
 
     public Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
