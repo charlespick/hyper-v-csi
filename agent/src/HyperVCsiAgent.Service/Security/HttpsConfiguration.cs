@@ -8,9 +8,9 @@ namespace HyperVCsiAgent.Service.Security;
 public static class HttpsConfiguration
 {
     /// <summary>
-    /// Configures the HTTPS listener: a Let's Encrypt server certificate read
-    /// from the Windows store, and mutual TLS against a pinned set of client
-    /// certificate fingerprints.
+    /// Configures the HTTPS listener: a self-signed server certificate read
+    /// from the Windows store and selected by pinned thumbprint, and mutual
+    /// TLS against a pinned set of client certificate fingerprints.
     ///
     /// Authorization happens during the handshake rather than in middleware, so
     /// an unrecognized caller never reaches the job API at all - there is no
@@ -45,7 +45,7 @@ public static class HttpsConfiguration
                     https.SslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13;
 
                     // Re-read per handshake (cheap - the provider caches) so a
-                    // certbot renewal is picked up without a restart.
+                    // manual rotation is picked up without a restart.
                     https.ServerCertificateSelector = (_, _) => certificates.Current;
 
                     if (!options.Authentication.IsConfigured)

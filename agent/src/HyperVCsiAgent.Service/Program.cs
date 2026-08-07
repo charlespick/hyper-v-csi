@@ -73,7 +73,7 @@ builder.ConfigureHttps(agentOptions);
 if (agentOptions.Tls.IsConfigured)
 {
     builder.Services.Configure<Microsoft.AspNetCore.HostFiltering.HostFilteringOptions>(
-        options => options.AllowedHosts = new[] { agentOptions.Tls.SubjectName });
+        options => options.AllowedHosts = new[] { agentOptions.Tls.HostName });
 }
 
 var app = builder.Build();

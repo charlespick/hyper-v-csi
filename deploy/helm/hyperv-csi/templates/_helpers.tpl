@@ -80,5 +80,8 @@ mistake surfaces at `helm install` rather than as a CrashLoopBackOff.
   {{- if and (not .Values.clientCertificate.existingSecret) (not (and .Values.clientCertificate.cert .Values.clientCertificate.key)) -}}
 {{- fail "a client certificate is required: set clientCertificate.existingSecret, or supply clientCertificate.cert and .key with --set-file" -}}
   {{- end -}}
+  {{- if not .Values.agent.serverCertificateThumbprints -}}
+{{- fail "agent.serverCertificateThumbprints is required: the agent's server certificate is self-signed, so the driver has no other way to trust it" -}}
+  {{- end -}}
 {{- end -}}
 {{- end -}}

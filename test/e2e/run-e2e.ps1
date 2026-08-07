@@ -5,9 +5,21 @@ Runs the upstream Kubernetes external storage e2e suite against a cluster that
 already has hyperv-csi installed.
 
 .DESCRIPTION
-Downloads the e2e.test and ginkgo binaries matching the cluster's own
-Kubernetes version, builds the skip regex from skips.txt (plus skips-smoke.txt
-for the smoke profile), and runs the suite against testdriver.yaml.
+Orchestrates run-e2e.sh (its own Linux/macOS twin) inside a linux/amd64
+container built from docker/Dockerfile, rather than running e2e.test natively
+on Windows. That isn't just convenience: a windows/amd64 e2e.test builds
+in-container exec paths for the Linux test pods using the client's native
+path separator, so several upstream volume test helpers fail every time - a
+Linux pod sees `test -d \opt\0` instead of `test -d /opt/0`. Running the
+client itself as linux/amd64, whatever OS calls this script, is what avoids
+that class of false failure. See findings.md, 2026-08-06 entry.
+
+The repository and the resolved kubeconfig are bind-mounted into the
+container; everything else - downloading e2e.test/ginkgo, building the skip
+regex, running the suite - is run-e2e.sh's job, unchanged. This script's own
+job is just resolving what run-e2e.sh needs from the Windows side (the
+cluster's Kubernetes version, the kubeconfig to mount) and translating
+parameters into its flags.
 
 Nothing here installs or configures the driver, the agent, or the cluster. See
 testing.md for what has to be true before this will pass.
@@ -32,6 +44,11 @@ param(
     [ValidateSet('smoke', 'full')]
     [string]$TestProfile = 'smoke',
 
+    # Defaults to $env:KUBECONFIG, then ~/.kube/config - kubectl's own default -
+    # rather than leaving it unset: e2e.test's own config loader tries
+    # in-cluster config first when given no --kubeconfig at all, which fails
+    # outside a pod rather than falling back to the default file the way
+    # kubectl does.
     [string]$KubeConfig = $env:KUBECONFIG,
 
     # kubectl/e2e.test context to use. Defaults to the kubeconfig's current one.
@@ -39,7 +56,9 @@ param(
 
     # Which e2e.test to run. Defaults to the cluster's own server version, which
     # is what upstream supports: the suite is only guaranteed to match the
-    # cluster it shipped with.
+    # cluster it shipped with. Resolved here (not inside the container) so the
+    # container never needs kubectl - only e2e.test's own kubeconfig-based
+    # client talks to the cluster.
     [string]$KubernetesVersion = '',
 
     # Tests in flight at once. 1 is deliberate for a first run — see testing.md
@@ -80,14 +99,20 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-# Off, so a failing test run comes back as an exit code to pass on rather than a
-# PowerShell exception. Every native call below either checks $LASTEXITCODE or
-# means to ignore it.
+# Off, so a failing test run comes back as an exit code to pass on rather than
+# a PowerShell exception. The only native calls left are docker build/run, and
+# both are checked via $LASTEXITCODE.
 $PSNativeCommandUseErrorActionPreference = $false
 
 $here = $PSScriptRoot
 $repoRoot = (Resolve-Path (Join-Path $here '..' '..')).Path
-$testDriver = Join-Path $here 'testdriver.yaml'
+$dockerDir = Join-Path $here 'docker'
+$image = 'hyperv-csi-e2e-runner:latest'
+
+if (-not $KubeConfig) {
+    $default = Join-Path $HOME '.kube' 'config'
+    if (Test-Path $default -PathType Leaf) { $KubeConfig = $default }
+}
 
 function Invoke-Kubectl {
     param([string[]]$KubectlArgs)
@@ -120,93 +145,24 @@ function Resolve-KubernetesVersion {
     return $stable
 }
 
-# Downloads and verifies the kubernetes-test tarball for $version, once, into a
-# gitignored cache. Returns the directory holding e2e.test and ginkgo.
-function Resolve-TestBinaries {
-    param([string]$Version)
+# Translates an absolute Windows path under $repoRoot into the path it appears
+# at inside the container, where $repoRoot is mounted at /repo. Throws for
+# anything outside the repo - only $repoRoot is mounted, so nothing else is
+# reachable from inside the container.
+function ConvertTo-ContainerPath {
+    param([string]$WindowsPath)
 
-    $osName = if ($IsWindows) { 'windows' } elseif ($IsMacOS) { 'darwin' } else { 'linux' }
-    $exe = if ($IsWindows) { '.exe' } else { '' }
-    $arch = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
-        'X64' { 'amd64' }
-        'Arm64' { 'arm64' }
-        default { throw "Unsupported architecture $_" }
+    $resolved = (Resolve-Path $WindowsPath).Path
+    if (-not $resolved.StartsWith($repoRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "$WindowsPath is outside the repository ($repoRoot); only the repository is mounted into the e2e runner container."
     }
 
-    $cache = Join-Path $here '.bin' $Version
-    $binDir = Join-Path $cache 'kubernetes' 'test' 'bin'
-    if (Test-Path (Join-Path $binDir "e2e.test$exe")) { return $binDir }
-
-    if ($NoDownload) {
-        throw "No cached e2e.test for $Version under $cache, and -NoDownload was given."
-    }
-
-    $name = "kubernetes-test-$osName-$arch.tar.gz"
-    $url = "https://dl.k8s.io/$Version/$name"
-    New-Item -ItemType Directory -Force $cache | Out-Null
-    $tarball = Join-Path $cache $name
-
-    Write-Host "Downloading $url" -ForegroundColor Cyan
-    $previous = $ProgressPreference
-    $ProgressPreference = 'SilentlyContinue'
-    try {
-        Invoke-WebRequest -UseBasicParsing $url -OutFile $tarball
-        $expected = (Invoke-WebRequest -UseBasicParsing "$url.sha512").Content.Trim().ToLower()
-    } finally {
-        $ProgressPreference = $previous
-    }
-
-    # The tarball is an executable this script is about to run, so the published
-    # checksum is checked rather than trusted to the transport.
-    $actual = (Get-FileHash $tarball -Algorithm SHA512).Hash.ToLower()
-    if ($actual -ne $expected) {
-        Remove-Item $tarball -Force
-        throw "SHA512 mismatch for $name`n  expected $expected`n  actual   $actual"
-    }
-
-    tar -xzf $tarball -C $cache
-    if ($LASTEXITCODE -ne 0) { throw "Extracting $tarball failed." }
-    Remove-Item $tarball -Force
-
-    return $binDir
-}
-
-# One regex per non-comment line. See skips.txt for the format and the rule
-# that every line carries its reason.
-function Read-Patterns {
-    param([string]$Path)
-
-    if (-not (Test-Path $Path)) { throw "Missing skip list $Path" }
-    Get-Content $Path |
-        ForEach-Object { $_.Trim() } |
-        Where-Object { $_ -and -not $_.StartsWith('#') }
-}
-
-# Read back rather than duplicated, so the driver name lives in exactly one
-# place on this side of the fence. DriverInfo.Name is the only key at this
-# indentation in testdriver.yaml.
-function Get-DriverName {
-    $match = Select-String -Path $testDriver -Pattern '^  Name:\s*(\S+)\s*$' | Select-Object -First 1
-    if (-not $match) { throw "Could not read DriverInfo.Name from $testDriver" }
-    return $match.Matches[0].Groups[1].Value
+    $relative = $resolved.Substring($repoRoot.Length).TrimStart('\', '/') -replace '\\', '/'
+    if ($relative) { return "/repo/$relative" }
+    return '/repo'
 }
 
 $version = Resolve-KubernetesVersion
-$binDir = Resolve-TestBinaries -Version $version
-$exeSuffix = if ($IsWindows) { '.exe' } else { '' }
-$ginkgo = Join-Path $binDir "ginkgo$exeSuffix"
-$e2eTest = Join-Path $binDir "e2e.test$exeSuffix"
-
-$driverName = Get-DriverName
-if (-not $Focus) {
-    $Focus = 'External.Storage.*' + [regex]::Escape($driverName)
-}
-
-$skips = @(Read-Patterns (Join-Path $here 'skips.txt'))
-if ($TestProfile -eq 'smoke') {
-    $skips += @(Read-Patterns (Join-Path $here 'skips-smoke.txt'))
-}
-$skips += $Skip
 
 if (-not $ArtifactsDir) {
     $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
@@ -214,49 +170,49 @@ if (-not $ArtifactsDir) {
 }
 New-Item -ItemType Directory -Force $ArtifactsDir | Out-Null
 $ArtifactsDir = (Resolve-Path $ArtifactsDir).Path
-
-$ginkgoArgs = @(
-    "--focus=$Focus"
-    "--timeout=$Timeout"
-    "--procs=$Procs"
-    # --junit-report has to stay a bare filename: Ginkgo resolves it against
-    # --output-dir, and an absolute Windows path gets joined onto the suite's
-    # directory rather than recognised as absolute.
-    "--output-dir=$ArtifactsDir"
-    '--junit-report=junit.xml'
-)
-foreach ($pattern in $skips) { $ginkgoArgs += "--skip=$pattern" }
-if ($DryRun) { $ginkgoArgs += @('--dry-run', '-v') }
-
-# --storage.testdriver is read while flags are still being parsed, before
-# --repo-root has been applied, so it has to be absolute. The StorageClass path
-# inside it resolves against --repo-root and is therefore relative.
-$e2eArgs = @(
-    "--storage.testdriver=$testDriver"
-    "--repo-root=$repoRoot"
-    # Where e2e.test dumps cluster state on a failure. It writes its own
-    # per-process junit_NN.xml here too; the aggregated one to read is Ginkgo's
-    # junit.xml next to it.
-    "--report-dir=$ArtifactsDir"
-    # skeleton is the no-cloud-provider provider. It is also what keeps the
-    # SSH-dependent tests from trying: they check for a provider that has SSH.
-    '--provider=skeleton'
-    "--allowed-not-ready-nodes=$AllowedNotReadyNodes"
-)
-if ($KubeConfig) { $e2eArgs += "--kubeconfig=$KubeConfig" }
-if ($Context) { $e2eArgs += "--context=$Context" }
-if ($KeepNamespacesOnFailure) { $e2eArgs += '--delete-namespace-on-failure=false' }
-$e2eArgs += $ExtraArgs
+$containerArtifactsDir = ConvertTo-ContainerPath $ArtifactsDir
 
 Write-Host ''
+Write-Host "Building $image from $dockerDir" -ForegroundColor DarkGray
+& docker build --platform linux/amd64 -t $image $dockerDir
+if ($LASTEXITCODE -ne 0) { throw "docker build failed with exit code $LASTEXITCODE" }
+
+$dockerArgs = @(
+    'run', '--rm'
+    '-v', "${repoRoot}:/repo"
+    '-w', '/repo/test/e2e'
+)
+
+# Skipped, not mounted, for -DryRun with no kubeconfig on disk yet: Ginkgo's
+# dry-run mode never executes SynchronizedBeforeSuite, so nothing ever opens
+# it. Mounting a path Docker doesn't find would silently bind an empty
+# directory there instead, which is worse than just not passing it.
+$haveKubeConfig = $KubeConfig -and (Test-Path $KubeConfig -PathType Leaf)
+if ($haveKubeConfig) {
+    $dockerArgs += @('-v', "${KubeConfig}:/kubeconfig:ro")
+} elseif (-not $DryRun) {
+    throw "No kubeconfig found (checked -KubeConfig, `$env:KUBECONFIG, and $(Join-Path $HOME '.kube' 'config')). Pass -KubeConfig explicitly, or -DryRun if you don't need a cluster yet."
+}
+
+$sh = @('--profile', $TestProfile, '--kubernetes-version', $version, '--procs', "$Procs")
+if ($haveKubeConfig) { $sh += @('--kubeconfig', '/kubeconfig') }
+if ($Context) { $sh += @('--context', $Context) }
+if ($Focus) { $sh += @('--focus', $Focus) }
+foreach ($pattern in $Skip) { $sh += @('--skip', $pattern) }
+$sh += @('--artifacts-dir', $containerArtifactsDir, '--timeout', $Timeout, '--allowed-not-ready-nodes', "$AllowedNotReadyNodes")
+if ($DryRun) { $sh += '--dry-run' }
+if ($KeepNamespacesOnFailure) { $sh += '--keep-namespaces-on-failure' }
+if ($NoDownload) { $sh += '--no-download' }
+if ($ExtraArgs.Count -gt 0) { $sh += @('--') + $ExtraArgs }
+
 Write-Host "profile    $TestProfile" -ForegroundColor Cyan
-Write-Host "driver     $driverName"
-Write-Host "e2e.test   $version ($binDir)"
+Write-Host "kubeconfig $(if ($haveKubeConfig) { $KubeConfig } else { '(none - dry run)' })"
 Write-Host "artifacts  $ArtifactsDir"
-Write-Host "skipping   $($skips.Count) pattern(s): $($skips -join ' | ')"
 Write-Host ''
 
-& $ginkgo @ginkgoArgs $e2eTest -- @e2eArgs
+# bash explicitly, not ./run-e2e.sh: a Windows bind mount doesn't reliably
+# preserve the executable bit, so relying on it would work by accident.
+& docker @dockerArgs $image bash ./run-e2e.sh @sh
 $exitCode = $LASTEXITCODE
 
 Write-Host ''

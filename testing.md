@@ -38,12 +38,19 @@ the cluster to run them. That is not incidental — node failover testing, when 
 add it, has to survive the node it is testing going away, so the harness that
 drives it cannot live on that node. Starting outside means never having to move.
 
-The binaries are not vendored. `test/e2e/run-e2e.ps1` (and its `run-e2e.sh`
-twin) downloads the `kubernetes-test` tarball matching **the cluster's own
-version**, verifies its published SHA-512, and caches it under
-`test/e2e/.bin/<version>/`. Version-matching is upstream's rule: the suite is
-only guaranteed against the release it shipped with, and a cluster upgrade
-should change what runs.
+The binaries are not vendored. `run-e2e.sh` downloads the `kubernetes-test`
+tarball and `kubectl` matching **the cluster's own version**, verifies their
+published checksums, and caches them under `test/e2e/.bin/<version>/`.
+Version-matching is upstream's rule: the suite is only guaranteed against the
+release it shipped with, and a cluster upgrade should change what runs.
+
+`run-e2e.sh` is the one implementation. `run-e2e.ps1` doesn't reimplement any
+of it — it builds a linux/amd64 container from `test/e2e/docker/` and runs
+`run-e2e.sh` inside it, needed because `e2e.test` itself builds in-container
+exec paths for the Linux test pods using its own client OS's path separator: a
+windows/amd64 `e2e.test` sends Linux pods `test -d \opt\0` instead of
+`test -d /opt/0`, which fails every time regardless of what OS is driving the
+run. See `findings.md`'s 2026-08-06 entry for how that was found.
 
 ### What is in `test/e2e/`
 
@@ -53,7 +60,9 @@ should change what runs.
 | `storageclass.yaml` | The StorageClass tests provision against. **`reclaimPolicy: Delete`** |
 | `skips.txt` | Tests silenced in every profile, one regex per line with its reason |
 | `skips-smoke.txt` | Extra silences for the smoke profile — all of them temporary |
-| `run-e2e.ps1` / `run-e2e.sh` | Fetch, compose, run. Same flags on both |
+| `run-e2e.sh` | Fetch, compose, run. The one implementation |
+| `run-e2e.ps1` | Windows entry point: builds `docker/`'s image, runs `run-e2e.sh` inside it |
+| `docker/Dockerfile` | The linux/amd64 client image `run-e2e.ps1` runs `run-e2e.sh` in |
 
 ## Before the first run
 

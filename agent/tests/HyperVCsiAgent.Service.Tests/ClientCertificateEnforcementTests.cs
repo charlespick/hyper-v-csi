@@ -50,7 +50,7 @@ public sealed class ClientCertificateEnforcementTests : IAsyncLifetime
         var options = new AgentOptions
         {
             CsvVolumesRoot = Path.GetTempPath(),
-            Tls = { SubjectName = "agent.test", Port = 0 },
+            Tls = { HostName = "agent.test", Port = 0 },
             Authentication =
             {
                 // Both the live driver certificate and one that is pinned but

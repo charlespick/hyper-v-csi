@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 #
 # Runs the upstream Kubernetes external storage e2e suite against a cluster that
-# already has hyperv-csi installed. The Linux/macOS twin of run-e2e.ps1 — same
-# flags, same skip lists, same defaults — because the cluster is driven from a
-# Windows desktop today and from CI later.
+# already has hyperv-csi installed. This is the one implementation; run-e2e.ps1
+# doesn't reimplement it; it builds a linux/amd64 container from docker/ and
+# runs this script inside it, needed because e2e.test itself builds in-container
+# exec paths for the Linux test pods using its own client OS's path separator -
+# a windows/amd64 e2e.test sends `test -d \opt\0` instead of `test -d /opt/0`,
+# which fails every time regardless of what OS is driving the run.
 #
 # Nothing here installs or configures the driver, the agent, or the cluster. See
 # testing.md for what has to be true before this will pass.
@@ -101,6 +104,14 @@ sha512_of() {
 	fi
 }
 
+sha256_of() {
+	if command -v sha256sum >/dev/null; then
+		sha256sum "$1" | cut -d' ' -f1
+	else
+		shasum -a 256 "$1" | cut -d' ' -f1
+	fi
+}
+
 # Downloads and verifies the kubernetes-test tarball, once, into a gitignored
 # cache. Echoes the directory holding e2e.test and ginkgo.
 resolve_test_binaries() {
@@ -155,6 +166,59 @@ resolve_test_binaries() {
 	echo "$bin_dir"
 }
 
+# kubectl isn't in the kubernetes-test tarball - it ships in a separate
+# kubernetes-client archive - but the framework's own volume/subpath test
+# helpers shell out to it by name (kubectl exec, to write and read files
+# inside a test pod) rather than using the Go client library, so it has to be
+# on PATH for those to work. Cached and version-matched the same way as
+# e2e.test/ginkgo, in the same directory.
+resolve_kubectl() {
+	local version="$1"
+	local os arch cache path url expected actual
+
+	case "$(uname -s)" in
+	Linux) os=linux ;;
+	Darwin) os=darwin ;;
+	*) echo "unsupported OS $(uname -s); use run-e2e.ps1 on Windows" >&2; exit 1 ;;
+	esac
+	case "$(uname -m)" in
+	x86_64 | amd64) arch=amd64 ;;
+	aarch64 | arm64) arch=arm64 ;;
+	*) echo "unsupported architecture $(uname -m)" >&2; exit 1 ;;
+	esac
+
+	cache="$here/.bin/$version"
+	path="$cache/kubectl"
+	if [[ -x "$path" ]]; then
+		echo "$cache"
+		return
+	fi
+
+	if [[ "$no_download" == true ]]; then
+		echo "No cached kubectl for $version under $cache, and --no-download was given." >&2
+		exit 1
+	fi
+
+	url="https://dl.k8s.io/release/$version/bin/$os/$arch/kubectl"
+	mkdir -p "$cache"
+
+	echo "Downloading $url" >&2
+	curl -fsSL "$url" -o "$path"
+	expected="$(curl -fsSL "$url.sha256" | tr -d '[:space:]')"
+
+	actual="$(sha256_of "$path")"
+	if [[ "$actual" != "$expected" ]]; then
+		rm -f "$path"
+		echo "SHA256 mismatch for kubectl $version" >&2
+		echo "  expected $expected" >&2
+		echo "  actual   $actual" >&2
+		exit 1
+	fi
+
+	chmod +x "$path"
+	echo "$cache"
+}
+
 # One regex per non-comment line. See skips.txt for the format and the rule that
 # every line carries its reason.
 read_patterns() {
@@ -165,6 +229,7 @@ read_patterns() {
 
 version="$(resolve_version)"
 bin_dir="$(resolve_test_binaries "$version")"
+kubectl_dir="$(resolve_kubectl "$version")"
 
 # Read back rather than duplicated, so the driver name lives in exactly one
 # place on this side of the fence. DriverInfo.Name is the only key at this
@@ -231,13 +296,15 @@ e2e_args+=("${extra_args[@]+"${extra_args[@]}"}")
 echo
 echo "profile    $profile"
 echo "driver     $driver_name"
-echo "e2e.test   $version ($bin_dir)"
+echo "e2e.test   $version ($bin_dir, kubectl from $kubectl_dir)"
 echo "artifacts  $artifacts_dir"
 echo "skipping   ${#skips[@]} pattern(s): $(printf '%s | ' "${skips[@]}")"
 echo
 
 set +e
-"$bin_dir/ginkgo" "${ginkgo_args[@]}" "$bin_dir/e2e.test" -- "${e2e_args[@]}"
+# e2e.test shells out to "kubectl" by name (not via absolute path) for the
+# subprocess exec calls resolve_kubectl fetched it for.
+PATH="$kubectl_dir:$PATH" "$bin_dir/ginkgo" "${ginkgo_args[@]}" "$bin_dir/e2e.test" -- "${e2e_args[@]}"
 exit_code=$?
 set -e
 

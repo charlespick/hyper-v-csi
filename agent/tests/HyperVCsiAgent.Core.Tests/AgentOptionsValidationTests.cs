@@ -48,7 +48,8 @@ public class AgentOptionsValidationTests
         // Otherwise Enum.Parse throws inside every TLS handshake instead, long
         // after the role has come up looking healthy.
         var options = NewOptions();
-        options.Tls.SubjectName = "agent.test";
+        options.Tls.HostName = "agent.test";
+        options.Tls.AllowedThumbprints = ["6831285AB162AC3C472B39EC196A0F06D67B2A52"];
         options.Tls.StoreLocation = storeLocation;
         options.Tls.StoreName = storeName;
 
@@ -62,6 +63,39 @@ public class AgentOptionsValidationTests
         // anywhere else.
         var options = NewOptions();
         options.Tls.StoreLocation = "nonsense";
+
+        options.Validate();
+    }
+
+    [Fact]
+    public void Validate_HostNameSetWithNoAllowedThumbprints_IsRejected()
+    {
+        // Unlike the old subject-match, nothing else identifies which store
+        // certificate the agent should serve.
+        var options = NewOptions();
+        options.Tls.HostName = "agent.test";
+
+        var failure = Assert.Throws<InvalidOperationException>(options.Validate);
+        Assert.Contains("AllowedThumbprints", failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_MalformedServerThumbprint_IsRejected()
+    {
+        var options = NewOptions();
+        options.Tls.HostName = "agent.test";
+        options.Tls.AllowedThumbprints = ["not a thumbprint"];
+
+        var failure = Assert.Throws<InvalidOperationException>(options.Validate);
+        Assert.Contains("hex characters", failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_HostNameAndWellFormedThumbprints_IsAccepted()
+    {
+        var options = NewOptions();
+        options.Tls.HostName = "agent.test";
+        options.Tls.AllowedThumbprints = ["6831285AB162AC3C472B39EC196A0F06D67B2A52"];
 
         options.Validate();
     }

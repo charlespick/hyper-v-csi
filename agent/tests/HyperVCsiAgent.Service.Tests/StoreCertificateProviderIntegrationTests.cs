@@ -45,7 +45,8 @@ public sealed class StoreCertificateProviderIntegrationTests : IAsyncLifetime
             CsvVolumesRoot = Path.GetTempPath(),
             Tls =
             {
-                SubjectName = "agent.store.test",
+                HostName = "agent.store.test",
+                AllowedThumbprints = [_certificate.Thumbprint],
                 StoreName = "My",
                 StoreLocation = "CurrentUser",
                 Port = 0,
@@ -116,8 +117,8 @@ public sealed class StoreCertificateProviderIntegrationTests : IAsyncLifetime
             DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(30));
 
         // Exportable so it can be Add()-ed to the store and actually persists
-        // a private key backing it - the same shape a certbot-issued
-        // certificate has once certbot imports it.
+        // a private key backing it - the same shape an operator installing a
+        // self-signed certificate by hand produces.
         return X509CertificateLoader.LoadPkcs12(
             certificate.Export(X509ContentType.Pkcs12), password: null, X509KeyStorageFlags.Exportable);
     }

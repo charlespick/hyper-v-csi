@@ -9,10 +9,10 @@ namespace HyperVCsiAgent.Core.Configuration;
 /// only if it proves possession of a private key whose certificate is listed
 /// below.
 ///
-/// Note this pins by fingerprint while <see cref="TlsOptions"/> deliberately
-/// does not: these certificates are minted by hand and rotate only when someone
-/// decides to, whereas the server's Let's Encrypt certificate rotates on its own
-/// every couple of months.
+/// <see cref="TlsOptions"/> pins the agent's own server certificate the same
+/// way, for the same reason: both certificates are minted by hand and rotate
+/// only when someone decides to, so a fingerprint pin is the whole of the
+/// verification on both sides.
 /// </summary>
 public sealed class AuthenticationOptions
 {

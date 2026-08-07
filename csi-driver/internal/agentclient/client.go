@@ -100,23 +100,34 @@ func New(baseURL string) *Client {
 }
 
 // NewMutualTLS builds the client the controller actually deploys with. The
-// certificate and key come from a mounted Kubernetes Secret; the agent pins
-// this certificate's fingerprint, so possession of the key is the whole of the
-// authentication.
+// client certificate and key come from a mounted Kubernetes Secret; the agent
+// pins this certificate's fingerprint, so possession of the key is the whole
+// of the authentication in that direction.
 //
-// The agent's own certificate is a normal publicly-trusted one (Let's Encrypt),
-// so the system roots verify it and there is nothing to configure for the
-// server side — and, importantly, no verification to disable.
-func NewMutualTLS(baseURL, certificateFile, keyFile string) (*Client, error) {
+// The agent's own certificate is self-signed too - there is no CA to run for
+// either side - so serverCertificateThumbprints pins it by fingerprint the
+// same way, rather than validating it against a trust chain that doesn't
+// exist. At least one is required.
+func NewMutualTLS(baseURL, certificateFile, keyFile string, serverCertificateThumbprints []string) (*Client, error) {
 	certificate, err := tls.LoadX509KeyPair(certificateFile, keyFile)
 	if err != nil {
 		return nil, fmt.Errorf("loading client certificate from %s and %s: %w", certificateFile, keyFile, err)
+	}
+
+	allowed, err := normalizeServerCertificateThumbprints(serverCertificateThumbprints)
+	if err != nil {
+		return nil, err
 	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.TLSClientConfig = &tls.Config{
 		Certificates: []tls.Certificate{certificate},
 		MinVersion:   tls.VersionTLS12,
+		// Skips Go's own chain validation, which would reject a self-signed
+		// certificate outright; VerifyPeerCertificate below is the entire
+		// verification in its place. See serverpin.go.
+		InsecureSkipVerify: true, //nolint:gosec // replaced by fingerprint pinning, not disabled outright
+		VerifyPeerCertificate: verifyServerCertificateThumbprint(allowed),
 	}
 
 	return &Client{

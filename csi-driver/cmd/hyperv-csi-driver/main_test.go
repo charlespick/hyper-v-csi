@@ -12,11 +12,12 @@ func TestBuildAgentClientCredentialRules(t *testing.T) {
 	certFile, keyFile := "testdata/tls.crt", "testdata/tls.key"
 
 	tests := []struct {
-		name          string
-		cert, key     string
-		allowInsecure bool
-		address       string
-		wantErr       string
+		name              string
+		cert, key         string
+		serverThumbprints []string
+		allowInsecure     bool
+		address           string
+		wantErr           string
 	}{
 		{
 			name:    "no credentials and no opt-out is refused",
@@ -45,6 +46,15 @@ func TestBuildAgentClientCredentialRules(t *testing.T) {
 			wantErr: "must be https://",
 		},
 		{
+			// The agent's server certificate is self-signed, so there is no
+			// chain to fall back to trusting.
+			name:    "a client certificate without a server thumbprint is refused",
+			address: "https://agent.example",
+			cert:    certFile,
+			key:     keyFile,
+			wantErr: "agent-server-cert-thumbprint is required",
+		},
+		{
 			name:          "opting out explicitly is allowed",
 			address:       "http://localhost:5012",
 			allowInsecure: true,
@@ -53,7 +63,7 @@ func TestBuildAgentClientCredentialRules(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := buildAgentClient(test.address, test.cert, test.key, test.allowInsecure)
+			_, err := buildAgentClient(test.address, test.cert, test.key, test.serverThumbprints, test.allowInsecure)
 
 			if test.wantErr == "" {
 				if err != nil {
@@ -73,7 +83,10 @@ func TestBuildAgentClientCredentialRules(t *testing.T) {
 }
 
 func TestBuildAgentClientAcceptsAValidKeyPair(t *testing.T) {
-	if _, err := buildAgentClient("https://agent.example", "testdata/tls.crt", "testdata/tls.key", false); err != nil {
+	serverThumbprint := "370DD6340D9E6FDE640FBAF4C32E2809EC315310"
+	if _, err := buildAgentClient(
+		"https://agent.example", "testdata/tls.crt", "testdata/tls.key", []string{serverThumbprint}, false,
+	); err != nil {
 		t.Fatalf("buildAgentClient: %v", err)
 	}
 }

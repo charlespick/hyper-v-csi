@@ -7,10 +7,11 @@ namespace HyperVCsiAgent.Service.Security;
 
 /// <summary>
 /// Serves the current certificate from the Windows certificate store, re-reading
-/// it periodically. certbot renews the Let's Encrypt certificate into the store
-/// roughly every two months; re-reading means that renewal is picked up on the
-/// next connection instead of requiring the clustered role to be restarted,
-/// which would be a deliberate outage on a fixed schedule.
+/// it periodically. An operator rotating the self-signed certificate installs
+/// the new one into the store and adds its thumbprint to
+/// <see cref="TlsOptions.AllowedThumbprints"/>; re-reading means that swap is
+/// picked up on the next connection instead of requiring the clustered role to
+/// be restarted.
 /// </summary>
 public sealed class StoreCertificateProvider : IServerCertificateProvider
 {
@@ -68,8 +69,8 @@ public sealed class StoreCertificateProvider : IServerCertificateProvider
                 if (_current is not null && !_current.Thumbprint.Equals(selected.Thumbprint, StringComparison.OrdinalIgnoreCase))
                 {
                     _logger.LogInformation(
-                        "certificate for {SubjectName} rotated to {Thumbprint}, valid until {NotAfter}",
-                        _options.SubjectName, selected.Thumbprint, selected.NotAfter);
+                        "certificate for {HostName} rotated to {Thumbprint}, valid until {NotAfter}",
+                        _options.HostName, selected.Thumbprint, selected.NotAfter);
                 }
 
                 // The outgoing certificate is deliberately not disposed: a
@@ -101,15 +102,16 @@ public sealed class StoreCertificateProvider : IServerCertificateProvider
         if (_current is not null && now <= _current.NotAfter)
         {
             _logger.LogError(
-                "no certificate matching {SubjectName} in {StoreLocation}/{StoreName}; continuing with the current one, which expires {NotAfter}",
-                _options.SubjectName, _options.StoreLocation, _options.StoreName, _current.NotAfter);
+                "no certificate matching an allowed thumbprint (Tls:AllowedThumbprints) in {StoreLocation}/{StoreName}; " +
+                "continuing with the current one, which expires {NotAfter}",
+                _options.StoreLocation, _options.StoreName, _current.NotAfter);
             return _current;
         }
 
         _current = null;
         throw new InvalidOperationException(
-            $"no valid certificate for {_options.SubjectName} with a private key in " +
-            $"{_options.StoreLocation}/{_options.StoreName}; has certbot renewed it?");
+            $"no valid certificate with an allowed thumbprint (Tls:AllowedThumbprints) and a private key in " +
+            $"{_options.StoreLocation}/{_options.StoreName}; was it installed and its thumbprint added to the config?");
     }
 
     private X509Certificate2? LoadFromStore(DateTimeOffset now)
@@ -120,7 +122,7 @@ public sealed class StoreCertificateProvider : IServerCertificateProvider
         store.Open(OpenFlags.ReadOnly);
 
         var candidates = store.Certificates.OfType<X509Certificate2>().ToList();
-        var selected = CertificateSelector.Select(candidates, _options.SubjectName, now);
+        var selected = CertificateSelector.Select(candidates, _options.AllowedThumbprints, now);
 
         // The selected certificate outlives the store handle, so hand back a
         // copy and release everything else. Cloning via the copy constructor

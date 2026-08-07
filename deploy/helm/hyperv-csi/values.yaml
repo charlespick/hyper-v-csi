@@ -32,19 +32,17 @@ agent:
   # Development.
   allowInsecure: false
 
-  # Testing escape hatch, distinct from allowInsecure: for an agent that *does*
-  # serve TLS but with a self-signed or private-CA server certificate rather
-  # than a publicly-trusted one, so the driver's normal system-root verification
-  # would otherwise reject it outright. PEM content, set here. Mounted into the
-  # controller and pointed at via SSL_CERT_FILE, which replaces the driver
-  # container's default trust store rather than extending it - acceptable only
-  # because the agent is the one HTTPS peer this container talks to. Leave empty
-  # against a publicly-trusted server certificate, which is every real
-  # deployment.
-  caCertificate: ""
+  # SHA-1 thumbprints of the agent's own server certificate, which is
+  # self-signed - there is no CA on either side of this connection, so the
+  # driver pins it by fingerprint the same way the agent pins the driver's
+  # client certificate, rather than validating a trust chain that doesn't
+  # exist. List two during a rotation: add the new certificate's thumbprint,
+  # roll the agent onto it, then remove the old one. Required whenever
+  # allowInsecure is false.
+  serverCertificateThumbprints: []
 
   # Testing escape hatch: the agent's HostFiltering only accepts a Host header
-  # matching Tls:SubjectName, so agent.address has to name that DNS name -
+  # matching Tls:HostName, so agent.address has to name that DNS name -
   # addressing the agent by bare IP gets "400 Bad Request - Invalid Hostname"
   # from Kestrel. A real deployment resolves that name through real DNS; this
   # is for pointing it at a host with none, via the pod's /etc/hosts. Standard

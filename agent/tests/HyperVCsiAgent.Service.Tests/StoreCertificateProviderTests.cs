@@ -9,9 +9,11 @@ namespace HyperVCsiAgent.Service.Tests;
 
 /// <summary>
 /// The caching and fallback rules decide whether the agent stays reachable
-/// across a Let's Encrypt renewal, which happens unattended every couple of
-/// months. Tested against an injected loader rather than a real certificate
-/// store so the behaviour is pinned somewhere other than production.
+/// across a manual certificate rotation, without the clustered role being
+/// restarted for it. Tested against an injected loader rather than a real
+/// certificate store so the behaviour is pinned somewhere other than
+/// production; none of this exercises CertificateSelector's own thumbprint
+/// matching, which CertificateSelectorTests covers directly.
 /// </summary>
 public sealed class StoreCertificateProviderTests
 {
@@ -34,8 +36,9 @@ public sealed class StoreCertificateProviderTests
     [Fact]
     public void Current_AfterTheReloadInterval_PicksUpARenewal()
     {
-        // The whole point: certbot replaces the certificate and the agent
-        // starts serving it without the clustered role being restarted.
+        // The whole point: an operator swaps the certificate in the store and
+        // the agent starts serving it without the clustered role being
+        // restarted.
         using var oldCertificate = SelfSigned(days: 1);
         using var renewed = SelfSigned(days: 90);
         var clock = new FakeClock();
@@ -104,7 +107,7 @@ public sealed class StoreCertificateProviderTests
         clock.Advance(TimeSpan.FromDays(6));
 
         var failure = Assert.Throws<InvalidOperationException>(() => provider.Current);
-        Assert.Contains("certbot", failure.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("AllowedThumbprints", failure.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -124,7 +127,7 @@ public sealed class StoreCertificateProviderTests
             Options.Create(new AgentOptions
             {
                 CsvVolumesRoot = Path.GetTempPath(),
-                Tls = { SubjectName = "agent.test", ReloadInterval = TimeSpan.FromHours(1) },
+                Tls = { HostName = "agent.test", ReloadInterval = TimeSpan.FromHours(1) },
             }),
             NullLogger<StoreCertificateProvider>.Instance,
             clock,

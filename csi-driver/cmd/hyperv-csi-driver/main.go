@@ -42,6 +42,10 @@ func main() {
 		allowInsecureAgent = flag.Bool("allow-insecure-agent", false,
 			"talk to the agent without TLS or a client certificate. Development only: the credentials are what stop anyone who can reach the agent from creating and deleting volumes")
 	)
+	var agentServerCertThumbprints stringSliceFlag
+	flag.Var(&agentServerCertThumbprints, "agent-server-cert-thumbprint",
+		"SHA-1 thumbprint of a certificate the agent's own (self-signed) server certificate is allowed to match. "+
+			"Repeatable; list two during a rotation. Required alongside --agent-client-cert")
 	flag.Parse()
 
 	// Fail fast on mode-specific required flags: an empty node ID otherwise
@@ -85,7 +89,7 @@ func main() {
 	var agent *agentclient.Client
 	if *agentAddress != "" {
 		var err error
-		agent, err = buildAgentClient(*agentAddress, *agentClientCert, *agentClientKey, *allowInsecureAgent)
+		agent, err = buildAgentClient(*agentAddress, *agentClientCert, *agentClientKey, agentServerCertThumbprints, *allowInsecureAgent)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -145,7 +149,7 @@ func main() {
 // silently. Losing mutual TLS isn't a degraded mode — it removes the only thing
 // standing between the agent's job API and anything that can route to it — so
 // dropping it has to be something an operator asked for in writing.
-func buildAgentClient(address, certificateFile, keyFile string, allowInsecure bool) (*agentclient.Client, error) {
+func buildAgentClient(address, certificateFile, keyFile string, serverCertThumbprints []string, allowInsecure bool) (*agentclient.Client, error) {
 	hasCertificate := certificateFile != "" || keyFile != ""
 
 	if hasCertificate && (certificateFile == "" || keyFile == "") {
@@ -167,7 +171,24 @@ func buildAgentClient(address, certificateFile, keyFile string, allowInsecure bo
 			"--agent-address %q must be https:// when a client certificate is configured; over plaintext the certificate proves nothing", address)
 	}
 
-	return agentclient.NewMutualTLS(address, certificateFile, keyFile)
+	if len(serverCertThumbprints) == 0 {
+		return nil, fmt.Errorf(
+			"--agent-server-cert-thumbprint is required alongside --agent-client-cert; the agent's server certificate is self-signed, so there is no other way to trust it")
+	}
+
+	return agentclient.NewMutualTLS(address, certificateFile, keyFile, serverCertThumbprints)
+}
+
+// stringSliceFlag implements flag.Value so --agent-server-cert-thumbprint can
+// be repeated, matching the shape of the agent's own AllowedClientCertificateThumbprints
+// config array.
+type stringSliceFlag []string
+
+func (s *stringSliceFlag) String() string { return strings.Join(*s, ",") }
+
+func (s *stringSliceFlag) Set(value string) error {
+	*s = append(*s, value)
+	return nil
 }
 
 func listen(endpoint string) (net.Listener, error) {
