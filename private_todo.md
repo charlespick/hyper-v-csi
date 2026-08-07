@@ -7,3 +7,4 @@
 * project name
 * squash and move to new repo
 * integration testing - there's a csi testing package apparently
+* pivot to full copy ("copy" on refs) for snapshots and implement snapshots
