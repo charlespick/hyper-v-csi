@@ -2,3 +2,8 @@
 * review all code for violations of the "fail closed" rule
 * review all code for possibilities to minimize wmi, winrm, cross-host, and such calls
 * review all code for possibilities to reduce "fan out" behavior - enumerating VMs, cluster nodes, Disks, anything in kubernetes
+* review for correctness and remove sketch-design.md
+* same for timeout cancelation status.md
+* project name
+* squash and move to new repo
+* integration testing - there's a csi testing package apparently
