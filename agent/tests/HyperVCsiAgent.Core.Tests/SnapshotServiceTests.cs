@@ -1088,6 +1088,101 @@ public sealed class SnapshotServiceTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task DeleteAsync_WhileTheCopyIsStillQueuedBehindAnotherOfTheSameVolume_KeepsItFromEverPublishing()
+    {
+        // The leak: CreateSnapshot for snapshot-b enqueues its copy on
+        // volume:pvc-1 - the InMemoryJobStore target every copy of this
+        // volume shares - where it queues behind snapshot-a's copy, already
+        // running. DeleteSnapshot for snapshot-b runs immediately, since its
+        // own target (snapshot:pvc-1~snapshot-b) is free, and finds neither
+        // snapshotPath nor copyingPath written yet, because the queued copy
+        // has not started. Without the tombstone this pins, both deletes are
+        // no-ops, the call reports success, and once snapshot-a's copy
+        // finishes and snapshot-b's own turn comes, it copies the entire
+        // disk and publishes anyway - a full-size VHDX with nothing left in
+        // Kubernetes referencing it.
+        //
+        // Verified to fail against the pre-fix code: with DeleteAsync's
+        // tombstone write and RunCopyAsync's tombstone check both reverted,
+        // this test's final two assertions fail - snapshot-b publishes and
+        // its copier destination is recorded, exactly the leak described
+        // above.
+        var harness = NewHarness();
+        WriteVolume("pvc-1", 4096);
+        using var release = new SemaphoreSlim(0);
+        harness.Copier.DuringCopy = _ => release.WaitAsync();
+
+        await harness.Service.CreateAsync("pvc-1", "snapshot-a", null, CancellationToken.None);
+        await WaitForAsync(() => harness.Copier.Destinations.Count == 1);
+
+        await harness.Service.CreateAsync("pvc-1", "snapshot-b", null, CancellationToken.None);
+        await WaitForAsync(() => harness.Store.Created.Count == 2);
+        // Confirms snapshot-b's copy really is still queued, not running,
+        // at the moment the delete below fires - the shape the leak needs.
+        Assert.Single(harness.Copier.Destinations);
+
+        await harness.Service.DeleteAsync("pvc-1~snapshot-b", CancellationToken.None);
+
+        // Lets snapshot-a's copy finish, which lets snapshot-b's queued copy
+        // finally get its turn.
+        release.Release(2);
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-a")));
+        await WaitForAsync(() => harness.Store.Created[1].Status is JobStatus.Succeeded or JobStatus.Failed);
+
+        Assert.False(File.Exists(SnapshotPath("pvc-1~snapshot-b")));
+        Assert.False(File.Exists(MarkerPath("pvc-1~snapshot-b")));
+        // The queued copy never even started reading the disk once it
+        // found the tombstone.
+        Assert.Single(harness.Copier.Destinations);
+    }
+
+    [Fact]
+    public async Task CreateAsync_ClearsALeftoverTombstoneAndPublishesNormally()
+    {
+        // A tombstone left by an earlier delete of this identical (source
+        // volume, name) pair must not poison the name for good: CSI's own
+        // idempotency key for CreateSnapshot is the name, and a user may
+        // delete a VolumeSnapshot and create a new one under it - which
+        // composes the identical snapshot id, since ComposeId is a pure
+        // function of the two. Written directly here rather than produced
+        // by driving the race in DeleteAsync_WhileTheCopyIsStillQueued...
+        // above: that test already pins how the file gets left behind, this
+        // one isolates what CreateAsync does about one that already exists.
+        var harness = NewHarness();
+        WriteVolume("pvc-1", 4096);
+        Directory.CreateDirectory(_snapshotsRoot);
+        var tombstonePath = SnapshotNaming.TombstonePathFor(SnapshotPath("pvc-1~snapshot-abc"));
+        await File.WriteAllTextAsync(tombstonePath, string.Empty);
+
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
+
+        Assert.Equal("pvc-1~snapshot-abc", result.SnapshotId);
+        Assert.False(File.Exists(tombstonePath));
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+    }
+
+    [Fact]
+    public async Task CreateAsync_ATombstoneDoesNotCountAsTheNameBeingInUse()
+    {
+        // EnsureNameIsFree's precondition refuses a name already taken by a
+        // different volume's snapshot. A tombstone naming that same snapshot
+        // id must not trip that refusal for an unrelated volume that simply
+        // wants the same name: EnumerateSnapshotFiles globs strictly on
+        // VolumeNaming.VhdxExtension, which a tombstone deliberately does not
+        // end in, so it is invisible to this check rather than needing a
+        // case carved out of it.
+        var harness = NewHarness();
+        WriteVolume("pvc-2", 4096);
+        Directory.CreateDirectory(_snapshotsRoot);
+        await File.WriteAllTextAsync(SnapshotNaming.TombstonePathFor(SnapshotPath("pvc-1~shared-name")), string.Empty);
+
+        var result = await harness.Service.CreateAsync("pvc-2", "shared-name", null, CancellationToken.None);
+
+        Assert.Equal("pvc-2~shared-name", result.SnapshotId);
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-2~shared-name")));
+    }
+
     // ------------------------------------------------------------------ list
 
     [Fact]
@@ -1113,6 +1208,23 @@ public sealed class SnapshotServiceTests : IDisposable
         WriteSnapshot("pvc-1~a", 4096);
         WriteMarker("pvc-1~b");
         WriteMarker("pvc-2~c");
+
+        var result = await harness.Service.ListAsync(null, null, null, 0, CancellationToken.None);
+
+        Assert.Equal(["pvc-1~a"], result.Entries.Select(entry => entry.SnapshotId));
+    }
+
+    [Fact]
+    public async Task ListAsync_ExcludesATombstone()
+    {
+        // A tombstone is strictly agent-internal bookkeeping, the same
+        // reading this file already gives an in-progress copy: it names a
+        // snapshot that no longer exists, and showing it would be worse than
+        // showing a copy in flight, not better.
+        var harness = NewHarness();
+        WriteSnapshot("pvc-1~a", 4096);
+        Directory.CreateDirectory(_snapshotsRoot);
+        await File.WriteAllTextAsync(SnapshotNaming.TombstonePathFor(SnapshotPath("pvc-1~ghost")), string.Empty);
 
         var result = await harness.Service.ListAsync(null, null, null, 0, CancellationToken.None);
 

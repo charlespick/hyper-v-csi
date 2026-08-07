@@ -52,6 +52,32 @@ public static class SnapshotNaming
     public const string InProgressSuffix = InProgressMarker + VolumeNaming.VhdxExtension;
 
     /// <summary>
+    /// Marks a snapshot ID that DeleteSnapshot could not fully reclaim with a
+    /// plain file delete, because - at the moment the delete ran - this exact
+    /// ID's copy job existed but had not yet reached either
+    /// <see cref="ResolvePath"/> or <see cref="InProgressPathFor"/>: it was
+    /// still queued on its source volume's own job target, behind another
+    /// copy of that same volume, and had not started. Neither of those two
+    /// deletes is a no-op through neglect in that state; there is nothing yet
+    /// for either to find. The copy running instead of merely queued is a
+    /// different case DeleteSnapshot already handles without this file - see
+    /// <see cref="SnapshotService"/>'s own remarks on <c>DeleteAsync</c> for
+    /// the full shape of both.
+    ///
+    /// Deliberately not the <see cref="VolumeNaming.VhdxExtension"/> every
+    /// other file in this directory ends in. That is what makes a tombstone
+    /// safe to add here without touching <see cref="ParseFileName"/> at all:
+    /// it checks that suffix first and returns null immediately for anything
+    /// that does not end in it, and <see cref="SnapshotService"/>'s own
+    /// <c>EnumerateSnapshotFiles</c> globs strictly on
+    /// <see cref="VolumeNaming.VhdxExtension"/> too - so a tombstone is
+    /// already invisible to every caller built on either of those (a listing,
+    /// or the name-is-free check) rather than needing a case carved out of
+    /// them.
+    /// </summary>
+    public const string TombstoneSuffix = ".deleted";
+
+    /// <summary>
     /// Builds the snapshot ID for a (source volume, snapshot name) pair.
     /// </summary>
     /// <remarks>
@@ -155,6 +181,18 @@ public static class SnapshotNaming
     /// </summary>
     public static string InProgressPathFor(string publishedPath) =>
         publishedPath[..^VolumeNaming.VhdxExtension.Length] + InProgressSuffix;
+
+    /// <summary>
+    /// The path a snapshot ID's tombstone occupies, if it has one. Kept next
+    /// to <see cref="InProgressPathFor"/> for the same reason that one is:
+    /// DeleteSnapshot writes it, the copy job checks for it and clears it on
+    /// abandoning, and a fresh CreateSnapshot for the identical ID clears it
+    /// too - three callers that disagreeing on the path would either leave a
+    /// leaked copy publishing anyway or poison a name a legitimate re-create
+    /// can never use again.
+    /// </summary>
+    public static string TombstonePathFor(string publishedPath) =>
+        publishedPath[..^VolumeNaming.VhdxExtension.Length] + TombstoneSuffix;
 
     /// <summary>
     /// Classifies one file name in the snapshots directory, or returns null if

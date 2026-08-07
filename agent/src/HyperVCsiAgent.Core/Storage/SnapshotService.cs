@@ -184,6 +184,7 @@ public sealed class SnapshotService : ISnapshotService
         var snapshotId = SnapshotNaming.ComposeId(sourceVolumeId, snapshotName);
         var snapshotPath = SnapshotNaming.ResolvePath(_options.CsvSnapshotsRoot, snapshotId);
         var copyingPath = SnapshotNaming.InProgressPathFor(snapshotPath);
+        var tombstonePath = SnapshotNaming.TombstonePathFor(snapshotPath);
         var sourcePath = VolumeNaming.ResolvePath(_options.CsvVolumesRoot, sourceVolumeId);
 
         // The fast job's own budget, not the copy's: nothing below waits for a
@@ -196,6 +197,22 @@ public sealed class SnapshotService : ISnapshotService
 
         try
         {
+            // Cleared unconditionally, on every call, not just a call that
+            // turns out to need it: CSI's idempotency key for CreateSnapshot
+            // is the *name*, and ComposeId is a pure function of (source
+            // volume, name) - so a user who deletes a VolumeSnapshot and
+            // creates a new one under the same name gets back the identical
+            // snapshotId and the identical paths computed above. A tombstone
+            // DeleteAsync left for the old one must not poison the name for
+            // the new one, which is what leaving this conditional on some
+            // crash-matrix row below would risk. See
+            // SnapshotNaming.TombstonePathFor and DeleteAsync's own remarks
+            // for why one might be here at all, and RunCopyAsync's own check
+            // for the other half of clearing it - the case where the copy
+            // this exact call is about to start (or resume) reaches it
+            // first.
+            TryDeleteMarker(snapshotId, tombstonePath);
+
             // Crash-matrix rows 5 and 6: the snapshot is already published, so
             // it is finished and - being a full copy rather than a differencing
             // child - completely independent of its source from here on. A
@@ -325,6 +342,7 @@ public sealed class SnapshotService : ISnapshotService
 
         var snapshotPath = SnapshotNaming.ResolvePath(_options.CsvSnapshotsRoot, snapshotId);
         var copyingPath = SnapshotNaming.InProgressPathFor(snapshotPath);
+        var tombstonePath = SnapshotNaming.TombstonePathFor(snapshotPath);
 
         using var attempt = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         attempt.CancelAfter(_options.DiskOperationTimeout);
@@ -334,11 +352,50 @@ public sealed class SnapshotService : ISnapshotService
         // between its last write and its rename left it, and only a later
         // snapshot under the identical name would otherwise collect it, which
         // for one being reclaimed never comes.
+        //
+        // Neither delete can reach the one case that actually leaks: a copy
+        // CreateAsync already enqueued for this exact id on its source
+        // volume's own job target, still queued - not running, which holds
+        // copyingPath open and trips DeleteFile's own sharing-violation
+        // FailedPrecondition below before any of this is reached - behind
+        // another copy of that same volume, with neither snapshotPath nor
+        // copyingPath written yet for either delete to find. Both deletes are
+        // no-ops, this call reports success, and nothing is left to stop that
+        // copy publishing in full once its turn comes.
+        //
+        // A tombstone closes that gap. It is written below whenever
+        // snapshotPath was not already published at the moment this call
+        // reclaimed it - which is also exactly what an ordinary idempotent
+        // replay of a delete that already succeeded looks like from here, so
+        // it is written on that replay too. That is deliberate, not an
+        // oversight: TombstonePathFor is a pure function of snapshotId, so a
+        // burst of replays for the one id touches the one file each time
+        // rather than accumulating a new one per call, and RunCopyAsync
+        // clears it the moment a copy actually reaches it, while CreateAsync
+        // clears it the moment this exact id is asked for again - see each of
+        // their own remarks. What is never written is a tombstone for a
+        // snapshot this agent could not possibly have a copy queued for in
+        // the first place: CreateAsync always creates CsvSnapshotsRoot before
+        // it ever enqueues a copy, so a missing root proves no copy of
+        // anything can be queued, and there is nothing here worth a file for.
         var work = Task.Run(
             () =>
             {
+                // Captured on this same pool thread, immediately before
+                // either delete runs - not on the caller's thread above,
+                // which must not touch the CSV at all, and not after the
+                // deletes below, which is exactly the question a tombstone
+                // needs answered: whether this call is the one that actually
+                // reclaimed the file, or found it already gone.
+                var wasPublished = File.Exists(snapshotPath);
+
                 DeleteFile(snapshotPath, snapshotId);
                 DeleteFile(copyingPath, snapshotId);
+
+                if (!wasPublished && Directory.Exists(_options.CsvSnapshotsRoot))
+                {
+                    WriteTombstone(snapshotId, tombstonePath);
+                }
             },
             CancellationToken.None);
 
@@ -555,6 +612,54 @@ public sealed class SnapshotService : ISnapshotService
                 {
                     await DestroyOwnedCheckpointIfAnyAsync(snapshotId, stale.Vm, stale.ElementName, attempt.Token).ConfigureAwait(false);
                 }
+
+                return;
+            }
+
+            // A DeleteSnapshot may have run while this job sat in the queue
+            // behind another copy of the same volume, finding neither
+            // snapshotPath nor copyingPath written yet - the one case a
+            // plain file delete cannot reach, since there is nothing there
+            // yet for it to find. See SnapshotNaming.TombstonePathFor and
+            // DeleteAsync's own remarks for the full race this closes.
+            //
+            // Checked before the abandoned-marker branch below rather than
+            // folded into it: a tombstone means abandon regardless of
+            // whether copyingPath happens to exist too (it should not, since
+            // this delegate reaching this line at all means no earlier
+            // attempt at this exact copy ever got far enough to write one,
+            // per that branch's own reasoning) - a real find is defensive,
+            // not the expected shape of this case.
+            var tombstonePath = SnapshotNaming.TombstonePathFor(snapshotPath);
+            if (File.Exists(tombstonePath))
+            {
+                _logger.LogInformation(
+                    "CopySnapshot {SnapshotId}: deleted while its copy was still queued; abandoning without publishing",
+                    snapshotId);
+
+                // The checkpoint still needs freeing even though nothing
+                // will ever restore from what this copy would have
+                // produced: CreateAsync took it in good faith, and once this
+                // delegate returns, nothing else will ever revisit it - the
+                // same reasoning that makes the ordinary post-copy call below
+                // unconditional, not skippable just because there is nothing
+                // left to publish.
+                if (checkpoint is { } abandoned)
+                {
+                    await DestroyOwnedCheckpointIfAnyAsync(snapshotId, abandoned.Vm, abandoned.ElementName, attempt.Token).ConfigureAwait(false);
+                }
+
+                // The tombstone's own job is done: a fresh CreateSnapshot for
+                // this identical id also clears it (see CreateAsync's own
+                // remarks), but there is no reason to leave it standing until
+                // one arrives, if one ever does.
+                TryDeleteMarker(snapshotId, tombstonePath);
+
+                // Should not exist - reaching this line at all means no
+                // earlier attempt at this exact copy got far enough to write
+                // one - but a defensive check costs one File.Exists rather
+                // than assuming a shape that turned out to be wrong.
+                TryDeleteMarker(snapshotId, copyingPath);
 
                 return;
             }
@@ -1365,20 +1470,57 @@ public sealed class SnapshotService : ISnapshotService
         }
     }
 
-    private void TryDeleteMarker(string snapshotId, string copyingPath)
+    /// <summary>
+    /// Deletes one leftover file if it is there, logging rather than throwing
+    /// on a failure. Shared by every best-effort cleanup this file does -
+    /// discarding a stale copying marker and clearing a tombstone alike -
+    /// because none of them is worth failing the caller's own outcome over:
+    /// whatever left the file behind, or whatever will need it gone next, is
+    /// unaffected by this attempt not landing.
+    /// </summary>
+    private void TryDeleteMarker(string snapshotId, string path)
     {
-        // Best-effort: the next attempt discards any leftover anyway, this just
-        // avoids leaving a partial file behind for a snapshot nobody retries.
         try
         {
-            if (File.Exists(copyingPath))
+            if (File.Exists(path))
             {
-                File.Delete(copyingPath);
+                File.Delete(path);
             }
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "snapshot {SnapshotId}: failed to clean up {Path}", snapshotId, copyingPath);
+            _logger.LogWarning(ex, "snapshot {SnapshotId}: failed to clean up {Path}", snapshotId, path);
+        }
+    }
+
+    /// <summary>
+    /// Leaves this exact snapshot id's tombstone - see
+    /// <see cref="SnapshotNaming.TombstonePathFor"/> for what it is guarding
+    /// against and what makes its name safe in this directory. Best-effort in
+    /// the same sense <see cref="TryDeleteMarker"/> is, and deliberately not
+    /// escalated to a failure of the delete it runs inside: the real files
+    /// are already gone by the time this is called, so DeleteSnapshot has
+    /// already done what it was asked, and the cost of losing this write is
+    /// the very leak it exists to close reappearing - not a violation of
+    /// DeleteSnapshot's own contract.
+    /// </summary>
+    private void WriteTombstone(string snapshotId, string tombstonePath)
+    {
+        try
+        {
+            // No content to write, only presence to leave: nothing ever reads
+            // this file back, and File.Create truncates a stale tombstone
+            // from an earlier delete of this identical id to zero bytes just
+            // as well as it creates a fresh one - which is exactly the
+            // "reuse the one file" idempotency DeleteAsync's own remarks
+            // above rely on.
+            using var _ = File.Create(tombstonePath);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "DeleteSnapshot {SnapshotId}: failed to leave a tombstone at {Path}; a copy already queued for " +
+                "this snapshot, if any, may still publish despite the delete", snapshotId, tombstonePath);
         }
     }
 }
