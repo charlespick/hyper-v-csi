@@ -349,10 +349,10 @@ const (
 // owning host via cluster APIs, then attaching through that host.
 // Idempotency key: volume ID + node ID.
 //
-// The node ID is opaque here and stays that way. The agent alone interprets it
-// — today by matching it against a cluster resource name — so replacing that
-// with a guest-reported VM identity later is a change to the agent and to what
-// the node plugin reports, and to nothing in this file.
+// The node ID is opaque here and stays that way. It is the guest's own Hyper-V
+// VM ID, read from the key-value pools by the node plugin and reported by
+// NodeGetInfo; the agent alone interprets it, by matching that GUID against the
+// cluster database. Nothing in this file depends on what the value is.
 //
 // The CSIDriver object sets attachRequired: true and external-attacher is
 // deployed, so Kubernetes creates a VolumeAttachment and calls this before a

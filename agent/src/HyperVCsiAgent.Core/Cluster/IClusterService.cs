@@ -17,12 +17,16 @@ public interface IClusterService
     /// </summary>
     /// <remarks>
     /// This is the only place a node ID is interpreted. Everything downstream
-    /// uses the <see cref="ClusteredVm"/> this returns, so a node ID that is
-    /// something other than a name - a guest-reported BIOSGUID, say - would
-    /// change this method and what the node plugin reports, and nothing else.
-    /// Matching is exact: a near-miss must resolve to nothing rather than to a
-    /// neighbouring VM, because the consequence of the latter is attaching a
-    /// disk to the wrong machine.
+    /// uses the <see cref="ClusteredVm"/> this returns, so what a node ID is -
+    /// the VM's GUID, read out of the guest's key-value pools by the node
+    /// plugin - is known to this method and to nothing else.
+    ///
+    /// Nothing about it is a name, deliberately: an implementation must match
+    /// on that GUID rather than on a Kubernetes node name, a cluster group
+    /// name, or a VM display name, none of which are guaranteed to agree with
+    /// each other. Matching is also exact - a near-miss must resolve to nothing
+    /// rather than to a neighbouring VM, because the consequence of the latter
+    /// is attaching a disk to the wrong machine.
     /// </remarks>
     Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken);
 

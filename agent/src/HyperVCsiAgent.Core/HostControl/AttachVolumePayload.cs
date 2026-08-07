@@ -12,9 +12,9 @@ public sealed class AttachVolumePayload
     public string? VolumeId { get; init; }
 
     /// <summary>
-    /// The CSI node ID, opaque above <see cref="Cluster.IClusterService"/>.
-    /// Today that resolves it as a Kubernetes node name matching a cluster
-    /// resource name; nothing here depends on that being what it is.
+    /// The CSI node ID, opaque above <see cref="Cluster.IClusterService"/>,
+    /// which resolves it as the guest-reported Hyper-V VM GUID. Nothing here
+    /// depends on that being what it is.
     /// </summary>
     public string? NodeId { get; init; }
 }

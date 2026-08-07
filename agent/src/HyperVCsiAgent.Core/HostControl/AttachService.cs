@@ -209,11 +209,11 @@ public sealed class AttachService : IAttachService, IDisposable
 
         if (vm is null)
         {
-            // The node ID names no VM this cluster knows about. Terminal for the
-            // same reason a missing VHDX is: retrying cannot conjure the VM, and
-            // the likeliest cause is a node whose cluster group is named
-            // something other than the node - a configuration mistake an
-            // operator has to fix, not a fault that clears on its own.
+            // The node ID identifies no VM this cluster knows about. Terminal
+            // for the same reason a missing VHDX is: retrying cannot conjure the
+            // VM, and the likeliest cause is a VM that is not clustered, or is
+            // clustered elsewhere - something an operator has to fix, not a
+            // fault that clears on its own.
             throw JobFailureException.NotFound(
                 $"node {nodeId} does not name a clustered virtual machine in this failover cluster");
         }
