@@ -894,12 +894,14 @@ public sealed class SnapshotService : ISnapshotService
 
     /// <summary>
     /// Starts merging this snapshot's checkpoint back into its base, holding
-    /// the VM's mutual-exclusion slot for the call. Never throws for a
-    /// cancellation encountered while waiting for that slot: a failure here
-    /// is the checkpoint's problem, not the snapshot's - the copy already
-    /// published successfully by the time this runs, so nothing polls this job
-    /// for the outcome and the only place a failure can usefully go is the log,
-    /// the same posture <see cref="RunCopyAsync"/>'s own catch blocks take for
+    /// the VM's mutual-exclusion slot for the call. Never throws, for either
+    /// step it takes: not for a cancellation encountered while waiting for
+    /// that slot, and not for a cancellation - or any other failure -
+    /// encountered starting the merge itself. A failure here is the
+    /// checkpoint's problem, not the snapshot's - the copy already published
+    /// successfully by the time this runs, so nothing polls this job for the
+    /// outcome and the only place a failure can usefully go is the log, the
+    /// same posture <see cref="RunCopyAsync"/>'s own catch blocks take for
     /// everything else nothing external observes.
     /// </summary>
     /// <remarks>
@@ -909,9 +911,27 @@ public sealed class SnapshotService : ISnapshotService
     /// from here to tell a copy that ran out of its budget apart from the
     /// agent shutting down. Both lead to the same right action: the
     /// checkpoint is standing, nothing here will retry its merge, and an
-    /// operator needs to be told which one and where - so any cancellation
-    /// observed while waiting for the slot is reported as an orphan rather
-    /// than left to propagate.
+    /// operator needs to be told which one and where - so any cancellation,
+    /// whether waiting for the slot or waiting for
+    /// <see cref="IHyperVHostClient.DestroyCheckpointAsync"/> itself to
+    /// return, is reported as an orphan rather than left to propagate: if
+    /// either escaped, it would land in <c>RunCopyAsync</c>'s own
+    /// <see cref="OperationCanceledException"/> handler, which deletes the
+    /// marker and fails the job - discarding a copy that had already
+    /// finished reading, over a checkpoint problem that does not change once
+    /// the copy is retried.
+    /// <para>
+    /// The two cancellations are worded differently in the log, though,
+    /// because they are not the same fact. A cancellation on the slot wait
+    /// means the merge genuinely never started - <see cref="SemaphoreSlim.WaitAsync(CancellationToken)"/>
+    /// only ever reaches this VM's own checkpoint operation, not the merge
+    /// itself. <c>DestroyCheckpointAsync</c>'s own doc says it returns once
+    /// the merge has *started*, not once it has finished, so a cancellation
+    /// observed while awaiting that specific call does not reliably mean the
+    /// merge never began: vmms may already have started it, independently of
+    /// this process, before the token fired. The log line for that case says
+    /// only what is actually known.
+    /// </para>
     /// </remarks>
     private async Task DestroyOwnedCheckpointAsync(
         string snapshotId, ClusteredVm vm, Checkpoint checkpoint, CancellationToken cancellationToken)
@@ -939,7 +959,22 @@ public sealed class SnapshotService : ISnapshotService
         {
             await _host.DestroyCheckpointAsync(vm.OwningHost, checkpoint, cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (OperationCanceledException)
+        {
+            // Unlike the slot wait above, this cannot be read as "the merge
+            // never started": DestroyCheckpointAsync is fire-and-forget and
+            // returns once the merge has *started*, not once it has
+            // finished, so the token firing while this call was still being
+            // awaited does not rule out vmms having already begun the merge
+            // moments before. Reported as an orphan regardless - the
+            // checkpoint is standing either way, and nothing here will
+            // revisit it - but worded so it does not assert more than is
+            // known.
+            LogOrphanedCheckpoint(
+                snapshotId, checkpoint.ElementName, vm,
+                "was cancelled while starting its merge (whether the merge itself had already begun is not known)");
+        }
+        catch (Exception ex)
         {
             LogOrphanedCheckpoint(snapshotId, checkpoint.ElementName, vm, "starting its merge failed", ex);
         }

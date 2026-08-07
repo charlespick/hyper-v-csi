@@ -797,6 +797,31 @@ public sealed class SnapshotServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateAsync_WhenStartingTheMergeItselfIsCancelled_StillPublishesAndOrphansTheCheckpoint()
+    {
+        // Pins the fix to DestroyOwnedCheckpointAsync's destroy-call catch.
+        // It used to let an OperationCanceledException from
+        // _host.DestroyCheckpointAsync itself propagate - the filter there
+        // deliberately excluded it by type - which reaches RunCopyAsync's
+        // own generic catch, deletes the marker and fails the job: a copy
+        // that had already finished reading discarded over a checkpoint
+        // problem, with no LogOrphanedCheckpoint line naming it.
+        var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient { CancelNextDestroy = true };
+        var harness = NewHarness(cluster: cluster, host: host);
+        WriteVolume("pvc-1", 4096);
+
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", "node-a", CancellationToken.None);
+        Assert.Equal("pvc-1~snapshot-abc", result.SnapshotId);
+
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+
+        // The checkpoint stands - the cancelled call never removed it, and
+        // nothing retried it - while the copy published regardless.
+        Assert.Empty(host.DestroyedCheckpointElementNames);
+    }
+
+    [Fact]
     public async Task CreateAsync_NodeHintResolvesToNoClusteredVm_FallsBackToALocalRead()
     {
         // Go believed the volume was attached to a node the cluster cannot
@@ -1689,6 +1714,9 @@ public sealed class SnapshotServiceTests : IDisposable
 
         public bool FailNextDestroy { get; set; }
 
+        /// <summary>Makes DestroyCheckpointAsync throw OperationCanceledException once, as a cancellation observed while awaiting that call - rather than a plain failure - does.</summary>
+        public bool CancelNextDestroy { get; set; }
+
         /// <summary>Makes FindOwnedCheckpointAsync throw once, as a CIM call that could not answer does.</summary>
         public bool FailNextFind { get; set; }
 
@@ -1777,6 +1805,13 @@ public sealed class SnapshotServiceTests : IDisposable
         public Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken)
         {
             DuringDestroy?.Invoke(checkpoint);
+
+            if (CancelNextDestroy)
+            {
+                CancelNextDestroy = false;
+                throw new OperationCanceledException(
+                    "cancelled while awaiting DestroySnapshot, which may or may not have started the merge", cancellationToken);
+            }
 
             if (FailNextDestroy)
             {
