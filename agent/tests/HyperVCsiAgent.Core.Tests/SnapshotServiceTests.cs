@@ -532,6 +532,30 @@ public sealed class SnapshotServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateAsync_AttachedVolumeWithNoRoomForTheCopy_FailsWithoutStrandingACheckpoint()
+    {
+        // The bug this pins: taking the checkpoint before every precondition
+        // that can still refuse the snapshot has passed would strand it - no
+        // copy job gets started, and nothing but RunCopyAsync's own merge
+        // ever destroys one. A stranded checkpoint is VM-wide, so it would
+        // take every other disk on the VM down with it until an operator
+        // deleted it by hand. CreateCheckpointAsync must therefore never be
+        // called when ResourceExhausted is what ends up refusing this.
+        var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient { AllocatedBytesOnHost = 4096 };
+        var harness = NewHarness(cluster: cluster, host: host);
+        WriteVolume("pvc-1", 4096);
+        harness.Copier.FreeBytes = 1;
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", "node-a", CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.ResourceExhausted, failure.ErrorCode);
+        Assert.Empty(host.CreatedCheckpointElementNames);
+        Assert.Empty(harness.Copier.Destinations);
+    }
+
+    [Fact]
     public async Task CreateAsync_NodeHintResolvesToNoClusteredVm_FallsBackToALocalRead()
     {
         // Go believed the volume was attached to a node the cluster cannot

@@ -226,12 +226,26 @@ public sealed class SnapshotService : ISnapshotService
                     _options.DiskOperationTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
             }
 
-            // Preconditions, in order, each with its own message. Re-run on
-            // every call rather than only on the first: the per-volume job queue
-            // does not span an agent restart, so a copy resumed after one cannot
-            // assume the volume is still in the state the original call found it
-            // in. A volume attached between an abandoned copy and its restart is
-            // the case that makes this matter.
+            // Preconditions, in order, each with its own message - except the
+            // checkpoint that freezes an attached source's base, which is
+            // deliberately the *last* one satisfied rather than the first.
+            // InspectSourceAsync below only classifies and measures the
+            // source; it does not take one. Every precondition after it -
+            // the target/space check and the name check - can still refuse
+            // the snapshot, and nothing on this path ever merges a checkpoint
+            // back except the copy job EnsureCheckpointedCopyUnderway starts.
+            // A checkpoint taken here and then abandoned to one of those
+            // refusals would sit there un-mergeable, and being VM-wide, would
+            // take every other disk on the VM down with it - see this file's
+            // own remarks on RunCopyAsync for why that outcome is not merely
+            // untidy. So the checkpoint itself waits until right before that
+            // call, once nothing left can throw.
+            //
+            // Re-run on every call rather than only on the first: the per-volume
+            // job queue does not span an agent restart, so a copy resumed after
+            // one cannot assume the volume is still in the state the original
+            // call found it in. A volume attached between an abandoned copy and
+            // its restart is the case that makes this matter.
             var source = await InspectSourceAsync(
                 snapshotId, sourceVolumeId, snapshotName, sourcePath, nodeId, attempt).ConfigureAwait(false);
 
@@ -252,7 +266,19 @@ public sealed class SnapshotService : ISnapshotService
 
             EnsureNameIsFree(snapshotId, sourceVolumeId, snapshotName);
 
-            if (source.Checkpoint is { } checkpoint)
+            if (source.CheckpointPending)
+            {
+                // Nothing left can refuse this snapshot, so this is the one
+                // place in this method it is safe to take the checkpoint:
+                // EnsureCheckpointedCopyUnderway, right below, is what
+                // guarantees a copy job exists to merge it back.
+                var checkpoint = await CreateOwnedCheckpointAsync(
+                    source.Vm!, CheckpointElementName(sourceVolumeId, snapshotName), sourceVolumeId, snapshotName, attempt)
+                    .ConfigureAwait(false);
+                EnsureCheckpointedCopyUnderway(
+                    snapshotId, sourceVolumeId, sourcePath, snapshotPath, copyingPath, source.Vm!, checkpoint);
+            }
+            else if (source.Checkpoint is { } checkpoint)
             {
                 EnsureCheckpointedCopyUnderway(
                     snapshotId, sourceVolumeId, sourcePath, snapshotPath, copyingPath, source.Vm!, checkpoint);
@@ -610,14 +636,21 @@ public sealed class SnapshotService : ISnapshotService
     }
 
     /// <summary>
-    /// What preconditions 1-3 found: how much room the copy needs, and - for an
-    /// attached source - the VM and checkpoint it is now safe to read the base
-    /// through.
+    /// What preconditions 1-3 found: how much room the copy needs and, for an
+    /// attached source, the VM it is on. <see cref="Checkpoint"/> is set only
+    /// when there already is one to reuse - the BehindOwnedCheckpoint resume
+    /// case. <see cref="CheckpointPending"/> marks the Direct case instead,
+    /// where a checkpoint is still owed but deliberately not taken here - see
+    /// <see cref="CreateAsync"/> for why that has to wait.
     /// </summary>
-    private sealed record SourceInspection(long AllocatedBytes, ClusteredVm? Vm, Checkpoint? Checkpoint);
+    private sealed record SourceInspection(long AllocatedBytes, ClusteredVm? Vm, Checkpoint? Checkpoint, bool CheckpointPending);
 
     /// <summary>
-    /// Preconditions 1 and 2, and the measurement precondition 3 needs.
+    /// Preconditions 1 and 2, and the measurement precondition 3 needs - all
+    /// without taking a checkpoint of its own. An attached source with
+    /// nothing frozen yet comes back with <see cref="SourceInspection.CheckpointPending"/>
+    /// set instead of already holding one; see <see cref="CreateAsync"/> for
+    /// why taking it is deferred past this method.
     /// </summary>
     /// <remarks>
     /// With no node hint, this is exactly the local-open check it always was:
@@ -629,8 +662,16 @@ public sealed class SnapshotService : ISnapshotService
     /// local open - <see cref="IHyperVHostClient.ClassifyAttachmentAsync"/>
     /// tells the difference between not attached, attached with nothing in the
     /// way, and attached behind a checkpoint this driver already took for this
-    /// exact snapshot. The last one is a resume, not a fresh start: the base is
-    /// already frozen, so this skips straight past taking a new one.
+    /// exact snapshot. The last one is a resume, not a fresh start: its
+    /// checkpoint is reused rather than a new one taken. Being read-only, this
+    /// classification is safe to run this early regardless of which case it
+    /// turns out to be - unlike taking a checkpoint, it cannot itself strand
+    /// anything. Both attached cases measure through
+    /// <see cref="ReadAllocatedBytesThroughHostAsync"/>, which needs no
+    /// checkpoint to work: it is a CIM query against the VM and path, not a
+    /// local file open a running VM's own handle would block, so the Direct
+    /// case can call it before a checkpoint exists exactly as the resumed case
+    /// calls it after.
     /// </remarks>
     private async Task<SourceInspection> InspectSourceAsync(
         string snapshotId, string sourceVolumeId, string snapshotName, string sourcePath, string? nodeId,
@@ -645,7 +686,7 @@ public sealed class SnapshotService : ISnapshotService
         if (string.IsNullOrEmpty(nodeId))
         {
             var allocatedBytes = OpenSourceLocally(snapshotId, sourceVolumeId, sourcePath);
-            return new SourceInspection(allocatedBytes, null, null);
+            return new SourceInspection(allocatedBytes, null, null, false);
         }
 
         var vm = await _cluster.ResolveVmAsync(nodeId, attempt.Token).ConfigureAwait(false);
@@ -657,7 +698,7 @@ public sealed class SnapshotService : ISnapshotService
             // VolumeAttachment, most plausibly) and reports the same refusal
             // as always if something else still has it open.
             var allocatedBytes = OpenSourceLocally(snapshotId, sourceVolumeId, sourcePath);
-            return new SourceInspection(allocatedBytes, null, null);
+            return new SourceInspection(allocatedBytes, null, null, false);
         }
 
         var elementName = CheckpointElementName(sourceVolumeId, snapshotName);
@@ -683,20 +724,21 @@ public sealed class SnapshotService : ISnapshotService
                 // Go's hint did not pan out - answer from a local read, same
                 // as having no hint at all.
                 var unattachedBytes = OpenSourceLocally(snapshotId, sourceVolumeId, sourcePath);
-                return new SourceInspection(unattachedBytes, null, null);
+                return new SourceInspection(unattachedBytes, null, null, false);
 
             case VolumeAttachmentKind.BehindOwnedCheckpoint:
-                // Resuming: an earlier attempt already froze the base. The
-                // checkpoint is what makes it readable now, so measure it the
-                // same way the direct-attach branch below does.
+                // Resuming: an earlier attempt already froze the base. Reuse
+                // that checkpoint rather than taking a second one.
                 var resumedBytes = await ReadAllocatedBytesThroughHostAsync(vm, sourcePath, attempt.Token).ConfigureAwait(false);
-                return new SourceInspection(resumedBytes, vm, attachment.OwnedCheckpoint);
+                return new SourceInspection(resumedBytes, vm, attachment.OwnedCheckpoint, false);
 
             case VolumeAttachmentKind.Direct:
-                var checkpoint = await CreateOwnedCheckpointAsync(
-                    vm, elementName, sourceVolumeId, snapshotName, attempt).ConfigureAwait(false);
+                // Nothing frozen yet, and nothing taken here: nothing about
+                // this measurement needs a checkpoint, so taking one is left
+                // to CreateAsync, once nothing else can still refuse the
+                // snapshot.
                 var freshBytes = await ReadAllocatedBytesThroughHostAsync(vm, sourcePath, attempt.Token).ConfigureAwait(false);
-                return new SourceInspection(freshBytes, vm, checkpoint);
+                return new SourceInspection(freshBytes, vm, null, true);
 
             default:
                 throw new JobFailureException(
@@ -748,11 +790,14 @@ public sealed class SnapshotService : ISnapshotService
     }
 
     /// <summary>
-    /// The source's allocated size once a checkpoint has frozen it, read
-    /// through the owning host rather than a local open: the base is only
-    /// readable at all because the checkpoint exists, and asking the host that
-    /// took it is the same trade <see cref="IHyperVHostClient.GetDiskSizeAsync"/>
-    /// makes for an attached, running disk generally.
+    /// The source's allocated size, read through the owning host rather than a
+    /// local open. <see cref="IHyperVHostClient.GetDiskSizeAsync"/> is a CIM
+    /// query against the VM and path, not a local file handle a running VM's
+    /// own open would block - so unlike a local open, it answers the same way
+    /// whether or not a checkpoint exists yet. That is what lets the Direct
+    /// case in <see cref="InspectSourceAsync"/> call this *before* a checkpoint
+    /// is taken, using the same call the BehindOwnedCheckpoint case makes
+    /// after one already exists.
     /// </summary>
     private async Task<long> ReadAllocatedBytesThroughHostAsync(ClusteredVm vm, string sourcePath, CancellationToken cancellationToken) =>
         await _host.GetDiskSizeAsync(vm.OwningHost, vm.VmId, sourcePath, cancellationToken).ConfigureAwait(false);
