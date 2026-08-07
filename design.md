@@ -49,6 +49,24 @@
   serializes many VM-configuration operations anyway, and stacking requests
   produces spurious failures.
 
+## Opinions
+
+Design guidance for all implemenation, in no particular order
+
+* Keep the actual operations taken by the system as close as possible to what
+  Kubernetes is asking for as possible. Make it "thin" as in, we are a "thin"
+  translation layer between the Kubernetes CSI surface and Hyper-V. This not
+  only simplifies implementation and keeps the codebase smaller for higher
+  reliability through smaller space for bugs, but also alleiviates the need for
+  complex state handling - see scalability below.
+* Fail closed - because much of our avoidance of implementing centralized state
+  tracking relies on the idempotant nature of the CSI specification, we need to
+  only return success to any CSI function when we are absolutely certain the
+  requested state is acheived. Under normal circumstances this works but it
+  means under certain admin interventions, such as removing deleting a VM
+  backing a K8s node without first draining and deregistering said node with the
+  K8s API server, will lock up the cluster and require manual recovery.
+
 ## Authentication and remoting
 
 - The agent runs as a **domain service account**. Active Directory and DNS must
@@ -70,13 +88,12 @@
 
 ## Scalability posture
 
-The target for v1 is **eventual consistency, not immediate consistency.**
-Kubernetes CSI callers already retry on failure, so a window where the agent is
-unreachable — most commonly during its own failover to another node — is
-tolerable rather than something the driver must engineer around.
-
-If that turns out to be insufficient in practice, the fallback is **full
-serialization in the agent**: process every job for a given VM/host strictly in
-order rather than allowing any interleaving. That's a strictly simpler (if
-slower) model available if eventual consistency proves too loose, not something
-to build up front.
+Windows Server Failover Clustering is largely stateless in nature, relying on
+distributed/replicated *configuration* and logical failover mechanisims with no
+live state replication. Instead of trying to build our own distributed state
+service, the goal is to rely on the idempotant nature of CSI's specification
+design to offload state reconciliation to the Kubernetes control plane. This
+means that retries may be more common than with other CSI drivers if operations
+end up happening during a node live migration or other such operation, but the
+natural retry behavior in K8s resolves this issue in a neat way. This is a key
+driving factor behind some of the architectural opinions documented above.
