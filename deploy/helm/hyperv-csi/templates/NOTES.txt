@@ -3,12 +3,18 @@ hyperv-csi {{ .Chart.AppVersion }} installed as {{ .Release.Name }} in {{ .Relea
 Driver name: {{ include "hyperv-csi.driverName" . }}
 Agent:       {{ .Values.agent.address }}
 
-What works right now: CreateVolume, DeleteVolume, ControllerPublishVolume,
-ControllerUnpublishVolume, and NodeStageVolume/NodeUnstageVolume. A PVC will
-provision, bind, and attach to its node VM, and the node plugin will format
-and mount it at the staging path; a pod that tries to actually use it will
-still fail, since NodePublishVolume — the bind-mount into the pod's path — is
-not implemented.
+What works right now: the whole path from PVC to running pod. CreateVolume and
+DeleteVolume, ControllerPublishVolume/ControllerUnpublishVolume,
+NodeStageVolume/NodeUnstageVolume, NodePublishVolume/NodeUnpublishVolume,
+online expansion through ControllerExpandVolume/NodeExpandVolume,
+NodeGetVolumeStats, and ValidateVolumeCapabilities. A PVC will provision, bind,
+attach to its node VM, get formatted and mounted, and serve a pod that uses it.
+
+Snapshots are built — CreateSnapshot, DeleteSnapshot and ListSnapshots — but
+external-snapshotter is only deployed when controller.snapshotter.enabled is
+set, and that path has not been exercised against a real Hyper-V cluster.
+Restoring a volume from a snapshot is not implemented: CreateVolume rejects a
+VolumeContentSource.
 
 Watch a volume get provisioned:
 
