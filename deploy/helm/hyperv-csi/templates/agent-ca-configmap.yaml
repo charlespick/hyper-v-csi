@@ -1,0 +1,14 @@
+{{- if .Values.agent.caCertificate }}
+# Only rendered when testing against an agent whose server certificate isn't
+# publicly trusted. See agent.caCertificate in values.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "hyperv-csi.fullname" . }}-agent-ca
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "hyperv-csi.labels" . | nindent 4 }}
+data:
+  ca.crt: |
+    {{- .Values.agent.caCertificate | nindent 4 }}
+{{- end }}

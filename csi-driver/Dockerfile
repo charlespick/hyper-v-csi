@@ -11,6 +11,7 @@ RUN CGO_ENABLED=0 go build -ldflags "-X github.com/charlespick/hyper-v-csi/csi-d
 # which a static distroless image has.
 FROM debian:12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
         e2fsprogs \
         util-linux \
     && rm -rf /var/lib/apt/lists/*

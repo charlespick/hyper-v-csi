@@ -32,6 +32,25 @@ agent:
   # Development.
   allowInsecure: false
 
+  # Testing escape hatch, distinct from allowInsecure: for an agent that *does*
+  # serve TLS but with a self-signed or private-CA server certificate rather
+  # than a publicly-trusted one, so the driver's normal system-root verification
+  # would otherwise reject it outright. PEM content, set here. Mounted into the
+  # controller and pointed at via SSL_CERT_FILE, which replaces the driver
+  # container's default trust store rather than extending it - acceptable only
+  # because the agent is the one HTTPS peer this container talks to. Leave empty
+  # against a publicly-trusted server certificate, which is every real
+  # deployment.
+  caCertificate: ""
+
+  # Testing escape hatch: the agent's HostFiltering only accepts a Host header
+  # matching Tls:SubjectName, so agent.address has to name that DNS name -
+  # addressing the agent by bare IP gets "400 Bad Request - Invalid Hostname"
+  # from Kestrel. A real deployment resolves that name through real DNS; this
+  # is for pointing it at a host with none, via the pod's /etc/hosts. Standard
+  # Pod.spec.hostAliases shape - see the Kubernetes docs. Empty by default.
+  hostAliases: []
+
 # The self-signed client certificate the agent pins by fingerprint. Create it
 # with the commands in the repository README, and put its fingerprint in the
 # agent's own config file — the agent will reject anything else at the TLS

@@ -23,6 +23,10 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "hyperv-csi.serviceAccountName" . }}
+      {{- with .Values.agent.hostAliases }}
+      hostAliases:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -139,12 +143,24 @@ spec:
             - --agent-client-cert=/etc/hyperv-csi/tls.crt
             - --agent-client-key=/etc/hyperv-csi/tls.key
             {{- end }}
+          {{- if .Values.agent.caCertificate }}
+          env:
+            # Replaces, not extends, the container's default trust store - see
+            # agent.caCertificate in values.yaml for why that's fine here.
+            - name: SSL_CERT_FILE
+              value: /etc/hyperv-csi-ca/ca.crt
+          {{- end }}
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
             {{- if not .Values.agent.allowInsecure }}
             - name: client-cert
               mountPath: /etc/hyperv-csi
+              readOnly: true
+            {{- end }}
+            {{- if .Values.agent.caCertificate }}
+            - name: agent-ca
+              mountPath: /etc/hyperv-csi-ca
               readOnly: true
             {{- end }}
           resources:
@@ -164,6 +180,11 @@ spec:
           secret:
             secretName: {{ include "hyperv-csi.clientCertificateSecret" . }}
             defaultMode: 0400
+        {{- end }}
+        {{- if .Values.agent.caCertificate }}
+        - name: agent-ca
+          configMap:
+            name: {{ include "hyperv-csi.fullname" . }}-agent-ca
         {{- end }}
       {{- with .Values.controller.nodeSelector }}
       nodeSelector:
