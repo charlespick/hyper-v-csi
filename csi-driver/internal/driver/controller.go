@@ -98,6 +98,11 @@ func (s *controllerServer) ControllerGetCapabilities(ctx context.Context, req *c
 type createVolumePayload struct {
 	Name      string `json:"name"`
 	SizeBytes int64  `json:"sizeBytes"`
+	// SourceSnapshotID is set for a restore - CreateVolume with a
+	// VolumeContentSource naming a snapshot - and empty for the ordinary
+	// empty-VHDX create. One payload field rather than a second operation: see
+	// CreateVolume's own content-source handling for why.
+	SourceSnapshotID string `json:"sourceSnapshotId,omitempty"`
 }
 
 type createVolumeResult struct {
@@ -123,8 +128,9 @@ func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		return nil, err
 	}
 
-	if req.GetVolumeContentSource() != nil {
-		return nil, status.Error(codes.Unimplemented, "creating a volume from a snapshot or clone is not implemented yet")
+	sourceSnapshotID, err := volumeContentSourceSnapshotID(req.GetVolumeContentSource())
+	if err != nil {
+		return nil, err
 	}
 
 	sizeBytes, err := pickVolumeSize(req.GetCapacityRange())
@@ -136,13 +142,22 @@ func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	// provisioner retry for the same PVC re-attaches to this job instead of
 	// racing a second create for the same file.
 	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetName(), operationCreateVolume, volumeTarget(req.GetName()), createVolumePayload{
-		Name:      req.GetName(),
-		SizeBytes: sizeBytes,
+		Name:             req.GetName(),
+		SizeBytes:        sizeBytes,
+		SourceSnapshotID: sourceSnapshotID,
 	})
 	if err != nil {
 		return nil, enqueueFailed(ctx, err, "enqueueing CreateVolume for %s", req.GetName())
 	}
 
+	// Unlike every other CreateVolume, a restore's job can run for as long as
+	// the snapshot it is copying took - hours, not seconds. That is fine
+	// without any change here: CreateVolume has no ready_to_use the way
+	// CreateSnapshot does, so there is nothing to answer with besides waiting,
+	// and awaitJob already reports ABORTED "retry" once jobPollBudget expires.
+	// external-provisioner's own retry-with-backoff re-attaches to this same
+	// job via the idempotency key above, so nothing here needs a longer budget
+	// or a second polling mode.
 	done, err := awaitJob(ctx, s.driver.Agent, job.ID, jobPollBudget)
 	if err != nil {
 		return nil, err
@@ -157,6 +172,18 @@ func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	}
 
 	if limit := req.GetCapacityRange().GetLimitBytes(); limit > 0 && result.ActualSizeBytes > limit {
+		if sourceSnapshotID != "" {
+			// Not "should be impossible" the way it is for an empty create: the
+			// agent floors a restore's size at the snapshot's own, which can
+			// legitimately exceed a limit nothing about the request could have
+			// caught in advance. The request is unsatisfiable, not a name
+			// collision or a driver bug, in both the fresh-restore and the
+			// replay case alike.
+			return nil, status.Errorf(codes.OutOfRange,
+				"snapshot %s is %d bytes, above the requested limit of %d",
+				sourceSnapshotID, result.ActualSizeBytes, limit)
+		}
+
 		// A pre-existing disk too big for this request is a name collision
 		// with incompatible parameters, which CSI spells ALREADY_EXISTS.
 		if result.AlreadyPresent {
@@ -197,8 +224,40 @@ func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 			// name-to-ID mapping that would be lost on an agent restart.
 			VolumeId:      result.VolumeID,
 			CapacityBytes: result.ActualSizeBytes,
+			// CSI requires a restored volume to report where it came from;
+			// external-provisioner records this on the PV. Nil for an empty
+			// create, exactly mirroring the request.
+			ContentSource: req.GetVolumeContentSource(),
 		},
 	}, nil
+}
+
+// volumeContentSourceSnapshotID extracts the snapshot ID CreateVolume should
+// restore from, or "" for an ordinary empty-VHDX create.
+//
+// CLONE_VOLUME (restoring from another volume rather than a snapshot) is
+// deliberately not advertised in ControllerGetCapabilities and stays
+// Unimplemented here: the e2e pvcDataSource capability is off, and accepting
+// the request without anything behind it would look like support that does
+// not exist.
+func volumeContentSourceSnapshotID(source *csi.VolumeContentSource) (string, error) {
+	if source == nil {
+		return "", nil
+	}
+
+	switch t := source.GetType().(type) {
+	case *csi.VolumeContentSource_Snapshot:
+		snapshotID := t.Snapshot.GetSnapshotId()
+		if snapshotID == "" {
+			return "", status.Error(codes.InvalidArgument, "snapshot id is required in the volume content source")
+		}
+		return snapshotID, nil
+	case *csi.VolumeContentSource_Volume:
+		return "", status.Error(codes.Unimplemented,
+			"creating a volume from another volume is not implemented; CLONE_VOLUME is not advertised")
+	default:
+		return "", status.Errorf(codes.InvalidArgument, "unrecognized volume content source %T", t)
+	}
 }
 
 // supportedAccessModes is every mode a VHDX can honestly back: it attaches to

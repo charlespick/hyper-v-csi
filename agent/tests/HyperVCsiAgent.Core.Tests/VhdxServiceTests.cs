@@ -16,16 +16,52 @@ namespace HyperVCsiAgent.Core.Tests;
 public sealed class VhdxServiceTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), "hyperv-csi-tests", Guid.NewGuid().ToString("n"));
+    private readonly string _snapshotsRoot = Path.Combine(Path.GetTempPath(), "hyperv-csi-tests", Guid.NewGuid().ToString("n"), "snapshots");
+    private readonly List<IDisposable> _copySlots = [];
 
     private string VolumePath(string volumeName) => Path.Combine(_root, volumeName + ".vhdx");
 
     private string InProgressPath(string volumeName) => Path.Combine(_root, volumeName + "~creating.vhdx");
 
+    private string SnapshotPath(string snapshotId) => Path.Combine(_snapshotsRoot, snapshotId + ".vhdx");
+
+    private string CopyingSnapshotPath(string snapshotId) => Path.Combine(_snapshotsRoot, snapshotId + "~copying.vhdx");
+
+    /// <summary>
+    /// Seeds a finished snapshot directly on the CSV, the way a prior
+    /// CreateSnapshot would have left one. The virtual size travels in the
+    /// file's own content, which is what FakeVirtualDiskManager's fallback
+    /// reads for a file it did not create itself - and what makes a
+    /// byte-for-byte copy of it carry the same size without a lookup table on
+    /// either side.
+    /// </summary>
+    private void WriteSnapshot(string snapshotId, long virtualSizeBytes)
+    {
+        Directory.CreateDirectory(_snapshotsRoot);
+        File.WriteAllText(SnapshotPath(snapshotId), $"fake vhdx virtualSize={virtualSizeBytes}");
+    }
+
+    private void WriteCopyingMarker(string snapshotId)
+    {
+        Directory.CreateDirectory(_snapshotsRoot);
+        File.WriteAllText(CopyingSnapshotPath(snapshotId), "a copy in flight");
+    }
+
     public void Dispose()
     {
+        foreach (var slots in _copySlots)
+        {
+            slots.Dispose();
+        }
+
         if (Directory.Exists(_root))
         {
             Directory.Delete(_root, recursive: true);
+        }
+
+        if (Directory.Exists(_snapshotsRoot))
+        {
+            Directory.Delete(_snapshotsRoot, recursive: true);
         }
     }
 
@@ -35,7 +71,7 @@ public sealed class VhdxServiceTests : IDisposable
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks);
 
-        var result = await service.CreateAsync("pvc-1", 10L * 1024 * 1024 * 1024, CancellationToken.None);
+        var result = await service.CreateAsync("pvc-1", 10L * 1024 * 1024 * 1024, null, CancellationToken.None);
 
         Assert.Equal("pvc-1", result.VolumeId);
         Assert.Equal(10L * 1024 * 1024 * 1024, result.ActualSizeBytes);
@@ -49,7 +85,7 @@ public sealed class VhdxServiceTests : IDisposable
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks);
 
-        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
 
         // The CIM call must have been handed the in-progress path, never the
         // final one - that's what keeps a crash mid-create from leaving
@@ -69,7 +105,7 @@ public sealed class VhdxServiceTests : IDisposable
         var disks = new FakeVirtualDiskManager { RoundUpTo = 4096 };
         using var service = NewService(disks);
 
-        var result = await service.CreateAsync("pvc-1", 5000, CancellationToken.None);
+        var result = await service.CreateAsync("pvc-1", 5000, null, CancellationToken.None);
 
         Assert.Equal(8192, result.ActualSizeBytes);
     }
@@ -83,7 +119,7 @@ public sealed class VhdxServiceTests : IDisposable
         var disks = new FakeVirtualDiskManager { FailSizeReads = true };
         using var service = NewService(disks);
 
-        var result = await service.CreateAsync("pvc-1", 4096, CancellationToken.None);
+        var result = await service.CreateAsync("pvc-1", 4096, null, CancellationToken.None);
 
         Assert.Equal(4096, result.ActualSizeBytes);
         Assert.True(File.Exists(VolumePath("pvc-1")));
@@ -95,10 +131,10 @@ public sealed class VhdxServiceTests : IDisposable
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks);
 
-        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
         disks.Created.Clear();
 
-        var replay = await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        var replay = await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
 
         Assert.Equal(1024, replay.ActualSizeBytes);
         Assert.True(replay.AlreadyPresent);
@@ -113,8 +149,8 @@ public sealed class VhdxServiceTests : IDisposable
         var disks = new FakeVirtualDiskManager { RoundUpTo = 4096 };
         using var service = NewService(disks);
 
-        await service.CreateAsync("pvc-1", 5000, CancellationToken.None);
-        var replay = await service.CreateAsync("pvc-1", 5000, CancellationToken.None);
+        await service.CreateAsync("pvc-1", 5000, null, CancellationToken.None);
+        var replay = await service.CreateAsync("pvc-1", 5000, null, CancellationToken.None);
 
         Assert.Equal(8192, replay.ActualSizeBytes);
         Assert.True(replay.AlreadyPresent);
@@ -128,10 +164,10 @@ public sealed class VhdxServiceTests : IDisposable
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks);
 
-        await service.CreateAsync("pvc-1", existingSize, CancellationToken.None);
+        await service.CreateAsync("pvc-1", existingSize, null, CancellationToken.None);
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
-            () => service.CreateAsync("pvc-1", requestedSize, CancellationToken.None));
+            () => service.CreateAsync("pvc-1", requestedSize, null, CancellationToken.None));
 
         Assert.Equal(AgentErrorCodes.AlreadyExists, failure.ErrorCode);
     }
@@ -143,13 +179,13 @@ public sealed class VhdxServiceTests : IDisposable
         using var service = NewService(disks);
 
         await Assert.ThrowsAsync<InvalidOperationException>(
-            () => service.CreateAsync("pvc-1", 1024, CancellationToken.None));
+            () => service.CreateAsync("pvc-1", 1024, null, CancellationToken.None));
 
         // Nothing at the final path means the retry takes the create path
         // again rather than mistaking a partial file for a finished volume.
         Assert.False(File.Exists(VolumePath("pvc-1")));
 
-        var result = await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        var result = await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
 
         Assert.Equal(1024, result.ActualSizeBytes);
         Assert.True(File.Exists(VolumePath("pvc-1")));
@@ -164,7 +200,7 @@ public sealed class VhdxServiceTests : IDisposable
         Directory.CreateDirectory(_root);
         await File.WriteAllTextAsync(InProgressPath("pvc-1"), "half-written disk");
 
-        var result = await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        var result = await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
 
         Assert.Equal(1024, result.ActualSizeBytes);
         Assert.Equal("fake vhdx", await File.ReadAllTextAsync(VolumePath("pvc-1")));
@@ -180,7 +216,7 @@ public sealed class VhdxServiceTests : IDisposable
         using var service = NewService(disks, diskOperationTimeout: TimeSpan.FromMilliseconds(100));
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
-            () => service.CreateAsync("pvc-1", 1024, CancellationToken.None));
+            () => service.CreateAsync("pvc-1", 1024, null, CancellationToken.None));
 
         Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
         Assert.Contains("timed out", failure.Message, StringComparison.Ordinal);
@@ -199,7 +235,7 @@ public sealed class VhdxServiceTests : IDisposable
         using var service = NewService(new FakeVirtualDiskManager());
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
-            () => service.CreateAsync(volumeName, 1024, CancellationToken.None));
+            () => service.CreateAsync(volumeName, 1024, null, CancellationToken.None));
 
         Assert.Equal(AgentErrorCodes.InvalidArgument, failure.ErrorCode);
     }
@@ -210,7 +246,7 @@ public sealed class VhdxServiceTests : IDisposable
         using var service = NewService(new FakeVirtualDiskManager());
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
-            () => service.CreateAsync("pvc-1", 0, CancellationToken.None));
+            () => service.CreateAsync("pvc-1", 0, null, CancellationToken.None));
 
         Assert.Equal(AgentErrorCodes.InvalidArgument, failure.ErrorCode);
     }
@@ -224,7 +260,7 @@ public sealed class VhdxServiceTests : IDisposable
         using var service = NewService(disks, maxConcurrentDiskOperations: 2);
 
         var creates = Enumerable.Range(0, 5)
-            .Select(i => service.CreateAsync($"pvc-{i}", 1024, CancellationToken.None))
+            .Select(i => service.CreateAsync($"pvc-{i}", 1024, null, CancellationToken.None))
             .ToArray();
 
         await WaitFor(() => disks.InFlightPeak >= 2);
@@ -247,7 +283,7 @@ public sealed class VhdxServiceTests : IDisposable
 
         for (var i = 0; i < 5; i++)
         {
-            await service.CreateAsync($"pvc-{i}", 1024, CancellationToken.None);
+            await service.CreateAsync($"pvc-{i}", 1024, null, CancellationToken.None);
         }
 
         using var release = new SemaphoreSlim(0);
@@ -255,7 +291,7 @@ public sealed class VhdxServiceTests : IDisposable
         disks.BeforeGetSize = _ => release.WaitAsync();
 
         var replays = Enumerable.Range(0, 5)
-            .Select(i => service.CreateAsync($"pvc-{i}", 1024, CancellationToken.None))
+            .Select(i => service.CreateAsync($"pvc-{i}", 1024, null, CancellationToken.None))
             .ToArray();
 
         await WaitFor(() => disks.InFlightPeak >= 2);
@@ -266,12 +302,225 @@ public sealed class VhdxServiceTests : IDisposable
         await Task.WhenAll(replays);
     }
 
+    // ------------------------------------------------------- restore (CreateAsync with a source snapshot)
+
+    [Fact]
+    public async Task CreateAsync_FromASnapshot_CopiesItToTheVolumesPath()
+    {
+        var disks = new FakeVirtualDiskManager();
+        var copier = new FakeDiskCopier();
+        WriteSnapshot("pvc-1~snap-a", 4096);
+        using var service = NewService(disks, copier: copier);
+
+        var result = await service.CreateAsync("pvc-2", 4096, "pvc-1~snap-a", CancellationToken.None);
+
+        Assert.Equal("pvc-2", result.VolumeId);
+        Assert.Equal(4096, result.ActualSizeBytes);
+        Assert.False(result.AlreadyPresent);
+        Assert.True(File.Exists(VolumePath("pvc-2")));
+        Assert.Equal(InProgressPath("pvc-2"), Assert.Single(copier.Destinations));
+    }
+
+    [Fact]
+    public async Task CreateAsync_FromASnapshot_OnlyPublishesTheCopyViaAnAtomicRename()
+    {
+        var disks = new FakeVirtualDiskManager();
+        var copier = new FakeDiskCopier();
+        WriteSnapshot("pvc-1~snap-a", 4096);
+        using var service = NewService(disks, copier: copier);
+
+        await service.CreateAsync("pvc-2", 4096, "pvc-1~snap-a", CancellationToken.None);
+
+        var destination = Assert.Single(copier.Destinations);
+        Assert.Equal(InProgressPath("pvc-2"), destination);
+        Assert.False(File.Exists(InProgressPath("pvc-2")));
+    }
+
+    [Fact]
+    public async Task CreateAsync_FromASnapshot_WhenTheRequestedSizeExceedsTheSnapshot_GrowsTheCopy()
+    {
+        // The snapshot is the floor, not the ceiling: CSI allows a volume
+        // bigger than requested, and required_bytes above the snapshot's own
+        // size is exactly that request.
+        var disks = new FakeVirtualDiskManager();
+        var copier = new FakeDiskCopier();
+        WriteSnapshot("pvc-1~snap-a", 4096);
+        using var service = NewService(disks, copier: copier);
+
+        var result = await service.CreateAsync("pvc-2", 8192, "pvc-1~snap-a", CancellationToken.None);
+
+        Assert.Equal(8192, result.ActualSizeBytes);
+        // Grown before the publish rename, not after: the file the resize
+        // touches is still the in-progress copy at this point.
+        var resized = Assert.Single(disks.Resized);
+        Assert.Equal(InProgressPath("pvc-2"), resized.Path);
+        Assert.Equal(8192, resized.SizeBytes);
+    }
+
+    [Fact]
+    public async Task CreateAsync_FromASnapshot_WhenTheRequestedSizeIsBelowTheSnapshot_ReportsTheSnapshotsSize()
+    {
+        // CSI allows a volume larger than requested; it does not allow one
+        // that silently truncates the image it was restored from.
+        var disks = new FakeVirtualDiskManager();
+        var copier = new FakeDiskCopier();
+        WriteSnapshot("pvc-1~snap-a", 8192);
+        using var service = NewService(disks, copier: copier);
+
+        var result = await service.CreateAsync("pvc-2", 1024, "pvc-1~snap-a", CancellationToken.None);
+
+        Assert.Equal(8192, result.ActualSizeBytes);
+        Assert.Empty(disks.Resized);
+    }
+
+    [Fact]
+    public async Task CreateAsync_FromASnapshot_WhenTheVolumeAlreadyExists_ReturnsItWithoutCopyingAnything()
+    {
+        var disks = new FakeVirtualDiskManager();
+        var copier = new FakeDiskCopier();
+        WriteSnapshot("pvc-1~snap-a", 8192);
+        using var service = NewService(disks, copier: copier);
+
+        await service.CreateAsync("pvc-2", 1024, "pvc-1~snap-a", CancellationToken.None);
+
+        var replay = await service.CreateAsync("pvc-2", 1024, "pvc-1~snap-a", CancellationToken.None);
+
+        Assert.Equal(8192, replay.ActualSizeBytes);
+        Assert.True(replay.AlreadyPresent);
+        Assert.Single(copier.Destinations);
+    }
+
+    [Fact]
+    public async Task CreateAsync_FromASnapshot_ReplayNeedsNoLongerNeedTheSnapshotToStillExist()
+    {
+        // The idempotency check must answer from the restored volume alone,
+        // not from the snapshot: a re-driven CreateVolume for an already
+        // finished restore must succeed even after the snapshot it came from
+        // has since been deleted.
+        var disks = new FakeVirtualDiskManager();
+        var copier = new FakeDiskCopier();
+        WriteSnapshot("pvc-1~snap-a", 4096);
+        using var service = NewService(disks, copier: copier);
+
+        await service.CreateAsync("pvc-2", 4096, "pvc-1~snap-a", CancellationToken.None);
+        File.Delete(SnapshotPath("pvc-1~snap-a"));
+
+        var replay = await service.CreateAsync("pvc-2", 4096, "pvc-1~snap-a", CancellationToken.None);
+
+        Assert.True(replay.AlreadyPresent);
+    }
+
+    [Fact]
+    public async Task CreateAsync_FromASnapshot_WhenTheExistingVolumeIsTooSmall_FailsAsAlreadyExists()
+    {
+        var disks = new FakeVirtualDiskManager();
+        var copier = new FakeDiskCopier();
+        WriteSnapshot("pvc-1~snap-a", 1024);
+        using var service = NewService(disks, copier: copier);
+
+        await service.CreateAsync("pvc-2", 1024, "pvc-1~snap-a", CancellationToken.None);
+
+        WriteSnapshot("pvc-1~snap-b", 8192);
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => service.CreateAsync("pvc-2", 8192, "pvc-1~snap-b", CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.AlreadyExists, failure.ErrorCode);
+    }
+
+    [Fact]
+    public async Task CreateAsync_FromASnapshotThatDoesNotExist_FailsAsNotFound()
+    {
+        var disks = new FakeVirtualDiskManager();
+        var copier = new FakeDiskCopier();
+        using var service = NewService(disks, copier: copier);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => service.CreateAsync("pvc-2", 4096, "pvc-1~snap-a", CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.NotFound, failure.ErrorCode);
+        Assert.Empty(copier.Destinations);
+    }
+
+    [Fact]
+    public async Task CreateAsync_FromASnapshotStillBeingCopied_FailsAsNotFound()
+    {
+        // A snapshot still being written is not a snapshot yet, no matter how
+        // it looks on the CSV - and NotFound, not a wait, is the honest
+        // answer, since nothing here drives that copy to completion.
+        var disks = new FakeVirtualDiskManager();
+        var copier = new FakeDiskCopier();
+        WriteCopyingMarker("pvc-1~snap-a");
+        using var service = NewService(disks, copier: copier);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => service.CreateAsync("pvc-2", 4096, "pvc-1~snap-a", CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.NotFound, failure.ErrorCode);
+        Assert.Empty(copier.Destinations);
+    }
+
+    [Fact]
+    public async Task CreateAsync_FromASnapshotId_ThatThisAgentCouldNotHaveProduced_FailsAsNotFound()
+    {
+        var disks = new FakeVirtualDiskManager();
+        var copier = new FakeDiskCopier();
+        using var service = NewService(disks, copier: copier);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => service.CreateAsync("pvc-2", 4096, "not-a-snapshot-id", CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.NotFound, failure.ErrorCode);
+    }
+
+    [Fact]
+    public async Task CreateAsync_FromASnapshot_WhenTheCsvHasNoRoom_FailsAsResourceExhausted()
+    {
+        var disks = new FakeVirtualDiskManager();
+        var copier = new FakeDiskCopier { FreeBytes = 0 };
+        WriteSnapshot("pvc-1~snap-a", 4096);
+        using var service = NewService(disks, copier: copier);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => service.CreateAsync("pvc-2", 4096, "pvc-1~snap-a", CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.ResourceExhausted, failure.ErrorCode);
+        Assert.Empty(copier.Destinations);
+    }
+
+    [Fact]
+    public async Task CreateAsync_FromASnapshot_DoesNotQueueBehindTheDiskOperationLimit()
+    {
+        // A restore must not compete with ordinary fast disk operations for
+        // MaxConcurrentDiskOperations; it has its own, separate cap.
+        var disks = new FakeVirtualDiskManager();
+        var copier = new FakeDiskCopier();
+        WriteSnapshot("pvc-1~snap-a", 4096);
+        using var service = NewService(disks, copier: copier, maxConcurrentDiskOperations: 1);
+
+        // Holds the agent's one and only disk-operation slot for the whole test.
+        // BeforeCreate, not BeforeGetSize: the restore below never calls
+        // CreateDynamicVhdxAsync at all, so gating only that call cannot also
+        // block the restore's own read of the snapshot's size.
+        using var hold = new SemaphoreSlim(0);
+        disks.BeforeCreate = _ => hold.WaitAsync();
+        var stuckCreate = service.CreateAsync("pvc-3", 1024, null, CancellationToken.None);
+        await WaitFor(() => disks.InFlightPeak >= 1);
+
+        // The restore must still complete without that slot ever freeing up.
+        var result = await service.CreateAsync("pvc-2", 4096, "pvc-1~snap-a", CancellationToken.None);
+
+        Assert.Equal(4096, result.ActualSizeBytes);
+
+        hold.Release();
+        await stuckCreate;
+    }
+
     [Fact]
     public async Task ExpandAsync_GrowsTheDiskAndReportsItsNewSize()
     {
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks);
-        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
 
         var result = await service.ExpandAsync("pvc-1", 4096, null, CancellationToken.None);
 
@@ -290,7 +539,7 @@ public sealed class VhdxServiceTests : IDisposable
         // the volume actually has.
         var disks = new FakeVirtualDiskManager { RoundUpTo = 4096 };
         using var service = NewService(disks);
-        await service.CreateAsync("pvc-1", 4096, CancellationToken.None);
+        await service.CreateAsync("pvc-1", 4096, null, CancellationToken.None);
 
         var result = await service.ExpandAsync("pvc-1", 5000, null, CancellationToken.None);
 
@@ -305,7 +554,7 @@ public sealed class VhdxServiceTests : IDisposable
         // from the disk rather than from any remembered state.
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks);
-        await service.CreateAsync("pvc-1", 4096, CancellationToken.None);
+        await service.CreateAsync("pvc-1", 4096, null, CancellationToken.None);
 
         var result = await service.ExpandAsync("pvc-1", 4096, null, CancellationToken.None);
 
@@ -322,7 +571,7 @@ public sealed class VhdxServiceTests : IDisposable
         // would is read as "make it at least this big" - which it already is.
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks);
-        await service.CreateAsync("pvc-1", 1L << 30, CancellationToken.None);
+        await service.CreateAsync("pvc-1", 1L << 30, null, CancellationToken.None);
 
         var result = await service.ExpandAsync("pvc-1", 4096, null, CancellationToken.None);
 
@@ -367,7 +616,7 @@ public sealed class VhdxServiceTests : IDisposable
     {
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks);
-        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
             () => service.ExpandAsync("pvc-1", sizeBytes, null, CancellationToken.None));
@@ -383,7 +632,7 @@ public sealed class VhdxServiceTests : IDisposable
         // re-drive re-reads the size and picks up from what actually happened.
         var disks = new FakeVirtualDiskManager { FailNextResize = true };
         using var service = NewService(disks);
-        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
 
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => service.ExpandAsync("pvc-1", 4096, null, CancellationToken.None));
@@ -403,7 +652,7 @@ public sealed class VhdxServiceTests : IDisposable
         using var service = NewService(disks, maxConcurrentDiskOperations: 2);
         for (var i = 0; i < 5; i++)
         {
-            await service.CreateAsync($"pvc-{i}", 1024, CancellationToken.None);
+            await service.CreateAsync($"pvc-{i}", 1024, null, CancellationToken.None);
         }
 
         using var release = new SemaphoreSlim(0);
@@ -436,7 +685,7 @@ public sealed class VhdxServiceTests : IDisposable
             disks,
             cluster: new FakeClusterService { Vms = { ["node-1"] = new ClusteredVm("vm-1", "host-a") } },
             host: host);
-        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
         disks.VhdxInUse = true;
 
         var result = await service.ExpandAsync("pvc-1", 4096, "node-1", CancellationToken.None);
@@ -456,7 +705,7 @@ public sealed class VhdxServiceTests : IDisposable
             disks,
             cluster: new FakeClusterService { Vms = { ["node-1"] = new ClusteredVm("vm-1", "host-a") } },
             host: host);
-        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
         disks.VhdxInUse = true;
 
         var result = await service.ExpandAsync("pvc-1", 4096, "node-1", CancellationToken.None);
@@ -477,7 +726,7 @@ public sealed class VhdxServiceTests : IDisposable
             disks,
             cluster: new FakeClusterService(),
             host: new NeverCalledHostClient());
-        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
         disks.VhdxInUse = true;
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
@@ -495,7 +744,7 @@ public sealed class VhdxServiceTests : IDisposable
         // most plausibly), not something a retry resolves on its own.
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks, cluster: new NeverCalledClusterService(), host: new NeverCalledHostClient());
-        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
         disks.VhdxInUse = true;
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
@@ -509,7 +758,7 @@ public sealed class VhdxServiceTests : IDisposable
     {
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks);
-        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
 
         await service.ConfirmExistsAsync("pvc-1", CancellationToken.None);
     }
@@ -524,7 +773,7 @@ public sealed class VhdxServiceTests : IDisposable
         // about are the ones in use.
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks);
-        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
         disks.VhdxInUse = true;
         disks.ResetPeak();
 
@@ -588,7 +837,7 @@ public sealed class VhdxServiceTests : IDisposable
     {
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks);
-        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
 
         await service.DeleteAsync("pvc-1", CancellationToken.None);
 
@@ -600,8 +849,8 @@ public sealed class VhdxServiceTests : IDisposable
     {
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks);
-        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
-        await service.CreateAsync("pvc-2", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
+        await service.CreateAsync("pvc-2", 1024, null, CancellationToken.None);
 
         await service.DeleteAsync("pvc-1", CancellationToken.None);
 
@@ -618,8 +867,8 @@ public sealed class VhdxServiceTests : IDisposable
         // volume name can contain, which is what keeps these two disjoint.
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks);
-        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
-        await service.CreateAsync("pvc-1.creating", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
+        await service.CreateAsync("pvc-1.creating", 1024, null, CancellationToken.None);
 
         await service.DeleteAsync("pvc-1", CancellationToken.None);
 
@@ -634,9 +883,9 @@ public sealed class VhdxServiceTests : IDisposable
         // an existing "pvc-1.creating" as though it were its own leftover.
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks);
-        await service.CreateAsync("pvc-1.creating", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-1.creating", 1024, null, CancellationToken.None);
 
-        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
 
         Assert.True(File.Exists(VolumePath("pvc-1.creating")));
     }
@@ -650,7 +899,7 @@ public sealed class VhdxServiceTests : IDisposable
         // this one volume already reclaimed, which is the re-drive case proper.
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks);
-        await service.CreateAsync("pvc-other", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-other", 1024, null, CancellationToken.None);
         Assert.True(Directory.Exists(_root));
 
         await service.DeleteAsync("pvc-1", CancellationToken.None);
@@ -661,7 +910,7 @@ public sealed class VhdxServiceTests : IDisposable
     {
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks);
-        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
 
         await service.DeleteAsync("pvc-1", CancellationToken.None);
         await service.DeleteAsync("pvc-1", CancellationToken.None);
@@ -692,7 +941,7 @@ public sealed class VhdxServiceTests : IDisposable
         // cleans up after itself.
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks);
-        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
         await File.WriteAllTextAsync(InProgressPath("pvc-1"), "half-written disk");
 
         await service.DeleteAsync("pvc-1", CancellationToken.None);
@@ -716,12 +965,12 @@ public sealed class VhdxServiceTests : IDisposable
 
         using var release = new SemaphoreSlim(0);
         disks.BeforeCreate = _ => release.WaitAsync();
-        var hog = service.CreateAsync("pvc-hog", 1024, CancellationToken.None);
+        var hog = service.CreateAsync("pvc-hog", 1024, null, CancellationToken.None);
         await WaitFor(() => disks.InFlightPeak >= 1);
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
             () => operation == "create"
-                ? service.CreateAsync("pvc-1", 1024, CancellationToken.None)
+                ? service.CreateAsync("pvc-1", 1024, null, CancellationToken.None)
                 : service.DeleteAsync("pvc-1", CancellationToken.None));
 
         Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
@@ -748,7 +997,7 @@ public sealed class VhdxServiceTests : IDisposable
         // could ever satisfy.
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks);
-        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
 
         await service.DeleteAsync(volumeId, CancellationToken.None);
 
@@ -765,7 +1014,7 @@ public sealed class VhdxServiceTests : IDisposable
         // aren't attachments at all.
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks);
-        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
 
         using (HoldOpenExclusively(VolumePath("pvc-1")))
         {
@@ -783,7 +1032,7 @@ public sealed class VhdxServiceTests : IDisposable
         // create burst does, so the same cap has to cover it.
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks, maxConcurrentDiskOperations: 1);
-        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
 
         using var blocked = new SemaphoreSlim(0);
         disks.BeforeCreate = _ => blocked.WaitAsync();
@@ -791,7 +1040,7 @@ public sealed class VhdxServiceTests : IDisposable
         // has to be reset for this wait to mean "the second create holds the
         // slot" rather than returning immediately on stale state.
         disks.ResetPeak();
-        var holdsTheGate = service.CreateAsync("pvc-2", 1024, CancellationToken.None);
+        var holdsTheGate = service.CreateAsync("pvc-2", 1024, null, CancellationToken.None);
         await WaitFor(() => disks.InFlightPeak >= 1);
 
         var delete = service.DeleteAsync("pvc-1", CancellationToken.None);
@@ -816,22 +1065,40 @@ public sealed class VhdxServiceTests : IDisposable
         int maxConcurrentDiskOperations = 4,
         TimeSpan? diskOperationTimeout = null,
         IClusterService? cluster = null,
-        IHyperVHostClient? host = null) =>
-        new(
+        IHyperVHostClient? host = null,
+        IDiskCopier? copier = null,
+        int maxConcurrentSnapshotCopies = 4,
+        TimeSpan? snapshotCopyTimeout = null)
+    {
+        var copySlots = new SnapshotCopySlots(Options.Create(new AgentOptions
+        {
+            MaxConcurrentSnapshotCopies = maxConcurrentSnapshotCopies,
+        }));
+        _copySlots.Add(copySlots);
+
+        return new VhdxService(
             disks,
+            // Defaults to something that throws if ever called: restore is the
+            // only thing here that copies, and most tests never exercise it.
+            copier ?? new NeverCalledDiskCopier(),
             // Defaults to something that throws if ever called: most tests
             // never make GetVirtualSizeAsync fail with VhdxInUseException, so
             // ExpandAsync's fallback should never be reached in them, and a
             // fake that answers something plausible instead would hide that.
             cluster ?? new NeverCalledClusterService(),
             host ?? new NeverCalledHostClient(),
+            copySlots,
             Options.Create(new AgentOptions
             {
                 CsvVolumesRoot = _root,
+                CsvSnapshotsRoot = _snapshotsRoot,
                 MaxConcurrentDiskOperations = maxConcurrentDiskOperations,
                 DiskOperationTimeout = diskOperationTimeout ?? TimeSpan.FromMinutes(10),
+                MaxConcurrentSnapshotCopies = maxConcurrentSnapshotCopies,
+                SnapshotCopyTimeout = snapshotCopyTimeout ?? TimeSpan.FromHours(6),
             }),
             NullLogger<VhdxService>.Instance);
+    }
 
     private static async Task WaitFor(Func<bool> condition)
     {
@@ -940,11 +1207,12 @@ public sealed class VhdxServiceTests : IDisposable
                 var rounded = (maxInternalSizeBytes + RoundUpTo - 1) / RoundUpTo * RoundUpTo;
                 lock (_gate)
                 {
-                    if (RecordedName(path) is not { } name)
-                    {
-                        throw new InvalidOperationException($"no such disk: {path}");
-                    }
-
+                    // Falls back to the bare file name rather than requiring a
+                    // prior CreateDynamicVhdxAsync: a restore resizes a file
+                    // this fake never created, only copied - see
+                    // GetVirtualSizeAsync's own content-based fallback for the
+                    // read side of the same case.
+                    var name = RecordedName(path) ?? Path.GetFileName(path);
                     Resized.Add((path, maxInternalSizeBytes));
                     _sizes[name] = rounded;
                 }
@@ -987,6 +1255,22 @@ public sealed class VhdxServiceTests : IDisposable
                     if (RecordedName(path) is { } name)
                     {
                         return _sizes[name];
+                    }
+                }
+
+                // Falls back to the size embedded in the file's own content for
+                // a file this fake never created itself - a restore's source
+                // snapshot, seeded directly by a test, and the byte-for-byte
+                // copy of it FakeDiskCopier produces before this class ever
+                // resizes it.
+                if (File.Exists(path))
+                {
+                    var contents = await File.ReadAllTextAsync(path, cancellationToken);
+                    var marker = "virtualSize=";
+                    var index = contents.IndexOf(marker, StringComparison.Ordinal);
+                    if (index >= 0)
+                    {
+                        return long.Parse(contents[(index + marker.Length)..]);
                     }
                 }
 
@@ -1129,5 +1413,71 @@ public sealed class VhdxServiceTests : IDisposable
 
         public Task<long> ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
+    }
+
+    /// <summary>NeverCalledClusterService's counterpart for IDiskCopier: only restore tests should ever reach it.</summary>
+    private sealed class NeverCalledDiskCopier : IDiskCopier
+    {
+        public Task<DiskCopyTarget> InspectTargetAsync(string directoryPath, TimeSpan remainingBudget, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("only a restore should ever reach the copier");
+
+        public Task<DiskCopyResult> CopyAsync(string sourcePath, string destinationPath, TimeSpan remainingBudget, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("only a restore should ever reach the copier");
+    }
+
+    /// <summary>
+    /// A real file copy for restore tests, reusing <see cref="StreamedDiskCopy"/>'s
+    /// own destination and source rules so the CREATE_NEW-and-clean-up-on-failure
+    /// contract is the real one rather than a test's approximation of it - the
+    /// same trade <see cref="SnapshotServiceTests"/>'s own fake makes.
+    /// </summary>
+    private sealed class FakeDiskCopier : IDiskCopier
+    {
+        public long FreeBytes { get; set; } = long.MaxValue;
+
+        public bool SupportsBlockCloning { get; set; }
+
+        public bool FailNextCopy { get; set; }
+
+        public List<string> Destinations { get; } = [];
+
+        public Task<DiskCopyTarget> InspectTargetAsync(string directoryPath, TimeSpan remainingBudget, CancellationToken cancellationToken)
+        {
+            if (!Directory.Exists(directoryPath))
+            {
+                throw JobFailureException.NotFound($"there is no directory at {directoryPath}");
+            }
+
+            return Task.FromResult(new DiskCopyTarget(FreeBytes, SupportsBlockCloning));
+        }
+
+        public async Task<DiskCopyResult> CopyAsync(string sourcePath, string destinationPath, TimeSpan remainingBudget, CancellationToken cancellationToken)
+        {
+            Destinations.Add(destinationPath);
+
+            if (FailNextCopy)
+            {
+                FailNextCopy = false;
+                throw new InvalidOperationException("the copy said no");
+            }
+
+            using var source = StreamedDiskCopy.OpenSource(sourcePath, FileOptions.None);
+            var destination = StreamedDiskCopy.CreateDestination(destinationPath, FileOptions.None);
+            try
+            {
+                await source.CopyToAsync(destination, cancellationToken);
+                return new DiskCopyResult(source.Length, SupportsBlockCloning);
+            }
+            catch
+            {
+                await destination.DisposeAsync();
+                File.Delete(destinationPath);
+                throw;
+            }
+            finally
+            {
+                await destination.DisposeAsync();
+            }
+        }
     }
 }

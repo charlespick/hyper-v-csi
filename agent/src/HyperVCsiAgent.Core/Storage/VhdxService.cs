@@ -73,6 +73,15 @@ public sealed class VhdxService : IVhdxService, IDisposable
     private readonly IVirtualDiskManager _diskManager;
 
     /// <summary>
+    /// The restore-from-snapshot copy's seam, unused by every other operation
+    /// here. Nothing here touches CIM through it - a restore duplicates a file
+    /// on the CSV exactly the way a snapshot does, which is why it goes through
+    /// the same seam <see cref="SnapshotService"/> uses rather than a Hyper-V
+    /// convert.
+    /// </summary>
+    private readonly IDiskCopier _copier;
+
+    /// <summary>
     /// Used only by <see cref="ExpandAsync"/>'s fallback, when a VHDX cannot be
     /// read locally because a running VM already has it open: there is no
     /// cheaper way to learn which VM that is, since CSI's ExpandVolume request
@@ -88,28 +97,54 @@ public sealed class VhdxService : IVhdxService, IDisposable
     private readonly ILogger<VhdxService> _logger;
     private readonly SemaphoreSlim _concurrency;
 
+    /// <summary>
+    /// Bounds a restore's copy, and only that - every other operation in this
+    /// class uses <see cref="_concurrency"/> instead. Shared with
+    /// <see cref="SnapshotService"/>'s own copy, via <see cref="SnapshotCopySlots"/>,
+    /// because the two compete for the same CSV throughput and a cap that only
+    /// bounded one of them would give half of it back.
+    /// </summary>
+    private readonly SnapshotCopySlots _copySlots;
+
     public VhdxService(
         IVirtualDiskManager diskManager,
+        IDiskCopier copier,
         IClusterService cluster,
         IHyperVHostClient host,
+        SnapshotCopySlots copySlots,
         IOptions<AgentOptions> options,
         ILogger<VhdxService> logger)
     {
         _diskManager = diskManager;
+        _copier = copier;
         _cluster = cluster;
         _host = host;
+        _copySlots = copySlots;
         _options = options.Value;
         _logger = logger;
         _concurrency = new SemaphoreSlim(_options.MaxConcurrentDiskOperations);
     }
 
-    public async Task<CreateVolumeResult> CreateAsync(string volumeName, long sizeBytes, CancellationToken cancellationToken)
+    public Task<CreateVolumeResult> CreateAsync(
+        string volumeName, long sizeBytes, string? sourceSnapshotId, CancellationToken cancellationToken)
     {
         if (sizeBytes <= 0)
         {
             throw JobFailureException.InvalidArgument($"size must be positive, got {sizeBytes}");
         }
 
+        // Restore is CreateVolume with one extra payload field, not a second
+        // operation - see CreateVolumePayload.SourceSnapshotId. The two share
+        // this entry point and nothing else below it: an empty create and a
+        // restore need different budgets, different concurrency caps, and a
+        // completely different source of truth for what to write.
+        return string.IsNullOrEmpty(sourceSnapshotId)
+            ? CreateEmptyAsync(volumeName, sizeBytes, cancellationToken)
+            : CreateFromSnapshotAsync(volumeName, sizeBytes, sourceSnapshotId, cancellationToken);
+    }
+
+    private async Task<CreateVolumeResult> CreateEmptyAsync(string volumeName, long sizeBytes, CancellationToken cancellationToken)
+    {
         var path = ResolveVolumePath(volumeName);
         var inProgressPath = InProgressPathFor(path);
 
@@ -190,6 +225,179 @@ public sealed class VhdxService : IVhdxService, IDisposable
         finally
         {
             _concurrency.Release();
+        }
+    }
+
+    /// <summary>
+    /// Restore: the volume is a byte-for-byte copy of a finished snapshot
+    /// rather than an empty disk.
+    /// </summary>
+    /// <remarks>
+    /// Unlike <see cref="CreateEmptyAsync"/>, this is genuinely slow - the copy
+    /// takes as long as the snapshot's own did, which can be hours - so it runs
+    /// on the snapshot-copy budget (<see cref="_copySlots"/>,
+    /// <see cref="AgentOptions.SnapshotCopyTimeout"/>) rather than the fast
+    /// disk-operation one. CreateVolume has no <c>ready_to_use</c> the way
+    /// CreateSnapshot does, so there is nothing to split into a fast and a slow
+    /// job here: this job simply runs for as long as the copy does, and the Go
+    /// side's ordinary awaitJob already reports ABORTED "retry" if that outruns
+    /// its poll budget - ordinary CSI retry semantics re-attach to this same
+    /// job rather than starting a second copy, since the idempotency key stays
+    /// the volume name.
+    ///
+    /// Only the copy and the grow that follows it take a slot - the cheap
+    /// checks above them must not queue behind another restore's multi-hour
+    /// copy just to answer a replay or report a missing snapshot.
+    ///
+    /// The grow, when the request asks for more than the snapshot has, happens
+    /// on the in-progress file before the publish rename, not after: that
+    /// keeps this method's one and only publish at the volume's final size, so
+    /// the idempotency check above never has to reason about a published
+    /// volume that is not yet the right size. It reuses
+    /// <see cref="IVirtualDiskManager.ResizeVhdxAsync"/>, the same primitive
+    /// <see cref="ExpandAsync"/> itself calls, rather than a second resize
+    /// implementation.
+    /// </remarks>
+    private async Task<CreateVolumeResult> CreateFromSnapshotAsync(
+        string volumeName, long sizeBytes, string sourceSnapshotId, CancellationToken cancellationToken)
+    {
+        if (SnapshotNaming.ParseId(sourceSnapshotId) is null)
+        {
+            throw JobFailureException.NotFound(
+                $"volume {volumeName} cannot be restored: {sourceSnapshotId} is not a snapshot id this agent could have produced");
+        }
+
+        var snapshotPath = SnapshotNaming.ResolvePath(_options.CsvSnapshotsRoot, sourceSnapshotId);
+        var copyingSnapshotPath = SnapshotNaming.InProgressPathFor(snapshotPath);
+        var path = ResolveVolumePath(volumeName);
+        var inProgressPath = InProgressPathFor(path);
+
+        using var attempt = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        attempt.CancelAfter(_options.SnapshotCopyTimeout);
+
+        var elapsed = Stopwatch.StartNew();
+
+        try
+        {
+            // Idempotency first, and without touching the snapshot at all: a
+            // replay after a finished restore must succeed even if the
+            // snapshot has since been deleted, the same way CreateEmptyAsync's
+            // replay does not care what produced the disk it finds. Unlike its
+            // tight rounding tolerance, "at least the requested size" is the
+            // whole test here - a restore's real size is the snapshot's own,
+            // which legitimately exceeds sizeBytes, and CSI allows a volume
+            // larger than requested.
+            if (File.Exists(path))
+            {
+                var existingSize = await _diskManager.GetVirtualSizeAsync(
+                    path, _options.SnapshotCopyTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
+                if (existingSize >= sizeBytes)
+                {
+                    _logger.LogInformation(
+                        "CreateVolume {VolumeName}: {Path} already exists at {ExistingSize} bytes, satisfying the requested {RequestedSize}",
+                        volumeName, path, existingSize, sizeBytes);
+                    return new CreateVolumeResult(volumeName, existingSize, AlreadyPresent: true);
+                }
+
+                throw JobFailureException.AlreadyExists(
+                    $"volume {volumeName} already exists at {existingSize} bytes, which does not satisfy the requested {sizeBytes}");
+            }
+
+            // The snapshot has to be a finished, published copy. One still
+            // being written is not a snapshot yet no matter how it looks on
+            // the CSV, and NotFound - not a wait - is the honest answer: a
+            // restore cannot succeed by polling here, since nothing drives the
+            // in-flight copy to completion on this volume's behalf.
+            if (!File.Exists(snapshotPath))
+            {
+                if (File.Exists(copyingSnapshotPath))
+                {
+                    throw JobFailureException.NotFound(
+                        $"volume {volumeName} cannot be restored: snapshot {sourceSnapshotId} is still being created");
+                }
+
+                throw JobFailureException.NotFound(
+                    $"volume {volumeName} cannot be restored: snapshot {sourceSnapshotId} does not exist");
+            }
+
+            var snapshotSize = await _diskManager.GetVirtualSizeAsync(
+                snapshotPath, _options.SnapshotCopyTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
+
+            // The snapshot's size is the floor: CSI allows a volume larger
+            // than requested, not one that silently truncates the image it
+            // was restored from.
+            var targetSize = Math.Max(sizeBytes, snapshotSize);
+
+            Directory.CreateDirectory(_options.CsvVolumesRoot);
+
+            if (File.Exists(inProgressPath))
+            {
+                _logger.LogWarning(
+                    "CreateVolume {VolumeName}: removing {Path} left behind by an earlier attempt", volumeName, inProgressPath);
+                File.Delete(inProgressPath);
+            }
+
+            // Free-space check, same as CreateSnapshot's: charged against the
+            // snapshot's allocated size, not its virtual size, since that is
+            // what the copy actually has to move.
+            var target = await _copier.InspectTargetAsync(
+                _options.CsvVolumesRoot, _options.SnapshotCopyTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
+            var snapshotAllocatedBytes = new FileInfo(snapshotPath).Length;
+            target.EnsureRoomFor(snapshotAllocatedBytes, snapshotPath, _options.CsvVolumesRoot);
+
+            await AcquireCopySlotAsync(attempt, cancellationToken, volumeName).ConfigureAwait(false);
+            try
+            {
+                await _copier.CopyAsync(
+                    snapshotPath, inProgressPath, _options.SnapshotCopyTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
+
+                long actualSize;
+                if (targetSize > snapshotSize)
+                {
+                    actualSize = await _diskManager.ResizeVhdxAsync(
+                        inProgressPath, targetSize, _options.SnapshotCopyTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
+                }
+                else
+                {
+                    actualSize = await ReadBackSizeAsync(
+                        inProgressPath, snapshotSize, _options.SnapshotCopyTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
+                }
+
+                File.Move(inProgressPath, path);
+                _logger.LogInformation(
+                    "CreateVolume {VolumeName}: restored {Path} from snapshot {SnapshotId} at {ActualSize} bytes in {Elapsed}",
+                    volumeName, path, sourceSnapshotId, actualSize, elapsed.Elapsed);
+                return new CreateVolumeResult(volumeName, actualSize, AlreadyPresent: false);
+            }
+            finally
+            {
+                _copySlots.Release();
+            }
+        }
+        catch (TimeoutException ex)
+        {
+            // The copier's own budget, spent mid-copy. It has already removed
+            // its own partial destination.
+            TryDeleteInProgress(inProgressPath);
+            _logger.LogError(ex,
+                "CreateVolume {VolumeName}: restoring from snapshot {SnapshotId} ran out of its {Budget} budget",
+                volumeName, sourceSnapshotId, _options.SnapshotCopyTimeout);
+            throw new JobFailureException(
+                AgentErrorCodes.Internal,
+                $"restoring volume {volumeName} from snapshot {sourceSnapshotId} ran out of its {_options.SnapshotCopyTimeout} budget: {ex.Message}",
+                ex);
+        }
+        catch (OperationCanceledException) when (attempt.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            TryDeleteInProgress(inProgressPath);
+            throw new JobFailureException(
+                AgentErrorCodes.Internal,
+                $"restoring volume {volumeName} from snapshot {sourceSnapshotId} timed out after {_options.SnapshotCopyTimeout}");
+        }
+        catch
+        {
+            TryDeleteInProgress(inProgressPath);
+            throw;
         }
     }
 
@@ -476,6 +684,28 @@ public sealed class VhdxService : IVhdxService, IDisposable
                 AgentErrorCodes.Internal,
                 $"{verb} volume {volumeId} timed out after {_options.DiskOperationTimeout} waiting for one of " +
                 $"{_options.MaxConcurrentDiskOperations} disk operation slots");
+        }
+    }
+
+    /// <summary>
+    /// Takes a slot against <see cref="_copySlots"/>, the cap shared with
+    /// <see cref="SnapshotService"/>'s own copy. Same reasoning as
+    /// <see cref="AcquireSlotAsync"/>: reporting a timeout spent queuing as the
+    /// operation timing out, rather than a bare OperationCanceledException with
+    /// no volume or budget attached to it.
+    /// </summary>
+    private async Task AcquireCopySlotAsync(
+        CancellationTokenSource attempt, CancellationToken callerToken, string volumeName)
+    {
+        try
+        {
+            await _copySlots.WaitAsync(attempt.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (attempt.IsCancellationRequested && !callerToken.IsCancellationRequested)
+        {
+            throw new JobFailureException(
+                AgentErrorCodes.Internal,
+                $"restoring volume {volumeName} timed out after {_options.SnapshotCopyTimeout} waiting for a snapshot copy slot");
         }
     }
 

@@ -12,11 +12,22 @@ public interface IVhdxService
     /// this name is already there with a compatible size. Idempotent against the
     /// CSV itself, which is what makes a retry after a lost job record safe.
     /// </summary>
+    /// <param name="sourceSnapshotId">
+    /// When set, this is a restore: the volume is a copy of this snapshot rather
+    /// than an empty disk, and <paramref name="sizeBytes"/> is a floor the
+    /// snapshot's own size may exceed - CSI allows a volume larger than
+    /// requested, not one that truncates the image it was restored from. Null or
+    /// empty means the ordinary empty-VHDX create.
+    /// </param>
     /// <exception cref="Jobs.JobFailureException">
     /// AlreadyExists if a volume of this name exists at a different size - the
-    /// response CSI mandates for an incompatible name collision.
+    /// response CSI mandates for an incompatible name collision. For a restore,
+    /// NotFound if <paramref name="sourceSnapshotId"/> names no finished snapshot
+    /// on the CSV - including one still being copied, which is not a snapshot
+    /// yet - and ResourceExhausted if the CSV has no room for the copy.
     /// </exception>
-    Task<CreateVolumeResult> CreateAsync(string volumeName, long sizeBytes, CancellationToken cancellationToken);
+    Task<CreateVolumeResult> CreateAsync(
+        string volumeName, long sizeBytes, string? sourceSnapshotId, CancellationToken cancellationToken);
 
     /// <summary>
     /// Grows the volume's VHDX to <paramref name="newSizeBytes"/> and reports

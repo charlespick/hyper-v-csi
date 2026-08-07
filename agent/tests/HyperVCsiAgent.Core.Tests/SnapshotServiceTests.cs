@@ -955,10 +955,15 @@ public sealed class SnapshotServiceTests : IDisposable
         var disks = new FakeVirtualDiskManager();
         var copier = new FakeDiskCopier();
         var store = new RecordingJobStore();
+        var copySlots = new SnapshotCopySlots(Options.Create(new AgentOptions
+        {
+            MaxConcurrentSnapshotCopies = maxConcurrentSnapshotCopies,
+        }));
         var service = new SnapshotService(
             disks,
             copier,
             store,
+            copySlots,
             Options.Create(new AgentOptions
             {
                 CsvVolumesRoot = _volumesRoot,
@@ -971,10 +976,10 @@ public sealed class SnapshotServiceTests : IDisposable
 
         // The store goes first at the end of the test: disposing it cancels the
         // token any copy still in flight is watching, so those copies unwind
-        // through their own finally - and release the service's semaphore -
-        // before the service disposes it.
+        // through their own finally - and release the shared copy slot - before
+        // that gets disposed.
         _disposables.Add(store);
-        _disposables.Add(service);
+        _disposables.Add(copySlots);
         return new Harness(service, disks, copier, store);
     }
 

@@ -19,8 +19,25 @@ public class JobDispatcherTests
         var job = NewJob();
         await run(job, CancellationToken.None);
 
-        Assert.Equal(("pvc-1", 2048L), vhdx.LastCreate);
+        Assert.Equal(("pvc-1", 2048L, (string?)null), vhdx.LastCreate);
         Assert.Equal(new CreateVolumeResult("pvc-1", 2048, AlreadyPresent: false), job.Result);
+    }
+
+    [Fact]
+    public async Task Resolve_CreateVolume_PassesTheSourceSnapshotIdThrough()
+    {
+        // Restore is CreateVolume with one extra field, not a second operation -
+        // the wire contract adds sourceSnapshotId to the same payload rather than
+        // growing a CreateVolumeFromSnapshot operation.
+        var vhdx = new RecordingVhdxService();
+        var run = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService()).Resolve(
+            JobDispatcher.CreateVolume,
+            Payload("""{"name":"pvc-2","sizeBytes":2048,"sourceSnapshotId":"pvc-1~snap-a"}"""),
+            WireOptions);
+
+        await run(NewJob(), CancellationToken.None);
+
+        Assert.Equal(("pvc-2", 2048L, "pvc-1~snap-a"), vhdx.LastCreate);
     }
 
     [Fact]
@@ -268,7 +285,7 @@ public class JobDispatcherTests
 
     private sealed class RecordingVhdxService : IVhdxService
     {
-        public (string VolumeName, long SizeBytes)? LastCreate { get; private set; }
+        public (string VolumeName, long SizeBytes, string? SourceSnapshotId)? LastCreate { get; private set; }
 
         public (string VolumeId, long SizeBytes, string? NodeId)? LastExpand { get; private set; }
 
@@ -276,9 +293,10 @@ public class JobDispatcherTests
 
         public string? LastConfirmExists { get; private set; }
 
-        public Task<CreateVolumeResult> CreateAsync(string volumeName, long sizeBytes, CancellationToken cancellationToken)
+        public Task<CreateVolumeResult> CreateAsync(
+            string volumeName, long sizeBytes, string? sourceSnapshotId, CancellationToken cancellationToken)
         {
-            LastCreate = (volumeName, sizeBytes);
+            LastCreate = (volumeName, sizeBytes, sourceSnapshotId);
             return Task.FromResult(new CreateVolumeResult(volumeName, sizeBytes, AlreadyPresent: false));
         }
 

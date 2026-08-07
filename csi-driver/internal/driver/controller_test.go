@@ -124,6 +124,107 @@ func TestCreateVolumeSizeSelection(t *testing.T) {
 	}
 }
 
+func TestCreateVolumeRestoreEnqueuesTheSourceSnapshotId(t *testing.T) {
+	agent := newFakeAgent(t, created(10*gibibyte))
+	server := newControllerServer(agent)
+
+	req := createVolumeRequestFromSnapshot("pvc-2", "pvc-1~snap-a", 10*gibibyte, 0)
+	if _, err := server.CreateVolume(context.Background(), req); err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+
+	enqueued := agent.onlyEnqueued(t)
+	if enqueued.Payload.SourceSnapshotID != "pvc-1~snap-a" {
+		t.Errorf("sourceSnapshotId = %q, want pvc-1~snap-a", enqueued.Payload.SourceSnapshotID)
+	}
+}
+
+func TestCreateVolumeEmptyCreateEnqueuesNoSourceSnapshotId(t *testing.T) {
+	agent := newFakeAgent(t, created(gibibyte))
+	server := newControllerServer(agent)
+
+	if _, err := server.CreateVolume(context.Background(), createVolumeRequest("pvc-1", gibibyte, 0)); err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+
+	if got := agent.onlyEnqueued(t).Payload.SourceSnapshotID; got != "" {
+		t.Errorf("sourceSnapshotId = %q, want empty for an ordinary create", got)
+	}
+}
+
+func TestCreateVolumeRestoreEchoesTheContentSourceInTheResponse(t *testing.T) {
+	agent := newFakeAgent(t, created(10*gibibyte))
+	server := newControllerServer(agent)
+
+	req := createVolumeRequestFromSnapshot("pvc-2", "pvc-1~snap-a", 10*gibibyte, 0)
+	resp, err := server.CreateVolume(context.Background(), req)
+	if err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+
+	got := resp.GetVolume().GetContentSource().GetSnapshot().GetSnapshotId()
+	if got != "pvc-1~snap-a" {
+		t.Errorf("content source snapshot id = %q, want pvc-1~snap-a", got)
+	}
+}
+
+func TestCreateVolumeEmptyCreateHasNoContentSourceInTheResponse(t *testing.T) {
+	agent := newFakeAgent(t, created(gibibyte))
+	server := newControllerServer(agent)
+
+	resp, err := server.CreateVolume(context.Background(), createVolumeRequest("pvc-1", gibibyte, 0))
+	if err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+
+	if resp.GetVolume().GetContentSource() != nil {
+		t.Errorf("content source = %v, want nil for an ordinary create", resp.GetVolume().GetContentSource())
+	}
+}
+
+func TestCreateVolumeRestoreOverTheLimitIsOutOfRange(t *testing.T) {
+	tests := []struct {
+		name string
+		job  agentclient.Job
+	}{
+		{
+			// A snapshot bigger than the limit is a request nothing could
+			// satisfy, not a driver bug: the agent floors a restore's size at
+			// the snapshot's own.
+			name: "fresh restore",
+			job:  created(10 * gibibyte),
+		},
+		{
+			// The same is true on a replay of an already-finished restore.
+			name: "replay of a finished restore",
+			job:  succeeded(`{"volumeId":"pvc-2","actualSizeBytes":10737418240,"alreadyPresent":true}`),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := newControllerServer(newFakeAgent(t, test.job))
+
+			req := createVolumeRequestFromSnapshot("pvc-2", "pvc-1~snap-a", gibibyte, 2*gibibyte)
+			_, err := server.CreateVolume(context.Background(), req)
+
+			if got := status.Code(err); got != codes.OutOfRange {
+				t.Fatalf("code = %s, want OutOfRange (err: %v)", got, err)
+			}
+		})
+	}
+}
+
+func createVolumeRequestFromSnapshot(name, snapshotID string, requiredBytes, limitBytes int64) *csi.CreateVolumeRequest {
+	req := createVolumeRequest(name, requiredBytes, limitBytes)
+	req.VolumeContentSource = &csi.VolumeContentSource{
+		Type: &csi.VolumeContentSource_Snapshot{
+			Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: snapshotID},
+		},
+	}
+	return req
+}
+
 func TestCreateVolumeRejectsUnusableRequests(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -179,17 +280,32 @@ func TestCreateVolumeRejectsUnusableRequests(t *testing.T) {
 			want:    codes.OutOfRange,
 		},
 		{
-			name: "restore from a snapshot",
+			// Restoring from a snapshot is implemented; cloning from another
+			// volume is not, and CLONE_VOLUME is not advertised.
+			name: "clone from another volume",
 			request: func() *csi.CreateVolumeRequest {
 				req := createVolumeRequest("pvc-1", gibibyte, 0)
 				req.VolumeContentSource = &csi.VolumeContentSource{
-					Type: &csi.VolumeContentSource_Snapshot{
-						Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "snap-1"},
+					Type: &csi.VolumeContentSource_Volume{
+						Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "pvc-0"},
 					},
 				}
 				return req
 			}(),
 			want: codes.Unimplemented,
+		},
+		{
+			name: "restore with an empty snapshot id",
+			request: func() *csi.CreateVolumeRequest {
+				req := createVolumeRequest("pvc-1", gibibyte, 0)
+				req.VolumeContentSource = &csi.VolumeContentSource{
+					Type: &csi.VolumeContentSource_Snapshot{
+						Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: ""},
+					},
+				}
+				return req
+			}(),
+			want: codes.InvalidArgument,
 		},
 	}
 
@@ -1993,15 +2109,16 @@ type enqueuedJob struct {
 	// The union of every operation's payload, so one decode covers whichever
 	// one the test under way enqueued.
 	Payload struct {
-		Name           string `json:"name"`
-		SizeBytes      int64  `json:"sizeBytes"`
-		VolumeID       string `json:"volumeId"`
-		NodeID         string `json:"nodeId"`
-		SourceVolumeID string `json:"sourceVolumeId"`
-		SnapshotName   string `json:"snapshotName"`
-		SnapshotID     string `json:"snapshotId"`
-		StartingToken  string `json:"startingToken"`
-		MaxEntries     int32  `json:"maxEntries"`
+		Name             string `json:"name"`
+		SizeBytes        int64  `json:"sizeBytes"`
+		SourceSnapshotID string `json:"sourceSnapshotId"`
+		VolumeID         string `json:"volumeId"`
+		NodeID           string `json:"nodeId"`
+		SourceVolumeID   string `json:"sourceVolumeId"`
+		SnapshotName     string `json:"snapshotName"`
+		SnapshotID       string `json:"snapshotId"`
+		StartingToken    string `json:"startingToken"`
+		MaxEntries       int32  `json:"maxEntries"`
 	} `json:"payload"`
 }
 

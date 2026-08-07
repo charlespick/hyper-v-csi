@@ -44,7 +44,7 @@ namespace HyperVCsiAgent.Core.Storage;
 /// separate piece of work, and until it exists this refuses the case rather than
 /// copying a disk out from under a live writer.
 /// </remarks>
-public sealed class SnapshotService : ISnapshotService, IDisposable
+public sealed class SnapshotService : ISnapshotService
 {
     /// <summary>
     /// The operation type of the internal copy job.
@@ -106,23 +106,27 @@ public sealed class SnapshotService : ISnapshotService, IDisposable
     /// down would give all of it back.
     ///
     /// Nothing on the fast path takes a slot here: it must never queue behind a
-    /// copy, which is the whole point.
+    /// copy, which is the whole point. Shared with <see cref="VhdxService"/>'s
+    /// restore-from-snapshot copy, which is the same kind of bulk CSV I/O and has
+    /// to compete for the same budget rather than getting one of its own - see
+    /// <see cref="SnapshotCopySlots"/>.
     /// </summary>
-    private readonly SemaphoreSlim _copyConcurrency;
+    private readonly SnapshotCopySlots _copySlots;
 
     public SnapshotService(
         IVirtualDiskManager diskManager,
         IDiskCopier copier,
         IJobStore jobs,
+        SnapshotCopySlots copySlots,
         IOptions<AgentOptions> options,
         ILogger<SnapshotService> logger)
     {
         _diskManager = diskManager;
         _copier = copier;
         _jobs = jobs;
+        _copySlots = copySlots;
         _options = options.Value;
         _logger = logger;
-        _copyConcurrency = new SemaphoreSlim(_options.MaxConcurrentSnapshotCopies);
     }
 
     public async Task<SnapshotResult> CreateAsync(string sourceVolumeId, string snapshotName, CancellationToken cancellationToken)
@@ -354,8 +358,6 @@ public sealed class SnapshotService : ISnapshotService, IDisposable
         }
     }
 
-    public void Dispose() => _copyConcurrency.Dispose();
-
     /// <summary>
     /// Starts the copy, or attaches to the one already running.
     /// </summary>
@@ -489,7 +491,7 @@ public sealed class SnapshotService : ISnapshotService, IDisposable
         }
         finally
         {
-            _copyConcurrency.Release();
+            _copySlots.Release();
         }
     }
 
@@ -742,7 +744,7 @@ public sealed class SnapshotService : ISnapshotService, IDisposable
     /// source volume that has since been attached, which says nothing about the
     /// snapshot.
     ///
-    /// Takes no slot against <see cref="_copyConcurrency"/>: that cap exists to
+    /// Takes no slot against <see cref="_copySlots"/>: that cap exists to
     /// stop long copies stacking up, and this is a single bounded query on the
     /// fast path, which must never queue behind one.
     /// </remarks>
@@ -774,7 +776,7 @@ public sealed class SnapshotService : ISnapshotService, IDisposable
     {
         try
         {
-            await _copyConcurrency.WaitAsync(attempt.Token).ConfigureAwait(false);
+            await _copySlots.WaitAsync(attempt.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (attempt.IsCancellationRequested && !callerToken.IsCancellationRequested)
         {

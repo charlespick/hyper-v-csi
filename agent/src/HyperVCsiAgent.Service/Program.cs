@@ -58,6 +58,11 @@ else
     builder.Services.AddSingleton<IDiskCopier, UnsupportedDiskCopier>();
 }
 
+// Shared by VhdxService's restore-from-snapshot copy and SnapshotService's own
+// copy: one cap on concurrent bulk copies against the CSV, not one per caller.
+// See SnapshotCopySlots for why two separate semaphores would double it.
+builder.Services.AddSingleton<SnapshotCopySlots>();
+
 builder.Services.AddSingleton<IVhdxService, VhdxService>();
 builder.Services.AddSingleton<IAttachService, AttachService>();
 

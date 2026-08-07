@@ -50,7 +50,8 @@ public sealed class JobDispatcher(IVhdxService vhdxService, IAttachService attac
                 }
 
                 return async (job, cancellationToken) =>
-                    job.Result = await vhdxService.CreateAsync(request.Name, request.SizeBytes, cancellationToken)
+                    job.Result = await vhdxService
+                        .CreateAsync(request.Name, request.SizeBytes, request.SourceSnapshotId, cancellationToken)
                         .ConfigureAwait(false);
 
             case DeleteVolume:
