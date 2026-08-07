@@ -26,4 +26,5 @@
 * scalability - might not be ideal at first, overal intent is for "eventual
   consistency" at first but we may need to implement full serialization in the
   agent at first, the agent may be down momentarily for failover, etc. but
-  kubernetes should keep retrying, and it'll get there eventuallyÍ
+  kubernetes should keep retrying, and it'll get there eventually
+  
