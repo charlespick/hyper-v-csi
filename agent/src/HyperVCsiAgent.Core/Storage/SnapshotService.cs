@@ -35,9 +35,12 @@ namespace HyperVCsiAgent.Core.Storage;
 /// interleave with a create, expand or delete of the disk it is reading. It can
 /// run for hours and nothing polls it; its only observable output is the file it
 /// publishes. For an attached source, this job also starts the checkpoint's
-/// merge once the copy is safely published - see
-/// <see cref="IHyperVHostClient.DestroyCheckpointAsync"/> for why that stays
-/// fire-and-forget.
+/// merge - fire-and-forget, see
+/// <see cref="IHyperVHostClient.DestroyCheckpointAsync"/> for why - once the
+/// copy has read everything it needs, and deliberately before the publish
+/// rename rather than after: see <see cref="RunCopyAsync"/>'s own remarks for
+/// why that order is the one that keeps a crash from stranding an unmerged
+/// checkpoint nothing ever revisits.
 /// </item>
 /// </list>
 ///
@@ -455,8 +458,9 @@ public sealed class SnapshotService : ISnapshotService
 
     /// <summary>
     /// <see cref="EnsureCopyUnderway"/>'s attached-source counterpart: the same
-    /// job, on the same target, with one addition - once the copy is safely
-    /// published, this drives the checkpoint's merge.
+    /// job, on the same target, with one addition - once the copy has read
+    /// everything it needs, this drives the checkpoint's merge, before the
+    /// snapshot is published rather than after.
     /// </summary>
     private void EnsureCheckpointedCopyUnderway(
         string snapshotId, string sourceVolumeId, string sourcePath, string snapshotPath, string copyingPath,
@@ -469,9 +473,10 @@ public sealed class SnapshotService : ISnapshotService
                 RunCopyAsync(snapshotId, sourcePath, snapshotPath, copyingPath, (vm, checkpoint), cancellationToken));
 
     /// <summary>
-    /// The long-running half: copy into the marker, publish by atomic rename,
-    /// and - for an attached source - start merging the checkpoint that froze
-    /// it. Nothing polls this, so every outcome has to be legible in the log.
+    /// The long-running half: copy into the marker, then - for an attached
+    /// source - start merging the checkpoint that froze it, then publish by
+    /// atomic rename. Nothing polls this, so every outcome has to be legible
+    /// in the log.
     /// </summary>
     private async Task RunCopyAsync(
         string snapshotId, string sourcePath, string snapshotPath, string copyingPath,
@@ -493,11 +498,14 @@ public sealed class SnapshotService : ISnapshotService
                 _logger.LogInformation(
                     "CopySnapshot {SnapshotId}: {Path} is already published; nothing to copy", snapshotId, snapshotPath);
 
-                // Crash-matrix row 3: the copy finished, but whatever should
-                // have started the merge afterward never ran (or never got
-                // the chance to). Reaching here means it is safe to try again
-                // - DestroySnapshot on an already-merged or already-gone
-                // checkpoint is a no-op, per IHyperVHostClient.DestroyCheckpointAsync.
+                // Defensive, not the expected path: the merge is issued
+                // *before* the publish rename below now, so reaching here
+                // with a checkpoint still to destroy means something odd
+                // happened - a crash between the two calls in a prior run of
+                // this exact code, or debris from before that ordering was
+                // fixed. Safe to retry regardless: DestroySnapshot on an
+                // already-merged or already-gone checkpoint is a no-op, per
+                // IHyperVHostClient.DestroyCheckpointAsync.
                 if (checkpoint is { } stale)
                 {
                     await DestroyOwnedCheckpointAsync(snapshotId, stale.Vm, stale.Checkpoint, attempt.Token).ConfigureAwait(false);
@@ -529,6 +537,27 @@ public sealed class SnapshotService : ISnapshotService
             var copy = await _copier.CopyAsync(
                 sourcePath, copyingPath, _options.SnapshotCopyTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
 
+            // Started before the publish, not after. The copy no longer needs
+            // the checkpoint once it has read every byte - the base is not
+            // touched again below, only the destination gets renamed - so
+            // there is nothing left for the checkpoint to protect from here.
+            // Issuing the merge now instead of after publishing means a crash
+            // in the gap between this call and the rename below loses at most
+            // the copy, which a retry redoes from a fresh checkpoint. The
+            // order this replaced put the merge *after* the rename, which put
+            // the one truly unsafe outcome - an unmerged checkpoint nothing
+            // ever revisits, since a published snapshot short-circuits every
+            // later CreateSnapshot before it looks at the checkpoint again -
+            // behind the crash window instead of in front of it. A checkpoint
+            // is VM-wide, so that outcome does not just sit there harmlessly:
+            // GuardAgainstDifferencingChain does not know this driver's tag,
+            // so every other disk on the VM would start refusing attach,
+            // detach and expand until an operator deleted it by hand.
+            if (checkpoint is { } taken)
+            {
+                await DestroyOwnedCheckpointAsync(snapshotId, taken.Vm, taken.Checkpoint, attempt.Token).ConfigureAwait(false);
+            }
+
             // The publish. Until this rename the snapshot does not exist as far
             // as anything else is concerned, which is what makes a crash at any
             // earlier point leave debris rather than a plausible-looking lie.
@@ -539,15 +568,6 @@ public sealed class SnapshotService : ISnapshotService
             _logger.LogInformation(
                 "CopySnapshot {SnapshotId}: published {Path} after copying {Bytes} bytes ({Method}) in {Elapsed}",
                 snapshotId, snapshotPath, copy.BytesCopied, copy.BlockCloned ? "block clone" : "streamed", elapsed.Elapsed);
-
-            // The snapshot is complete and independent of its source the
-            // instant it is published - the merge is cleanup of the *volume*
-            // from here, not part of the snapshot, so a failure destroying the
-            // checkpoint does not undo the publish above or fail this job.
-            if (checkpoint is { } taken)
-            {
-                await DestroyOwnedCheckpointAsync(snapshotId, taken.Vm, taken.Checkpoint, attempt.Token).ConfigureAwait(false);
-            }
         }
         catch (TimeoutException ex)
         {

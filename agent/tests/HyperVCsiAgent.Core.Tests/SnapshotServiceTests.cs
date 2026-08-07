@@ -451,10 +451,30 @@ public sealed class SnapshotServiceTests : IDisposable
         await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
 
         // Tagged with this exact (volume, name) pair's identity, taken once,
-        // and merged once the copy safely published.
+        // and merged once the copy had read everything it needed.
         Assert.Equal(["hyperv-csi/pvc-1/snapshot-abc"], host.CreatedCheckpointElementNames);
         await WaitForAsync(() => host.DestroyedCheckpointElementNames.Count == 1);
         Assert.Equal(["hyperv-csi/pvc-1/snapshot-abc"], host.DestroyedCheckpointElementNames);
+    }
+
+    [Fact]
+    public async Task CreateAsync_AttachedVolume_MergesTheCheckpointBeforePublishingNotAfter()
+    {
+        // The order that keeps a crash from stranding an unmerged checkpoint
+        // nothing ever revisits: a published snapshot short-circuits every
+        // later CreateSnapshot before it looks at the checkpoint again, so
+        // the merge has to be underway *before* that file exists, not after.
+        var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient();
+        var snapshotPublishedBeforeDestroy = true;
+        host.DuringDestroy = () => snapshotPublishedBeforeDestroy = File.Exists(SnapshotPath("pvc-1~snapshot-abc"));
+        var harness = NewHarness(cluster: cluster, host: host);
+        WriteVolume("pvc-1", 4096);
+
+        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", "node-a", CancellationToken.None);
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+
+        Assert.False(snapshotPublishedBeforeDestroy);
     }
 
     [Fact]
@@ -1404,6 +1424,9 @@ public sealed class SnapshotServiceTests : IDisposable
 
         public bool FailNextDestroy { get; set; }
 
+        /// <summary>Runs synchronously inside DestroyCheckpointAsync, before it records the call - lets a test observe what else is (or isn't) true at that exact moment.</summary>
+        public Action? DuringDestroy { get; set; }
+
         public long AllocatedBytesOnHost { get; set; } = 4096;
 
         public List<string> CreatedCheckpointElementNames { get; } = [];
@@ -1453,6 +1476,8 @@ public sealed class SnapshotServiceTests : IDisposable
 
         public Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken)
         {
+            DuringDestroy?.Invoke();
+
             if (FailNextDestroy)
             {
                 FailNextDestroy = false;
