@@ -148,13 +148,30 @@ public class JobDispatcherTests
         var job = NewJob();
         await run(job, CancellationToken.None);
 
-        Assert.Equal(("pvc-1", "snapshot-abc"), snapshots.LastCreate);
+        Assert.Equal(("pvc-1", "snapshot-abc", (string?)null), snapshots.LastCreate);
         // A result even though the copy has not finished: readyToUse is part of
         // it, so "not done yet" is a succeeded job with something to say rather
         // than a job left Running for hours.
         Assert.Equal(
             new SnapshotResult("pvc-1~snapshot-abc", "pvc-1", 4096, 1770000000, ReadyToUse: false),
             job.Result);
+    }
+
+    [Fact]
+    public async Task Resolve_CreateSnapshot_PassesTheNodeIdThrough()
+    {
+        // A node hint is what lets an attached source be snapshotted at all -
+        // see SnapshotService.InspectSourceAsync - so it has to survive the
+        // wire decode intact.
+        var snapshots = new RecordingSnapshotService();
+        var run = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), snapshots).Resolve(
+            JobDispatcher.CreateSnapshot,
+            Payload("""{"sourceVolumeId":"pvc-1","snapshotName":"snapshot-abc","nodeId":"node-a"}"""),
+            WireOptions);
+
+        await run(NewJob(), CancellationToken.None);
+
+        Assert.Equal(("pvc-1", "snapshot-abc", "node-a"), snapshots.LastCreate);
     }
 
     [Fact]
@@ -341,15 +358,16 @@ public class JobDispatcherTests
 
     private sealed class RecordingSnapshotService : ISnapshotService
     {
-        public (string SourceVolumeId, string SnapshotName)? LastCreate { get; private set; }
+        public (string SourceVolumeId, string SnapshotName, string? NodeId)? LastCreate { get; private set; }
 
         public string? LastDelete { get; private set; }
 
         public (string? SnapshotId, string? SourceVolumeId, string? StartingToken, int MaxEntries)? LastList { get; private set; }
 
-        public Task<SnapshotResult> CreateAsync(string sourceVolumeId, string snapshotName, CancellationToken cancellationToken)
+        public Task<SnapshotResult> CreateAsync(
+            string sourceVolumeId, string snapshotName, string? nodeId, CancellationToken cancellationToken)
         {
-            LastCreate = (sourceVolumeId, snapshotName);
+            LastCreate = (sourceVolumeId, snapshotName, nodeId);
             return Task.FromResult(new SnapshotResult(
                 sourceVolumeId + "~" + snapshotName, sourceVolumeId, 4096, 1770000000, ReadyToUse: false));
         }

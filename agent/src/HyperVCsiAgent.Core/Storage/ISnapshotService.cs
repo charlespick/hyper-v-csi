@@ -22,9 +22,10 @@ public interface ISnapshotService
     /// <remarks>
     /// Fast, always, and that is a design decision rather than an accident of
     /// what a copy costs. Copying a VHDX can run for hours; a CSI RPC cannot. So
-    /// this runs the preconditions, makes sure a copy is underway or already
-    /// done, and reports what the CSV currently shows - while the copy itself is
-    /// a separate long-running job started internally through
+    /// this runs the preconditions - for an attached source, including taking
+    /// the checkpoint that freezes the base - makes sure a copy is underway or
+    /// already done, and reports what the CSV currently shows - while the copy
+    /// itself is a separate long-running job started internally through
     /// <see cref="Jobs.IJobStore"/>, which the controller never polls.
     ///
     /// An unfinished snapshot is a perfectly good answer with
@@ -32,21 +33,25 @@ public interface ISnapshotService
     /// again until it flips true, which is also what makes an agent that
     /// restarted mid-copy answer correctly: readiness is re-derived from the
     /// files, which survive, not from the job record, which does not.
-    ///
-    /// Only unattached source volumes are supported for now. A volume a running
-    /// VM has open needs a Hyper-V checkpoint to freeze the base before anything
-    /// can read it, which is a separate piece of work; this refuses that case
-    /// rather than copying a disk out from under a live writer.
     /// </remarks>
+    /// <param name="nodeId">
+    /// The CSI node ID of the VM currently holding the source volume attached,
+    /// if the Go driver found one - see <see cref="ExpandVolumePayload.NodeId"/>
+    /// for the same hint on ExpandVolume. Only consulted when the source cannot
+    /// be read locally because something else has it open; null or empty means
+    /// either an unattached source or nothing to resolve an attached one
+    /// through, both of which are answered the way they always have been.
+    /// </param>
     /// <exception cref="Jobs.JobFailureException">
     /// NotFound if the source volume has no VHDX; FailedPrecondition if the
-    /// source is held open, which for now includes every attached, running
-    /// volume; ResourceExhausted if the CSV has no room for the copy;
-    /// AlreadyExists if this snapshot name is already taken by a snapshot of a
-    /// different volume, which is what CSI requires for an incompatible name
-    /// collision.
+    /// source is held open and either no node hint was given or the VM it names
+    /// sits behind a differencing chain this driver did not create;
+    /// ResourceExhausted if the CSV has no room for the copy; AlreadyExists if
+    /// this snapshot name is already taken by a snapshot of a different volume,
+    /// which is what CSI requires for an incompatible name collision.
     /// </exception>
-    Task<SnapshotResult> CreateAsync(string sourceVolumeId, string snapshotName, CancellationToken cancellationToken);
+    Task<SnapshotResult> CreateAsync(
+        string sourceVolumeId, string snapshotName, string? nodeId, CancellationToken cancellationToken);
 
     /// <summary>
     /// Removes a snapshot and any in-progress copy of it. Succeeds when there is

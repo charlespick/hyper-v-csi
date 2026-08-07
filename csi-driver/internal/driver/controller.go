@@ -837,6 +837,11 @@ const snapshotsTarget = "snapshots"
 type createSnapshotPayload struct {
 	SourceVolumeID string `json:"sourceVolumeId"`
 	SnapshotName   string `json:"snapshotName"`
+	// NodeID is the CSI node ID of the VM currently holding the source volume
+	// attached, when one exists - found via findAttachedNode the same way
+	// expandVolumePayload.NodeID is, since CSI's own request carries neither.
+	// Empty for an unattached source.
+	NodeID string `json:"nodeId,omitempty"`
 }
 
 // snapshotResult is the agent's description of one snapshot, matching
@@ -926,6 +931,18 @@ func (s *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 	// on them would look like support for them; dropping them here keeps the gap
 	// where it already is, and honest.
 
+	// CreateSnapshotRequest carries no node hint, unlike ControllerPublish/
+	// UnpublishVolume's own — the same gap ControllerExpandVolume has, and the
+	// same fix: ask Kubernetes which node the VolumeAttachment API says has
+	// this volume, so the agent can freeze it through a checkpoint if it's
+	// attached. An empty result is not an error - most snapshots are of
+	// unattached volumes, and the agent's own local read already handles that
+	// case without any hint at all.
+	nodeID, err := findAttachedNode(ctx, s.driver.KubeClient, req.GetSourceVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "finding which node has %s attached: %v", req.GetSourceVolumeId(), err)
+	}
+
 	// The snapshot name is the idempotency key per CSI Spec.md, so a retry from
 	// external-snapshotter for the same VolumeSnapshot re-attaches to the job in
 	// flight instead of starting a second copy of the same disk.
@@ -933,6 +950,7 @@ func (s *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 		snapshotTarget(req.GetSourceVolumeId()+snapshotIDSeparator+req.GetName()), createSnapshotPayload{
 			SourceVolumeID: req.GetSourceVolumeId(),
 			SnapshotName:   req.GetName(),
+			NodeID:         nodeID,
 		})
 	if err != nil {
 		return nil, enqueueFailed(ctx, err,

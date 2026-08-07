@@ -612,6 +612,21 @@ public sealed class AttachServiceTests : IDisposable
         public Task<long> ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
+        public Task<VolumeAttachment> ClassifyAttachmentAsync(
+            string hostName, string vmId, string vhdxPath, string ownedCheckpointElementNamePrefix, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<Checkpoint> CreateCheckpointAsync(
+            string hostName, string vmId, string elementName, string notesJson, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<Checkpoint?> FindOwnedCheckpointAsync(
+            string hostName, string vmId, string elementNamePrefix, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
         private void Migrated(string hostName, string vmId)
         {
             if (AlwaysMigrating || hostName == NotOnHost)

@@ -143,7 +143,9 @@ public sealed class JobDispatcher(IVhdxService vhdxService, IAttachService attac
                 // successful job with something to say, never a job left Running.
                 return async (job, cancellationToken) =>
                     job.Result = await snapshotService
-                        .CreateAsync(createSnapshotRequest.SourceVolumeId, createSnapshotRequest.SnapshotName, cancellationToken)
+                        .CreateAsync(
+                            createSnapshotRequest.SourceVolumeId, createSnapshotRequest.SnapshotName,
+                            createSnapshotRequest.NodeId, cancellationToken)
                         .ConfigureAwait(false);
 
             case DeleteSnapshot:

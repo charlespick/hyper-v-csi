@@ -10,4 +10,11 @@ public sealed class CreateSnapshotPayload
     public string? SourceVolumeId { get; init; }
 
     public string? SnapshotName { get; init; }
+
+    /// <summary>
+    /// The CSI node ID of the VM currently holding the source volume attached,
+    /// if the Go driver found one - see <see cref="ISnapshotService.CreateAsync"/>.
+    /// Null or empty for an unattached source, or when nothing was found.
+    /// </summary>
+    public string? NodeId { get; init; }
 }

@@ -34,6 +34,21 @@ public sealed class UnsupportedHyperVHostClient : IHyperVHostClient
     public Task<long> ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
         throw Unsupported();
 
+    public Task<VolumeAttachment> ClassifyAttachmentAsync(
+        string hostName, string vmId, string vhdxPath, string ownedCheckpointElementNamePrefix, CancellationToken cancellationToken) =>
+        throw Unsupported();
+
+    public Task<Checkpoint> CreateCheckpointAsync(
+        string hostName, string vmId, string elementName, string notesJson, CancellationToken cancellationToken) =>
+        throw Unsupported();
+
+    public Task<Checkpoint?> FindOwnedCheckpointAsync(
+        string hostName, string vmId, string elementNamePrefix, CancellationToken cancellationToken) =>
+        throw Unsupported();
+
+    public Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
+        throw Unsupported();
+
     private static PlatformNotSupportedException Unsupported() =>
         new("VM configuration requires Windows with the Hyper-V role; this agent is running on " +
             $"{Environment.OSVersion.Platform}");

@@ -1489,6 +1489,62 @@ func TestCreateSnapshotEnqueuesUnderTheSnapshotNameAsIdempotencyKey(t *testing.T
 	}
 }
 
+func TestCreateSnapshotEnqueuesNoNodeIdWhenTheSourceIsUnattached(t *testing.T) {
+	agent := newFakeAgent(t, succeeded(snapshotJSON("pvc-1~snap-1", "pvc-1", gibibyte, 1770000000, true)))
+	server := newControllerServer(agent)
+
+	if _, err := server.CreateSnapshot(context.Background(), createSnapshotRequest("pvc-1", "snap-1")); err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+
+	if got := agent.onlyEnqueued(t).Payload.NodeID; got != "" {
+		t.Errorf("nodeId = %q, want empty: nothing attaches this volume in the fake cluster", got)
+	}
+}
+
+func TestCreateSnapshotIncludesTheAttachedNodeWhenOneHoldsTheSource(t *testing.T) {
+	// The reason the lookup exists at all: the agent can only freeze an
+	// attached volume's base through a checkpoint if it knows which VM to
+	// take one on, and CreateSnapshotRequest itself carries no such hint.
+	agent := newFakeAgent(t, succeeded(snapshotJSON("pvc-1~snap-1", "pvc-1", gibibyte, 1770000000, false)))
+	server := &controllerServer{driver: New("", agentclient.New(agent.URL),
+		fake.NewSimpleClientset(
+			volumeAttachment(DriverName, "pvc-1", "csidevnode01"),
+			csiNode("csidevnode01", DriverName, "7a446141-becd-4c7e-968a-65257139f98c"),
+		))}
+
+	if _, err := server.CreateSnapshot(context.Background(), createSnapshotRequest("pvc-1", "snap-1")); err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+
+	if got := agent.onlyEnqueued(t).Payload.NodeID; got != "7a446141-becd-4c7e-968a-65257139f98c" {
+		t.Errorf("nodeId = %q, want the attached VM's ID", got)
+	}
+}
+
+func TestCreateSnapshotFailsRatherThanSilentlyDroppingAKubernetesLookupError(t *testing.T) {
+	// Same reasoning as ControllerExpandVolume's own version of this test: a
+	// Kubernetes API the driver cannot reach is indistinguishable from
+	// "nothing attached" if swallowed, and reporting an attached source as
+	// unattached would send the agent's own local read into a sharing
+	// violation with no node hint to recover from.
+	client := fake.NewSimpleClientset()
+	client.PrependReactor("list", "volumeattachments", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("connection refused")
+	})
+	agent := newFakeAgent(t, succeeded(snapshotJSON("pvc-1~snap-1", "pvc-1", gibibyte, 1770000000, true)))
+	server := &controllerServer{driver: New("", agentclient.New(agent.URL), client)}
+
+	_, err := server.CreateSnapshot(context.Background(), createSnapshotRequest("pvc-1", "snap-1"))
+
+	if got := status.Code(err); got != codes.Internal {
+		t.Fatalf("code = %s, want Internal (err: %v)", got, err)
+	}
+	if n := agent.enqueueCount(); n != 0 {
+		t.Errorf("enqueued %d jobs, want none once the node lookup failed", n)
+	}
+}
+
 func TestCreateSnapshotDeleteSnapshotShareATarget(t *testing.T) {
 	// The two have to serialize against each other, and they only do if the
 	// target a create derives from its source and name is the same string a

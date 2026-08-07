@@ -1,4 +1,6 @@
+using HyperVCsiAgent.Core.Cluster;
 using HyperVCsiAgent.Core.Configuration;
+using HyperVCsiAgent.Core.HostControl;
 using HyperVCsiAgent.Core.Jobs;
 using HyperVCsiAgent.Core.Storage;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -68,7 +70,7 @@ public sealed class SnapshotServiceTests : IDisposable
         var harness = NewHarness();
         WriteVolume("pvc-1", 10L * 1024 * 1024 * 1024);
 
-        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
 
         Assert.Equal("pvc-1~snapshot-abc", result.SnapshotId);
         Assert.Equal("pvc-1", result.SourceVolumeId);
@@ -84,7 +86,7 @@ public sealed class SnapshotServiceTests : IDisposable
         var harness = NewHarness();
         WriteVolume("pvc-1", 4096);
 
-        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
         await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
 
         var destination = Assert.Single(harness.Copier.Destinations);
@@ -103,7 +105,7 @@ public sealed class SnapshotServiceTests : IDisposable
         using var release = new SemaphoreSlim(0);
         harness.Copier.DuringCopy = _ => release.WaitAsync();
 
-        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
 
         Assert.False(result.ReadyToUse);
         Assert.False(File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
@@ -120,10 +122,10 @@ public sealed class SnapshotServiceTests : IDisposable
         var harness = NewHarness();
         WriteVolume("pvc-1", 4096);
 
-        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
         await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
 
-        var replay = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        var replay = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
 
         Assert.True(replay.ReadyToUse);
     }
@@ -136,11 +138,11 @@ public sealed class SnapshotServiceTests : IDisposable
         // directories, which is exactly what the next process sees.
         var first = NewHarness();
         WriteVolume("pvc-1", 4096);
-        await first.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        await first.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
         await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
 
         var restarted = NewHarness();
-        var result = await restarted.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        var result = await restarted.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
 
         Assert.True(result.ReadyToUse);
         // And it did not copy the disk a second time to find that out.
@@ -158,10 +160,10 @@ public sealed class SnapshotServiceTests : IDisposable
         using var release = new SemaphoreSlim(0);
         harness.Copier.DuringCopy = _ => release.WaitAsync();
 
-        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
         await WaitForAsync(() => harness.Copier.Destinations.Count == 1);
-        var second = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
-        var third = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        var second = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
+        var third = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
 
         Assert.False(second.ReadyToUse);
         Assert.False(third.ReadyToUse);
@@ -182,7 +184,7 @@ public sealed class SnapshotServiceTests : IDisposable
         Directory.CreateDirectory(_snapshotsRoot);
         await File.WriteAllTextAsync(MarkerPath("pvc-1~snapshot-abc"), "half of an earlier attempt");
 
-        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
         await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
 
         Assert.Single(harness.Copier.Destinations);
@@ -201,7 +203,7 @@ public sealed class SnapshotServiceTests : IDisposable
         Directory.CreateDirectory(_snapshotsRoot);
         await File.WriteAllTextAsync(MarkerPath("pvc-1~snapshot-abc"), "half of an earlier attempt");
 
-        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
         await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
 
         Assert.Equal(
@@ -217,7 +219,7 @@ public sealed class SnapshotServiceTests : IDisposable
         WriteVolume("pvc-1", 4096);
         WriteSnapshot("pvc-1~snapshot-abc", 4096);
 
-        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
 
         Assert.True(result.ReadyToUse);
         Assert.Empty(harness.Copier.Destinations);
@@ -233,7 +235,7 @@ public sealed class SnapshotServiceTests : IDisposable
         WriteSnapshot("pvc-1~snapshot-abc", 4096);
         await File.WriteAllTextAsync(MarkerPath("pvc-1~snapshot-abc"), "stale attempt");
 
-        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
 
         Assert.True(result.ReadyToUse);
         Assert.False(File.Exists(MarkerPath("pvc-1~snapshot-abc")));
@@ -251,7 +253,7 @@ public sealed class SnapshotServiceTests : IDisposable
         WriteSnapshot("pvc-1~snapshot-abc", 4096);
         // No source volume at all, which is the strongest form of the case.
 
-        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
 
         Assert.True(result.ReadyToUse);
         Assert.Equal(4096, result.SizeBytes);
@@ -265,7 +267,7 @@ public sealed class SnapshotServiceTests : IDisposable
         var harness = NewHarness();
         WriteVolume("pvc-1", 10L * 1024 * 1024 * 1024);
 
-        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
 
         Assert.Equal(10L * 1024 * 1024 * 1024, result.SizeBytes);
         Assert.True(result.SizeBytes > new FileInfo(VolumePath("pvc-1")).Length);
@@ -281,7 +283,7 @@ public sealed class SnapshotServiceTests : IDisposable
         WriteVolume("pvc-1", 4096);
         harness.Disks.FailSizeReads = true;
 
-        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
 
         Assert.Equal(0, result.SizeBytes);
         await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
@@ -297,17 +299,17 @@ public sealed class SnapshotServiceTests : IDisposable
         using var release = new SemaphoreSlim(0);
         harness.Copier.DuringCopy = _ => release.WaitAsync();
 
-        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
         await WaitForAsync(() => File.Exists(MarkerPath("pvc-1~snapshot-abc")));
 
-        var whileCopying = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        var whileCopying = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
         Assert.False(whileCopying.ReadyToUse);
         Assert.True(whileCopying.CreationTimeUnixSeconds > 0);
 
         release.Release();
         await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
 
-        var published = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        var published = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
 
         Assert.True(published.ReadyToUse);
         Assert.Equal(whileCopying.CreationTimeUnixSeconds, published.CreationTimeUnixSeconds);
@@ -324,7 +326,7 @@ public sealed class SnapshotServiceTests : IDisposable
         using var release = new SemaphoreSlim(0);
         harness.Copier.BeforeCopy = _ => release.WaitAsync();
 
-        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
 
         Assert.Equal(0, result.CreationTimeUnixSeconds);
         Assert.False(result.ReadyToUse);
@@ -345,7 +347,7 @@ public sealed class SnapshotServiceTests : IDisposable
         var harness = NewHarness();
         WriteVolume("pvc-1", 4096);
 
-        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
         await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
 
         var copy = Assert.Single(harness.Store.Created);
@@ -364,10 +366,10 @@ public sealed class SnapshotServiceTests : IDisposable
         WriteVolume("pvc-1", 4096);
         harness.Copier.FailNextCopy = true;
 
-        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
         await WaitForAsync(() => harness.Store.Created.Count == 1 && harness.Store.Created[0].Status == JobStatus.Failed);
 
-        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
         await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
 
         Assert.Equal(2, harness.Store.Created.Count);
@@ -387,7 +389,7 @@ public sealed class SnapshotServiceTests : IDisposable
             // Distinct snapshot names, because one name across five volumes is
             // the collision the AlreadyExists precondition exists to refuse.
             WriteVolume($"pvc-{i}", 4096);
-            await harness.Service.CreateAsync($"pvc-{i}", $"snapshot-{i}", CancellationToken.None);
+            await harness.Service.CreateAsync($"pvc-{i}", $"snapshot-{i}", null, CancellationToken.None);
         }
 
         await WaitForAsync(() => harness.Copier.InFlightPeak >= 2);
@@ -407,31 +409,142 @@ public sealed class SnapshotServiceTests : IDisposable
         var harness = NewHarness();
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
-            () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None));
+            () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None));
 
         Assert.Equal(AgentErrorCodes.NotFound, failure.ErrorCode);
         Assert.Empty(harness.Copier.Destinations);
     }
 
     [WindowsOnlyFact]
-    public async Task CreateAsync_SourceHeldOpenByARunningVm_FailsAsFailedPreconditionNamingTheUnbuiltPath()
+    public async Task CreateAsync_SourceHeldOpenByARunningVmWithNoNodeHint_FailsAsFailedPreconditionNamingNothingToResolveItThrough()
     {
-        // The attached case, refused rather than half-implemented. Copying a
-        // disk a VM is writing captures a torn image that mounts and then
-        // corrupts, and freezing it needs a Hyper-V checkpoint this agent cannot
-        // yet take.
+        // The attached case with no way to freeze it: no node hint means no
+        // VM to checkpoint through, so this is refused exactly as it always
+        // has been rather than guessing at one.
         var harness = NewHarness();
         WriteVolume("pvc-1", 4096);
 
         using (HoldOpenExclusively(VolumePath("pvc-1")))
         {
             var failure = await Assert.ThrowsAsync<JobFailureException>(
-                () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None));
+                () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None));
 
             Assert.Equal(AgentErrorCodes.FailedPrecondition, failure.ErrorCode);
-            Assert.Contains("checkpoint", failure.Message, StringComparison.Ordinal);
+            Assert.Contains("no attaching node was given", failure.Message, StringComparison.Ordinal);
             Assert.Empty(harness.Copier.Destinations);
         }
+    }
+
+    // -------------------------------------------------- create, attached source (with a node hint)
+
+    [Fact]
+    public async Task CreateAsync_AttachedVolumeWithANodeHint_TakesAChekpointCopiesAndMergesIt()
+    {
+        var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient { AllocatedBytesOnHost = 4096 };
+        var harness = NewHarness(cluster: cluster, host: host);
+        WriteVolume("pvc-1", 4096);
+
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", "node-a", CancellationToken.None);
+
+        Assert.Equal("pvc-1~snapshot-abc", result.SnapshotId);
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+
+        // Tagged with this exact (volume, name) pair's identity, taken once,
+        // and merged once the copy safely published.
+        Assert.Equal(["hyperv-csi/pvc-1/snapshot-abc"], host.CreatedCheckpointElementNames);
+        await WaitForAsync(() => host.DestroyedCheckpointElementNames.Count == 1);
+        Assert.Equal(["hyperv-csi/pvc-1/snapshot-abc"], host.DestroyedCheckpointElementNames);
+    }
+
+    [Fact]
+    public async Task CreateAsync_AttachedVolumeNotConfiguredForProductionOnlyCheckpoints_FailsAsFailedPrecondition()
+    {
+        var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient { CheckpointsNotConfigured = true };
+        var harness = NewHarness(cluster: cluster, host: host);
+        WriteVolume("pvc-1", 4096);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", "node-a", CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.FailedPrecondition, failure.ErrorCode);
+        Assert.Empty(host.CreatedCheckpointElementNames);
+        Assert.Empty(harness.Copier.Destinations);
+    }
+
+    [Fact]
+    public async Task CreateAsync_AttachedVolumeBehindAForeignChain_FailsAsFailedPrecondition()
+    {
+        var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient { ForeignChainInTheWay = true };
+        var harness = NewHarness(cluster: cluster, host: host);
+        WriteVolume("pvc-1", 4096);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", "node-a", CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.FailedPrecondition, failure.ErrorCode);
+        Assert.Empty(harness.Copier.Destinations);
+    }
+
+    [Fact]
+    public async Task CreateAsync_AttachedVolumeAlreadyBehindOwnedCheckpoint_ResumesWithoutTakingANewOne()
+    {
+        // Crash-matrix row 1/2 territory: an earlier attempt already froze the
+        // base. Modelled by pre-seeding the fake host's checkpoint the way
+        // ClassifyAttachmentAsync would report finding one on a real VM.
+        var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient();
+        await host.CreateCheckpointAsync("host-1", "vm-1", "hyperv-csi/pvc-1/snapshot-abc", "{}", CancellationToken.None);
+        var harness = NewHarness(cluster: cluster, host: host);
+        WriteVolume("pvc-1", 4096);
+
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", "node-a", CancellationToken.None);
+
+        Assert.Equal("pvc-1~snapshot-abc", result.SnapshotId);
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+
+        // Exactly the one checkpoint seeded above - CreateCheckpointAsync was
+        // never called again for it.
+        Assert.Single(host.CreatedCheckpointElementNames);
+        await WaitForAsync(() => host.DestroyedCheckpointElementNames.Count == 1);
+    }
+
+    [Fact]
+    public async Task CreateAsync_NodeHintResolvesToNoClusteredVm_FallsBackToALocalRead()
+    {
+        // Go believed the volume was attached to a node the cluster cannot
+        // resolve - a stale VolumeAttachment, most plausibly. The volume is
+        // not actually locked here, so the local-read fallback succeeds the
+        // same way it would with no hint at all.
+        var cluster = new FakeClusterService();
+        var harness = NewHarness(cluster: cluster, host: new NeverCalledHostClient());
+        WriteVolume("pvc-1", 4096);
+
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", "node-a", CancellationToken.None);
+
+        Assert.Equal("pvc-1~snapshot-abc", result.SnapshotId);
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+    }
+
+    [Fact]
+    public async Task CreateAsync_NodeHintButHyperVReportsNotAttached_FallsBackToALocalRead()
+    {
+        // The other side of the same race: Go's hint named a node, but by the
+        // time this runs Hyper-V no longer shows the volume attached there
+        // either (detached in between). Answered from a local read, same as
+        // any other unattached source.
+        var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient { AttachmentKind = VolumeAttachmentKind.NotAttached };
+        var harness = NewHarness(cluster: cluster, host: host);
+        WriteVolume("pvc-1", 4096);
+
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", "node-a", CancellationToken.None);
+
+        Assert.Equal("pvc-1~snapshot-abc", result.SnapshotId);
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+        Assert.Empty(host.CreatedCheckpointElementNames);
     }
 
     [Fact]
@@ -446,7 +559,7 @@ public sealed class SnapshotServiceTests : IDisposable
         harness.Copier.FreeBytes = 1;
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
-            () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None));
+            () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None));
 
         Assert.Equal(AgentErrorCodes.ResourceExhausted, failure.ErrorCode);
         Assert.Empty(harness.Copier.Destinations);
@@ -462,7 +575,7 @@ public sealed class SnapshotServiceTests : IDisposable
         harness.Copier.SupportsBlockCloning = true;
         harness.Copier.FreeBytes = new FileInfo(VolumePath("pvc-1")).Length;
 
-        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
 
         Assert.Equal("pvc-1~snapshot-abc", result.SnapshotId);
         await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
@@ -481,7 +594,7 @@ public sealed class SnapshotServiceTests : IDisposable
         WriteSnapshot("pvc-2~shared-name", 4096);
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
-            () => harness.Service.CreateAsync("pvc-1", "shared-name", CancellationToken.None));
+            () => harness.Service.CreateAsync("pvc-1", "shared-name", null, CancellationToken.None));
 
         Assert.Equal(AgentErrorCodes.AlreadyExists, failure.ErrorCode);
         Assert.Contains("pvc-2~shared-name", failure.Message, StringComparison.Ordinal);
@@ -500,7 +613,7 @@ public sealed class SnapshotServiceTests : IDisposable
         await File.WriteAllTextAsync(MarkerPath("pvc-2~shared-name"), "a copy in flight");
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
-            () => harness.Service.CreateAsync("pvc-1", "shared-name", CancellationToken.None));
+            () => harness.Service.CreateAsync("pvc-1", "shared-name", null, CancellationToken.None));
 
         Assert.Equal(AgentErrorCodes.AlreadyExists, failure.ErrorCode);
     }
@@ -513,7 +626,7 @@ public sealed class SnapshotServiceTests : IDisposable
         WriteVolume("pvc-1", 4096);
         WriteSnapshot("pvc-1~snapshot-abc", 4096);
 
-        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
 
         Assert.True(result.ReadyToUse);
     }
@@ -528,7 +641,7 @@ public sealed class SnapshotServiceTests : IDisposable
         var harness = NewHarness();
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
-            () => harness.Service.CreateAsync(sourceVolumeId, snapshotName, CancellationToken.None));
+            () => harness.Service.CreateAsync(sourceVolumeId, snapshotName, null, CancellationToken.None));
 
         Assert.Equal(AgentErrorCodes.InvalidArgument, failure.ErrorCode);
     }
@@ -542,7 +655,7 @@ public sealed class SnapshotServiceTests : IDisposable
         // copy and its restart is the case that makes this matter.
         var harness = NewHarness();
         WriteVolume("pvc-1", 4096);
-        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
         await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
 
         // Both the source and the snapshot disappear, leaving the same state a
@@ -551,7 +664,7 @@ public sealed class SnapshotServiceTests : IDisposable
         File.Delete(SnapshotPath("pvc-1~snapshot-abc"));
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
-            () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None));
+            () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None));
 
         Assert.Equal(AgentErrorCodes.NotFound, failure.ErrorCode);
     }
@@ -950,7 +1063,11 @@ public sealed class SnapshotServiceTests : IDisposable
 
     // --------------------------------------------------------------- helpers
 
-    private Harness NewHarness(int maxConcurrentSnapshotCopies = 4, TimeSpan? snapshotCopyTimeout = null)
+    private Harness NewHarness(
+        int maxConcurrentSnapshotCopies = 4,
+        TimeSpan? snapshotCopyTimeout = null,
+        IClusterService? cluster = null,
+        IHyperVHostClient? host = null)
     {
         var disks = new FakeVirtualDiskManager();
         var copier = new FakeDiskCopier();
@@ -963,6 +1080,11 @@ public sealed class SnapshotServiceTests : IDisposable
             disks,
             copier,
             store,
+            // Defaults to something that throws if ever called: most tests
+            // pass no node hint, so nothing here should ever try to resolve a
+            // VM or touch a checkpoint.
+            cluster ?? new NeverCalledClusterService(),
+            host ?? new NeverCalledHostClient(),
             copySlots,
             Options.Create(new AgentOptions
             {
@@ -1181,5 +1303,186 @@ public sealed class SnapshotServiceTests : IDisposable
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// The default for tests that pass no node hint: the attached-source path
+    /// should never be reached in them, and answering something plausible
+    /// instead of throwing would hide it if it ever were.
+    /// </summary>
+    private sealed class NeverCalledClusterService : IClusterService
+    {
+        public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("no node hint was given in this test, so nothing should resolve a VM");
+
+        public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("no node hint was given in this test, so nothing should resolve a VM");
+    }
+
+    /// <summary>NeverCalledClusterService's counterpart for IHyperVHostClient.</summary>
+    private sealed class NeverCalledHostClient : IHyperVHostClient
+    {
+        private static InvalidOperationException Unexpected() =>
+            new("no node hint was given in this test, so nothing should touch a VM or a checkpoint");
+
+        public Task<AttachedDisk?> FindAttachedDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+            throw Unexpected();
+
+        public Task<bool> IsDiskAttachedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+            throw Unexpected();
+
+        public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
+            throw Unexpected();
+
+        public Task AttachDiskAsync(string hostName, string vmId, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken) =>
+            throw Unexpected();
+
+        public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+            throw Unexpected();
+
+        public Task<long> GetDiskSizeAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+            throw Unexpected();
+
+        public Task<long> ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
+            throw Unexpected();
+
+        public Task<VolumeAttachment> ClassifyAttachmentAsync(
+            string hostName, string vmId, string vhdxPath, string ownedCheckpointElementNamePrefix, CancellationToken cancellationToken) =>
+            throw Unexpected();
+
+        public Task<Checkpoint> CreateCheckpointAsync(
+            string hostName, string vmId, string elementName, string notesJson, CancellationToken cancellationToken) =>
+            throw Unexpected();
+
+        public Task<Checkpoint?> FindOwnedCheckpointAsync(
+            string hostName, string vmId, string elementNamePrefix, CancellationToken cancellationToken) =>
+            throw Unexpected();
+
+        public Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
+            throw Unexpected();
+    }
+
+    /// <summary>
+    /// Resolves exactly the node IDs listed in <see cref="Vms"/>, the same
+    /// (nodeId -&gt; VM) mapping <c>MsClusterService.ResolveVmAsync</c> answers
+    /// from CLUSDB.
+    /// </summary>
+    private sealed class FakeClusterService : IClusterService
+    {
+        public Dictionary<string, ClusteredVm> Vms { get; init; } = [];
+
+        public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
+            Task.FromResult(Vms.TryGetValue(nodeId, out var vm) ? vm : null);
+
+        public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
+            Task.FromResult(true);
+    }
+
+    /// <summary>
+    /// Stands in for the checkpoint half of <see cref="IHyperVHostClient"/>.
+    /// Attach/detach members are never called by SnapshotService and throw if
+    /// reached. A checkpoint, once created, is tracked in
+    /// <see cref="_checkpointsByElementName"/> - the same source of truth
+    /// <see cref="ClassifyAttachmentAsync"/> and
+    /// <see cref="FindOwnedCheckpointAsync"/> both read, so a test cannot get
+    /// the two seams to disagree the way two independent fields could.
+    /// </summary>
+    private sealed class FakeHostClient : IHyperVHostClient
+    {
+        private readonly Dictionary<string, Checkpoint> _checkpointsByElementName = new(StringComparer.Ordinal);
+
+        /// <summary>What ClassifyAttachmentAsync reports when no owned checkpoint already covers the path.</summary>
+        public VolumeAttachmentKind AttachmentKind { get; set; } = VolumeAttachmentKind.Direct;
+
+        /// <summary>Makes ClassifyAttachmentAsync throw, the way an unresolved foreign chain does.</summary>
+        public bool ForeignChainInTheWay { get; set; }
+
+        /// <summary>Makes CreateCheckpointAsync throw CheckpointsNotConfiguredException, as it does against a real VM not set to ProductionOnly.</summary>
+        public bool CheckpointsNotConfigured { get; set; }
+
+        public bool FailNextCreate { get; set; }
+
+        public bool FailNextDestroy { get; set; }
+
+        public long AllocatedBytesOnHost { get; set; } = 4096;
+
+        public List<string> CreatedCheckpointElementNames { get; } = [];
+
+        public List<string> DestroyedCheckpointElementNames { get; } = [];
+
+        public Task<VolumeAttachment> ClassifyAttachmentAsync(
+            string hostName, string vmId, string vhdxPath, string ownedCheckpointElementNamePrefix, CancellationToken cancellationToken)
+        {
+            if (ForeignChainInTheWay)
+            {
+                throw new InvalidOperationException(
+                    $"{vhdxPath} sits behind a foreign checkpoint this driver did not tag");
+            }
+
+            if (_checkpointsByElementName.TryGetValue(ownedCheckpointElementNamePrefix, out var owned))
+            {
+                return Task.FromResult(new VolumeAttachment(VolumeAttachmentKind.BehindOwnedCheckpoint, owned));
+            }
+
+            return Task.FromResult(new VolumeAttachment(AttachmentKind, null));
+        }
+
+        public Task<Checkpoint> CreateCheckpointAsync(
+            string hostName, string vmId, string elementName, string notesJson, CancellationToken cancellationToken)
+        {
+            if (CheckpointsNotConfigured)
+            {
+                throw new CheckpointsNotConfiguredException(vmId, 3);
+            }
+
+            if (FailNextCreate)
+            {
+                FailNextCreate = false;
+                throw new InvalidOperationException("CreateSnapshot said no");
+            }
+
+            var checkpoint = new Checkpoint($"checkpoint:{elementName}", elementName);
+            _checkpointsByElementName[elementName] = checkpoint;
+            CreatedCheckpointElementNames.Add(elementName);
+            return Task.FromResult(checkpoint);
+        }
+
+        public Task<Checkpoint?> FindOwnedCheckpointAsync(
+            string hostName, string vmId, string elementNamePrefix, CancellationToken cancellationToken) =>
+            Task.FromResult(_checkpointsByElementName.TryGetValue(elementNamePrefix, out var checkpoint) ? checkpoint : null);
+
+        public Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken)
+        {
+            if (FailNextDestroy)
+            {
+                FailNextDestroy = false;
+                throw new InvalidOperationException("DestroySnapshot said no");
+            }
+
+            _checkpointsByElementName.Remove(checkpoint.ElementName);
+            DestroyedCheckpointElementNames.Add(checkpoint.ElementName);
+            return Task.CompletedTask;
+        }
+
+        public Task<long> GetDiskSizeAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+            Task.FromResult(AllocatedBytesOnHost);
+
+        public Task<AttachedDisk?> FindAttachedDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+            throw new NotSupportedException("SnapshotService never looks up an attached disk's address");
+
+        public Task<bool> IsDiskAttachedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+            throw new NotSupportedException("SnapshotService uses ClassifyAttachmentAsync instead");
+
+        public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
+            throw new NotSupportedException("SnapshotService never attaches anything");
+
+        public Task AttachDiskAsync(string hostName, string vmId, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken) =>
+            throw new NotSupportedException("SnapshotService never attaches anything");
+
+        public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+            throw new NotSupportedException("SnapshotService never detaches anything");
+
+        public Task<long> ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
+            throw new NotSupportedException("SnapshotService never resizes anything");
     }
 }

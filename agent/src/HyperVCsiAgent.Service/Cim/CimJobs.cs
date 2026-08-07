@@ -12,9 +12,13 @@ namespace HyperVCsiAgent.Service.Cim;
 [SupportedOSPlatform("windows")]
 public static class CimJobs
 {
-    // Msvm method return values.
-    private const uint Completed = 0;
-    private const uint JobStarted = 4096;
+    // Msvm method return values. Internal rather than private: a fire-and-forget
+    // caller that deliberately does not want WaitForCompletion's blocking-poll
+    // behavior - see CimHyperVHostClient.DestroyCheckpointAsync - still needs to
+    // recognize the same two success values rather than carrying its own copy
+    // of these magic numbers.
+    internal const uint Completed = 0;
+    internal const uint JobStarted = 4096;
 
     // Msvm_ConcreteJob.JobState. Everything below Completed is still in
     // flight; 8/9/10 (Terminated/Killed/Exception) are failures.

@@ -52,6 +52,56 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     /// </summary>
     private const int MaxDifferencingChainDepth = 64;
 
+    /// <summary>
+    /// <c>Msvm_VirtualSystemSettingData.UserSnapshotType</c>'s value for
+    /// "Production, no fallback to a Standard checkpoint" - what
+    /// <c>Set-VM -CheckpointType ProductionOnly</c> sets. Confirmed against a
+    /// real host rather than taken from documentation alone, alongside
+    /// <see cref="DiskOnlyCheckpointSnapshotType"/> below.
+    /// </summary>
+    private const int ProductionOnlyUserSnapshotType = 4;
+
+    /// <summary>
+    /// The <c>SnapshotType</c> CreateSnapshot needs to produce a disk-only
+    /// checkpoint - which, despite the value Hyper-V's own schema documents for
+    /// "Disk Snapshot" being 3, is actually 2 ("Full Snapshot"). Measured
+    /// against a real host: value 3 is rejected outright with "invalid
+    /// checkpoint type" regardless of the VM's own checkpoint setting, while
+    /// value 2 against a VM configured for <see cref="ProductionOnlyUserSnapshotType"/>
+    /// produces exactly the disk-only, no-saved-state checkpoint this driver
+    /// needs - VSS quiesces the guest instead of a memory capture running. The
+    /// "Full Snapshot" label describes what value 2 does when the VM is on a
+    /// Standard checkpoint, not what it does here.
+    /// </summary>
+    private const ushort DiskOnlyCheckpointSnapshotType = 2;
+
+    /// <summary>
+    /// <c>Msvm_VirtualSystemSnapshotSettingData.ConsistencyLevel</c>'s "Crash
+    /// Consistent" value. Requested rather than "Application Consistent"
+    /// because the guest's VSS integration has no visibility into whatever is
+    /// actually running as containers on the node - asking for more would not
+    /// deliver it, only claim it.
+    /// </summary>
+    private const byte CrashConsistentLevel = 2;
+
+    /// <summary>
+    /// How long <see cref="FindNewCheckpoint"/> waits between checking whether
+    /// the checkpoint <c>CreateSnapshot</c>'s job just finished has actually
+    /// shown up in <c>Msvm_SnapshotOfVirtualSystem</c>. Measured against a real
+    /// host: the association can lag the job's own completion by a moment, in
+    /// a way nothing documents.
+    /// </summary>
+    private static readonly TimeSpan CheckpointDiscoveryPollInterval = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>
+    /// How many times <see cref="ClassifyAttachmentAsync"/> re-checks an
+    /// ambiguous chain before believing it. Bounds a real but narrow and
+    /// self-clearing race - see <see cref="AmbiguousChainException"/> - to a
+    /// second or so, not the kind of wait that should ever mask a genuinely
+    /// foreign checkpoint for long.
+    /// </summary>
+    private const int MaxAttachmentClassificationAttempts = 5;
+
     private readonly ILogger<CimHyperVHostClient> _logger;
     private readonly TimeSpan _hostOperationTimeout;
 
@@ -327,6 +377,427 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                 "resized VHDX {Path} for {VmId} on {HostName} to {SizeBytes} bytes", vhdxPath, vmId, hostName, actualSize);
             return actualSize;
         }, cancellationToken);
+
+    public Task<VolumeAttachment> ClassifyAttachmentAsync(
+        string hostName, string vmId, string vhdxPath, string ownedCheckpointElementNamePrefix, CancellationToken cancellationToken) =>
+        Task.Run(() =>
+        {
+            var deadline = CimDeadline.After(_hostOperationTimeout);
+            var scope = ScopeFor(hostName);
+
+            // Retried rather than a single query: measured against a real
+            // host, DestroySnapshot's checkpoint object can disappear a
+            // moment before the VM's disk actually re-points to the base -
+            // the merge itself lags the checkpoint's own removal by a beat.
+            // A single query in that window sees a chain with no owned
+            // checkpoint at its root, which is indistinguishable from a
+            // genuinely foreign one without waiting a moment and asking
+            // again. Re-fetches the active settings fresh each attempt,
+            // unlike FindNewCheckpoint's retry: what has to change here is
+            // the VM's own disk configuration, not an association's
+            // eventual consistency, and a stale settings snapshot would
+            // never show that.
+            for (var attempt = 0; ; attempt++)
+            {
+                using var settings = GetActiveSettings(scope, hostName, vmId, deadline, cancellationToken);
+                try
+                {
+                    return ClassifyAttachment(
+                        scope, settings, hostName, vmId, vhdxPath, ownedCheckpointElementNamePrefix, deadline, cancellationToken);
+                }
+                catch (AmbiguousChainException) when (attempt < MaxAttachmentClassificationAttempts - 1)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    Thread.Sleep(CheckpointDiscoveryPollInterval);
+                }
+            }
+        }, cancellationToken);
+
+    public Task<Checkpoint> CreateCheckpointAsync(
+        string hostName, string vmId, string elementName, string notesJson, CancellationToken cancellationToken) =>
+        Task.Run(() =>
+        {
+            var deadline = CimDeadline.After(_hostOperationTimeout);
+            var scope = ScopeFor(hostName);
+
+            using var activeSettings = GetActiveSettings(scope, hostName, vmId, deadline, cancellationToken);
+            EnsureProductionOnlyCheckpoints(vmId, activeSettings);
+
+            using var vm = GetComputerSystem(scope, hostName, vmId, deadline, cancellationToken);
+            var before = ExistingCheckpointInstanceIds(vm, deadline, cancellationToken);
+
+            var settingsText = BuildSnapshotSettingsText(scope, deadline, cancellationToken);
+
+            using var session = CimSession.Create(hostName);
+            using var snapshotService = GetSnapshotService(session, deadline, cancellationToken);
+
+            var parameters = new CimMethodParametersCollection
+            {
+                CimMethodParameter.Create("AffectedSystem", ComputerSystemReference(vmId), CimType.Reference, CimFlags.In),
+                CimMethodParameter.Create("SnapshotSettings", settingsText, CimType.String, CimFlags.In),
+                CimMethodParameter.Create("SnapshotType", DiskOnlyCheckpointSnapshotType, CimType.UInt16, CimFlags.In),
+            };
+
+            using var result = session.InvokeMethod(
+                NamespaceName, snapshotService, "CreateSnapshot", parameters,
+                deadline.Options("CreateSnapshot", cancellationToken));
+
+            _ = CimJobs.WaitForCompletion(
+                session, NamespaceName, result, "CreateSnapshot", deadline, cancellationToken, _logger);
+
+            var createdPath = FindNewCheckpoint(vm, before, deadline, cancellationToken);
+            using var created = new ManagementObject(scope, new ManagementPath(createdPath), null);
+            WithDeadline(deadline, cancellationToken, "reading the new checkpoint's settings", created.Get);
+
+            var taggedPath = TagCheckpoint(hostName, created, elementName, notesJson, deadline, cancellationToken);
+
+            _logger.LogInformation(
+                "created checkpoint {ElementName} of {VmId} on {HostName}", elementName, vmId, hostName);
+            return new Checkpoint(taggedPath, elementName);
+        }, cancellationToken);
+
+    public Task<Checkpoint?> FindOwnedCheckpointAsync(
+        string hostName, string vmId, string elementNamePrefix, CancellationToken cancellationToken) =>
+        Task.Run(() =>
+        {
+            var deadline = CimDeadline.After(_hostOperationTimeout);
+            var scope = ScopeFor(hostName);
+            using var vm = GetComputerSystem(scope, hostName, vmId, deadline, cancellationToken);
+            return FindOwnedCheckpoint(vm, elementNamePrefix, deadline, cancellationToken);
+        }, cancellationToken);
+
+    public Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
+        Task.Run(() =>
+        {
+            var deadline = CimDeadline.After(_hostOperationTimeout);
+            using var session = CimSession.Create(hostName);
+            using var snapshotService = GetSnapshotService(session, deadline, cancellationToken);
+
+            var parameters = new CimMethodParametersCollection
+            {
+                CimMethodParameter.Create(
+                    "AffectedSnapshot", ReferenceToPath(checkpoint.SettingsPath), CimType.Reference, CimFlags.In),
+            };
+
+            using var result = session.InvokeMethod(
+                NamespaceName, snapshotService, "DestroySnapshot", parameters,
+                deadline.Options("DestroySnapshot", cancellationToken));
+
+            // Fire-and-forget by design: confirm the merge started (or
+            // finished inline, for a checkpoint nothing was ever written
+            // through) and return without waiting for it. vmms owns finishing
+            // a live merge independent of this process from here on - see
+            // IHyperVHostClient.DestroyCheckpointAsync's remarks for why that
+            // is deliberate rather than a shortcut.
+            var returnValue = Convert.ToUInt32(result.ReturnValue.Value);
+            if (returnValue is not (CimJobs.Completed or CimJobs.JobStarted))
+            {
+                throw new InvalidOperationException(
+                    $"DestroySnapshot for checkpoint {checkpoint.ElementName} failed with return value {returnValue}");
+            }
+
+            _logger.LogInformation(
+                "started merging checkpoint {ElementName} on {HostName}", checkpoint.ElementName, hostName);
+        }, cancellationToken);
+
+    /// <summary>
+    /// <see cref="ClassifyAttachmentAsync"/>'s traversal. Structurally the same
+    /// walk <see cref="LocateDisk"/> and <see cref="GuardAgainstDifferencingChain"/>
+    /// do for attach/detach/expand, deliberately kept as a separate copy rather
+    /// than a shared one: those callers must keep throwing on any unresolved
+    /// chain exactly as they do today, and only a snapshot of an attached
+    /// volume has a legitimate reason to recognize its own prior checkpoint
+    /// instead of refusing.
+    /// </summary>
+    private VolumeAttachment ClassifyAttachment(
+        ManagementScope scope,
+        ManagementObject settings,
+        string hostName,
+        string vmId,
+        string vhdxPath,
+        string ownedCheckpointElementNamePrefix,
+        CimDeadline deadline,
+        CancellationToken cancellationToken)
+    {
+        var otherDisks = new List<string>();
+
+        foreach (var disk in DeviceSettings(scope, settings, "Msvm_StorageAllocationSettingData", deadline, cancellationToken))
+        {
+            using (disk)
+            {
+                if ((disk["ResourceSubType"] as string) != VirtualHardDiskSubType)
+                {
+                    continue;
+                }
+
+                if (disk["HostResource"] is not string[] { Length: > 0 } hostResource)
+                {
+                    continue;
+                }
+
+                if (SamePath(hostResource[0], vhdxPath))
+                {
+                    return new VolumeAttachment(VolumeAttachmentKind.Direct, null);
+                }
+
+                otherDisks.Add(hostResource[0]);
+            }
+        }
+
+        foreach (var attached in otherDisks)
+        {
+            var descendant = attached;
+            var depth = 0;
+
+            for (; depth < MaxDifferencingChainDepth; depth++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if (ParentPathOf(scope, descendant, deadline, cancellationToken) is not { } parent)
+                {
+                    break;
+                }
+
+                if (SamePath(parent, vhdxPath))
+                {
+                    using var vm = GetComputerSystem(scope, hostName, vmId, deadline, cancellationToken);
+                    var owned = FindOwnedCheckpoint(vm, ownedCheckpointElementNamePrefix, deadline, cancellationToken);
+                    if (owned is not null)
+                    {
+                        return new VolumeAttachment(VolumeAttachmentKind.BehindOwnedCheckpoint, owned);
+                    }
+
+                    // Ambiguous rather than definitely foreign: the checkpoint
+                    // at the root of this chain might be ours, already merged
+                    // away in the instant before the disk pointer catches up
+                    // - see ClassifyAttachmentAsync's retry. Only becomes the
+                    // caller-visible "foreign chain" failure once that retry
+                    // is exhausted.
+                    throw new AmbiguousChainException(
+                        $"{vhdxPath} is not attached to {vmId} directly, but {attached} is and its differencing " +
+                        "chain is built on it, and the checkpoint at the root of that chain is not one this driver " +
+                        "tagged - delete the foreign checkpoint before snapshotting this volume");
+                }
+
+                descendant = parent;
+            }
+
+            if (depth == MaxDifferencingChainDepth)
+            {
+                throw new InvalidOperationException(
+                    $"{attached}'s differencing chain is still {MaxDifferencingChainDepth} disks deep without " +
+                    $"reaching a disk with no parent; cannot determine whether it is built on {vhdxPath}, so " +
+                    "this operation is refusing to guess");
+            }
+        }
+
+        return new VolumeAttachment(VolumeAttachmentKind.NotAttached, null);
+    }
+
+    /// <summary>
+    /// A chain rooted on the target path with no owned checkpoint at its
+    /// root - which is either a genuinely foreign checkpoint, or this
+    /// driver's own, already merged away, with the disk pointer not yet
+    /// caught up. <see cref="ClassifyAttachmentAsync"/> retries a few times
+    /// before letting one of these become the caller-visible
+    /// <see cref="InvalidOperationException"/>; deriving from it means an
+    /// exhausted retry needs no unwrapping to surface the same message and
+    /// type the interface already documents.
+    /// </summary>
+    private sealed class AmbiguousChainException(string message) : InvalidOperationException(message);
+
+    private static void EnsureProductionOnlyCheckpoints(string vmId, ManagementObject activeSettings)
+    {
+        var userSnapshotType = activeSettings["UserSnapshotType"] is { } raw ? Convert.ToUInt16(raw) : (ushort)0;
+        if (userSnapshotType != ProductionOnlyUserSnapshotType)
+        {
+            throw new CheckpointsNotConfiguredException(vmId, userSnapshotType);
+        }
+    }
+
+    /// <summary>
+    /// Builds the embedded <c>Msvm_VirtualSystemSnapshotSettingData</c> instance
+    /// <c>CreateSnapshot</c> requires as its <c>SnapshotSettings</c> parameter.
+    /// An empty or default-constructed string does not work here - measured
+    /// against a real host, it fails as "invalid checkpoint type" regardless of
+    /// <c>SnapshotType</c> - so this always builds a real embedded instance, the
+    /// same way <see cref="GetDefaultSettings"/>'s templates do for
+    /// AddResourceSettings.
+    /// </summary>
+    private static string BuildSnapshotSettingsText(ManagementScope scope, CimDeadline deadline, CancellationToken cancellationToken)
+    {
+        using var settingsClass = new ManagementClass(scope, new ManagementPath("Msvm_VirtualSystemSnapshotSettingData"), null);
+        using var instance = WithDeadline(deadline, cancellationToken, "building snapshot settings", settingsClass.CreateInstance);
+        instance["ConsistencyLevel"] = CrashConsistentLevel;
+        return instance.GetText(TextFormat.WmiDtd20);
+    }
+
+    private static HashSet<string> ExistingCheckpointInstanceIds(
+        ManagementObject vm, CimDeadline deadline, CancellationToken cancellationToken)
+    {
+        var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var checkpoint in CheckpointSettings(vm, deadline, cancellationToken))
+        {
+            using (checkpoint)
+            {
+                ids.Add((string)checkpoint["InstanceID"]);
+            }
+        }
+
+        return ids;
+    }
+
+    /// <summary>
+    /// Finds the one checkpoint <see cref="ExistingCheckpointInstanceIds"/>'s
+    /// snapshot did not already know about, retrying because the association
+    /// can lag <c>CreateSnapshot</c>'s own job completion - see
+    /// <see cref="CheckpointDiscoveryPollInterval"/>.
+    /// </summary>
+    private static string FindNewCheckpoint(
+        ManagementObject vm, HashSet<string> before, CimDeadline deadline, CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            var found = new List<string>();
+            foreach (var checkpoint in CheckpointSettings(vm, deadline, cancellationToken))
+            {
+                using (checkpoint)
+                {
+                    if (!before.Contains((string)checkpoint["InstanceID"]))
+                    {
+                        found.Add(checkpoint.Path.Path);
+                    }
+                }
+            }
+
+            if (found.Count == 1)
+            {
+                return found[0];
+            }
+
+            if (found.Count > 1)
+            {
+                throw new InvalidOperationException(
+                    $"CreateSnapshot on {vm["Name"]} produced {found.Count} new checkpoints; expected exactly one");
+            }
+
+            if (deadline.HasExpired)
+            {
+                throw new TimeoutException(
+                    $"CreateSnapshot on {vm["Name"]} reported success but no new checkpoint had appeared before " +
+                    "this operation ran out of time");
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            Thread.Sleep(CheckpointDiscoveryPollInterval);
+        }
+    }
+
+    /// <summary>
+    /// Renames a just-created checkpoint to carry this driver's identity.
+    /// Always a second call after creation, never folded into it: measured
+    /// against a real host, <c>CreateSnapshot</c>'s own <c>SnapshotSettings</c>
+    /// input does not apply <c>ElementName</c> - Hyper-V assigns its own
+    /// default regardless of what was asked for.
+    /// </summary>
+    private string TagCheckpoint(
+        string hostName,
+        ManagementObject checkpointSettings,
+        string elementName,
+        string notesJson,
+        CimDeadline deadline,
+        CancellationToken cancellationToken)
+    {
+        // A clone carries the original's InstanceID as its key property, which
+        // is what tells ModifySystemSettings to update this instance in place
+        // rather than attempt to create a new one.
+        using var clone = (ManagementObject)checkpointSettings.Clone();
+        clone["ElementName"] = elementName;
+        clone["Notes"] = new[] { notesJson };
+        var text = clone.GetText(TextFormat.WmiDtd20);
+
+        using var session = CimSession.Create(hostName);
+        using var management = GetManagementService(session, deadline, cancellationToken);
+
+        var parameters = new CimMethodParametersCollection
+        {
+            CimMethodParameter.Create("SystemSettings", text, CimType.String, CimFlags.In),
+        };
+
+        using var result = session.InvokeMethod(
+            NamespaceName, management, "ModifySystemSettings", parameters,
+            deadline.Options("ModifySystemSettings", cancellationToken));
+
+        _ = CimJobs.WaitForCompletion(
+            session, NamespaceName, result, "ModifySystemSettings", deadline, cancellationToken, _logger);
+
+        return checkpointSettings.Path.Path;
+    }
+
+    private static Checkpoint? FindOwnedCheckpoint(
+        ManagementObject vm, string elementNamePrefix, CimDeadline deadline, CancellationToken cancellationToken)
+    {
+        Checkpoint? found = null;
+
+        foreach (var checkpoint in CheckpointSettings(vm, deadline, cancellationToken))
+        {
+            using (checkpoint)
+            {
+                if (checkpoint["ElementName"] is not string { Length: > 0 } elementName
+                    || !elementName.StartsWith(elementNamePrefix, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                if (found is not null)
+                {
+                    throw new InvalidOperationException(
+                        $"{vm["Name"]} has more than one checkpoint tagged {elementNamePrefix}*, which should be " +
+                        "impossible under this driver's per-VM job serialization");
+                }
+
+                found = new Checkpoint(checkpoint.Path.Path, elementName);
+            }
+        }
+
+        return found;
+    }
+
+    /// <summary>
+    /// Every checkpoint currently associated with the VM, finished or not -
+    /// there is no "in progress" state for a checkpoint the way there is for a
+    /// CSV file, so unlike <c>EnumerateSnapshotFiles</c> this has nothing to
+    /// filter.
+    /// </summary>
+    private static IEnumerable<ManagementObject> CheckpointSettings(
+        ManagementObject vm, CimDeadline deadline, CancellationToken cancellationToken)
+    {
+        using var related = WithDeadline(
+            deadline,
+            cancellationToken,
+            "enumerating checkpoints",
+            () => vm.GetRelated("Msvm_VirtualSystemSettingData", "Msvm_SnapshotOfVirtualSystem", null, null, null, null, false, null));
+
+        foreach (var instance in related)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            yield return (ManagementObject)instance;
+        }
+    }
+
+    private static CimInstance GetSnapshotService(
+        CimSession session, CimDeadline deadline, CancellationToken cancellationToken)
+    {
+        var options = deadline.Options("locating Msvm_VirtualSystemSnapshotService", cancellationToken);
+        foreach (var instance in session.QueryInstances(
+            NamespaceName, "WQL", "SELECT * FROM Msvm_VirtualSystemSnapshotService", options))
+        {
+            return instance;
+        }
+
+        throw new InvalidOperationException(
+            $"no Msvm_VirtualSystemSnapshotService in {NamespaceName}; is the Hyper-V role installed on this host?");
+    }
 
     private static CimInstance GetImageManagementService(
         CimSession session, CimDeadline deadline, CancellationToken cancellationToken)
@@ -838,6 +1309,41 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         CimDeadline deadline,
         CancellationToken cancellationToken)
     {
+        using var vm = GetComputerSystem(scope, hostName, vmId, deadline, cancellationToken);
+
+        // The *active* settings, not a snapshot's: Msvm_SettingsDefineState
+        // associates a VM with the configuration it is currently running.
+        using var settings = WithDeadline(
+            deadline,
+            cancellationToken,
+            $"reading active settings for VM {vmId}",
+            () => vm.GetRelated("Msvm_VirtualSystemSettingData", "Msvm_SettingsDefineState", null, null, null, null, false, null));
+
+        foreach (var setting in settings)
+        {
+            return (ManagementObject)setting;
+        }
+
+        throw new InvalidOperationException($"VM {vmId} on {hostName} has no active setting data");
+    }
+
+    /// <summary>
+    /// Resolves the VM's own <c>Msvm_ComputerSystem</c>, which is what a
+    /// checkpoint operation's <c>AffectedSystem</c> reference names - as
+    /// opposed to <see cref="GetActiveSettings"/>'s
+    /// <c>Msvm_VirtualSystemSettingData</c>, which is what every VM
+    /// *configuration* call takes instead. Split out of
+    /// <see cref="GetActiveSettings"/> rather than duplicated, since the two
+    /// share the same VM lookup and disagreeing about it would mean the two
+    /// halves of this class describing "the VM" two different ways.
+    /// </summary>
+    private static ManagementObject GetComputerSystem(
+        ManagementScope scope,
+        string hostName,
+        string vmId,
+        CimDeadline deadline,
+        CancellationToken cancellationToken)
+    {
         if (!WqlNames.IsVmId(vmId))
         {
             // Not VmNotOnHostException: this VM has not migrated anywhere, the
@@ -864,22 +1370,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             searcher.Get);
         foreach (var instance in results)
         {
-            using var vm = (ManagementObject)instance;
-
-            // The *active* settings, not a snapshot's: Msvm_SettingsDefineState
-            // associates a VM with the configuration it is currently running.
-            using var settings = WithDeadline(
-                deadline,
-                cancellationToken,
-                $"reading active settings for VM {vmId}",
-                () => vm.GetRelated("Msvm_VirtualSystemSettingData", "Msvm_SettingsDefineState", null, null, null, null, false, null));
-
-            foreach (var setting in settings)
-            {
-                return (ManagementObject)setting;
-            }
-
-            throw new InvalidOperationException($"VM {vmId} on {hostName} has no active setting data");
+            return (ManagementObject)instance;
         }
 
         // Not a generic failure: the VM has almost certainly migrated, and the
@@ -997,6 +1488,25 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     {
         var reference = new CimInstance(new ManagementPath(wmiPath).ClassName, NamespaceName);
         reference.CimInstanceProperties.Add(CimProperty.Create("InstanceID", InstanceIdOfPath(wmiPath), CimFlags.Key));
+        return reference;
+    }
+
+    /// <summary>
+    /// A reference to a VM's own <c>Msvm_ComputerSystem</c>, for method
+    /// parameters typed REF against that class - <c>CreateSnapshot</c>'s
+    /// <c>AffectedSystem</c>, so far the only one. Deliberately not built with
+    /// <see cref="ReferenceToPath"/>: measured against a real host,
+    /// <c>Msvm_ComputerSystem</c>'s key is the compound
+    /// (<c>CreationClassName</c>, <c>Name</c>) pair CIM_ComputerSystem defines,
+    /// not the single <c>InstanceID</c> every resource-setting-data class in
+    /// this file uses - reusing that helper here produces a reference WMI
+    /// rejects with "the following selector is not a key property... InstanceID".
+    /// </summary>
+    private static CimInstance ComputerSystemReference(string vmId)
+    {
+        var reference = new CimInstance("Msvm_ComputerSystem", NamespaceName);
+        reference.CimInstanceProperties.Add(CimProperty.Create("CreationClassName", "Msvm_ComputerSystem", CimFlags.Key));
+        reference.CimInstanceProperties.Add(CimProperty.Create("Name", vmId, CimFlags.Key));
         return reference;
     }
 
