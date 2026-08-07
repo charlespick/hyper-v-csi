@@ -666,12 +666,14 @@ public sealed class SnapshotService : ISnapshotService
     /// checkpoint is reused rather than a new one taken. Being read-only, this
     /// classification is safe to run this early regardless of which case it
     /// turns out to be - unlike taking a checkpoint, it cannot itself strand
-    /// anything. Both attached cases measure through
-    /// <see cref="ReadAllocatedBytesThroughHostAsync"/>, which needs no
-    /// checkpoint to work: it is a CIM query against the VM and path, not a
-    /// local file open a running VM's own handle would block, so the Direct
-    /// case can call it before a checkpoint exists exactly as the resumed case
-    /// calls it after.
+    /// anything. Both attached cases measure with <see cref="FileInfo.Length"/>
+    /// on <paramref name="sourcePath"/> directly, which needs no checkpoint to
+    /// work either: it reads the file's directory entry rather than opening
+    /// it, so - unlike <see cref="OpenSourceLocally"/>'s <see cref="FileStream"/>,
+    /// which a running VM's own exclusive handle blocks - it answers correctly
+    /// whether or not a checkpoint exists yet. That is what lets the Direct
+    /// case call it before a checkpoint is taken, exactly as the resumed case
+    /// calls it after one already exists.
     /// </remarks>
     private async Task<SourceInspection> InspectSourceAsync(
         string snapshotId, string sourceVolumeId, string snapshotName, string sourcePath, string? nodeId,
@@ -729,7 +731,7 @@ public sealed class SnapshotService : ISnapshotService
             case VolumeAttachmentKind.BehindOwnedCheckpoint:
                 // Resuming: an earlier attempt already froze the base. Reuse
                 // that checkpoint rather than taking a second one.
-                var resumedBytes = await ReadAllocatedBytesThroughHostAsync(vm, sourcePath, attempt.Token).ConfigureAwait(false);
+                var resumedBytes = new FileInfo(sourcePath).Length;
                 return new SourceInspection(resumedBytes, vm, attachment.OwnedCheckpoint, false);
 
             case VolumeAttachmentKind.Direct:
@@ -737,7 +739,7 @@ public sealed class SnapshotService : ISnapshotService
                 // this measurement needs a checkpoint, so taking one is left
                 // to CreateAsync, once nothing else can still refuse the
                 // snapshot.
-                var freshBytes = await ReadAllocatedBytesThroughHostAsync(vm, sourcePath, attempt.Token).ConfigureAwait(false);
+                var freshBytes = new FileInfo(sourcePath).Length;
                 return new SourceInspection(freshBytes, vm, null, true);
 
             default:
@@ -788,19 +790,6 @@ public sealed class SnapshotService : ISnapshotService
                 $"snapshot {snapshotId} cannot be taken: the agent is not permitted to read {sourcePath}: {ex.Message}");
         }
     }
-
-    /// <summary>
-    /// The source's allocated size, read through the owning host rather than a
-    /// local open. <see cref="IHyperVHostClient.GetDiskSizeAsync"/> is a CIM
-    /// query against the VM and path, not a local file handle a running VM's
-    /// own open would block - so unlike a local open, it answers the same way
-    /// whether or not a checkpoint exists yet. That is what lets the Direct
-    /// case in <see cref="InspectSourceAsync"/> call this *before* a checkpoint
-    /// is taken, using the same call the BehindOwnedCheckpoint case makes
-    /// after one already exists.
-    /// </summary>
-    private async Task<long> ReadAllocatedBytesThroughHostAsync(ClusteredVm vm, string sourcePath, CancellationToken cancellationToken) =>
-        await _host.GetDiskSizeAsync(vm.OwningHost, vm.VmId, sourcePath, cancellationToken).ConfigureAwait(false);
 
     /// <summary>
     /// This checkpoint's identity: unique to the (source volume, snapshot name)

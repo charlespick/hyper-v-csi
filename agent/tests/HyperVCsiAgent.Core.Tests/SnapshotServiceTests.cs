@@ -441,7 +441,7 @@ public sealed class SnapshotServiceTests : IDisposable
     public async Task CreateAsync_AttachedVolumeWithANodeHint_TakesAChekpointCopiesAndMergesIt()
     {
         var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
-        var host = new FakeHostClient { AllocatedBytesOnHost = 4096 };
+        var host = new FakeHostClient();
         var harness = NewHarness(cluster: cluster, host: host);
         WriteVolume("pvc-1", 4096);
 
@@ -542,7 +542,7 @@ public sealed class SnapshotServiceTests : IDisposable
         // deleted it by hand. CreateCheckpointAsync must therefore never be
         // called when ResourceExhausted is what ends up refusing this.
         var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
-        var host = new FakeHostClient { AllocatedBytesOnHost = 4096 };
+        var host = new FakeHostClient();
         var harness = NewHarness(cluster: cluster, host: host);
         WriteVolume("pvc-1", 4096);
         harness.Copier.FreeBytes = 1;
@@ -553,6 +553,29 @@ public sealed class SnapshotServiceTests : IDisposable
         Assert.Equal(AgentErrorCodes.ResourceExhausted, failure.ErrorCode);
         Assert.Empty(host.CreatedCheckpointElementNames);
         Assert.Empty(harness.Copier.Destinations);
+    }
+
+    [Fact]
+    public async Task CreateAsync_AttachedSourceWithVirtualSizeFarLargerThanItsFileSize_IsNotRefusedForSpaceItWouldNotUse()
+    {
+        // The bug this pins: an attached source used to be charged its
+        // *virtual* size against free space - what a 100GB dynamically
+        // expanding disk with 5GB of real data reports to the guest - rather
+        // than what the copy actually has to move. Here the fake volume
+        // claims a 10GB virtual size but is, in reality, a tiny file on disk;
+        // the target has room for the file, and nowhere near room for the
+        // virtual size, so this must succeed.
+        var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient();
+        var harness = NewHarness(cluster: cluster, host: host);
+        WriteVolume("pvc-1", 10L * 1024 * 1024 * 1024);
+        var actualFileBytes = new FileInfo(VolumePath("pvc-1")).Length;
+        harness.Copier.FreeBytes = actualFileBytes + 1;
+
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", "node-a", CancellationToken.None);
+
+        Assert.Equal("pvc-1~snapshot-abc", result.SnapshotId);
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
     }
 
     [Fact]
@@ -1451,8 +1474,6 @@ public sealed class SnapshotServiceTests : IDisposable
         /// <summary>Runs synchronously inside DestroyCheckpointAsync, before it records the call - lets a test observe what else is (or isn't) true at that exact moment.</summary>
         public Action? DuringDestroy { get; set; }
 
-        public long AllocatedBytesOnHost { get; set; } = 4096;
-
         public List<string> CreatedCheckpointElementNames { get; } = [];
 
         public List<string> DestroyedCheckpointElementNames { get; } = [];
@@ -1514,7 +1535,8 @@ public sealed class SnapshotServiceTests : IDisposable
         }
 
         public Task<long> GetDiskSizeAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
-            Task.FromResult(AllocatedBytesOnHost);
+            throw new NotSupportedException(
+                "SnapshotService measures an attached source's allocated bytes from the CSV file directly now, not through the host");
 
         public Task<AttachedDisk?> FindAttachedDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
             throw new NotSupportedException("SnapshotService never looks up an attached disk's address");
