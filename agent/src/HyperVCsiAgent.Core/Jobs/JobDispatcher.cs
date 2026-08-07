@@ -18,6 +18,8 @@ public sealed class JobDispatcher(IVhdxService vhdxService, IAttachService attac
 
     public const string ExpandVolume = "ExpandVolume";
 
+    public const string VolumeExists = "VolumeExists";
+
     public const string AttachVolume = "AttachVolume";
 
     public const string DetachVolume = "DetachVolume";
@@ -71,6 +73,18 @@ public sealed class JobDispatcher(IVhdxService vhdxService, IAttachService attac
                 return async (job, cancellationToken) =>
                     job.Result = await vhdxService.ExpandAsync(expandRequest.VolumeId, expandRequest.SizeBytes, expandRequest.NodeId, cancellationToken)
                         .ConfigureAwait(false);
+
+            case VolumeExists:
+                var existsRequest = Decode<VolumeExistsPayload>(payload, jsonOptions);
+                if (string.IsNullOrWhiteSpace(existsRequest.VolumeId))
+                {
+                    throw new InvalidJobRequestException("payload.volumeId is required");
+                }
+
+                // No job.Result: the answer is the job's own outcome. Success
+                // means the disk is there, NotFound means it is not, and there
+                // is nothing else the controller asked about.
+                return (_, cancellationToken) => vhdxService.ConfirmExistsAsync(existsRequest.VolumeId, cancellationToken);
 
             case AttachVolume:
                 var attachRequest = Decode<AttachVolumePayload>(payload, jsonOptions);

@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -22,6 +23,10 @@ const operationDeleteVolume = "DeleteVolume"
 // operationExpandVolume is the operationType the agent dispatches on; it must
 // match JobDispatcher.ExpandVolume on the .NET side.
 const operationExpandVolume = "ExpandVolume"
+
+// operationVolumeExists is the operationType the agent dispatches on; it must
+// match JobDispatcher.VolumeExists on the .NET side.
+const operationVolumeExists = "VolumeExists"
 
 // operationAttachVolume is the operationType the agent dispatches on; it must
 // match JobDispatcher.AttachVolume on the .NET side.
@@ -496,10 +501,97 @@ func (s *controllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 	return &csi.ControllerUnpublishVolumeResponse{}, nil
 }
 
+// volumeExistsPayload is the operation-specific half of the agent's job
+// envelope, matching VolumeExistsPayload on the .NET side. There is no result
+// half: the job succeeding is the answer, and its NotFound failure is the other
+// one.
+type volumeExistsPayload struct {
+	VolumeID string `json:"volumeId"`
+}
+
 // ValidateVolumeCapabilities confirms a volume supports the requested access
-// mode and type. Lookup only; no idempotency key needed.
+// mode and type. Idempotency key: volume ID.
+//
+// Two questions, answered in two places and in this order. Whether the volume
+// exists is the agent's to answer — it reads the CSV, the same way every other
+// operation decides what is already true — and CSI requires NOT_FOUND when it
+// doesn't, so that lookup has to happen before anything is confirmed:
+// confirming capabilities against a volume ID nothing ever provisioned would be
+// a guess wearing an answer's clothes. Whether a VHDX can back the capabilities
+// asked about needs no lookup at all; it's a property of the driver, so it is
+// decided here.
+//
+// The volume ID is the idempotency key and the target, as it is for create,
+// delete and expand. That queues this lookup behind any work in flight on the
+// same disk rather than racing it, which is what makes the answer worth having:
+// a validation issued during a create answers about the finished volume, and
+// one issued during a delete answers about its absence.
 func (s *controllerServer) ValidateVolumeCapabilities(ctx context.Context, req *csi.ValidateVolumeCapabilitiesRequest) (*csi.ValidateVolumeCapabilitiesResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "ValidateVolumeCapabilities not implemented")
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume id is required")
+	}
+	if len(req.GetVolumeCapabilities()) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "volume capabilities are required")
+	}
+
+	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetVolumeId(), operationVolumeExists, volumeTarget(req.GetVolumeId()), volumeExistsPayload{
+		VolumeID: req.GetVolumeId(),
+	})
+	if err != nil {
+		return nil, enqueueFailed(ctx, err, "enqueueing ValidateVolumeCapabilities for %s", req.GetVolumeId())
+	}
+
+	// A volume with no VHDX comes back as the agent's NotFound, which
+	// translateJobFailure already maps to the NOT_FOUND this RPC owes the
+	// caller. Nothing else to decode: the job carries no result, because
+	// whether it succeeded is the entire answer.
+	if _, err := awaitJob(ctx, s.driver.Agent, job.ID, jobPollBudget); err != nil {
+		return nil, err
+	}
+
+	for _, capability := range req.GetVolumeCapabilities() {
+		if reason := unsupportedCapability(capability); reason != "" {
+			// Not an error. CSI reserves this RPC's error codes for a request
+			// that could not be evaluated; "evaluated, and no" is an ordinary
+			// response with confirmed left unset and the reason in the message.
+			return &csi.ValidateVolumeCapabilitiesResponse{Message: reason}, nil
+		}
+	}
+
+	return &csi.ValidateVolumeCapabilitiesResponse{
+		Confirmed: &csi.ValidateVolumeCapabilitiesResponse_Confirmed{
+			VolumeCapabilities: req.GetVolumeCapabilities(),
+			VolumeContext:      req.GetVolumeContext(),
+			// Parameters are deliberately not echoed. Confirming them would
+			// claim the volume was provisioned to honor them, and CreateVolume
+			// ignores StorageClass parameters outright — see "CreateVolume gaps"
+			// in CSI Spec.md. Echoing them back would turn a documented gap into
+			// a guarantee this driver does not keep.
+		},
+	}, nil
+}
+
+// unsupportedCapability reports why a VHDX cannot back this capability, or ""
+// if it can. Separate from validateVolumeCapabilities because the two draw
+// opposite conclusions from the same facts: every other RPC is *given* a
+// capability and treats an unsupported one as a malformed request, while this
+// RPC is *asked* about one and owes a plain answer — an error there would say
+// the question couldn't be evaluated, not that the answer was no.
+//
+// It is also stricter in one respect. A block volume is a "no" here, because
+// nothing in this driver formats or mounts a raw block device; CreateVolume
+// still accepts one without complaint, which is a gap already named in CSI
+// Spec.md and its own piece of work rather than a side effect of this one.
+func unsupportedCapability(capability *csi.VolumeCapability) string {
+	if capability.GetMount() == nil {
+		return "only mount volumes are supported; block volumes are not implemented"
+	}
+
+	if mode := capability.GetAccessMode().GetMode(); !supportedAccessModes[mode] {
+		return fmt.Sprintf("access mode %s is not supported; a VHDX attaches to one node at a time", mode)
+	}
+
+	return ""
 }
 
 // expandVolumePayload and expandVolumeResult are the operation-specific halves

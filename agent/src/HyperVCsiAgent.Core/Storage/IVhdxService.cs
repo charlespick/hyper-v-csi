@@ -65,6 +65,27 @@ public interface IVhdxService
     /// </exception>
     Task DeleteAsync(string volumeId, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// Confirms the volume's VHDX is on the CSV, which is all CSI's
+    /// ValidateVolumeCapabilities needs from this side: whether the capabilities
+    /// asked about are ones a VHDX can back is a question the Go driver answers
+    /// on its own, but whether *this* volume exists can only be answered here.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately reads nothing but the directory entry - no CIM call, no
+    /// size. Opening a VHDX to read its settings is exactly what fails with a
+    /// sharing violation when a running VM has the disk attached (see
+    /// <see cref="ExpandAsync"/>), and an attached volume is the ordinary case
+    /// for this lookup, not an edge one. There is nothing here worth paying
+    /// that for.
+    /// </remarks>
+    /// <exception cref="Jobs.JobFailureException">
+    /// NotFound if no VHDX exists for this volume ID, which is the code CSI
+    /// requires ValidateVolumeCapabilities to answer with for a volume that
+    /// isn't there.
+    /// </exception>
+    Task ConfirmExistsAsync(string volumeId, CancellationToken cancellationToken);
+
     Task<string> CreateCheckpointAsync(string volumeId, string snapshotName, CancellationToken cancellationToken);
 
     Task DeleteCheckpointAsync(string snapshotId, CancellationToken cancellationToken);

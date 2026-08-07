@@ -10,14 +10,14 @@ covered by unit tests but has never run against a real failover cluster or Hyper
 | CSI Surface Call | Implementation Spot | Description | Idempotency Key | Status |
 |---|---|---|---|---|
 | GetPluginInfo | Both | Returns the plugin's name and version so Kubernetes can identify it. | N/A | Tested — returns the correct name and version against a real deployment |
-| GetPluginCapabilities | Both | Reports which optional CSI features this plugin supports. | N/A | Over advertising until project is finished |
+| GetPluginCapabilities | Both | Reports which optional CSI features this plugin supports. | N/A | Tested — external-resizer reads it before it will resize anything, and the ONLINE expansion it claims ran end to end |
 | Probe | Both | Health check confirming the plugin is ready to serve requests. | N/A | Stub — always reports ready |
 | CreateVolume | Controller | Provisions a new volume and returns its identifier. | Volume name | Tested — creates a VHDX on disk |
 | DeleteVolume | Controller | Removes a previously provisioned volume. | Volume ID | Tested |
 | ControllerPublishVolume | Controller | Attaches a volume to a specified node. | Volume ID + node ID | Tested — attaches against a real cluster |
 | ControllerUnpublishVolume | Controller | Detaches a volume from a specified node. | Volume ID + node ID | Tested — detaches against a real cluster |
-| ValidateVolumeCapabilities | Controller | Confirms a volume supports the requested access mode and type. | Volume ID (lookup only) | Not started |
-| ControllerGetCapabilities | Controller | Reports which controller RPCs this plugin implements. | N/A | Over advertising until project is finished |
+| ValidateVolumeCapabilities | Controller | Confirms a volume supports the requested access mode and type. | Volume ID (lookup only) | Pending testing |
+| ControllerGetCapabilities | Controller | Reports which controller RPCs this plugin implements. | N/A | Over advertising snapshots, and only snapshots |
 | ControllerExpandVolume | Controller | Grows a volume's underlying storage. | Volume ID | Tested — grows a volume attached to a running VM, via that VM's own host |
 | CreateSnapshot | Controller | Creates a point-in-time snapshot of a volume. | Snapshot name | Not started |
 | DeleteSnapshot | Controller | Removes a previously created snapshot. | Snapshot ID | Not started |
@@ -31,23 +31,65 @@ covered by unit tests but has never run against a real failover cluster or Hyper
 | NodeGetCapabilities | Node | Reports which node RPCs this plugin implements. | N/A | Tested — kubelet reads it before every stage |
 | NodeGetInfo | Node | Reports node identity/topology info used for scheduling and attach decisions. | N/A | Tested — reports the Hyper-V VM ID against a real cluster |
 
-**Over advertising until project is finished** means the RPC works — it's a declaration, and
-declarations are just constants — but it announces capabilities whose RPCs are still stubs. The
-lists describe the finished driver, not today's code, so the sidecars will call things that return
-Unimplemented. Either trim each list to what's actually built, or land the missing RPCs, before
-running this in a cluster. What each one currently overstates:
+**Over advertising snapshots, and only snapshots.** A capability list is a declaration — constants,
+not code — so it can name an RPC that isn't there, and for most of this project's life all three
+lists did: they described the finished driver rather than today's code, and a sidecar reading one
+would go on to call something that returned Unimplemented. Two of the three are now honest, and the
+third is honest about everything except the one feature this driver has deliberately not built:
 
-- `GetPluginCapabilities` — nothing any more. Volume expansion (ONLINE) is the only thing it claims,
-  and both halves of one are now built. It correctly omits VOLUME_ACCESSIBILITY_CONSTRAINTS.
-- `ControllerGetCapabilities` — CREATE_DELETE_SNAPSHOT and LIST_SNAPSHOTS, and only those.
-  CREATE_DELETE_VOLUME, PUBLISH_UNPUBLISH_VOLUME and EXPAND_VOLUME are the three it does not
-  overstate: both halves of each are built.
-- `NodeGetCapabilities` — nothing any more. Every RPC it names is built: STAGE_UNSTAGE_VOLUME,
+- `GetPluginCapabilities` — honest. Volume expansion (ONLINE) is the only thing it claims, and both
+  halves of one are built. It correctly omits VOLUME_ACCESSIBILITY_CONSTRAINTS.
+- `NodeGetCapabilities` — honest. Every RPC it names is built: STAGE_UNSTAGE_VOLUME,
   GET_VOLUME_STATS and EXPAND_VOLUME.
+- `ControllerGetCapabilities` — claims CREATE_DELETE_SNAPSHOT and LIST_SNAPSHOTS, and neither is
+  built: CreateSnapshot, DeleteSnapshot and ListSnapshots all return Unimplemented, as does
+  restore-from-snapshot through CreateVolume's `VolumeContentSource`. CREATE_DELETE_VOLUME,
+  PUBLISH_UNPUBLISH_VOLUME and EXPAND_VOLUME are not overstated: both halves of each are built.
 
-Two of the three lists are now honest. They stay in this section rather than dropping out of it
-because "honest" is not "exercised" — everything in them past attach and stage is still
-Pending testing, and this section exists to stop a list quietly outrunning the code again.
+That last one costs nothing today, because nothing calls the RPCs it names. external-snapshotter is
+the only thing that would, the chart deliberately does not deploy it, and without the sidecar a
+VolumeSnapshotClass has nothing to act on. It becomes real the moment someone deploys the sidecar on
+the strength of the list, which is why it still has to be closed one way or the other before first
+release: trim the two capabilities, or land the RPCs.
+
+Everything else on the checklist is built, which is what makes this section short now rather than
+gone. What is left is one deliberately deferred feature, named as such, instead of a list quietly
+outrunning the code. The section stays anyway: it exists to catch the next list that does.
+
+**ValidateVolumeCapabilities answers two questions and only owns one of them.** Whether a VHDX can
+back the capabilities being asked about is a property of the driver — single-node access modes yes,
+multi-node no, block no — and needs no lookup at all, so the Go controller answers it. Whether the
+volume exists is a fact about the CSV, so the agent answers it, through a `VolumeExists` job keyed
+and targeted on the volume ID exactly as create, delete and expand are.
+
+Existence is checked first, and the order is the point. CSI requires NOT_FOUND for a volume that
+isn't there, and confirming capabilities against an ID nothing ever provisioned would be a guess
+wearing an answer's clothes: a caller with a mistyped volume ID would be told its access mode was
+fine. Sharing the volume's job target is what makes the answer worth having — the lookup queues
+behind whatever is already in flight on that disk instead of racing it, so a validation issued
+during a create answers about the finished volume and one issued during a delete answers about its
+absence.
+
+An unsupported capability is *not* an error. CSI reserves this RPC's error codes for a request that
+could not be evaluated; "evaluated, and the answer is no" is an ordinary response with `confirmed`
+left unset and the reason in `message`. A CO reads those two differently — an error means ask again,
+an unconfirmed response means this volume will not do what you want — so INVALID_ARGUMENT here,
+which is what every other RPC in this driver returns for a capability it cannot back, would be the
+wrong answer to a question that was asked perfectly well.
+
+The existence check reads the directory entry and nothing else: no CIM call, no size, no open
+handle. Opening a VHDX to read its settings is precisely what fails with a sharing violation once a
+running VM has the disk — the failure ControllerExpandVolume had to grow a whole host-targeted
+fallback for — and the volumes a CO asks about are typically the ones in use, so paying that cost
+here would break the RPC on exactly the volumes it is most often asked about. A disk still being
+created reads as absent, which is correct: it only reaches its real path via the rename that
+publishes it.
+
+Two things it deliberately does not confirm. `parameters` are not echoed back, because CreateVolume
+ignores StorageClass parameters (below), and confirming them would turn a documented gap into a
+guarantee nothing keeps. And a block volume is a "no", even though CreateVolume still accepts one:
+this is the RPC whose entire job is answering honestly, so it answers, and tightening create is its
+own piece of work rather than a side effect of this one.
 
 **CreateVolume gaps.** StorageClass `parameters` are ignored rather than consumed or rejected, the
 access *type* (mount vs block) is not validated, and `volume_context` is left empty.

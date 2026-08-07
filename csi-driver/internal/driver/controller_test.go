@@ -900,6 +900,190 @@ func TestControllerUnpublishVolumeForgottenJobIsRetryable(t *testing.T) {
 	}
 }
 
+func TestValidateVolumeCapabilitiesConfirmsWhatAVhdxCanBack(t *testing.T) {
+	server := newControllerServer(newFakeAgent(t, agentclient.Job{Status: agentclient.JobSucceeded}))
+
+	req := validateRequest("pvc-1")
+	req.VolumeContext = map[string]string{"anything": "the CO sent"}
+	resp, err := server.ValidateVolumeCapabilities(context.Background(), req)
+	if err != nil {
+		t.Fatalf("ValidateVolumeCapabilities: %v", err)
+	}
+
+	if resp.GetConfirmed() == nil {
+		t.Fatalf("nothing confirmed for a capability a VHDX backs (message: %q)", resp.GetMessage())
+	}
+	if got := len(resp.GetConfirmed().GetVolumeCapabilities()); got != 1 {
+		t.Errorf("confirmed %d capabilities, want the 1 that was asked about", got)
+	}
+	if got := resp.GetConfirmed().GetVolumeContext()["anything"]; got != "the CO sent" {
+		t.Errorf("volume context = %q, want it echoed back", got)
+	}
+	// Parameters stay unset on purpose: CreateVolume ignores StorageClass
+	// parameters, so confirming them would promise something nothing enforces.
+	if got := resp.GetConfirmed().GetParameters(); len(got) != 0 {
+		t.Errorf("parameters = %v, want none confirmed", got)
+	}
+}
+
+func TestValidateVolumeCapabilitiesEnqueuesUnderTheVolumeIDAsIdempotencyKeyAndTarget(t *testing.T) {
+	agent := newFakeAgent(t, agentclient.Job{Status: agentclient.JobSucceeded})
+	server := newControllerServer(agent)
+
+	if _, err := server.ValidateVolumeCapabilities(context.Background(), validateRequest("pvc-1")); err != nil {
+		t.Fatalf("ValidateVolumeCapabilities: %v", err)
+	}
+
+	enqueued := agent.onlyEnqueued(t)
+	if enqueued.IdempotencyKey != "pvc-1" {
+		t.Errorf("idempotency key = %q, want the CSI volume id", enqueued.IdempotencyKey)
+	}
+	if enqueued.OperationType != operationVolumeExists {
+		t.Errorf("operation type = %q, want %q", enqueued.OperationType, operationVolumeExists)
+	}
+	// Same target as create, delete and expand, so a lookup answers about a
+	// finished operation rather than racing one on the same disk.
+	if enqueued.Target != "volume:pvc-1" {
+		t.Errorf("target = %q, want volume:pvc-1", enqueued.Target)
+	}
+	if enqueued.Payload.VolumeID != "pvc-1" {
+		t.Errorf("payload = %+v, want the volume id", enqueued.Payload)
+	}
+}
+
+func TestValidateVolumeCapabilitiesVolumeThatIsNotThereIsNotFound(t *testing.T) {
+	// CSI's answer for a volume that doesn't exist. Confirming capabilities
+	// against an ID nothing provisioned would be a guess, not an answer.
+	server := newControllerServer(newFakeAgent(t, agentclient.Job{
+		Status:    agentclient.JobFailed,
+		Error:     "volume pvc-1 has no disk",
+		ErrorCode: agentclient.ErrorCodeNotFound,
+	}))
+
+	_, err := server.ValidateVolumeCapabilities(context.Background(), validateRequest("pvc-1"))
+
+	if got := status.Code(err); got != codes.NotFound {
+		t.Fatalf("code = %s, want NotFound (err: %v)", got, err)
+	}
+}
+
+func TestValidateVolumeCapabilitiesAnswersAboutTheVolumeBeforeTheCapabilities(t *testing.T) {
+	// A capability a VHDX can't back is still not the answer when the volume
+	// itself isn't there: NOT_FOUND is what tells the caller its volume id is
+	// the problem, and reporting an unsupported capability instead would have it
+	// looking at the wrong thing entirely.
+	server := newControllerServer(newFakeAgent(t, agentclient.Job{
+		Status:    agentclient.JobFailed,
+		Error:     "volume pvc-1 has no disk",
+		ErrorCode: agentclient.ErrorCodeNotFound,
+	}))
+
+	req := validateRequest("pvc-1")
+	req.VolumeCapabilities[0].AccessMode.Mode = csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER
+
+	_, err := server.ValidateVolumeCapabilities(context.Background(), req)
+
+	if got := status.Code(err); got != codes.NotFound {
+		t.Fatalf("code = %s, want NotFound (err: %v)", got, err)
+	}
+}
+
+func TestValidateVolumeCapabilitiesUnsupportedCapabilityIsAnAnswerNotAnError(t *testing.T) {
+	tests := []struct {
+		name       string
+		capability *csi.VolumeCapability
+	}{
+		{
+			name: "a mode a VHDX cannot back",
+			capability: &csi.VolumeCapability{
+				AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{FsType: "ext4"}},
+				AccessMode: &csi.VolumeCapability_AccessMode{
+					Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
+				},
+			},
+		},
+		{
+			// Nothing in this driver formats or mounts a raw block device, so
+			// confirming one would promise what no layer delivers.
+			name: "a block volume",
+			capability: &csi.VolumeCapability{
+				AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+				AccessMode: &csi.VolumeCapability_AccessMode{
+					Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := newControllerServer(newFakeAgent(t, agentclient.Job{Status: agentclient.JobSucceeded}))
+
+			req := validateRequest("pvc-1")
+			req.VolumeCapabilities = []*csi.VolumeCapability{test.capability}
+			resp, err := server.ValidateVolumeCapabilities(context.Background(), req)
+
+			// The question was evaluated and the answer is no. An error would
+			// say something else entirely: that it couldn't be evaluated.
+			if err != nil {
+				t.Fatalf("ValidateVolumeCapabilities: %v", err)
+			}
+			if resp.GetConfirmed() != nil {
+				t.Error("confirmed a capability a VHDX cannot back")
+			}
+			if resp.GetMessage() == "" {
+				t.Error("declined to confirm without saying why")
+			}
+		})
+	}
+}
+
+func TestValidateVolumeCapabilitiesRejectsUnusableRequests(t *testing.T) {
+	tests := []struct {
+		name    string
+		request *csi.ValidateVolumeCapabilitiesRequest
+	}{
+		{
+			name:    "no volume id",
+			request: validateRequest(""),
+		},
+		{
+			name: "no capabilities",
+			request: func() *csi.ValidateVolumeCapabilitiesRequest {
+				req := validateRequest("pvc-1")
+				req.VolumeCapabilities = nil
+				return req
+			}(),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			agent := newFakeAgent(t, agentclient.Job{Status: agentclient.JobSucceeded})
+			server := newControllerServer(agent)
+
+			_, err := server.ValidateVolumeCapabilities(context.Background(), test.request)
+
+			if got := status.Code(err); got != codes.InvalidArgument {
+				t.Fatalf("code = %s, want InvalidArgument (err: %v)", got, err)
+			}
+			if n := agent.enqueueCount(); n != 0 {
+				t.Errorf("enqueued %d jobs, want none", n)
+			}
+		})
+	}
+}
+
+func TestValidateVolumeCapabilitiesForgottenJobIsRetryable(t *testing.T) {
+	server := newControllerServer(newFakeAgent(t))
+
+	_, err := server.ValidateVolumeCapabilities(context.Background(), validateRequest("pvc-1"))
+
+	if got := status.Code(err); got != codes.Aborted {
+		t.Fatalf("code = %s, want Aborted (err: %v)", got, err)
+	}
+}
+
 func TestControllerExpandVolumeReturnsTheNewCapacityAndAsksForANodeExpansion(t *testing.T) {
 	server := newControllerServer(newFakeAgent(t, expanded(4*gibibyte, false)))
 
@@ -1151,6 +1335,18 @@ func publishRequest(volumeID, nodeID string) *csi.ControllerPublishVolumeRequest
 				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
 			},
 		},
+	}
+}
+
+func validateRequest(volumeID string) *csi.ValidateVolumeCapabilitiesRequest {
+	return &csi.ValidateVolumeCapabilitiesRequest{
+		VolumeId: volumeID,
+		VolumeCapabilities: []*csi.VolumeCapability{{
+			AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{FsType: "ext4"}},
+			AccessMode: &csi.VolumeCapability_AccessMode{
+				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+			},
+		}},
 	}
 }
 

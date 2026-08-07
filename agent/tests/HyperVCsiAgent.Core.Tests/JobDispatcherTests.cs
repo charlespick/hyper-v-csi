@@ -72,6 +72,22 @@ public class JobDispatcherTests
     }
 
     [Fact]
+    public async Task Resolve_VolumeExists_RunsTheLookupAndPublishesNoResult()
+    {
+        var vhdx = new RecordingVhdxService();
+        var run = new JobDispatcher(vhdx, new RecordingAttachService()).Resolve(
+            JobDispatcher.VolumeExists, Payload("""{"volumeId":"pvc-1"}"""), WireOptions);
+
+        var job = NewJob();
+        await run(job, CancellationToken.None);
+
+        Assert.Equal("pvc-1", vhdx.LastConfirmExists);
+        // The answer is the job's own outcome - a succeeded job means the disk
+        // is there - so there is nothing for a result to carry.
+        Assert.Null(job.Result);
+    }
+
+    [Fact]
     public async Task Resolve_AttachVolume_RunsTheAttachAndPublishesWhereItLanded()
     {
         var attach = new RecordingAttachService();
@@ -119,6 +135,10 @@ public class JobDispatcherTests
     [InlineData(JobDispatcher.ExpandVolume, """{"volumeId":"pvc-1","sizeBytes":-1}""")]
     [InlineData(JobDispatcher.ExpandVolume, """{"volumeId":"pvc-1","sizeBytes":"big"}""")]
     [InlineData(JobDispatcher.ExpandVolume, "\"not an object\"")]
+    [InlineData(JobDispatcher.VolumeExists, "{}")]
+    [InlineData(JobDispatcher.VolumeExists, """{"volumeId":""}""")]
+    [InlineData(JobDispatcher.VolumeExists, """{"volumeId":42}""")]
+    [InlineData(JobDispatcher.VolumeExists, "\"not an object\"")]
     [InlineData(JobDispatcher.AttachVolume, """{"nodeId":"node-a"}""")]
     [InlineData(JobDispatcher.AttachVolume, """{"volumeId":"pvc-1"}""")]
     [InlineData(JobDispatcher.AttachVolume, """{"volumeId":"pvc-1","nodeId":""}""")]
@@ -139,6 +159,7 @@ public class JobDispatcherTests
         Assert.Null(vhdx.LastCreate);
         Assert.Null(vhdx.LastExpand);
         Assert.Null(vhdx.LastDelete);
+        Assert.Null(vhdx.LastConfirmExists);
         Assert.Null(attach.LastAttach);
         Assert.Null(attach.LastDetach);
     }
@@ -161,6 +182,8 @@ public class JobDispatcherTests
 
         public string? LastDelete { get; private set; }
 
+        public string? LastConfirmExists { get; private set; }
+
         public Task<CreateVolumeResult> CreateAsync(string volumeName, long sizeBytes, CancellationToken cancellationToken)
         {
             LastCreate = (volumeName, sizeBytes);
@@ -176,6 +199,12 @@ public class JobDispatcherTests
         public Task DeleteAsync(string volumeId, CancellationToken cancellationToken)
         {
             LastDelete = volumeId;
+            return Task.CompletedTask;
+        }
+
+        public Task ConfirmExistsAsync(string volumeId, CancellationToken cancellationToken)
+        {
+            LastConfirmExists = volumeId;
             return Task.CompletedTask;
         }
 

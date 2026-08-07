@@ -505,6 +505,85 @@ public sealed class VhdxServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task ConfirmExistsAsync_WhenTheDiskIsThere_Succeeds()
+    {
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks);
+        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+
+        await service.ConfirmExistsAsync("pvc-1", CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task ConfirmExistsAsync_WhenTheDiskIsAttachedToARunningVm_StillSucceeds()
+    {
+        // The whole reason this reads nothing but the directory entry. Opening
+        // a VHDX to read its settings is what fails with a sharing violation
+        // once a running VM has the disk, which for ValidateVolumeCapabilities
+        // is the ordinary case rather than an edge one - the volumes a CO asks
+        // about are the ones in use.
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks);
+        await service.CreateAsync("pvc-1", 1024, CancellationToken.None);
+        disks.VhdxInUse = true;
+        disks.ResetPeak();
+
+        await service.ConfirmExistsAsync("pvc-1", CancellationToken.None);
+
+        // Nothing reached the CIM seam, so nothing could have failed there, and
+        // no disk-operation slot was spent on a directory lookup.
+        Assert.Equal(0, disks.InFlightPeak);
+    }
+
+    [Fact]
+    public async Task ConfirmExistsAsync_VolumeThatIsNotThere_FailsAsNotFound()
+    {
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => service.ConfirmExistsAsync("pvc-1", CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.NotFound, failure.ErrorCode);
+    }
+
+    [Fact]
+    public async Task ConfirmExistsAsync_DiskStillBeingCreated_IsNotThereYet()
+    {
+        // A volume only exists once the rename publishes it. Reporting the
+        // in-progress file as a volume would confirm capabilities against a
+        // disk that may yet be cleaned up.
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks);
+        Directory.CreateDirectory(_root);
+        await File.WriteAllTextAsync(InProgressPath("pvc-1"), "half-written disk");
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => service.ConfirmExistsAsync("pvc-1", CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.NotFound, failure.ErrorCode);
+    }
+
+    [Theory]
+    [InlineData("../escape")]
+    [InlineData("sub/dir")]
+    [InlineData(@"sub\dir")]
+    [InlineData("")]
+    public async Task ConfirmExistsAsync_VolumeIdThatCouldNotHaveBeenCreated_FailsAsNotFound(string volumeId)
+    {
+        // Same reading as ExpandAsync's rather than DeleteAsync's: no volume
+        // can exist under this name, and unlike a delete, answering "yes" would
+        // be a claim about a disk that isn't there.
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => service.ConfirmExistsAsync(volumeId, CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.NotFound, failure.ErrorCode);
+    }
+
+    [Fact]
     public async Task DeleteAsync_RemovesTheVolumesVhdx()
     {
         var disks = new FakeVirtualDiskManager();

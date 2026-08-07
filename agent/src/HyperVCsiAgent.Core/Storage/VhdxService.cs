@@ -392,6 +392,36 @@ public sealed class VhdxService : IVhdxService, IDisposable
         }
     }
 
+    public Task ConfirmExistsAsync(string volumeId, CancellationToken cancellationToken)
+    {
+        // Same reading as ExpandAsync's, and for the same reason: an ID that
+        // could not have come from CreateAsync names a volume that cannot
+        // exist, and no retry will bring it into being.
+        if (!VolumeNaming.IsSafeName(volumeId))
+        {
+            throw JobFailureException.NotFound(
+                $"volume {volumeId} is not a name this agent could have created, so there is no disk to validate");
+        }
+
+        var path = ResolveVolumePath(volumeId);
+
+        // No concurrency slot and no timeout, unlike every other operation
+        // here: this makes no CIM call and opens no file, so there is no
+        // provider to overwhelm and nothing that can wedge the way File.Delete
+        // can. A disk still being created is absent by this test, which is
+        // correct - it only lands at this path via the rename that publishes it
+        // - and the job's target queues this behind any create for the same
+        // volume anyway, so a validation issued during one answers about the
+        // finished disk rather than racing it.
+        if (!File.Exists(path))
+        {
+            throw JobFailureException.NotFound($"volume {volumeId} has no disk at {path}");
+        }
+
+        _logger.LogInformation("VolumeExists {VolumeId}: {Path} is present", volumeId, path);
+        return Task.CompletedTask;
+    }
+
     public Task<string> CreateCheckpointAsync(string volumeId, string snapshotName, CancellationToken cancellationToken) =>
         throw new NotSupportedException("CreateSnapshot is not implemented yet");
 
