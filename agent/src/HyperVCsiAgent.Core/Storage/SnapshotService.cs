@@ -851,13 +851,25 @@ public sealed class SnapshotService : ISnapshotService
 
     /// <summary>
     /// Starts merging this snapshot's checkpoint back into its base, holding
-    /// the VM's mutual-exclusion slot for the call. Never throws: a failure
-    /// here is the checkpoint's problem, not the snapshot's - the copy already
+    /// the VM's mutual-exclusion slot for the call. Never throws for a
+    /// cancellation encountered while waiting for that slot: a failure here
+    /// is the checkpoint's problem, not the snapshot's - the copy already
     /// published successfully by the time this runs, so nothing polls this job
     /// for the outcome and the only place a failure can usefully go is the log,
     /// the same posture <see cref="RunCopyAsync"/>'s own catch blocks take for
     /// everything else nothing external observes.
     /// </summary>
+    /// <remarks>
+    /// <paramref name="cancellationToken"/> is <c>RunCopyAsync</c>'s single
+    /// <c>attempt.Token</c> - the caller's own token linked with
+    /// <see cref="AgentOptions.SnapshotCopyTimeout"/> - so there is no way
+    /// from here to tell a copy that ran out of its budget apart from the
+    /// agent shutting down. Both lead to the same right action: the
+    /// checkpoint is standing, nothing here will retry its merge, and an
+    /// operator needs to be told which one and where - so any cancellation
+    /// observed while waiting for the slot is reported as an orphan rather
+    /// than left to propagate.
+    /// </remarks>
     private async Task DestroyOwnedCheckpointAsync(
         string snapshotId, ClusteredVm vm, Checkpoint checkpoint, CancellationToken cancellationToken)
     {
@@ -866,9 +878,17 @@ public sealed class SnapshotService : ISnapshotService
         {
             await slot.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
-            LogOrphanedCheckpoint(snapshotId, checkpoint, vm, "timed out waiting to start merging it");
+            // Not filtered on cancellationToken.IsCancellationRequested: this
+            // token is the only one SemaphoreSlim.WaitAsync was given, so it
+            // throws OperationCanceledException *because* that token was
+            // cancelled - by the time this runs, IsCancellationRequested is
+            // always true, and a filter that checked for it being false could
+            // never match. Whether the cause was the copy's own timeout or
+            // the agent shutting down, the merge never started, so this is an
+            // orphan either way.
+            LogOrphanedCheckpoint(snapshotId, checkpoint, vm, "was cancelled before it could start merging it");
             return;
         }
 

@@ -579,6 +579,72 @@ public sealed class SnapshotServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task DestroyOwnedCheckpointAsync_WhenTheMergeCannotEvenBeStarted_StillPublishesAndOrphansTheCheckpoint()
+    {
+        // Pins the fix to DestroyOwnedCheckpointAsync's dead exception filter.
+        // pvc-2 already has an owned checkpoint - a resumed snapshot - so its
+        // CreateSnapshot call never touches the VM's checkpoint slot; only its
+        // copy job does, once it tries to start the merge. Meanwhile pvc-1's
+        // own CreateSnapshot call (a fresh checkpoint, on the same VM) is
+        // deliberately held inside CreateCheckpointAsync - which holds the
+        // slot the whole time, since CreateOwnedCheckpointAsync releases it
+        // only once that call returns - for far longer than pvc-2's own
+        // SnapshotCopyTimeout. pvc-2's copy job is therefore guaranteed to
+        // still be waiting for the slot when its own cancellation fires,
+        // deterministically reaching the fix rather than racing for it.
+        //
+        // That must not throw pvc-2's job or discard the copy it already
+        // finished reading: it must still publish, with the checkpoint it
+        // never got to merge left standing rather than thrown away with it.
+        var cluster = new FakeClusterService
+        {
+            Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") },
+        };
+        var host = new FakeHostClient();
+        await host.CreateCheckpointAsync("host-1", "vm-1", "hyperv-csi/pvc-2/snapshot-b", "{}", CancellationToken.None);
+
+        var slotHeld = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseSlot = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        host.DuringCreate = () =>
+        {
+            slotHeld.TrySetResult();
+            releaseSlot.Task.Wait(TimeSpan.FromSeconds(10));
+        };
+
+        var harness = NewHarness(cluster: cluster, host: host, snapshotCopyTimeout: TimeSpan.FromMilliseconds(200));
+        WriteVolume("pvc-1", 4096);
+        WriteVolume("pvc-2", 4096);
+
+        // pvc-1 has no checkpoint yet, so its fast CreateSnapshot call is the
+        // one that takes - and, via the hook above, holds - the VM's slot.
+        var creatingPvc1 = Task.Run(
+            () => harness.Service.CreateAsync("pvc-1", "snapshot-a", "node-a", CancellationToken.None));
+        await slotHeld.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        try
+        {
+            // pvc-2's own checkpoint already exists, so this never touches
+            // the slot itself - only the copy job it starts does, once it
+            // tries to merge.
+            var result = await harness.Service.CreateAsync("pvc-2", "snapshot-b", "node-a", CancellationToken.None);
+            Assert.Equal("pvc-2~snapshot-b", result.SnapshotId);
+
+            await WaitForAsync(() => File.Exists(SnapshotPath("pvc-2~snapshot-b")));
+
+            // The checkpoint pvc-2's copy could not even start merging stays
+            // standing - it was never thrown away along with a failed job.
+            Assert.DoesNotContain("hyperv-csi/pvc-2/snapshot-b", host.DestroyedCheckpointElementNames);
+        }
+        finally
+        {
+            releaseSlot.TrySetResult();
+            await creatingPvc1;
+        }
+
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-a")));
+    }
+
+    [Fact]
     public async Task CreateAsync_NodeHintResolvesToNoClusteredVm_FallsBackToALocalRead()
     {
         // Go believed the volume was attached to a node the cluster cannot
@@ -1474,6 +1540,9 @@ public sealed class SnapshotServiceTests : IDisposable
         /// <summary>Runs synchronously inside DestroyCheckpointAsync, before it records the call - lets a test observe what else is (or isn't) true at that exact moment.</summary>
         public Action? DuringDestroy { get; set; }
 
+        /// <summary>Runs synchronously inside CreateCheckpointAsync, before it records the call - the VM's checkpoint slot is held for as long as this blocks, since CreateOwnedCheckpointAsync releases it only after this call returns.</summary>
+        public Action? DuringCreate { get; set; }
+
         public List<string> CreatedCheckpointElementNames { get; } = [];
 
         public List<string> DestroyedCheckpointElementNames { get; } = [];
@@ -1498,6 +1567,8 @@ public sealed class SnapshotServiceTests : IDisposable
         public Task<Checkpoint> CreateCheckpointAsync(
             string hostName, string vmId, string elementName, string notesJson, CancellationToken cancellationToken)
         {
+            DuringCreate?.Invoke();
+
             if (CheckpointsNotConfigured)
             {
                 throw new CheckpointsNotConfiguredException(vmId, 3);
