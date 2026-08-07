@@ -162,6 +162,40 @@ func (c *Client) GetJob(ctx context.Context, jobID string) (*Job, error) {
 	return c.do(req)
 }
 
+// Healthz calls GET /healthz, the agent's liveness endpoint. It answers with a
+// status code and nothing else, so this reports reachability rather than
+// decoding anything — which is why it doesn't go through do, and why a caller
+// gets an error or nil rather than a Job.
+//
+// What "reachable" covers here is more than the network. The agent authorizes
+// clients during the TLS handshake rather than in middleware, so an unpinned
+// certificate never gets a route at all: reaching this endpoint proves the DNS
+// name resolves, the clustered role is up and serving, and this client's
+// certificate is one the agent accepts. It proves nothing about any particular
+// Hyper-V host, which is deliberate — those are resolved per operation.
+func (c *Client) Healthz(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/healthz"), nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
+		return fmt.Errorf("agent returned %s from /healthz: %s", resp.Status, strings.TrimSpace(string(detail)))
+	}
+
+	// Drained so the connection goes back to the pool rather than being torn
+	// down and redialed on every probe.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBody))
+	return nil
+}
+
 func (c *Client) do(req *http.Request) (*Job, error) {
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {

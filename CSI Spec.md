@@ -11,7 +11,7 @@ covered by unit tests but has never run against a real failover cluster or Hyper
 |---|---|---|---|---|
 | GetPluginInfo | Both | Returns the plugin's name and version so Kubernetes can identify it. | N/A | Tested — returns the correct name and version against a real deployment |
 | GetPluginCapabilities | Both | Reports which optional CSI features this plugin supports. | N/A | Tested — external-resizer reads it before it will resize anything, and the ONLINE expansion it claims ran end to end |
-| Probe | Both | Health check confirming the plugin is ready to serve requests. | N/A | Stub — always reports ready |
+| Probe | Both | Health check confirming the plugin is ready to serve requests. | N/A | Pending testing |
 | CreateVolume | Controller | Provisions a new volume and returns its identifier. | Volume name | Tested — creates a VHDX on disk |
 | DeleteVolume | Controller | Removes a previously provisioned volume. | Volume ID | Tested |
 | ControllerPublishVolume | Controller | Attaches a volume to a specified node. | Volume ID + node ID | Tested — attaches against a real cluster |
@@ -55,6 +55,37 @@ release: trim the two capabilities, or land the RPCs.
 Everything else on the checklist is built, which is what makes this section short now rather than
 gone. What is left is one deliberately deferred feature, named as such, instead of a list quietly
 outrunning the code. The section stays anyway: it exists to catch the next list that does.
+
+**Probe checks the one dependency every controller RPC has, and nothing beyond it.** That is the
+agent: a `GET /healthz` against the address this driver was configured with. It does not touch a
+Hyper-V host, deliberately — which host serves an operation is resolved per operation, so consulting
+one here would report the entire driver unready because a single host was down, and consulting all
+of them would be the cluster-wide fan-out this design declines everywhere else.
+
+Reaching that endpoint proves more than a route. The agent authorizes clients during the TLS
+handshake rather than in middleware, so an unpinned certificate never reaches a route at all: a
+probe that gets an answer has confirmed the DNS name resolves, the clustered role is up and serving,
+and the client certificate this driver was deployed with is one the agent accepts. The sidecars call
+Probe before they call anything else, which makes it the right place to find a mistyped fingerprint
+— the alternative is discovering it at the first CreateVolume, as a provisioning failure on a PVC
+that had nothing wrong with it.
+
+An unreachable agent is FAILED_PRECONDITION with the reason attached, not a bare `ready: false`.
+`ProbeResponse` has nowhere to put an explanation, so an unready-but-successful answer is a silent
+one; the sidecars log the error from a failed probe while they retry it, which is the difference
+between an operator seeing "connection refused" or a certificate rejection and seeing a provisioner
+that simply never starts. Either way it is retried rather than fatal — the agent is a clustered role
+and a failover window is an expected transient state.
+
+Worth knowing before that changes: nothing restarts on a failed probe today, because the chart
+deploys no `livenessprobe` sidecar. A failing probe delays the sidecars until the agent answers.
+Adding `livenessprobe` would turn every agent failover window into a container restart of the
+controller, which is a decision to make deliberately rather than to inherit.
+
+The node plugin answers ready without checking anything, and that is not a shortcut: it is
+configured with no agent address, because no node RPC calls the agent — staging, publishing, stats
+and expansion are all local to the guest. Reporting unready there would hold back a plugin that is
+perfectly able to mount, on account of a dependency it does not have.
 
 **ValidateVolumeCapabilities answers two questions and only owns one of them.** Whether a VHDX can
 back the capabilities being asked about is a property of the driver — single-node access modes yes,

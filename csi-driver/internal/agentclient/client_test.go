@@ -129,6 +129,38 @@ func TestUnexpectedStatusIncludesTheAgentsDetail(t *testing.T) {
 	}
 }
 
+func TestHealthzAsksTheLivenessEndpoint(t *testing.T) {
+	var gotMethod, gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+	}))
+	defer server.Close()
+
+	if err := New(server.URL).Healthz(context.Background()); err != nil {
+		t.Fatalf("Healthz: %v", err)
+	}
+
+	if gotMethod != http.MethodGet || gotPath != "/healthz" {
+		t.Errorf("asked %s %s, want GET /healthz", gotMethod, gotPath)
+	}
+}
+
+func TestHealthzReportsAnUnhealthyAgent(t *testing.T) {
+	// No body to decode either way, so the status code is the entire answer -
+	// which is why this doesn't go through the Job-decoding path.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, "role is starting")
+	}))
+	defer server.Close()
+
+	err := New(server.URL).Healthz(context.Background())
+
+	if err == nil || !strings.Contains(err.Error(), "role is starting") {
+		t.Errorf("err = %v, want it to carry what the agent said", err)
+	}
+}
+
 func TestBaseURLTrailingSlashDoesNotDoubleUpThePath(t *testing.T) {
 	var gotPath string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
