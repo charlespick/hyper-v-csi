@@ -720,6 +720,83 @@ public sealed class SnapshotServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateAsync_WhenTheCheckpointHasAlreadyMergedBeforeTheCopyReachesItsDestroyStep_DoesNotTryAgain()
+    {
+        // Pins the fix to RunCopyAsync's closure. It used to carry the actual
+        // Checkpoint captured when the job started and would merge *that*
+        // object unconditionally once the copy finished, even if the
+        // checkpoint it names had, by then, already gone - the case that
+        // makes the discarded-delegate window (see this file's remarks on
+        // EnsureCheckpointedCopyUnderway) land a checkpoint nothing revisits.
+        // Re-deriving via FindOwnedCheckpointAsync instead means a checkpoint
+        // already gone by the time this job's own destroy step runs answers
+        // null, not a redundant DestroyCheckpointAsync call.
+        var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient();
+        var seeded = await host.CreateCheckpointAsync(
+            "host-1", "vm-1", "hyperv-csi/pvc-1/snapshot-abc", "{}", CancellationToken.None);
+        var harness = NewHarness(cluster: cluster, host: host);
+        WriteVolume("pvc-1", 4096);
+
+        using var release = new SemaphoreSlim(0);
+        harness.Copier.DuringCopy = _ => release.WaitAsync();
+
+        var creating = harness.Service.CreateAsync("pvc-1", "snapshot-abc", "node-a", CancellationToken.None);
+        await WaitForAsync(() => harness.Copier.Destinations.Count == 1);
+
+        // Simulates the checkpoint having already merged by some other path
+        // - the "may legitimately be gone" case this fix has to tolerate -
+        // while this job's own copy is still reading, well before its own
+        // destroy step runs. A direct call against the fake host, bypassing
+        // SnapshotService entirely, is the only way to get the checkpoint
+        // gone without also racing this same job's own eventual destroy call
+        // for it.
+        await host.DestroyCheckpointAsync("host-1", seeded, CancellationToken.None);
+
+        release.Release();
+        await creating;
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+
+        // Exactly the one destroy call - the one this test made directly. A
+        // second one from RunCopyAsync's own destroy step, merging a stale
+        // reference to a checkpoint already gone, is exactly the bug this
+        // pins.
+        Assert.Single(host.DestroyedCheckpointElementNames, name => name == "hyperv-csi/pvc-1/snapshot-abc");
+    }
+
+    [Fact]
+    public async Task CreateAsync_WhenLookingUpTheCheckpointToMergeItFails_StillPublishesRatherThanFailingTheJob()
+    {
+        // The lookup RunCopyAsync's destroy step now makes is itself a CIM
+        // call, and can fail like any other. By the time it runs, the copy
+        // has already read everything it needs, so a lookup that cannot even
+        // answer must not discard a finished copy - it goes to
+        // LogOrphanedCheckpoint instead, and publishing proceeds regardless.
+        var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient();
+        await host.CreateCheckpointAsync("host-1", "vm-1", "hyperv-csi/pvc-1/snapshot-abc", "{}", CancellationToken.None);
+        var harness = NewHarness(cluster: cluster, host: host);
+        WriteVolume("pvc-1", 4096);
+
+        // The resumed classification itself never calls FindOwnedCheckpointAsync
+        // (it reads the fake's dictionary directly, mirroring how
+        // ClassifyAttachment reads a real VM's checkpoints without going back
+        // through this interface), so the one call this fails is
+        // unambiguously RunCopyAsync's own destroy-step lookup.
+        host.FailNextFind = true;
+
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", "node-a", CancellationToken.None);
+        Assert.Equal("pvc-1~snapshot-abc", result.SnapshotId);
+
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+
+        // The failed lookup could not tell whether anything needed merging,
+        // so nothing was destroyed - the checkpoint, whatever it is now, is
+        // left for an operator rather than guessed at.
+        Assert.Empty(host.DestroyedCheckpointElementNames);
+    }
+
+    [Fact]
     public async Task CreateAsync_NodeHintResolvesToNoClusteredVm_FallsBackToALocalRead()
     {
         // Go believed the volume was attached to a node the cluster cannot
@@ -1612,6 +1689,9 @@ public sealed class SnapshotServiceTests : IDisposable
 
         public bool FailNextDestroy { get; set; }
 
+        /// <summary>Makes FindOwnedCheckpointAsync throw once, as a CIM call that could not answer does.</summary>
+        public bool FailNextFind { get; set; }
+
         /// <summary>
         /// Runs synchronously inside DestroyCheckpointAsync, before it
         /// records the call - lets a test observe what else is (or isn't)
@@ -1683,8 +1763,16 @@ public sealed class SnapshotServiceTests : IDisposable
         }
 
         public Task<Checkpoint?> FindOwnedCheckpointAsync(
-            string hostName, string vmId, string elementName, CancellationToken cancellationToken) =>
-            Task.FromResult(CheckpointMatching.FindExact(_checkpointsByElementName.Values, elementName));
+            string hostName, string vmId, string elementName, CancellationToken cancellationToken)
+        {
+            if (FailNextFind)
+            {
+                FailNextFind = false;
+                throw new InvalidOperationException("the CIM query for this checkpoint said no");
+            }
+
+            return Task.FromResult(CheckpointMatching.FindExact(_checkpointsByElementName.Values, elementName));
+        }
 
         public Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken)
         {

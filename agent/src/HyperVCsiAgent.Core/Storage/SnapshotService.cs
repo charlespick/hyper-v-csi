@@ -271,17 +271,22 @@ public sealed class SnapshotService : ISnapshotService
                 // Nothing left can refuse this snapshot, so this is the one
                 // place in this method it is safe to take the checkpoint:
                 // EnsureCheckpointedCopyUnderway, right below, is what
-                // guarantees a copy job exists to merge it back.
-                var checkpoint = await CreateOwnedCheckpointAsync(
+                // guarantees a copy job exists to merge it back. Only the
+                // element name travels on from here, not the Checkpoint this
+                // call returns - see EnsureCheckpointedCopyUnderway's own
+                // remarks for why.
+                await CreateOwnedCheckpointAsync(
                     source.Vm!, CheckpointElementName(sourceVolumeId, snapshotName), sourceVolumeId, snapshotName, attempt)
                     .ConfigureAwait(false);
                 EnsureCheckpointedCopyUnderway(
-                    snapshotId, sourceVolumeId, sourcePath, snapshotPath, copyingPath, source.Vm!, checkpoint);
+                    snapshotId, sourceVolumeId, sourcePath, snapshotPath, copyingPath, source.Vm!,
+                    CheckpointElementName(sourceVolumeId, snapshotName));
             }
-            else if (source.Checkpoint is { } checkpoint)
+            else if (source.Checkpoint is not null)
             {
                 EnsureCheckpointedCopyUnderway(
-                    snapshotId, sourceVolumeId, sourcePath, snapshotPath, copyingPath, source.Vm!, checkpoint);
+                    snapshotId, sourceVolumeId, sourcePath, snapshotPath, copyingPath, source.Vm!,
+                    CheckpointElementName(sourceVolumeId, snapshotName));
             }
             else
             {
@@ -488,15 +493,28 @@ public sealed class SnapshotService : ISnapshotService
     /// everything it needs, this drives the checkpoint's merge, before the
     /// snapshot is published rather than after.
     /// </summary>
+    /// <remarks>
+    /// Takes <paramref name="checkpointElementName"/>, not a <see cref="Checkpoint"/>,
+    /// and that is deliberate: this identity is all <see cref="RunCopyAsync"/>
+    /// needs to re-derive the checkpoint via <see cref="IHyperVHostClient.FindOwnedCheckpointAsync"/>
+    /// when it actually reaches its destroy step, rather than merging whatever
+    /// this call happened to find. A real <see cref="Checkpoint"/> closed over
+    /// here would sometimes never even be looked at:
+    /// <see cref="IJobStore.GetOrCreate"/> silently drops this whole delegate -
+    /// checkpoint included - whenever a job for this snapshot is already
+    /// Pending or Running, which stranded a checkpoint no code path would ever
+    /// revisit. See <see cref="DestroyOwnedCheckpointIfAnyAsync"/> for the
+    /// re-derivation this makes possible instead.
+    /// </remarks>
     private void EnsureCheckpointedCopyUnderway(
         string snapshotId, string sourceVolumeId, string sourcePath, string snapshotPath, string copyingPath,
-        ClusteredVm vm, Checkpoint checkpoint) =>
+        ClusteredVm vm, string checkpointElementName) =>
         _jobs.GetOrCreate(
             snapshotId,
             CopySnapshot,
             "volume:" + sourceVolumeId,
             (_, cancellationToken) =>
-                RunCopyAsync(snapshotId, sourcePath, snapshotPath, copyingPath, (vm, checkpoint), cancellationToken));
+                RunCopyAsync(snapshotId, sourcePath, snapshotPath, copyingPath, (vm, checkpointElementName), cancellationToken));
 
     /// <summary>
     /// The long-running half: copy into the marker, then - for an attached
@@ -506,7 +524,7 @@ public sealed class SnapshotService : ISnapshotService
     /// </summary>
     private async Task RunCopyAsync(
         string snapshotId, string sourcePath, string snapshotPath, string copyingPath,
-        (ClusteredVm Vm, Checkpoint Checkpoint)? checkpoint, CancellationToken cancellationToken)
+        (ClusteredVm Vm, string ElementName)? checkpoint, CancellationToken cancellationToken)
     {
         using var attempt = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         attempt.CancelAfter(_options.SnapshotCopyTimeout);
@@ -529,12 +547,13 @@ public sealed class SnapshotService : ISnapshotService
                 // with a checkpoint still to destroy means something odd
                 // happened - a crash between the two calls in a prior run of
                 // this exact code, or debris from before that ordering was
-                // fixed. Safe to retry regardless: DestroySnapshot on an
-                // already-merged or already-gone checkpoint is a no-op, per
-                // IHyperVHostClient.DestroyCheckpointAsync.
+                // fixed. Re-derived rather than assumed gone: whatever
+                // currently stands under this element name - if anything - is
+                // what DestroyOwnedCheckpointIfAnyAsync merges, the same
+                // re-derivation the ordinary post-copy call below relies on.
                 if (checkpoint is { } stale)
                 {
-                    await DestroyOwnedCheckpointAsync(snapshotId, stale.Vm, stale.Checkpoint, attempt.Token).ConfigureAwait(false);
+                    await DestroyOwnedCheckpointIfAnyAsync(snapshotId, stale.Vm, stale.ElementName, attempt.Token).ConfigureAwait(false);
                 }
 
                 return;
@@ -581,7 +600,7 @@ public sealed class SnapshotService : ISnapshotService
             // detach and expand until an operator deleted it by hand.
             if (checkpoint is { } taken)
             {
-                await DestroyOwnedCheckpointAsync(snapshotId, taken.Vm, taken.Checkpoint, attempt.Token).ConfigureAwait(false);
+                await DestroyOwnedCheckpointIfAnyAsync(snapshotId, taken.Vm, taken.ElementName, attempt.Token).ConfigureAwait(false);
             }
 
             // The publish. Until this rename the snapshot does not exist as far
@@ -912,7 +931,7 @@ public sealed class SnapshotService : ISnapshotService
             // never match. Whether the cause was the copy's own timeout or
             // the agent shutting down, the merge never started, so this is an
             // orphan either way.
-            LogOrphanedCheckpoint(snapshotId, checkpoint, vm, "was cancelled before it could start merging it");
+            LogOrphanedCheckpoint(snapshotId, checkpoint.ElementName, vm, "was cancelled before it could start merging it");
             return;
         }
 
@@ -922,12 +941,74 @@ public sealed class SnapshotService : ISnapshotService
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            LogOrphanedCheckpoint(snapshotId, checkpoint, vm, "starting its merge failed", ex);
+            LogOrphanedCheckpoint(snapshotId, checkpoint.ElementName, vm, "starting its merge failed", ex);
         }
         finally
         {
             slot.Release();
         }
+    }
+
+    /// <summary>
+    /// <see cref="RunCopyAsync"/>'s entire post-copy checkpoint step:
+    /// re-derives whatever currently stands for this snapshot's checkpoint
+    /// identity and merges it, rather than merging a <see cref="Checkpoint"/>
+    /// remembered from when the job started.
+    /// </summary>
+    /// <remarks>
+    /// Re-deriving, not remembering, for the reason <see cref="Checkpoint"/>'s
+    /// own doc gives: a checkpoint is not persisted anywhere, so anything that
+    /// needs one again is expected to ask
+    /// <see cref="IHyperVHostClient.FindOwnedCheckpointAsync"/> rather than
+    /// hold on to what an earlier call returned. Closing over an actual
+    /// <see cref="Checkpoint"/> in the job delegate
+    /// <see cref="EnsureCheckpointedCopyUnderway"/> builds is exactly the kind
+    /// of remembering that doc rules out: <see cref="IJobStore.GetOrCreate"/>
+    /// silently drops that delegate - and everything it captured - whenever a
+    /// job for this snapshot is already Pending or Running, which a poll
+    /// landing between this job's own destroy step and its publish rename can
+    /// make true for a *second*, freshly-taken checkpoint under the identical
+    /// identity string, once an idle checkpoint's merge has already completed.
+    /// Looking the checkpoint up here instead means whichever job's delegate
+    /// actually reaches this step finds whatever currently stands under
+    /// <paramref name="elementName"/>, not whatever happened to exist when its
+    /// own job was created.
+    /// </remarks>
+    private async Task DestroyOwnedCheckpointIfAnyAsync(
+        string snapshotId, ClusteredVm vm, string elementName, CancellationToken cancellationToken)
+    {
+        Checkpoint? checkpoint;
+        try
+        {
+            checkpoint = await _host.FindOwnedCheckpointAsync(vm.OwningHost, vm.VmId, elementName, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // A CIM call, so it can fail or time out like any other CIM call
+            // this service makes - and by the time this runs, the copy has
+            // already read everything it needs, so a lookup that cannot even
+            // answer must not discard it. Whatever stands under elementName,
+            // if anything, is left for an operator, the same posture
+            // DestroyOwnedCheckpointAsync's own catches below take.
+            LogOrphanedCheckpoint(snapshotId, elementName, vm, "looking it up to merge it failed", ex);
+            return;
+        }
+
+        if (checkpoint is null)
+        {
+            // Nothing stands under this identity anymore - already merged,
+            // whether by this exact job on an earlier statement or by
+            // whichever job's delegate actually reached this step first (see
+            // this method's own remarks). Nothing to destroy is success here,
+            // not a gap: the copy is publishing regardless.
+            _logger.LogInformation(
+                "CopySnapshot {SnapshotId}: no checkpoint {ElementName} stands on {VmId} anymore; nothing to merge",
+                snapshotId, elementName, vm.VmId);
+            return;
+        }
+
+        await DestroyOwnedCheckpointAsync(snapshotId, vm, checkpoint, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -942,11 +1023,11 @@ public sealed class SnapshotService : ISnapshotService
     /// than a warning.
     /// </summary>
     private void LogOrphanedCheckpoint(
-        string snapshotId, Checkpoint checkpoint, ClusteredVm vm, string what, Exception? ex = null) =>
+        string snapshotId, string elementName, ClusteredVm vm, string what, Exception? ex = null) =>
         _logger.LogError(ex,
             "CopySnapshot {SnapshotId}: {What} for checkpoint {ElementName} on {VmId}; it stays in place - " +
             "nothing here will retry merging it, so this needs an operator to look at {HostName}",
-            snapshotId, what, checkpoint.ElementName, vm.VmId, vm.OwningHost);
+            snapshotId, what, elementName, vm.VmId, vm.OwningHost);
 
     /// <summary>
     /// Takes the VM's checkpoint slot, reporting a timeout spent queuing as the
