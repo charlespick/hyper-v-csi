@@ -11,12 +11,12 @@ covered by unit tests but has never run against a real failover cluster or Hyper
 |---|---|---|---|---|
 | GetPluginInfo | Both | Returns the plugin's name and version so Kubernetes can identify it. | N/A | Tested — returns the correct name and version against a real deployment |
 | GetPluginCapabilities | Both | Reports which optional CSI features this plugin supports. | N/A | Tested — external-resizer reads it before it will resize anything, and the ONLINE expansion it claims ran end to end |
-| Probe | Both | Health check confirming the plugin is ready to serve requests. | N/A | Pending testing |
+| Probe | Both | Health check confirming the plugin is ready to serve requests. | N/A | Tested — ready against a real agent from the controller; the node plugin answers ready with no agent dependency |
 | CreateVolume | Controller | Provisions a new volume and returns its identifier. | Volume name | Tested — creates a VHDX on disk |
 | DeleteVolume | Controller | Removes a previously provisioned volume. | Volume ID | Tested |
 | ControllerPublishVolume | Controller | Attaches a volume to a specified node. | Volume ID + node ID | Tested — attaches against a real cluster |
 | ControllerUnpublishVolume | Controller | Detaches a volume from a specified node. | Volume ID + node ID | Tested — detaches against a real cluster |
-| ValidateVolumeCapabilities | Controller | Confirms a volume supports the requested access mode and type. | Volume ID (lookup only) | Pending testing |
+| ValidateVolumeCapabilities | Controller | Confirms a volume supports the requested access mode and type. | Volume ID (lookup only) | Tested — confirms a real volume, NOT_FOUND for one that doesn't exist, unconfirmed for an unsupported access mode |
 | ControllerGetCapabilities | Controller | Reports which controller RPCs this plugin implements. | N/A | Over advertising snapshots, and only snapshots |
 | ControllerExpandVolume | Controller | Grows a volume's underlying storage. | Volume ID | Tested — grows a volume attached to a running VM, via that VM's own host |
 | CreateSnapshot | Controller | Creates a point-in-time snapshot of a volume. | Snapshot name | Not started |
@@ -87,6 +87,13 @@ configured with no agent address, because no node RPC calls the agent — stagin
 and expansion are all local to the guest. Reporting unready there would hold back a plugin that is
 perfectly able to mount, on account of a dependency it does not have.
 
+Confirmed against a real deployment: a direct Probe call to the controller returns ready with the
+agent up, and the same call against the node plugin returns ready with no agent configured at all —
+consistent with the node plugin advertising no Controller service, which the same deployment also
+confirms (a Controller RPC issued against the node plugin gets Unimplemented, not a stale or empty
+answer). Not yet exercised against a real cluster: the FAILED_PRECONDITION path when the agent is
+unreachable, which unit tests cover but nothing has driven end to end.
+
 **ValidateVolumeCapabilities answers two questions and only owns one of them.** Whether a VHDX can
 back the capabilities being asked about is a property of the driver — single-node access modes yes,
 multi-node no, block no — and needs no lookup at all, so the Go controller answers it. Whether the
@@ -121,6 +128,12 @@ ignores StorageClass parameters (below), and confirming them would turn a docume
 guarantee nothing keeps. And a block volume is a "no", even though CreateVolume still accepts one:
 this is the RPC whose entire job is answering honestly, so it answers, and tightening create is its
 own piece of work rather than a side effect of this one.
+
+Confirmed against a real deployment, all three answers it is built to give: a real volume asked
+about a supported capability (SINGLE_NODE_WRITER, mount, ext4) comes back confirmed; a volume ID
+with no VHDX comes back NOT_FOUND, carrying the agent's own no-disk-at-that-path message; and the
+same real volume asked about MULTI_NODE_MULTI_WRITER comes back with `confirmed` unset and the
+access-mode reason in `message`, not an error.
 
 **CreateVolume gaps.** StorageClass `parameters` are ignored rather than consumed or rejected, the
 access *type* (mount vs block) is not validated, and `volume_context` is left empty.
