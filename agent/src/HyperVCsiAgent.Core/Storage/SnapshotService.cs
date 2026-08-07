@@ -763,19 +763,40 @@ public sealed class SnapshotService : ISnapshotService
                 // sibling volume, not just a stuck retry of this one.
                 // Retryable rather than FailedPrecondition: nothing here is
                 // broken, and there is nothing an operator should delete -
-                // the checkpoint in the way belongs to that other attempt's
-                // copy job and clears on its own, via that job's own
-                // DestroyOwnedCheckpointAsync call, once its copy finishes.
-                // Naming it and saying so is what keeps an operator from
-                // reading this the way the old single "foreign checkpoint"
-                // message would have had them read it: as an instruction to
-                // go delete something that is not foreign at all.
+                // the checkpoint in the way *ordinarily* belongs to that
+                // other attempt's still-running copy job and clears on its
+                // own, via that job's own DestroyOwnedCheckpointAsync call,
+                // once its copy finishes.
+                //
+                // "Ordinarily" is doing real work in that sentence: the job
+                // driving that merge lives only in this process's memory and
+                // does not survive an agent restart, and the only thing that
+                // ever restarts that other snapshot's copy is a CreateSnapshot
+                // call for it. If the agent has restarted since that job
+                // started, and that other snapshot's VolumeSnapshot has since
+                // been deleted, external-snapshotter has no reason left to
+                // ever send it another CreateSnapshot - so nothing will drive
+                // that copy again, and this checkpoint will not clear on its
+                // own. Promising otherwise unconditionally is what the old
+                // single "foreign checkpoint, delete it" message got wrong in
+                // the opposite direction: at least that one pointed at
+                // something to act on. The message below keeps this retryable
+                // and states the ordinary case still resolves itself, but
+                // gives an operator seeing it persist something concrete to
+                // check instead of a bare "no action needed" - whether that
+                // other snapshot still exists, and whether its copy is still
+                // running. Detecting the gap mechanically - an orphan sweep,
+                // or tracking whether a job still exists for that other
+                // attempt - is not built here.
                 throw new JobFailureException(
                     AgentErrorCodes.Internal,
                     $"snapshot {snapshotId} cannot be taken yet: {sourcePath} sits behind checkpoint " +
                     $"{attachment.OwnedCheckpoint!.ElementName}, which this driver took for a different " +
-                    "snapshot that is still copying; this will clear on its own once that snapshot's copy " +
-                    "finishes and its checkpoint merges back - no action needed");
+                    "snapshot that is still copying; retrying ordinarily succeeds on its own once that " +
+                    "snapshot's copy finishes and its checkpoint merges back. If this persists, check whether " +
+                    "that other snapshot still exists and its copy is still running - if the agent restarted " +
+                    "and that snapshot has since been deleted, nothing will ever drive its copy again and " +
+                    "this will not clear on its own");
 
             case VolumeAttachmentKind.Direct:
                 // Nothing frozen yet, and nothing taken here: nothing about
