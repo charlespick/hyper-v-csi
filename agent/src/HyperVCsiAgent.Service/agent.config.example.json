@@ -5,6 +5,11 @@
     "MaxConcurrentDiskOperations": 4,
     "DiskOperationTimeout": "00:10:00",
 
+    "//Snapshots": "A snapshot is a full VHDX copy, so it lives in its own directory and on its own clock. The copy runs for as long as the CSV takes - hours for a large disk on a volume that cannot block-clone - which is why the timeout is measured in hours rather than in DiskOperationTimeout's minutes, and why concurrent copies are capped separately: a few of them must never be able to wedge every CreateVolume on the agent.",
+    "CsvSnapshotsRoot": "C:\\ClusterStorage\\Volume1\\hyperv-csi\\snapshots",
+    "MaxConcurrentSnapshotCopies": 2,
+    "SnapshotCopyTimeout": "06:00:00",
+
     "//HostOperations": "Attaching a disk goes through the Hyper-V host that currently owns the node's VM. Bounded per host, and on a shorter clock than disk operations because none of it is bulk I/O.",
     "MaxConcurrentHostOperations": 4,
     "HostOperationTimeout": "00:02:00",

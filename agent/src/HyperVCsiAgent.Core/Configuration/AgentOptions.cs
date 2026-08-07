@@ -20,6 +20,23 @@ public sealed class AgentOptions
     public string CsvVolumesRoot { get; set; } = string.Empty;
 
     /// <summary>
+    /// CSV directory holding every snapshot, e.g.
+    /// <c>C:\ClusterStorage\Volume1\hyperv-csi\snapshots</c>. Must be a CSV path
+    /// for the same reason <see cref="CsvVolumesRoot"/> must.
+    /// </summary>
+    /// <remarks>
+    /// Separate from <see cref="CsvVolumesRoot"/> even though the naming rules
+    /// keep the two file namespaces disjoint on their own ('~' is forbidden in a
+    /// volume name, and every snapshot file name contains one). The reason is
+    /// operational rather than technical: snapshots and volumes have completely
+    /// different lifetimes and completely different growth, and an operator who
+    /// wants them on separate CSVs - or who just wants to see how much of a
+    /// volume is snapshots - should not have to disentangle one directory
+    /// listing to do it.
+    /// </remarks>
+    public string CsvSnapshotsRoot { get; set; } = string.Empty;
+
+    /// <summary>
     /// Cap on VHDX operations issued to the local CIM provider at once. Jobs for
     /// the same volume are already serialized by the job store; this bounds a
     /// burst across *different* volumes, which is the design's bounded-concurrency
@@ -34,6 +51,35 @@ public sealed class AgentOptions
     /// it - a stuck operation has to become a failure the controller can retry.
     /// </summary>
     public TimeSpan DiskOperationTimeout { get; set; } = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    /// Cap on snapshot copies running at once, deliberately separate from
+    /// <see cref="MaxConcurrentDiskOperations"/>.
+    /// </summary>
+    /// <remarks>
+    /// A copy holds its slot for hours where a create holds one for seconds, so
+    /// sharing a cap would let a few snapshots wedge every CreateVolume on the
+    /// agent until they finished. Defaults low because the constraint a copy
+    /// actually runs into is the CSV's throughput, not the agent's: two copies
+    /// of a multi-hundred-gigabyte disk running at once finish at very nearly
+    /// the same time as two run in sequence, while doing considerably more to
+    /// the latency of every VM on that volume.
+    /// </remarks>
+    public int MaxConcurrentSnapshotCopies { get; set; } = 2;
+
+    /// <summary>
+    /// How long a single snapshot copy may run before it is abandoned and
+    /// restarted from zero by the next CreateSnapshot.
+    /// </summary>
+    /// <remarks>
+    /// Hours, not <see cref="DiskOperationTimeout"/>'s minutes, and the
+    /// difference is the whole reason it is a separate setting: this bounds bulk
+    /// I/O over a CSV rather than a management call, and a terabyte-scale VHDX
+    /// on a volume that cannot block-clone legitimately takes most of a day. Set
+    /// it too low and every large snapshot restarts forever, each attempt
+    /// discarding the last - which is why the copy logs loudly when it expires.
+    /// </remarks>
+    public TimeSpan SnapshotCopyTimeout { get; set; } = TimeSpan.FromHours(6);
 
     /// <summary>
     /// Cap on operations issued to any one Hyper-V host at once - the design's
@@ -66,10 +112,28 @@ public sealed class AgentOptions
                 $"{SectionName}:{nameof(CsvVolumesRoot)} is required; pass --config <path to agent.config.json>");
         }
 
+        if (string.IsNullOrWhiteSpace(CsvSnapshotsRoot))
+        {
+            throw new InvalidOperationException(
+                $"{SectionName}:{nameof(CsvSnapshotsRoot)} is required; pass --config <path to agent.config.json>");
+        }
+
         if (MaxConcurrentDiskOperations < 1)
         {
             throw new InvalidOperationException(
                 $"{SectionName}:{nameof(MaxConcurrentDiskOperations)} must be at least 1");
+        }
+
+        if (MaxConcurrentSnapshotCopies < 1)
+        {
+            throw new InvalidOperationException(
+                $"{SectionName}:{nameof(MaxConcurrentSnapshotCopies)} must be at least 1");
+        }
+
+        if (SnapshotCopyTimeout <= TimeSpan.Zero)
+        {
+            throw new InvalidOperationException(
+                $"{SectionName}:{nameof(SnapshotCopyTimeout)} must be positive");
         }
 
         if (DiskOperationTimeout <= TimeSpan.Zero)

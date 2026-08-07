@@ -10,7 +10,7 @@ namespace HyperVCsiAgent.Core.Jobs;
 /// comes back as a 400 the controller can see immediately rather than as a job
 /// that fails a moment later.
 /// </summary>
-public sealed class JobDispatcher(IVhdxService vhdxService, IAttachService attachService)
+public sealed class JobDispatcher(IVhdxService vhdxService, IAttachService attachService, ISnapshotService snapshotService)
 {
     public const string CreateVolume = "CreateVolume";
 
@@ -23,6 +23,12 @@ public sealed class JobDispatcher(IVhdxService vhdxService, IAttachService attac
     public const string AttachVolume = "AttachVolume";
 
     public const string DetachVolume = "DetachVolume";
+
+    public const string CreateSnapshot = "CreateSnapshot";
+
+    public const string DeleteSnapshot = "DeleteSnapshot";
+
+    public const string ListSnapshots = "ListSnapshots";
 
     /// <exception cref="InvalidJobRequestException">
     /// The operation is unknown or its payload is unusable.
@@ -119,6 +125,62 @@ public sealed class JobDispatcher(IVhdxService vhdxService, IAttachService attac
                 return (_, cancellationToken) =>
                     attachService.DetachAsync(detachRequest.VolumeId, detachRequest.NodeId, cancellationToken);
 
+            case CreateSnapshot:
+                var createSnapshotRequest = Decode<CreateSnapshotPayload>(payload, jsonOptions);
+                if (string.IsNullOrWhiteSpace(createSnapshotRequest.SourceVolumeId))
+                {
+                    throw new InvalidJobRequestException("payload.sourceVolumeId is required");
+                }
+
+                if (string.IsNullOrWhiteSpace(createSnapshotRequest.SnapshotName))
+                {
+                    throw new InvalidJobRequestException("payload.snapshotName is required");
+                }
+
+                // Carries a result even though the snapshot may not be finished:
+                // readyToUse is part of that result, so "not done yet" is a
+                // successful job with something to say, never a job left Running.
+                return async (job, cancellationToken) =>
+                    job.Result = await snapshotService
+                        .CreateAsync(createSnapshotRequest.SourceVolumeId, createSnapshotRequest.SnapshotName, cancellationToken)
+                        .ConfigureAwait(false);
+
+            case DeleteSnapshot:
+                var deleteSnapshotRequest = Decode<DeleteSnapshotPayload>(payload, jsonOptions);
+                if (string.IsNullOrWhiteSpace(deleteSnapshotRequest.SnapshotId))
+                {
+                    throw new InvalidJobRequestException("payload.snapshotId is required");
+                }
+
+                // No job.Result: a deleted snapshot has nothing left to describe,
+                // exactly as for DeleteVolume.
+                return (_, cancellationToken) =>
+                    snapshotService.DeleteAsync(deleteSnapshotRequest.SnapshotId, cancellationToken);
+
+            case ListSnapshots:
+                // Every field is optional, mirroring CSI's own filters, so there
+                // is nothing to require here - only the object shape Decode
+                // already insists on. A missing payload field is a listing that
+                // is simply not narrowed that way.
+                var listSnapshotsRequest = Decode<ListSnapshotsPayload>(payload, jsonOptions);
+
+                return async (job, cancellationToken) =>
+                    job.Result = await snapshotService.ListAsync(
+                            listSnapshotsRequest.SnapshotId,
+                            listSnapshotsRequest.SourceVolumeId,
+                            listSnapshotsRequest.StartingToken,
+                            listSnapshotsRequest.MaxEntries,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+
+            // There is deliberately no case for SnapshotService.CopySnapshot,
+            // and this is not an oversight to be tidied up later. The copy is
+            // internal: it only ever starts as a consequence of a CreateSnapshot
+            // that has already run the preconditions, and one enqueued directly
+            // over POST /v1/jobs would skip every one of them - the free-space
+            // check and the attached-source refusal included - and start a
+            // multi-hour write to the CSV that nothing asked for. Falling
+            // through to the rejection below is the intended behaviour.
             default:
                 throw new InvalidJobRequestException($"unsupported operationType {operationType}");
         }

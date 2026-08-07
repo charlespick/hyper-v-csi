@@ -100,5 +100,55 @@ public class AgentOptionsValidationTests
         options.Validate();
     }
 
-    private static AgentOptions NewOptions() => new() { CsvVolumesRoot = "/tmp/volumes" };
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void Validate_MissingSnapshotsRoot_IsRejected(string root)
+    {
+        // Required exactly as CsvVolumesRoot is. There is no defensible default:
+        // a relative path would resolve against whatever directory the SCM
+        // started the process in, which for a clustered role is C:\Windows\System32.
+        var options = NewOptions();
+        options.CsvSnapshotsRoot = root;
+
+        var failure = Assert.Throws<InvalidOperationException>(options.Validate);
+        Assert.Contains(nameof(AgentOptions.CsvSnapshotsRoot), failure.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void Validate_NonPositiveSnapshotCopyConcurrency_IsRejected(int copies)
+    {
+        var options = NewOptions();
+        options.MaxConcurrentSnapshotCopies = copies;
+
+        var failure = Assert.Throws<InvalidOperationException>(options.Validate);
+        Assert.Contains(nameof(AgentOptions.MaxConcurrentSnapshotCopies), failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_NonPositiveSnapshotCopyTimeout_IsRejected()
+    {
+        var options = NewOptions();
+        options.SnapshotCopyTimeout = TimeSpan.Zero;
+
+        var failure = Assert.Throws<InvalidOperationException>(options.Validate);
+        Assert.Contains(nameof(AgentOptions.SnapshotCopyTimeout), failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_SnapshotCopyTimeout_IsNotTheDiskOperationTimeout()
+    {
+        // A copy is bulk I/O over a CSV, not a management call. Defaulting the
+        // two to the same clock would make every large snapshot restart forever,
+        // each attempt discarding the last, and it would do so silently.
+        var options = NewOptions();
+
+        Assert.True(options.SnapshotCopyTimeout > options.DiskOperationTimeout);
+        Assert.True(options.SnapshotCopyTimeout >= TimeSpan.FromHours(1));
+    }
+
+    private static AgentOptions NewOptions() =>
+        new() { CsvVolumesRoot = "/tmp/volumes", CsvSnapshotsRoot = "/tmp/snapshots" };
 }

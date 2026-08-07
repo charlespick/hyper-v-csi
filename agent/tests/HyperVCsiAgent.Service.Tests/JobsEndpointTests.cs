@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using HyperVCsiAgent.Core.Storage;
+using HyperVCsiAgent.Core.Tests;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
@@ -25,6 +26,7 @@ public sealed class JobsEndpointTests : IDisposable
         _factory = new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {
             builder.UseSetting("Agent:CsvVolumesRoot", _root);
+            builder.UseSetting("Agent:CsvSnapshotsRoot", Path.Combine(_root, "snapshots"));
             builder.ConfigureTestServices(services => services.AddSingleton<IVirtualDiskManager>(_disks));
         });
     }
@@ -161,6 +163,90 @@ public sealed class JobsEndpointTests : IDisposable
         Assert.Equal(0, _disks.CreateCount);
     }
 
+    [WindowsOnlyFact]
+    public async Task GetJob_CreateSnapshot_UsesTheFieldNamesTheGoControllerDecodes()
+    {
+        // Through the real host and the real WindowsDiskCopier, so this pins
+        // what the Go side actually receives rather than what AgentJson would
+        // produce in isolation. Windows-only because the copy seam has no
+        // implementation anywhere else - see UnsupportedDiskCopier.
+        var client = _factory.CreateClient();
+        await RunToCompletionAsync(client, CreateVolumeRequest("pvc-1", 4096));
+
+        var job = await RunToCompletionAsync(client, CreateSnapshotRequest("pvc-1", "snapshot-abc"));
+
+        Assert.Equal("Succeeded", job.RootElement.GetProperty("status").GetString());
+        Assert.Equal("CreateSnapshot", job.RootElement.GetProperty("operationType").GetString());
+        // The idempotency key is the snapshot name and the target is the
+        // snapshot, per the wire contract - the copy takes the volume target
+        // instead, and never reaches this endpoint at all.
+        Assert.Equal("snapshot-abc", job.RootElement.GetProperty("idempotencyKey").GetString());
+        Assert.Equal("snapshot:pvc-1~snapshot-abc", job.RootElement.GetProperty("target").GetString());
+
+        var result = job.RootElement.GetProperty("result");
+        Assert.Equal("pvc-1~snapshot-abc", result.GetProperty("snapshotId").GetString());
+        Assert.Equal("pvc-1", result.GetProperty("sourceVolumeId").GetString());
+        // Present even when zero: the Go side decides whether to report them by
+        // testing for > 0, so they have to be things the agent said.
+        Assert.True(result.TryGetProperty("sizeBytes", out _));
+        Assert.True(result.TryGetProperty("creationTimeUnixSeconds", out _));
+        Assert.True(result.TryGetProperty("readyToUse", out _));
+    }
+
+    [WindowsOnlyFact]
+    public async Task GetJob_CreateSnapshotThenList_ReportsTheFinishedSnapshot()
+    {
+        // The readiness protocol end to end: CreateSnapshot may answer false
+        // while the copy runs, external-snapshotter calls again, and the answer
+        // comes from the file rather than from any job record.
+        var client = _factory.CreateClient();
+        await RunToCompletionAsync(client, CreateVolumeRequest("pvc-1", 4096));
+
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (true)
+        {
+            using var job = await RunToCompletionAsync(client, CreateSnapshotRequest("pvc-1", "snapshot-abc"));
+            Assert.Equal("Succeeded", job.RootElement.GetProperty("status").GetString());
+            if (job.RootElement.GetProperty("result").GetProperty("readyToUse").GetBoolean())
+            {
+                break;
+            }
+
+            if (DateTime.UtcNow > deadline)
+            {
+                throw new TimeoutException("the snapshot never became ready");
+            }
+
+            await Task.Delay(10);
+        }
+
+        using var listed = await RunToCompletionAsync(client, ListSnapshotsRequest());
+        var entries = listed.RootElement.GetProperty("result").GetProperty("entries").EnumerateArray().ToList();
+
+        var entry = Assert.Single(entries);
+        Assert.Equal("pvc-1~snapshot-abc", entry.GetProperty("snapshotId").GetString());
+        Assert.True(entry.GetProperty("readyToUse").GetBoolean());
+        Assert.Equal(string.Empty, listed.RootElement.GetProperty("result").GetProperty("nextToken").GetString());
+    }
+
+    [Fact]
+    public async Task PostJobs_TheInternalSnapshotCopy_IsNotAnOperationTheControllerMayEnqueue()
+    {
+        // A copy started this way would skip every precondition CreateSnapshot
+        // runs and begin a multi-hour write to the CSV nobody asked for.
+        var client = _factory.CreateClient();
+
+        var response = await client.PostAsJsonAsync("/v1/jobs", new
+        {
+            operationType = "CopySnapshot",
+            idempotencyKey = "pvc-1~snapshot-abc",
+            target = "volume:pvc-1",
+            payload = new { sourceVolumeId = "pvc-1" },
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
     [Fact]
     public async Task GetJob_UnknownId_IsA404()
     {
@@ -185,6 +271,27 @@ public sealed class JobsEndpointTests : IDisposable
         idempotencyKey = volumeId,
         target = "volume:" + volumeId,
         payload = new { volumeId },
+    };
+
+    /// <summary>
+    /// Composed exactly as csi-driver/internal/driver/controller.go composes it:
+    /// the snapshot name as the idempotency key, and snapshot:&lt;id&gt; as the
+    /// target.
+    /// </summary>
+    private static object CreateSnapshotRequest(string sourceVolumeId, string snapshotName) => new
+    {
+        operationType = "CreateSnapshot",
+        idempotencyKey = snapshotName,
+        target = $"snapshot:{sourceVolumeId}~{snapshotName}",
+        payload = new { sourceVolumeId, snapshotName },
+    };
+
+    private static object ListSnapshotsRequest() => new
+    {
+        operationType = "ListSnapshots",
+        idempotencyKey = "///0",
+        target = "snapshots",
+        payload = new { },
     };
 
     private static async Task<JsonDocument> RunToCompletionAsync(HttpClient client, object request)

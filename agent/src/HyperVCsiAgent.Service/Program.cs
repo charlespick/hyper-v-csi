@@ -48,16 +48,24 @@ if (OperatingSystem.IsWindows())
     builder.Services.AddSingleton<IVirtualDiskManager, CimVirtualDiskManager>();
     builder.Services.AddSingleton<IClusterService, MsClusterService>();
     builder.Services.AddSingleton<IHyperVHostClient, CimHyperVHostClient>();
+    builder.Services.AddSingleton<IDiskCopier, WindowsDiskCopier>();
 }
 else
 {
     builder.Services.AddSingleton<IVirtualDiskManager, UnsupportedVirtualDiskManager>();
     builder.Services.AddSingleton<IClusterService, UnsupportedClusterService>();
     builder.Services.AddSingleton<IHyperVHostClient, UnsupportedHyperVHostClient>();
+    builder.Services.AddSingleton<IDiskCopier, UnsupportedDiskCopier>();
 }
 
 builder.Services.AddSingleton<IVhdxService, VhdxService>();
 builder.Services.AddSingleton<IAttachService, AttachService>();
+
+// Depends on IJobStore, which is registered above and depends on nothing: the
+// snapshot service starts its own long-running copy job rather than doing the
+// copy inline. The dependency runs one way only - JobDispatcher sits above both
+// - so there is no cycle for the container to resolve.
+builder.Services.AddSingleton<ISnapshotService, SnapshotService>();
 builder.Services.AddSingleton<JobDispatcher>();
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<StoreCertificateProvider>();
