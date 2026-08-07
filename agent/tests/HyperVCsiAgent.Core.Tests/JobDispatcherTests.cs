@@ -207,12 +207,6 @@ public class JobDispatcherTests
             LastConfirmExists = volumeId;
             return Task.CompletedTask;
         }
-
-        public Task<string> CreateCheckpointAsync(string volumeId, string snapshotName, CancellationToken cancellationToken) =>
-            throw new NotSupportedException();
-
-        public Task DeleteCheckpointAsync(string snapshotId, CancellationToken cancellationToken) =>
-            throw new NotSupportedException();
     }
 
     private sealed class RecordingAttachService : IAttachService

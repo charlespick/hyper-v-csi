@@ -422,12 +422,6 @@ public sealed class VhdxService : IVhdxService, IDisposable
         return Task.CompletedTask;
     }
 
-    public Task<string> CreateCheckpointAsync(string volumeId, string snapshotName, CancellationToken cancellationToken) =>
-        throw new NotSupportedException("CreateSnapshot is not implemented yet");
-
-    public Task DeleteCheckpointAsync(string snapshotId, CancellationToken cancellationToken) =>
-        throw new NotSupportedException("DeleteSnapshot is not implemented yet");
-
     public void Dispose() => _concurrency.Dispose();
 
     /// <summary>

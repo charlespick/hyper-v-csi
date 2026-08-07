@@ -85,8 +85,4 @@ public interface IVhdxService
     /// isn't there.
     /// </exception>
     Task ConfirmExistsAsync(string volumeId, CancellationToken cancellationToken);
-
-    Task<string> CreateCheckpointAsync(string volumeId, string snapshotName, CancellationToken cancellationToken);
-
-    Task DeleteCheckpointAsync(string snapshotId, CancellationToken cancellationToken);
 }
