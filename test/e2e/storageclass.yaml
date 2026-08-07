@@ -1,0 +1,27 @@
+# The StorageClass the external storage suite provisions against. The framework
+# copies this object, gives the copy a unique generated name, and deletes it
+# again at the end of each test, so nothing here collides with the chart's
+# StorageClass and nothing survives the run.
+#
+# reclaimPolicy is Delete, unlike the chart's Retain. That is deliberate and it
+# is the one thing to understand before running the suite: every volume this
+# test run provisions is deleted for real by DeleteVolume when the PVC goes
+# away. Retain would leak a VHDX per test — hundreds over a full run — and would
+# also fail every test that asserts the PV disappears. See testing.md.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: hyperv-csi-e2e
+provisioner: csi.hyper-v.makerland.xyz
+reclaimPolicy: Delete
+
+# Immediate, matching the chart. This driver advertises no topology at all — a
+# VHDX on the CSV is reachable from every node in the failover cluster — so
+# WaitForFirstConsumer would buy nothing and only defer the bind.
+volumeBindingMode: Immediate
+allowVolumeExpansion: true
+
+# No parameters: CreateVolume ignores StorageClass parameters outright. The
+# framework injects csi.storage.k8s.io/fstype here for the ext4 test patterns,
+# which external-provisioner consumes and turns into the PV's fsType — it never
+# reaches this driver's CreateVolume.

@@ -1,0 +1,40 @@
+# Tests silenced in every profile, including the full one a release gates on.
+#
+# One Ginkgo skip regex per line, matched against the whole test name. Blank
+# lines and # comments are stripped; the runner joins what is left with "|" and
+# passes it as --ginkgo.skip. Every line needs a comment saying why, and a line
+# that stops being true should be deleted rather than left behind.
+#
+# This file is only one of the three ways a test goes unrun. The other two are
+# capability flags in testdriver.yaml and options left unset there; testing.md
+# has the full table of what is silenced and by which mechanism.
+
+# Node and kubelet failover: kills or restarts the kubelet under a running pod
+# and checks the volume is cleaned up and reusable afterwards. Deliberately
+# deferred — this is the failure class the project has not built for yet, and
+# testing it properly means killing a Hyper-V VM rather than a kubelet, which
+# the upstream suite cannot orchestrate. These also require SSH to the nodes,
+# which --provider=skeleton does not have, so they would error rather than fail
+# honestly. See "Node failover" in testing.md for the plan to cover this with
+# our own tests.
+\[Disruptive\]
+
+# Everything behind a Kubernetes feature gate or an environment this cluster is
+# not. Skipping the whole family is what upstream's own README recommends. For
+# this driver it hides, in descending order of count:
+#   [Feature:Windows]                 — Windows worker nodes. Ours are Linux.
+#   [Feature:VolumeSnapshotDataSource]— snapshots. Not implemented; also off via
+#                                       the snapshotDataSource capability. This
+#                                       is the one line expected to be narrowed
+#                                       when CreateSnapshot lands.
+#   [Feature:VolumeAttributesClass]   — mutable volume attributes. Not implemented.
+#   [Feature:VolumeSourceXFS]         — xfs. The node image has only e2fsprogs.
+#   [Feature:SELinux]                 — SELinux mount options. Not implemented.
+#   [Feature:volumegroupsnapshot]     — group snapshots. Not implemented.
+#   [Feature:snapshotmetadata]        — snapshot metadata. Not implemented.
+#   [Feature:OffByDefault]            — gates disabled on a default cluster.
+\[Feature:
+
+# Upstream's own acknowledged flakes. A failure here says nothing about this
+# driver.
+\[Flaky\]

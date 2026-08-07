@@ -1,7 +1,9 @@
 # Hyper-V CSI Driver
 
-See [design.md](design.md) for the architecture and [CSI Spec.md](CSI%20Spec.md) for the
-RPC-to-implementation mapping.
+See [design.md](design.md) for the architecture, [CSI Spec.md](CSI%20Spec.md) for the
+RPC-to-implementation mapping, and [testing.md](testing.md) for how this is tested —
+including the storage e2e suite in [test/e2e](test/e2e) and what it deliberately does
+not cover.
 
 Two components, per the design:
 

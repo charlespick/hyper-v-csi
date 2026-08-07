@@ -1,0 +1,31 @@
+# Extra skips for the smoke profile, on top of skips.txt. Temporary by design:
+# every line here is a test this driver is expected to pass eventually, held
+# back only so the first integration runs fail on one simple thing at a time
+# instead of on a cascade. The full profile runs all of them.
+#
+# Same format as skips.txt: one Ginkgo skip regex per line.
+
+# Anything upstream tags as long-running. Not because a slow test is a bad
+# test, but because the slow ones here are also the concurrent ones — several
+# pods writing to several volumes at once — and this driver's Windows API path
+# is the part whose behaviour under load is least understood. Raising the
+# timeouts in testdriver.yaml is the answer to slow; this profile is about
+# reducing what happens at once.
+\[Slow\]
+
+# Ginkgo runs these alone, and each is the load-piling kind: the volume-limits
+# test provisions until the node refuses, and the ReadWriteOncePod preemption
+# test evicts a running pod to take its volume.
+\[Serial\]
+
+# Two volumes per pod, two pods per volume, and the cross-node cases that move
+# a volume from one VM to another by detaching and reattaching it. The most
+# valuable suite in the run for a driver like this one and the first thing to
+# turn on — drop this line, or run the full profile, once the smoke profile is
+# green. Overlaps with [Slow] above, which already covers most of it; named
+# separately so turning it on is one deliberate edit.
+multiVolume
+
+# Writes and reads back files up to MaxFileSize (100 MiB) through the mount. A
+# genuine data-integrity test, and the heaviest single I/O in the run.
+volumeIO

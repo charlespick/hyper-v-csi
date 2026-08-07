@@ -14,6 +14,10 @@ csi-driver/bin/
 # Machine-specific Helm values (real image/registry and agent addresses)
 deploy/helm/hyperv-csi/values.local.yaml
 
+# e2e: the downloaded upstream e2e.test/ginkgo binaries and per-run output
+test/e2e/.bin/
+test/e2e/_artifacts/
+
 # macOS
 .DS_Store
 .dotnet

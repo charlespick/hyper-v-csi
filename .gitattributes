@@ -1,0 +1,3 @@
+# Shell scripts keep LF in the working copy on every platform. A CRLF checkout
+# of run-e2e.sh fails on Linux with "bad interpreter: /usr/bin/env bash^M".
+*.sh text eol=lf

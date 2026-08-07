@@ -1,0 +1,98 @@
+# Driver definition for the upstream Kubernetes external storage test suite
+# (test/e2e/storage/external in kubernetes/kubernetes). The fields here are
+# storageframework.DriverInfo; the suite reads them to decide which of its test
+# patterns and test suites apply to this driver, so a capability set to true
+# that the driver cannot actually honor shows up as a test failure, and one left
+# false silently removes that test's coverage.
+#
+# Every false below is a documented silence. testing.md carries the full table
+# with the reason for each; keep the two in sync.
+
+StorageClass:
+  # Resolved relative to --repo-root, which the runner scripts point at the
+  # root of this repository.
+  FromFile: test/e2e/storageclass.yaml
+
+DriverInfo:
+  # Must match DriverName in csi-driver/internal/driver/driver.go and the
+  # provisioner of storageclass.yaml. It is also what the focus regex in the
+  # runner scripts matches on, since it appears in every test name as
+  # "[Driver: csi.hyper-v.makerland.xyz]".
+  Name: csi.hyper-v.makerland.xyz
+
+  # 1Gi is CreateVolume's own default size and the smallest thing worth asking
+  # a Hyper-V host for. The framework uses Min as the claim size for most
+  # tests, so this is the size the run provisions over and over — keeping it
+  # small keeps the run short.
+  SupportedSizeRange:
+    Min: 1Gi
+    Max: 64Gi
+
+  # "" is the default-filesystem pattern, which exercises NodeStageVolume's own
+  # defaultFsType fallback; ext4 is the only filesystem the node image can
+  # actually create, since only e2fsprogs is installed. Adding xfs here without
+  # adding xfsprogs to the node image would only prove that mkfs.xfs is missing.
+  SupportedFsType:
+    "": {}
+    ext4: {}
+
+  # Largest file the volume I/O suite writes and reads back. 100 MiB
+  # (storageframework.FileSizeMedium) is the usual choice for a CSI driver.
+  # Drop it to 1048576 (FileSizeSmall) if the CSV makes this the slowest part
+  # of the run.
+  MaxFileSize: 104857600
+
+  Capabilities:
+    # --- Supported, and exercised ---------------------------------------
+    persistence: true          # data survives pod restarts
+    exec: true                 # a binary in the volume can be executed
+    fsGroup: true              # CSIDriver sets fsGroupPolicy: File
+    multipods: true            # two pods on one node share a staged volume
+    controllerExpansion: true  # ControllerExpandVolume grows the VHDX
+    nodeExpansion: true        # NodeExpandVolume grows the filesystem
+    onlineExpansion: true      # both were verified against a running VM
+    offlineExpansion: true
+    readWriteOncePod: true     # SINGLE_NODE_SINGLE_WRITER is accepted
+
+    # --- Not supported: the driver rejects these outright ---------------
+    block: false               # requireMountVolume rejects block volumes
+    RWX: false                 # a VHDX attaches to one VM at a time
+    capReadOnlyMany: false     # ROX maps to MULTI_NODE_READER_ONLY, rejected
+    snapshotDataSource: false  # CreateSnapshot is Unimplemented
+    groupSnapshot: false
+    pvcDataSource: false       # CreateVolume rejects a volume content source
+    topology: false            # NodeGetInfo reports no accessible topology
+    capacity: false            # GetCapacity is not implemented
+    volumeLimits: false        # NodeGetInfo reports no max_volumes_per_node
+    volumeMountGroup: false    # no VOLUME_MOUNT_GROUP node capability
+    seLinuxMount: false        # no SELinux mount option support
+
+    # --- Supported in principle, silenced for the first run -------------
+    # Two PVs sharing one volume handle. findAttachedNode matches a
+    # VolumeAttachment by PV name and relies on PV name == volume handle, so a
+    # second PV with the same handle can resolve expansion to the wrong node.
+    # A real driver-side limitation, not a test-harness one.
+    multiplePVsSameID: false
+
+  # singleNodeVolume is deliberately absent (false): a VHDX is not node-local
+  # storage. Leaving it false is what lets the multi-volume suite run the
+  # "different node" cases, which are a detach-then-attach cycle driven by the
+  # attach/detach controller — the single most valuable thing in this run.
+
+# Every timeout the framework applies, in the few places a Hyper-V round trip is
+# slower than the cloud providers these defaults were tuned for. Raising a
+# timeout is always preferable to skipping a test: a slow pass is still a pass,
+# and a skip is coverage lost. Keys must match fields of
+# framework.TimeoutContext exactly or the suite refuses to start.
+Timeouts:
+  # Default 5m. Covers attach + NodeStageVolume's mkfs + mount.
+  PodStart: 10m
+  # Default 15m, used by the tests that already expect to wait.
+  PodStartSlow: 20m
+  # Default 5m. CreateVolume against the agent, through the job queue.
+  ClaimProvision: 10m
+  # Default 5m. Detach has to resolve cluster ownership before it can run.
+  PodDelete: 10m
+  # Default 5m. DeleteVolume, after external-attacher has cleared the
+  # VolumeAttachment.
+  PVDelete: 10m
