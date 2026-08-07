@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // operationCreateVolume is the operationType the agent dispatches on; it must
@@ -35,6 +37,18 @@ const operationAttachVolume = "AttachVolume"
 // operationDetachVolume is the operationType the agent dispatches on; it must
 // match JobDispatcher.DetachVolume on the .NET side.
 const operationDetachVolume = "DetachVolume"
+
+// operationCreateSnapshot is the operationType the agent dispatches on; it must
+// match JobDispatcher.CreateSnapshot on the .NET side.
+const operationCreateSnapshot = "CreateSnapshot"
+
+// operationDeleteSnapshot is the operationType the agent dispatches on; it must
+// match JobDispatcher.DeleteSnapshot on the .NET side.
+const operationDeleteSnapshot = "DeleteSnapshot"
+
+// operationListSnapshots is the operationType the agent dispatches on; it must
+// match JobDispatcher.ListSnapshots on the .NET side.
+const operationListSnapshots = "ListSnapshots"
 
 // defaultVolumeSizeBytes is used when a request carries no capacity range at
 // all. CSI allows that, and a VHDX has to be created with *some* size; the
@@ -728,18 +742,307 @@ func pickExpandSize(capacityRange *csi.CapacityRange) (int64, error) {
 	return pickVolumeSize(capacityRange)
 }
 
-// CreateSnapshot creates a point-in-time checkpoint of a volume. Idempotency
-// key: snapshot name.
-func (s *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "CreateSnapshot not implemented")
+// snapshotIDSeparator joins a source volume ID and a snapshot name into the
+// snapshot ID the agent derives its CSV path from. It appears here for one
+// purpose only — naming the serialization target of a CreateSnapshot job, which
+// has to be the same string DeleteSnapshot derives from the ID or the two would
+// not serialize against each other. The ID this driver *reports* is never
+// computed here; it is read out of the agent's result, because the path rule is
+// the agent's to own and two copies of it could drift. A local copy that drifted
+// would cost serialization between a create and a delete for one snapshot, not a
+// wrong path handed back to Kubernetes, which is why the trade is acceptable in
+// this one place and nowhere else.
+const snapshotIDSeparator = "~"
+
+// snapshotTarget names the resource the agent serializes snapshot-level work
+// against. Repeat CreateSnapshot and DeleteSnapshot calls for one snapshot
+// queue behind each other while snapshots of different volumes proceed in
+// parallel.
+//
+// Deliberately not the source volume's target. The long-running copy the agent
+// starts internally takes volume:<sourceVolumeId> so it cannot interleave with
+// a resize or delete of the disk it is reading; putting these fast RPCs on that
+// same target would park every CreateSnapshot behind a copy that can run for
+// hours, and CreateSnapshot's whole design is that it stays fast.
+func snapshotTarget(snapshotID string) string {
+	return "snapshot:" + snapshotID
 }
 
-// DeleteSnapshot removes a previously created checkpoint. Idempotency key: snapshot ID.
+// snapshotsTarget is the target for the read-only enumeration. Listing
+// serializes against nothing — it observes the CSV and changes none of it — but
+// the agent's job store requires a target, so every listing shares one constant.
+const snapshotsTarget = "snapshots"
+
+// createSnapshotPayload is the operation-specific half of the agent's job
+// envelope, matching CreateSnapshotPayload on the .NET side.
+type createSnapshotPayload struct {
+	SourceVolumeID string `json:"sourceVolumeId"`
+	SnapshotName   string `json:"snapshotName"`
+}
+
+// snapshotResult is the agent's description of one snapshot, matching
+// SnapshotResult on the .NET side. One struct serves both CreateSnapshot's
+// result and each entry of a ListSnapshots result because the .NET side sends
+// the same shape in both places — and because a snapshot must not describe
+// itself differently depending on which RPC asked about it, which is exactly
+// what two structs that drifted apart would produce.
+type snapshotResult struct {
+	SnapshotID     string `json:"snapshotId"`
+	SourceVolumeID string `json:"sourceVolumeId"`
+	// SizeBytes is the source volume's virtual size — what a restore of this
+	// snapshot will need, not what the copy currently occupies on the CSV. 0
+	// means the agent could not determine it yet.
+	SizeBytes int64 `json:"sizeBytes"`
+	// CreationTimeUnixSeconds is stable across repeat calls for one snapshot.
+	// 0 means unknown.
+	CreationTimeUnixSeconds int64 `json:"creationTimeUnixSeconds"`
+	// ReadyToUse is true only once the finished copy exists on the CSV. It is
+	// answered from the files, never from a job record, which is what lets an
+	// agent that restarted mid-copy still answer correctly.
+	ReadyToUse bool `json:"readyToUse"`
+}
+
+// csiSnapshot converts the agent's view of a snapshot into CSI's.
+//
+// The two conditionals are the point of this function. Both fields are optional
+// in csi.Snapshot, and the agent uses 0 for "not determinable yet" in each —
+// so copying a 0 through would not be a harmless pass-through, it would be a
+// claim. A zero size_bytes advertises a snapshot that restores into nothing,
+// which a CO may well believe when sizing the volume it restores into; a zero
+// creation_time advertises 1970, which is worse than no timestamp because it
+// sorts and ages like a real one. Leaving each unset says "unknown", which is
+// the truth.
+func (r snapshotResult) csiSnapshot() *csi.Snapshot {
+	snapshot := &csi.Snapshot{
+		// The snapshot ID comes from the agent verbatim; see snapshotIDSeparator
+		// for why this side does not derive it. The source volume ID is the
+		// agent's echo rather than the request's, so that a snapshot looks
+		// identical whether it arrived through CreateSnapshot or ListSnapshots —
+		// only the former has a request to fall back on anyway.
+		SnapshotId:     r.SnapshotID,
+		SourceVolumeId: r.SourceVolumeID,
+		ReadyToUse:     r.ReadyToUse,
+	}
+
+	if r.SizeBytes > 0 {
+		snapshot.SizeBytes = r.SizeBytes
+	}
+	if r.CreationTimeUnixSeconds > 0 {
+		snapshot.CreationTime = timestamppb.New(time.Unix(r.CreationTimeUnixSeconds, 0).UTC())
+	}
+
+	return snapshot
+}
+
+// CreateSnapshot creates a point-in-time copy of a volume. Idempotency
+// key: snapshot name.
+//
+// The job this drives is fast, and that is a design decision rather than an
+// accident of what a copy costs. Copying a VHDX can run for hours; a CSI RPC
+// cannot. So the job here only runs preconditions, makes sure a copy is underway
+// or already finished, and reports the snapshot's *observed* state read from the
+// CSV — while the copy itself is a separate long-running job the agent starts
+// internally and this controller never polls. That is why readiness arrives as
+// readyToUse in the result payload instead of as a poll that has not finished
+// yet, and why the ordinary awaitJob and jobPollBudget are enough: there is no
+// case here where "still running" is the honest answer to a caller, so there is
+// no need for a second polling mode that could return one.
+//
+// An unfinished snapshot is a perfectly good response with ready_to_use false.
+// external-snapshotter calls again until it flips true, which also means an
+// agent that restarted mid-copy answers correctly on the next call: readiness is
+// re-derived from the files, which survive, not from the job record, which does
+// not.
+func (s *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
+	if req.GetSourceVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "source volume id is required")
+	}
+	if req.GetName() == "" {
+		return nil, status.Error(codes.InvalidArgument, "name is required")
+	}
+
+	// req.GetParameters() is ignored, the same way CreateVolume ignores
+	// StorageClass parameters — see "CreateVolume gaps" in CSI Spec.md. Passing
+	// VolumeSnapshotClass parameters through to the agent without anything acting
+	// on them would look like support for them; dropping them here keeps the gap
+	// where it already is, and honest.
+
+	// The snapshot name is the idempotency key per CSI Spec.md, so a retry from
+	// external-snapshotter for the same VolumeSnapshot re-attaches to the job in
+	// flight instead of starting a second copy of the same disk.
+	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetName(), operationCreateSnapshot,
+		snapshotTarget(req.GetSourceVolumeId()+snapshotIDSeparator+req.GetName()), createSnapshotPayload{
+			SourceVolumeID: req.GetSourceVolumeId(),
+			SnapshotName:   req.GetName(),
+		})
+	if err != nil {
+		return nil, enqueueFailed(ctx, err,
+			"enqueueing CreateSnapshot %s of %s", req.GetName(), req.GetSourceVolumeId())
+	}
+
+	done, err := awaitJob(ctx, s.driver.Agent, job.ID, jobPollBudget)
+	if err != nil {
+		return nil, err
+	}
+
+	var result snapshotResult
+	if err := json.Unmarshal(done.Result, &result); err != nil {
+		return nil, status.Errorf(codes.Internal,
+			"decoding CreateSnapshot result for %s of %s: %v", req.GetName(), req.GetSourceVolumeId(), err)
+	}
+	if result.SnapshotID == "" {
+		// Mirrors CreateVolume's empty-volume-id check. snapshot_id is what every
+		// later DeleteSnapshot and restore is addressed by, so a snapshot handed
+		// back without one is an object Kubernetes can record but never act on
+		// again. An agent bug, and INTERNAL says so.
+		return nil, status.Errorf(codes.Internal,
+			"agent returned no snapshot id for %s of %s", req.GetName(), req.GetSourceVolumeId())
+	}
+
+	return &csi.CreateSnapshotResponse{Snapshot: result.csiSnapshot()}, nil
+}
+
+// deleteSnapshotPayload is the operation-specific half of the agent's job
+// envelope, matching DeleteSnapshotPayload on the .NET side. There is no result
+// half: a snapshot that is gone has nothing left to report about it, exactly as
+// for DeleteVolume.
+type deleteSnapshotPayload struct {
+	SnapshotID string `json:"snapshotId"`
+}
+
+// DeleteSnapshot removes a previously created snapshot. Idempotency key:
+// snapshot ID.
+//
+// A snapshot that isn't there is a success, which CSI mandates and which is also
+// what a retry of an already-finished delete looks like by the time it reaches
+// the agent. That tolerance extends to a snapshot ID this agent could not have
+// produced, on DeleteVolume's reasoning: no retry can make such a snapshot exist,
+// so failing would only strand the VolumeSnapshotContent forever.
 func (s *controllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "DeleteSnapshot not implemented")
+	if req.GetSnapshotId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "snapshot id is required")
+	}
+
+	// The snapshot ID is the idempotency key per CSI Spec.md, and it doubles as
+	// the target — the same target a CreateSnapshot for this snapshot derives
+	// from its source and name — so a delete can't interleave with a create of
+	// the snapshot it is removing.
+	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetSnapshotId(), operationDeleteSnapshot,
+		snapshotTarget(req.GetSnapshotId()), deleteSnapshotPayload{
+			SnapshotID: req.GetSnapshotId(),
+		})
+	if err != nil {
+		return nil, enqueueFailed(ctx, err, "enqueueing DeleteSnapshot for %s", req.GetSnapshotId())
+	}
+
+	// Nothing to decode: whether the job succeeded is the entire answer, as it
+	// is for DeleteVolume.
+	if _, err := awaitJob(ctx, s.driver.Agent, job.ID, jobPollBudget); err != nil {
+		return nil, err
+	}
+
+	return &csi.DeleteSnapshotResponse{}, nil
+}
+
+// listSnapshotsPayload and listSnapshotsResult are the operation-specific halves
+// of the agent's job envelope, matching ListSnapshotsPayload and
+// ListSnapshotsResult on the .NET side. Every payload field is optional and
+// mirrors one of CSI's own, so the filtering and paging happen where the data
+// is rather than by fetching everything and discarding most of it here.
+type listSnapshotsPayload struct {
+	SnapshotID     string `json:"snapshotId"`
+	SourceVolumeID string `json:"sourceVolumeId"`
+	StartingToken  string `json:"startingToken"`
+	MaxEntries     int32  `json:"maxEntries"`
+}
+
+type listSnapshotsResult struct {
+	Entries []snapshotResult `json:"entries"`
+	// NextToken empty means the listing is complete. It is opaque here — only
+	// the agent that issued it knows how to resume from it.
+	NextToken string `json:"nextToken"`
 }
 
 // ListSnapshots lists existing snapshots known to the plugin. Lookup only.
+//
+// The agent returns finished snapshots only: an in-progress copy and the debris
+// of an abandoned one are its own business, and surfacing either would show a
+// caller a snapshot it must never try to restore from.
+//
+// Filters are not a lookup. A snapshot_id that matches nothing is an empty list,
+// never NOT_FOUND — CSI is explicit about it, and external-snapshotter uses this
+// RPC to confirm a snapshot has actually gone after a delete, so an error there
+// would turn a completed deletion into a stuck one.
 func (s *controllerServer) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "ListSnapshots not implemented")
+	job, err := s.driver.Agent.EnqueueJob(ctx, listSnapshotsKey(req), operationListSnapshots,
+		snapshotsTarget, listSnapshotsPayload{
+			SnapshotID:     req.GetSnapshotId(),
+			SourceVolumeID: req.GetSourceVolumeId(),
+			StartingToken:  req.GetStartingToken(),
+			MaxEntries:     req.GetMaxEntries(),
+		})
+	if err != nil {
+		return nil, enqueueFailed(ctx, err, "enqueueing ListSnapshots")
+	}
+
+	done, err := awaitJob(ctx, s.driver.Agent, job.ID, jobPollBudget)
+	if err != nil {
+		return nil, invalidTokenIsAborted(req.GetStartingToken(), err)
+	}
+
+	var result listSnapshotsResult
+	if err := json.Unmarshal(done.Result, &result); err != nil {
+		// An empty listing still arrives as a result body with an empty entries
+		// array, so a body that won't decode is a broken agent rather than a
+		// listing with nothing in it. Treating the two alike would report "no
+		// snapshots" to a caller that is about to conclude they were all deleted.
+		return nil, status.Errorf(codes.Internal, "decoding ListSnapshots result: %v", err)
+	}
+
+	entries := make([]*csi.ListSnapshotsResponse_Entry, 0, len(result.Entries))
+	for _, entry := range result.Entries {
+		entries = append(entries, &csi.ListSnapshotsResponse_Entry{Snapshot: entry.csiSnapshot()})
+	}
+
+	return &csi.ListSnapshotsResponse{
+		Entries:   entries,
+		NextToken: result.NextToken,
+	}, nil
+}
+
+// listSnapshotsKey is the idempotency key for an enumeration. There is no
+// natural one — a listing is about no single object — so it is the whole filter
+// and page tuple: two identical listings issued at once dedupe onto one job,
+// while two different pages of the same listing stay separate jobs, which they
+// must, since each has its own answer.
+//
+// escapeKeyComponent is the same escaping publishKey uses, for the same reason:
+// a snapshot ID or an opaque token containing the delimiter must not be able to
+// collide with a different tuple that happens to concatenate the same way.
+func listSnapshotsKey(req *csi.ListSnapshotsRequest) string {
+	return strings.Join([]string{
+		escapeKeyComponent(req.GetSnapshotId()),
+		escapeKeyComponent(req.GetSourceVolumeId()),
+		escapeKeyComponent(req.GetStartingToken()),
+		strconv.FormatInt(int64(req.GetMaxEntries()), 10),
+	}, "/")
+}
+
+// invalidTokenIsAborted re-codes the one failure whose gRPC code CSI fixes for
+// this RPC specifically. A starting_token the agent cannot parse is the agent
+// rejecting an argument, so it arrives classified InvalidArgument like any other
+// — but CSI mandates ABORTED for an invalid token, and the difference is not
+// cosmetic: a paginating client treats ABORTED as "restart the listing from the
+// beginning" and INVALID_ARGUMENT as "this request was malformed", so getting it
+// wrong leaves the caller re-sending the same rejected token forever.
+//
+// Only re-coded when a token was actually sent. With no token there is nothing
+// for the agent to have found unparseable, so an InvalidArgument then is about
+// something else entirely and is passed through as it came.
+func invalidTokenIsAborted(startingToken string, err error) error {
+	if startingToken == "" || status.Code(err) != codes.InvalidArgument {
+		return err
+	}
+
+	return status.Errorf(codes.Aborted, "invalid starting token: %s", status.Convert(err).Message())
 }

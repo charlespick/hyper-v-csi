@@ -1319,6 +1319,567 @@ func TestControllerExpandVolumeForgottenJobIsRetryable(t *testing.T) {
 	}
 }
 
+func TestCreateSnapshotReturnsTheSnapshotTheAgentReported(t *testing.T) {
+	server := newControllerServer(newFakeAgent(t,
+		succeeded(snapshotJSON("pvc-1~snap-1", "pvc-1", 10*gibibyte, 1770000000, true))))
+
+	resp, err := server.CreateSnapshot(context.Background(), createSnapshotRequest("pvc-1", "snap-1"))
+	if err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+
+	snapshot := resp.GetSnapshot()
+	// The ID comes from the agent verbatim: it owns the rule that turns a source
+	// and a name into a CSV path, and a second copy of it here could drift.
+	if snapshot.GetSnapshotId() != "pvc-1~snap-1" {
+		t.Errorf("snapshot id = %q, want the id the agent reported", snapshot.GetSnapshotId())
+	}
+	if snapshot.GetSourceVolumeId() != "pvc-1" {
+		t.Errorf("source volume id = %q, want pvc-1", snapshot.GetSourceVolumeId())
+	}
+	if snapshot.GetSizeBytes() != 10*gibibyte {
+		t.Errorf("size = %d, want %d", snapshot.GetSizeBytes(), 10*gibibyte)
+	}
+	if got := snapshot.GetCreationTime().GetSeconds(); got != 1770000000 {
+		t.Errorf("creation time = %d, want 1770000000", got)
+	}
+	if !snapshot.GetReadyToUse() {
+		t.Error("ready_to_use = false, want true for a finished copy")
+	}
+}
+
+func TestCreateSnapshotEnqueuesUnderTheSnapshotNameAsIdempotencyKey(t *testing.T) {
+	agent := newFakeAgent(t, succeeded(snapshotJSON("pvc-1~snap-1", "pvc-1", gibibyte, 1770000000, true)))
+	server := newControllerServer(agent)
+
+	if _, err := server.CreateSnapshot(context.Background(), createSnapshotRequest("pvc-1", "snap-1")); err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+
+	enqueued := agent.onlyEnqueued(t)
+	if enqueued.IdempotencyKey != "snap-1" {
+		t.Errorf("idempotency key = %q, want the CSI snapshot name", enqueued.IdempotencyKey)
+	}
+	if enqueued.OperationType != operationCreateSnapshot {
+		t.Errorf("operation type = %q, want %q", enqueued.OperationType, operationCreateSnapshot)
+	}
+	// The snapshot, not the source volume: this job is fast and must not queue
+	// behind the hours-long copy that takes the volume target.
+	if enqueued.Target != "snapshot:pvc-1~snap-1" {
+		t.Errorf("target = %q, want snapshot:pvc-1~snap-1", enqueued.Target)
+	}
+	if enqueued.Payload.SourceVolumeID != "pvc-1" || enqueued.Payload.SnapshotName != "snap-1" {
+		t.Errorf("payload = %+v, want the source volume id and snapshot name", enqueued.Payload)
+	}
+}
+
+func TestCreateSnapshotDeleteSnapshotShareATarget(t *testing.T) {
+	// The two have to serialize against each other, and they only do if the
+	// target a create derives from its source and name is the same string a
+	// delete derives from the snapshot id.
+	createAgent := newFakeAgent(t, succeeded(snapshotJSON("pvc-1~snap-1", "pvc-1", gibibyte, 1770000000, true)))
+	if _, err := newControllerServer(createAgent).CreateSnapshot(context.Background(),
+		createSnapshotRequest("pvc-1", "snap-1")); err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+
+	deleteAgent := newFakeAgent(t, agentclient.Job{Status: agentclient.JobSucceeded})
+	if _, err := newControllerServer(deleteAgent).DeleteSnapshot(context.Background(),
+		&csi.DeleteSnapshotRequest{SnapshotId: "pvc-1~snap-1"}); err != nil {
+		t.Fatalf("DeleteSnapshot: %v", err)
+	}
+
+	if created, deleted := createAgent.onlyEnqueued(t).Target, deleteAgent.onlyEnqueued(t).Target; created != deleted {
+		t.Errorf("create targeted %q but delete targeted %q; the two would not serialize", created, deleted)
+	}
+}
+
+func TestCreateSnapshotUnfinishedCopyIsStillASuccess(t *testing.T) {
+	// The copy runs for as long as it runs; this RPC reports what is observably
+	// true on the CSV right now. ready_to_use false is the honest answer and
+	// external-snapshotter calls again until it flips, so failing or stalling
+	// here would only turn a working design into a timeout.
+	server := newControllerServer(newFakeAgent(t,
+		succeeded(snapshotJSON("pvc-1~snap-1", "pvc-1", 10*gibibyte, 1770000000, false))))
+
+	resp, err := server.CreateSnapshot(context.Background(), createSnapshotRequest("pvc-1", "snap-1"))
+	if err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+
+	if resp.GetSnapshot().GetReadyToUse() {
+		t.Error("ready_to_use = true, want false while the copy is still running")
+	}
+	if resp.GetSnapshot().GetSnapshotId() != "pvc-1~snap-1" {
+		t.Errorf("snapshot id = %q, want it reported even before the copy finishes",
+			resp.GetSnapshot().GetSnapshotId())
+	}
+}
+
+func TestCreateSnapshotOmitsUnknownSizeAndCreationTime(t *testing.T) {
+	// The agent uses 0 for "not determinable yet" in both. Passing a 0 through
+	// would not be a harmless copy: a zero size advertises a snapshot that
+	// restores into nothing, and a zero creation time advertises 1970, which
+	// sorts and ages like a real timestamp.
+	server := newControllerServer(newFakeAgent(t,
+		succeeded(snapshotJSON("pvc-1~snap-1", "pvc-1", 0, 0, false))))
+
+	resp, err := server.CreateSnapshot(context.Background(), createSnapshotRequest("pvc-1", "snap-1"))
+	if err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+
+	if got := resp.GetSnapshot().GetSizeBytes(); got != 0 {
+		t.Errorf("size = %d, want it left unset", got)
+	}
+	if got := resp.GetSnapshot().GetCreationTime(); got != nil {
+		t.Errorf("creation time = %v, want it left unset rather than the epoch", got)
+	}
+}
+
+func TestCreateSnapshotRejectsUnusableRequests(t *testing.T) {
+	tests := []struct {
+		name    string
+		request *csi.CreateSnapshotRequest
+	}{
+		{name: "no source volume id", request: createSnapshotRequest("", "snap-1")},
+		{name: "no name", request: createSnapshotRequest("pvc-1", "")},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			agent := newFakeAgent(t, succeeded(snapshotJSON("pvc-1~snap-1", "pvc-1", gibibyte, 1770000000, true)))
+			server := newControllerServer(agent)
+
+			_, err := server.CreateSnapshot(context.Background(), test.request)
+
+			if got := status.Code(err); got != codes.InvalidArgument {
+				t.Fatalf("code = %s, want InvalidArgument (err: %v)", got, err)
+			}
+			// Validation has to happen before the agent is touched, so a bad
+			// request never leaves a job behind.
+			if n := agent.enqueueCount(); n != 0 {
+				t.Errorf("enqueued %d jobs, want none", n)
+			}
+		})
+	}
+}
+
+func TestCreateSnapshotIgnoresParametersRatherThanForwardingThem(t *testing.T) {
+	// VolumeSnapshotClass parameters go the same way StorageClass parameters do
+	// in CreateVolume: nowhere. Forwarding them would look like support for
+	// something nothing acts on.
+	agent := newFakeAgent(t, succeeded(snapshotJSON("pvc-1~snap-1", "pvc-1", gibibyte, 1770000000, true)))
+	server := newControllerServer(agent)
+
+	req := createSnapshotRequest("pvc-1", "snap-1")
+	req.Parameters = map[string]string{"anything": "the CO sent"}
+
+	if _, err := server.CreateSnapshot(context.Background(), req); err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+
+	if enqueued := agent.onlyEnqueued(t); enqueued.Payload.Name != "" {
+		t.Errorf("payload = %+v, want only the source volume id and snapshot name", enqueued.Payload)
+	}
+}
+
+func TestCreateSnapshotTranslatesAgentFailures(t *testing.T) {
+	tests := []struct {
+		name string
+		job  agentclient.Job
+		want codes.Code
+	}{
+		{
+			// No VHDX for the source. Terminal: no retry brings it into being.
+			name: "the source volume has no disk",
+			job:  agentclient.Job{Status: agentclient.JobFailed, Error: "no such volume", ErrorCode: agentclient.ErrorCodeNotFound},
+			want: codes.NotFound,
+		},
+		{
+			// A differencing chain on the source, or checkpoints disabled on
+			// the node VM: terminal until an operator acts, which is what
+			// FAILED_PRECONDITION says and INTERNAL would not.
+			name: "the source cannot be snapshotted as it stands",
+			job:  agentclient.Job{Status: agentclient.JobFailed, Error: "differencing chain", ErrorCode: agentclient.ErrorCodeFailedPrecondition},
+			want: codes.FailedPrecondition,
+		},
+		{
+			name: "no room on the csv for the copy",
+			job:  agentclient.Job{Status: agentclient.JobFailed, Error: "csv full", ErrorCode: agentclient.ErrorCodeResourceExhausted},
+			want: codes.ResourceExhausted,
+		},
+		{
+			// The name is taken by a snapshot of a different source volume,
+			// which is the incompatible-collision case CSI spells ALREADY_EXISTS.
+			name: "the name belongs to a snapshot of another volume",
+			job:  agentclient.Job{Status: agentclient.JobFailed, Error: "name taken", ErrorCode: agentclient.ErrorCodeAlreadyExists},
+			want: codes.AlreadyExists,
+		},
+		{
+			name: "unclassified failure",
+			job:  agentclient.Job{Status: agentclient.JobFailed, Error: "CIM said no"},
+			want: codes.Internal,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := newControllerServer(newFakeAgent(t, test.job))
+
+			_, err := server.CreateSnapshot(context.Background(), createSnapshotRequest("pvc-1", "snap-1"))
+
+			if got := status.Code(err); got != test.want {
+				t.Fatalf("code = %s, want %s (err: %v)", got, test.want, err)
+			}
+			if s, _ := status.FromError(err); s.Message() != test.job.Error {
+				t.Errorf("message = %q, want the agent's detail %q", s.Message(), test.job.Error)
+			}
+		})
+	}
+}
+
+func TestCreateSnapshotRejectsAnUnusableResult(t *testing.T) {
+	// snapshot_id is what every later delete and restore is addressed by, so a
+	// snapshot handed back without one is an object Kubernetes can record but
+	// never act on again.
+	tests := []struct {
+		name string
+		job  agentclient.Job
+	}{
+		{name: "not decodable", job: succeeded(`"nonsense"`)},
+		{name: "no snapshot id", job: succeeded(`{"sourceVolumeId":"pvc-1","readyToUse":true}`)},
+		{name: "no result at all", job: agentclient.Job{Status: agentclient.JobSucceeded}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := newControllerServer(newFakeAgent(t, test.job))
+
+			_, err := server.CreateSnapshot(context.Background(), createSnapshotRequest("pvc-1", "snap-1"))
+
+			if got := status.Code(err); got != codes.Internal {
+				t.Fatalf("code = %s, want Internal (err: %v)", got, err)
+			}
+		})
+	}
+}
+
+func TestCreateSnapshotForgottenJobIsRetryable(t *testing.T) {
+	// The agent restarted mid-snapshot. Re-driving is safe: readiness is
+	// re-derived from the files on the CSV, which survive the restart, not from
+	// the job record, which does not.
+	server := newControllerServer(newFakeAgent(t))
+
+	_, err := server.CreateSnapshot(context.Background(), createSnapshotRequest("pvc-1", "snap-1"))
+
+	if got := status.Code(err); got != codes.Aborted {
+		t.Fatalf("code = %s, want Aborted (err: %v)", got, err)
+	}
+}
+
+func TestCreateSnapshotUnreachableAgentIsRetryable(t *testing.T) {
+	agent := newFakeAgent(t, succeeded(snapshotJSON("pvc-1~snap-1", "pvc-1", gibibyte, 1770000000, true)))
+	agent.Close()
+	server := newControllerServer(agent)
+
+	_, err := server.CreateSnapshot(context.Background(), createSnapshotRequest("pvc-1", "snap-1"))
+
+	if got := status.Code(err); got != codes.Unavailable {
+		t.Fatalf("code = %s, want Unavailable (err: %v)", got, err)
+	}
+}
+
+func TestDeleteSnapshotEnqueuesUnderTheSnapshotIDAsIdempotencyKeyAndTarget(t *testing.T) {
+	agent := newFakeAgent(t, agentclient.Job{Status: agentclient.JobSucceeded})
+	server := newControllerServer(agent)
+
+	if _, err := server.DeleteSnapshot(context.Background(),
+		&csi.DeleteSnapshotRequest{SnapshotId: "pvc-1~snap-1"}); err != nil {
+		t.Fatalf("DeleteSnapshot: %v", err)
+	}
+
+	enqueued := agent.onlyEnqueued(t)
+	if enqueued.IdempotencyKey != "pvc-1~snap-1" {
+		t.Errorf("idempotency key = %q, want the CSI snapshot id", enqueued.IdempotencyKey)
+	}
+	if enqueued.OperationType != operationDeleteSnapshot {
+		t.Errorf("operation type = %q, want %q", enqueued.OperationType, operationDeleteSnapshot)
+	}
+	if enqueued.Target != "snapshot:pvc-1~snap-1" {
+		t.Errorf("target = %q, want snapshot:pvc-1~snap-1", enqueued.Target)
+	}
+	if enqueued.Payload.SnapshotID != "pvc-1~snap-1" {
+		t.Errorf("payload = %+v, want the snapshot id", enqueued.Payload)
+	}
+}
+
+func TestDeleteSnapshotSucceedsWithoutAResultPayload(t *testing.T) {
+	// A deleted snapshot has nothing left to describe, so the agent sends no
+	// result. Requiring one would fail every successful delete.
+	server := newControllerServer(newFakeAgent(t, agentclient.Job{Status: agentclient.JobSucceeded}))
+
+	resp, err := server.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{SnapshotId: "pvc-1~snap-1"})
+	if err != nil {
+		t.Fatalf("DeleteSnapshot: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("DeleteSnapshot returned no response")
+	}
+}
+
+func TestDeleteSnapshotRequiresASnapshotID(t *testing.T) {
+	agent := newFakeAgent(t, agentclient.Job{Status: agentclient.JobSucceeded})
+	server := newControllerServer(agent)
+
+	_, err := server.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{})
+
+	if got := status.Code(err); got != codes.InvalidArgument {
+		t.Fatalf("code = %s, want InvalidArgument (err: %v)", got, err)
+	}
+	if n := agent.enqueueCount(); n != 0 {
+		t.Errorf("enqueued %d jobs, want none", n)
+	}
+}
+
+func TestDeleteSnapshotTranslatesAgentFailures(t *testing.T) {
+	tests := []struct {
+		name string
+		job  agentclient.Job
+		want codes.Code
+	}{
+		{
+			// Something is holding the snapshot file open. Tell the operator
+			// what to fix rather than dressing it up as a transient fault.
+			name: "the snapshot file is in use",
+			job:  agentclient.Job{Status: agentclient.JobFailed, Error: "file is open", ErrorCode: agentclient.ErrorCodeFailedPrecondition},
+			want: codes.FailedPrecondition,
+		},
+		{
+			name: "unclassified failure",
+			job:  agentclient.Job{Status: agentclient.JobFailed, Error: "CSV said no"},
+			want: codes.Internal,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := newControllerServer(newFakeAgent(t, test.job))
+
+			_, err := server.DeleteSnapshot(context.Background(),
+				&csi.DeleteSnapshotRequest{SnapshotId: "pvc-1~snap-1"})
+
+			if got := status.Code(err); got != test.want {
+				t.Fatalf("code = %s, want %s (err: %v)", got, test.want, err)
+			}
+			if s, _ := status.FromError(err); s.Message() != test.job.Error {
+				t.Errorf("message = %q, want the agent's detail %q", s.Message(), test.job.Error)
+			}
+		})
+	}
+}
+
+func TestDeleteSnapshotForgottenJobIsRetryable(t *testing.T) {
+	// The agent restarted mid-delete. Re-driving is safe: it decides what is
+	// left to do from the CSV, and a snapshot already gone is a success.
+	server := newControllerServer(newFakeAgent(t))
+
+	_, err := server.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{SnapshotId: "pvc-1~snap-1"})
+
+	if got := status.Code(err); got != codes.Aborted {
+		t.Fatalf("code = %s, want Aborted (err: %v)", got, err)
+	}
+}
+
+func TestListSnapshotsReturnsWhatTheAgentEnumerated(t *testing.T) {
+	server := newControllerServer(newFakeAgent(t, succeeded(fmt.Sprintf(
+		`{"entries":[%s,%s],"nextToken":"page-2"}`,
+		snapshotJSON("pvc-1~snap-1", "pvc-1", 10*gibibyte, 1770000000, true),
+		snapshotJSON("pvc-2~snap-2", "pvc-2", 0, 0, false)))))
+
+	resp, err := server.ListSnapshots(context.Background(), &csi.ListSnapshotsRequest{})
+	if err != nil {
+		t.Fatalf("ListSnapshots: %v", err)
+	}
+
+	if got := len(resp.GetEntries()); got != 2 {
+		t.Fatalf("entries = %d, want 2", got)
+	}
+
+	first := resp.GetEntries()[0].GetSnapshot()
+	if first.GetSnapshotId() != "pvc-1~snap-1" || first.GetSourceVolumeId() != "pvc-1" {
+		t.Errorf("first entry = %+v, want the snapshot the agent listed", first)
+	}
+	if first.GetSizeBytes() != 10*gibibyte || first.GetCreationTime().GetSeconds() != 1770000000 {
+		t.Errorf("first entry = %+v, want its size and creation time carried through", first)
+	}
+	if !first.GetReadyToUse() {
+		t.Error("first entry ready_to_use = false, want true")
+	}
+
+	// The same zero-value handling CreateSnapshot applies: unknown stays unknown
+	// rather than becoming a zero-byte snapshot taken in 1970.
+	second := resp.GetEntries()[1].GetSnapshot()
+	if second.GetSizeBytes() != 0 {
+		t.Errorf("second entry size = %d, want it left unset", second.GetSizeBytes())
+	}
+	if second.GetCreationTime() != nil {
+		t.Errorf("second entry creation time = %v, want it left unset", second.GetCreationTime())
+	}
+	if second.GetReadyToUse() {
+		t.Error("second entry ready_to_use = true, want false")
+	}
+
+	// Opaque to this side; only the agent that issued it knows how to resume.
+	if resp.GetNextToken() != "page-2" {
+		t.Errorf("next token = %q, want it passed through", resp.GetNextToken())
+	}
+}
+
+func TestListSnapshotsPassesTheFiltersAndPagingThrough(t *testing.T) {
+	// Filtering and paging happen where the data is. Fetching everything and
+	// discarding most of it here would make a listing cost the whole CSV.
+	agent := newFakeAgent(t, succeeded(`{"entries":[],"nextToken":""}`))
+	server := newControllerServer(agent)
+
+	if _, err := server.ListSnapshots(context.Background(), &csi.ListSnapshotsRequest{
+		SnapshotId:     "pvc-1~snap-1",
+		SourceVolumeId: "pvc-1",
+		StartingToken:  "page-2",
+		MaxEntries:     25,
+	}); err != nil {
+		t.Fatalf("ListSnapshots: %v", err)
+	}
+
+	enqueued := agent.onlyEnqueued(t)
+	if enqueued.OperationType != operationListSnapshots {
+		t.Errorf("operation type = %q, want %q", enqueued.OperationType, operationListSnapshots)
+	}
+	// A constant target: a read-only enumeration serializes against nothing, but
+	// the agent's job store requires a target all the same.
+	if enqueued.Target != "snapshots" {
+		t.Errorf("target = %q, want snapshots", enqueued.Target)
+	}
+	payload := enqueued.Payload
+	if payload.SnapshotID != "pvc-1~snap-1" || payload.SourceVolumeID != "pvc-1" ||
+		payload.StartingToken != "page-2" || payload.MaxEntries != 25 {
+		t.Errorf("payload = %+v, want every CSI filter carried through", payload)
+	}
+}
+
+func TestListSnapshotsKeysDifferentPagesSeparately(t *testing.T) {
+	// A listing is about no single object, so the filter and page tuple is the
+	// key. Two pages of one listing have different answers and must not dedupe
+	// onto each other; two identical requests may.
+	first := &csi.ListSnapshotsRequest{SourceVolumeId: "pvc-1", MaxEntries: 25}
+	second := &csi.ListSnapshotsRequest{SourceVolumeId: "pvc-1", MaxEntries: 25, StartingToken: "page-2"}
+
+	if listSnapshotsKey(first) == listSnapshotsKey(second) {
+		t.Errorf("two pages shared the key %q", listSnapshotsKey(first))
+	}
+	if listSnapshotsKey(first) != listSnapshotsKey(&csi.ListSnapshotsRequest{SourceVolumeId: "pvc-1", MaxEntries: 25}) {
+		t.Error("two identical listings got different keys")
+	}
+	// The delimiter appearing inside a filter must not let one tuple collide
+	// with another, the same hazard publishKey escapes for.
+	if listSnapshotsKey(&csi.ListSnapshotsRequest{SnapshotId: "a/b"}) ==
+		listSnapshotsKey(&csi.ListSnapshotsRequest{SnapshotId: "a", SourceVolumeId: "b"}) {
+		t.Error("an embedded delimiter collided with a different filter tuple")
+	}
+}
+
+func TestListSnapshotsFilterMatchingNothingIsAnEmptyList(t *testing.T) {
+	// CSI is explicit that a snapshot_id matching nothing is an empty listing,
+	// not NOT_FOUND — and external-snapshotter uses this RPC to confirm a
+	// snapshot has gone after a delete, so an error here would turn a completed
+	// deletion into a stuck one.
+	server := newControllerServer(newFakeAgent(t, succeeded(`{"entries":[],"nextToken":""}`)))
+
+	resp, err := server.ListSnapshots(context.Background(),
+		&csi.ListSnapshotsRequest{SnapshotId: "pvc-1~gone"})
+	if err != nil {
+		t.Fatalf("ListSnapshots: %v", err)
+	}
+
+	if got := len(resp.GetEntries()); got != 0 {
+		t.Errorf("entries = %d, want none", got)
+	}
+	if resp.GetNextToken() != "" {
+		t.Errorf("next token = %q, want empty for a complete listing", resp.GetNextToken())
+	}
+}
+
+func TestListSnapshotsInvalidStartingTokenIsAborted(t *testing.T) {
+	// CSI fixes ABORTED for this one, and the difference is not cosmetic: a
+	// paginating client reads ABORTED as "start the listing over" and
+	// INVALID_ARGUMENT as "this request was malformed", so the wrong code has it
+	// re-sending the same rejected token forever.
+	server := newControllerServer(newFakeAgent(t, agentclient.Job{
+		Status:    agentclient.JobFailed,
+		Error:     "token is not parseable",
+		ErrorCode: agentclient.ErrorCodeInvalidArgument,
+	}))
+
+	_, err := server.ListSnapshots(context.Background(),
+		&csi.ListSnapshotsRequest{StartingToken: "nonsense"})
+
+	if got := status.Code(err); got != codes.Aborted {
+		t.Fatalf("code = %s, want Aborted (err: %v)", got, err)
+	}
+}
+
+func TestListSnapshotsRejectedArgumentWithoutATokenStaysInvalidArgument(t *testing.T) {
+	// With no token there is nothing for the agent to have found unparseable, so
+	// an InvalidArgument is about something else and must not be re-coded into a
+	// token error the caller would then hunt for.
+	server := newControllerServer(newFakeAgent(t, agentclient.Job{
+		Status:    agentclient.JobFailed,
+		Error:     "max entries must not be negative",
+		ErrorCode: agentclient.ErrorCodeInvalidArgument,
+	}))
+
+	_, err := server.ListSnapshots(context.Background(), &csi.ListSnapshotsRequest{MaxEntries: -1})
+
+	if got := status.Code(err); got != codes.InvalidArgument {
+		t.Fatalf("code = %s, want InvalidArgument (err: %v)", got, err)
+	}
+}
+
+func TestListSnapshotsRejectsAnUnusableResult(t *testing.T) {
+	// An empty listing still arrives as a result body with an empty array, so a
+	// body that will not decode is a broken agent — reporting it as "no
+	// snapshots" would tell a caller they were all deleted.
+	tests := []struct {
+		name string
+		job  agentclient.Job
+	}{
+		{name: "not decodable", job: succeeded(`"nonsense"`)},
+		{name: "no result at all", job: agentclient.Job{Status: agentclient.JobSucceeded}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := newControllerServer(newFakeAgent(t, test.job))
+
+			_, err := server.ListSnapshots(context.Background(), &csi.ListSnapshotsRequest{})
+
+			if got := status.Code(err); got != codes.Internal {
+				t.Fatalf("code = %s, want Internal (err: %v)", got, err)
+			}
+		})
+	}
+}
+
+func TestListSnapshotsForgottenJobIsRetryable(t *testing.T) {
+	server := newControllerServer(newFakeAgent(t))
+
+	_, err := server.ListSnapshots(context.Background(), &csi.ListSnapshotsRequest{})
+
+	if got := status.Code(err); got != codes.Aborted {
+		t.Fatalf("code = %s, want Aborted (err: %v)", got, err)
+	}
+}
+
 func TestPublishKeyDoesNotCollideAcrossAnEmbeddedSlash(t *testing.T) {
 	if publishKey("a/b", "c") == publishKey("a", "b/c") {
 		t.Fatalf("publishKey(%q, %q) collided with publishKey(%q, %q)", "a/b", "c", "a", "b/c")
@@ -1365,6 +1926,20 @@ func expandRequest(volumeID string, requiredBytes, limitBytes int64) *csi.Contro
 func expanded(actualSizeBytes int64, alreadyLargeEnough bool) agentclient.Job {
 	return succeeded(fmt.Sprintf(
 		`{"actualSizeBytes":%d,"alreadyLargeEnough":%t}`, actualSizeBytes, alreadyLargeEnough))
+}
+
+func createSnapshotRequest(sourceVolumeID, name string) *csi.CreateSnapshotRequest {
+	return &csi.CreateSnapshotRequest{SourceVolumeId: sourceVolumeID, Name: name}
+}
+
+// snapshotJSON is one snapshot as the agent describes it. Shared between the
+// CreateSnapshot result and a ListSnapshots entry because the agent sends the
+// same shape in both places — a snapshot must not describe itself differently
+// depending on which RPC asked.
+func snapshotJSON(snapshotID, sourceVolumeID string, sizeBytes, creationTimeUnixSeconds int64, readyToUse bool) string {
+	return fmt.Sprintf(
+		`{"snapshotId":%q,"sourceVolumeId":%q,"sizeBytes":%d,"creationTimeUnixSeconds":%d,"readyToUse":%t}`,
+		snapshotID, sourceVolumeID, sizeBytes, creationTimeUnixSeconds, readyToUse)
 }
 
 // attached is a job that put the disk on a VM at the given address.
@@ -1418,10 +1993,15 @@ type enqueuedJob struct {
 	// The union of every operation's payload, so one decode covers whichever
 	// one the test under way enqueued.
 	Payload struct {
-		Name      string `json:"name"`
-		SizeBytes int64  `json:"sizeBytes"`
-		VolumeID  string `json:"volumeId"`
-		NodeID    string `json:"nodeId"`
+		Name           string `json:"name"`
+		SizeBytes      int64  `json:"sizeBytes"`
+		VolumeID       string `json:"volumeId"`
+		NodeID         string `json:"nodeId"`
+		SourceVolumeID string `json:"sourceVolumeId"`
+		SnapshotName   string `json:"snapshotName"`
+		SnapshotID     string `json:"snapshotId"`
+		StartingToken  string `json:"startingToken"`
+		MaxEntries     int32  `json:"maxEntries"`
 	} `json:"payload"`
 }
 
