@@ -43,19 +43,23 @@ func newTestNodeServer(t *testing.T) (*nodeServer, *mount.FakeMounter, string) {
 	return newNodeServer(driver, safe, sysRoot, devRoot), fakeMounter, sysRoot
 }
 
-// newFakeExecAlreadyFormatted scripts the two commands
-// SafeFormatAndMount.FormatAndMount runs against an rw target that
-// GetDiskFormat (blkid) reports as already carrying defaultFsType: blkid
-// itself, then the fsck repair check formatAndMountSensitive runs for any
-// already-formatted rw mount. Neither a real mkfs nor a real fsck binary is
-// needed in the test image as a result. A test exercising a read-only stage,
-// where formatAndMountSensitive skips the fsck step, only consumes the first
-// scripted command.
+// newFakeExecAlreadyFormatted scripts the four commands a full read-write
+// NodeStageVolume runs against a target that GetDiskFormat (blkid) reports as
+// already carrying defaultFsType: blkid itself, then the fsck repair check
+// formatAndMountSensitive runs for any already-formatted rw mount, then the
+// blkid ResizeFs.Resize uses to pick a resize tool, then that tool
+// (resize2fs) growing the now-mounted filesystem to match the device. Neither
+// a real mkfs nor a real fsck nor a real resize2fs binary is needed in the
+// test image as a result. A test exercising a read-only stage, where
+// formatAndMountSensitive skips the fsck step and stageVolume skips the
+// resize altogether, only consumes the first scripted command.
 func newFakeExecAlreadyFormatted() utilexec.Interface {
 	return &testingexec.FakeExec{
 		CommandScript: []testingexec.FakeCommandAction{
-			scriptedCommand(nil, "TYPE="+defaultFsType+"\n", nil), // blkid
+			scriptedCommand(nil, "TYPE="+defaultFsType+"\n", nil), // blkid (FormatAndMount)
 			scriptedCommand(nil, "", nil),                         // fsck
+			scriptedCommand(nil, "TYPE="+defaultFsType+"\n", nil), // blkid (ResizeFs.Resize)
+			scriptedCommand(nil, "", nil),                         // resize2fs
 		},
 	}
 }

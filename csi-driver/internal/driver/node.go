@@ -60,8 +60,9 @@ const (
 	defaultFsType = "ext4"
 
 	// stageOperationBudget bounds how long NodeStageVolume waits for device
-	// resolution (vmbusdisk.Resolve) plus format-and-mount before handing
-	// back a retryable status. Neither step can be cancelled once under way
+	// resolution (vmbusdisk.Resolve) plus format-and-mount plus the
+	// filesystem grow that follows it before handing back a retryable
+	// status. None of those steps can be cancelled once under way
 	// — a mount syscall has no cancellation token, the same limit CSI
 	// Spec.md notes for DeleteVolume's File.Delete — so giving up on the
 	// wait does not stop the work. It keeps running in a goroutine that
@@ -271,6 +272,23 @@ func (s *nodeServer) stageVolume(controllerID string, lun int32, target, fsType 
 
 	if err := s.mounter.FormatAndMount(devicePath, target, fsType, options); err != nil {
 		return status.Errorf(codes.Internal, "formatting/mounting %s at %s: %v", devicePath, target, err)
+	}
+
+	// A restore from a snapshot mounts a filesystem that already exists on
+	// disk, one sized for the snapshot's source volume rather than this
+	// VHDX — CreateVolume's restore path already grew the VHDX to the
+	// requested size, but nothing grows the filesystem inside it to match.
+	// Growing here, every stage, catches that case the same way
+	// NodeExpandVolume grows a filesystem after ControllerExpandVolume grows
+	// the disk; it costs nothing extra when the filesystem already fills the
+	// device, which is true for the fsType-defaulted mkfs FormatAndMount just
+	// ran. Skipped read-only: there is no writable device to grow into, and
+	// growing a filesystem the caller asked to mount read-only would be a
+	// change the caller did not ask for.
+	if !readOnly {
+		if _, err := mount.NewResizeFs(s.mounter.Exec).Resize(devicePath, target); err != nil {
+			return status.Errorf(codes.Internal, "growing the filesystem on %s mounted at %s: %v", devicePath, target, err)
+		}
 	}
 	return nil
 }
