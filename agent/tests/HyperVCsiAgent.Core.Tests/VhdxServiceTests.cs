@@ -29,16 +29,17 @@ public sealed class VhdxServiceTests : IDisposable
 
     /// <summary>
     /// Seeds a finished snapshot directly on the CSV, the way a prior
-    /// CreateSnapshot would have left one. The virtual size travels in the
-    /// file's own content, which is what FakeVirtualDiskManager's fallback
-    /// reads for a file it did not create itself - and what makes a
-    /// byte-for-byte copy of it carry the same size without a lookup table on
-    /// either side.
+    /// CreateSnapshot would have left one. The virtual size and disk
+    /// identifier travel in the file's own VHDX metadata, which is what
+    /// both FakeVirtualDiskManager's fallback and VhdxDiskIdentity read.
+    /// FakeDiskCopier copies the binary byte-for-byte, so the copy also
+    /// carries a valid structure and RegenerateAsync can patch it in place.
     /// </summary>
     private void WriteSnapshot(string snapshotId, long virtualSizeBytes)
     {
         Directory.CreateDirectory(_snapshotsRoot);
-        File.WriteAllText(SnapshotPath(snapshotId), $"fake vhdx virtualSize={virtualSizeBytes}");
+        File.WriteAllBytes(SnapshotPath(snapshotId),
+            MinimalVhdxBuilder.Build(virtualSizeBytes, Guid.NewGuid()));
     }
 
     private void WriteCopyingMarker(string snapshotId)
@@ -1265,6 +1266,16 @@ public sealed class VhdxServiceTests : IDisposable
                 // resizes it.
                 if (File.Exists(path))
                 {
+                    // Try as a minimal VHDX first (the format WriteSnapshot uses).
+                    try
+                    {
+                        return await VhdxDiskIdentity.ReadVirtualDiskSizeAsync(path, cancellationToken);
+                    }
+                    catch (InvalidDataException)
+                    {
+                        // Not a minimal VHDX; try the legacy text format.
+                    }
+
                     var contents = await File.ReadAllTextAsync(path, cancellationToken);
                     var marker = "virtualSize=";
                     var index = contents.IndexOf(marker, StringComparison.Ordinal);
