@@ -551,6 +551,15 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             }
         }
 
+        // No other disk to be behind, so this volume is simply not attached -
+        // answered without the service lookup the walk below would need.
+        if (otherDisks.Count == 0)
+        {
+            return new VolumeAttachment(VolumeAttachmentKind.NotAttached, null);
+        }
+
+        using var imageService = GetImageManagementService(scope, deadline, cancellationToken);
+
         foreach (var attached in otherDisks)
         {
             var descendant = attached;
@@ -560,7 +569,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                if (ParentPathOf(scope, descendant, deadline, cancellationToken) is not { } parent)
+                if (ParentPathOf(imageService, descendant, deadline, cancellationToken) is not { } parent)
                 {
                     break;
                 }
@@ -1050,6 +1059,15 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         CimDeadline deadline,
         CancellationToken cancellationToken)
     {
+        // Nothing else is attached, so there is no chain to walk and no reason to
+        // go asking the host for the service that would walk it.
+        if (otherDisks.Count == 0)
+        {
+            return;
+        }
+
+        using var service = GetImageManagementService(scope, deadline, cancellationToken);
+
         foreach (var attached in otherDisks)
         {
             var descendant = attached;
@@ -1070,7 +1088,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
 
                 // A disk with no parent is not a differencing disk, which ends
                 // this candidate rather than the search.
-                if (ParentPathOf(scope, descendant, deadline, cancellationToken) is not { } parent)
+                if (ParentPathOf(service, descendant, deadline, cancellationToken) is not { } parent)
                 {
                     break;
                 }
@@ -1097,12 +1115,19 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     }
 
     /// <summary>
-    /// A VHDX's parent, or null when it has none - which is also how a plain disk
-    /// is told from a differencing one.
+    /// The host's <c>Msvm_ImageManagementService</c> singleton, addressed the
+    /// System.Management way - as opposed to the
+    /// <see cref="GetImageManagementService(CimSession, CimDeadline, CancellationToken)"/>
+    /// overload, which answers the same question for the MI half of this class.
     /// </summary>
-    private static string? ParentPathOf(
+    /// <remarks>
+    /// Resolved once per chain walk and handed to <see cref="ParentPathOf"/>
+    /// rather than resolved inside it: a walk asks for a parent once per disk
+    /// per hop, and re-running this query on every one of those was a remote
+    /// round-trip per hop for an answer that cannot change during the walk.
+    /// </remarks>
+    private static ManagementObject GetImageManagementService(
         ManagementScope scope,
-        string vhdxPath,
         CimDeadline deadline,
         CancellationToken cancellationToken)
     {
@@ -1112,10 +1137,21 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         using var services = WithDeadline(
             deadline, cancellationToken, "locating Msvm_ImageManagementService", searcher.Get);
 
-        using var service = services.Cast<ManagementObject>().FirstOrDefault()
+        return services.Cast<ManagementObject>().FirstOrDefault()
             ?? throw new InvalidOperationException(
                 $"no Msvm_ImageManagementService in {scope.Path}; is the Hyper-V role installed on that host?");
+    }
 
+    /// <summary>
+    /// A VHDX's parent, or null when it has none - which is also how a plain disk
+    /// is told from a differencing one.
+    /// </summary>
+    private static string? ParentPathOf(
+        ManagementObject service,
+        string vhdxPath,
+        CimDeadline deadline,
+        CancellationToken cancellationToken)
+    {
         using var inParams = service.GetMethodParameters("GetVirtualHardDiskSettingData");
         inParams["Path"] = vhdxPath;
 
