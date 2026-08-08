@@ -1268,7 +1268,8 @@ public sealed class SnapshotService : ISnapshotService
         // external-snapshotter needs, having recorded it. A restarted copy does
         // legitimately move it: the abandoned attempt's marker is discarded, and
         // the new one captures a genuinely later point in time.
-        var creationTime = ReadCreationTime(readyToUse ? snapshotPath : copyingPath);
+        var creationTime = await ReadCreationTimeAsync(readyToUse ? snapshotPath : copyingPath, cancellationToken)
+            .ConfigureAwait(false);
 
         var sizeFrom = readyToUse ? snapshotPath : sourcePath;
         var sizeBytes = sizeFrom is null
@@ -1292,9 +1293,10 @@ public sealed class SnapshotService : ISnapshotService
         // snapshot is the one guaranteed to still be there and guaranteed not to
         // be attached to anything.
         var sizeBytes = await ReadVirtualSizeAsync(path, remainingBudget, cancellationToken).ConfigureAwait(false);
+        var creationTime = await ReadCreationTimeAsync(path, cancellationToken).ConfigureAwait(false);
 
         return new SnapshotResult(
-            file.SnapshotId, file.SourceVolumeId, sizeBytes, ReadCreationTime(path), ReadyToUse: true);
+            file.SnapshotId, file.SourceVolumeId, sizeBytes, creationTime, ReadyToUse: true);
     }
 
     /// <summary>
@@ -1354,6 +1356,20 @@ public sealed class SnapshotService : ISnapshotService
     }
 
     /// <summary>
+    /// How many times <see cref="ReadCreationTimeAsync"/> re-reads a file that
+    /// exists but has not yet answered a real creation time, and how long it
+    /// waits between attempts. The same shape as
+    /// <c>CimHyperVHostClient.MaxAttachmentClassificationAttempts</c> and
+    /// <c>CheckpointDiscoveryPollInterval</c>, for the same reason: a second or
+    /// so is enough to ride out a metadata lag that clears on its own, without
+    /// being the kind of wait that should ever mask a genuine, permanent
+    /// failure to read it.
+    /// </summary>
+    private const int CreationTimeReadAttempts = 5;
+
+    private static readonly TimeSpan CreationTimeReadRetryInterval = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>
     /// A file's creation time as Unix seconds, or 0 when it has none to report.
     /// </summary>
     /// <remarks>
@@ -1361,25 +1377,61 @@ public sealed class SnapshotService : ISnapshotService
     /// failing, so the existence check is what keeps a missing marker from being
     /// reported as a real - and extremely old - timestamp. 0 travels as
     /// "unknown" and the Go side omits the field entirely.
+    ///
+    /// The retry loop exists for a narrower case than "the file is not there
+    /// yet": a CSV can answer <c>File.Exists</c> true for a file whose creation
+    /// time has not finished propagating, the same beat of lag
+    /// <c>CimHyperVHostClient</c> already retries around for a checkpoint's
+    /// disk re-point - and <c>GetFileAttributesEx</c> under that condition
+    /// behaves exactly like the "not there" case above, answering 1601-01-01
+    /// rather than failing, so it reads as 0 too. For a snapshot still copying
+    /// that would self-correct on the next poll and cost nothing worth
+    /// retrying over. For the published file, once <c>ReadyToUse</c> is true
+    /// external-snapshotter never asks again - see this file's own remarks on
+    /// <see cref="DescribeAsync"/> - so a 0 caught in that exact window would
+    /// otherwise be permanent, not merely wrong for a moment.
     /// </remarks>
-    private static long ReadCreationTime(string path)
+    private async Task<long> ReadCreationTimeAsync(string path, CancellationToken cancellationToken)
     {
-        try
+        for (var attempt = 1; attempt <= CreationTimeReadAttempts; attempt++)
         {
             if (!File.Exists(path))
             {
                 return 0;
             }
 
-            var created = new DateTimeOffset(File.GetCreationTimeUtc(path), TimeSpan.Zero).ToUnixTimeSeconds();
-            return created > 0 ? created : 0;
+            long created = 0;
+            try
+            {
+                created = new DateTimeOffset(File.GetCreationTimeUtc(path), TimeSpan.Zero).ToUnixTimeSeconds();
+            }
+            catch (Exception)
+            {
+                // Fall through to the retry/give-up logic below rather than
+                // returning here: a transient read failure deserves the same
+                // second-or-so of patience as the sentinel-zero case, not an
+                // immediate "unknown".
+            }
+
+            if (created > 0)
+            {
+                return created;
+            }
+
+            if (attempt < CreationTimeReadAttempts)
+            {
+                await Task.Delay(CreationTimeReadRetryInterval, cancellationToken).ConfigureAwait(false);
+            }
         }
-        catch (Exception)
-        {
-            // A timestamp is not worth failing a snapshot over, and "unknown" is
-            // a value this protocol already carries.
-            return 0;
-        }
+
+        // Logged, unlike a plain "the file is not there" 0: this is a file
+        // File.Exists already confirmed is there, still refusing to answer
+        // its creation time after a second of retrying, which is a fact worth
+        // an operator seeing rather than a routine "not ready yet".
+        _logger.LogWarning(
+            "{Path} exists but did not report a creation time after {Attempts} attempts; reporting it as unknown",
+            path, CreationTimeReadAttempts);
+        return 0;
     }
 
     /// <summary>

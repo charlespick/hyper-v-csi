@@ -477,6 +477,40 @@ public sealed class SnapshotServiceTests : IDisposable
         Assert.False(snapshotPublishedBeforeDestroy);
     }
 
+    [WindowsOnlyFact]
+    public async Task CreateAsync_AttachedVolume_CreationTimeComesFromTheMarkerAndSurvivesTheCheckpointMergeAndPublish()
+    {
+        // The checkpoint-copy path's counterpart to
+        // CreateAsync_CreationTimeComesFromTheMarkerAndSurvivesThePublish: the
+        // checkpoint's merge runs between the copy finishing and the publish
+        // rename (see RunCopyAsync's own remarks for why that order), which is
+        // exactly the extra step this path has that the unattached one does
+        // not - so this pins the same "stable across repeat calls" guarantee
+        // with that step in the way.
+        var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient();
+        var harness = NewHarness(cluster: cluster, host: host);
+        WriteVolume("pvc-1", 4096);
+        using var release = new SemaphoreSlim(0);
+        harness.Copier.DuringCopy = _ => release.WaitAsync();
+
+        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", "node-a", CancellationToken.None);
+        await WaitForAsync(() => File.Exists(MarkerPath("pvc-1~snapshot-abc")));
+
+        var whileCopying = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", "node-a", CancellationToken.None);
+        Assert.False(whileCopying.ReadyToUse);
+        Assert.True(whileCopying.CreationTimeUnixSeconds > 0);
+
+        release.Release();
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+        await WaitForAsync(() => host.DestroyedCheckpointElementNames.Count == 1);
+
+        var published = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", "node-a", CancellationToken.None);
+
+        Assert.True(published.ReadyToUse);
+        Assert.Equal(whileCopying.CreationTimeUnixSeconds, published.CreationTimeUnixSeconds);
+    }
+
     [Fact]
     public async Task CreateAsync_AttachedVolumeNotConfiguredForProductionOnlyCheckpoints_FailsAsFailedPrecondition()
     {
