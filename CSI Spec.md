@@ -18,11 +18,11 @@ cluster or Hyper-V host.
 | ControllerPublishVolume | Controller | Attaches a volume to a specified node. | Volume ID + node ID | Tested — attaches against a real cluster |
 | ControllerUnpublishVolume | Controller | Detaches a volume from a specified node. | Volume ID + node ID | Tested — detaches against a real cluster |
 | ValidateVolumeCapabilities | Controller | Confirms a volume supports the requested access mode and type. | Volume ID (lookup only) | Tested — confirms a real volume, NOT_FOUND for one that doesn't exist, unconfirmed for an unsupported access mode |
-| ControllerGetCapabilities | Controller | Reports which controller RPCs this plugin implements. | N/A | Over advertising snapshots, and only snapshots |
+| ControllerGetCapabilities | Controller | Reports which controller RPCs this plugin implements. | N/A | Honest — every RPC it names is built |
 | ControllerExpandVolume | Controller | Grows a volume's underlying storage. | Volume ID | Tested — grows a volume attached to a running VM, via that VM's own host |
-| CreateSnapshot | Controller | Creates a point-in-time snapshot of a volume. | Snapshot name | Not started |
-| DeleteSnapshot | Controller | Removes a previously created snapshot. | Snapshot ID | Not started |
-| ListSnapshots | Controller | Lists existing snapshots known to the plugin. | Snapshot ID or source volume ID (optional filter, lookup only) | Not started |
+| CreateSnapshot | Controller | Creates a point-in-time snapshot of a volume. | Snapshot name | Tested — creates a real checkpoint-backed snapshot of both an unattached and an attached (Production-only checkpoint) volume against a real cluster |
+| DeleteSnapshot | Controller | Removes a previously created snapshot. | Snapshot ID | Tested — against a real cluster, including the live-merge path for an attached-volume snapshot |
+| ListSnapshots | Controller | Lists existing snapshots known to the plugin. | Snapshot ID or source volume ID (optional filter, lookup only) | Tested — against a real cluster |
 | NodeStageVolume | Node | Makes a volume ready for use on a node (format and node-wide mount). | Volume ID + staging target path | Tested — formats and mounts against a real cluster |
 | NodeUnstageVolume | Node | Undoes NodeStageVolume, releasing the node-wide mount. | Volume ID + staging target path | Tested — unmounts against a real cluster |
 | NodePublishVolume | Node | Bind-mounts a staged volume into a specific pod's path. | Volume ID + target path | Tested — bind-mounts against a real cluster |
@@ -32,13 +32,11 @@ cluster or Hyper-V host.
 | NodeGetCapabilities | Node | Reports which node RPCs this plugin implements. | N/A | Tested — kubelet reads it before every stage |
 | NodeGetInfo | Node | Reports node identity/topology info used for scheduling and attach decisions. | N/A | Tested — reports the Hyper-V VM ID against a real cluster |
 
-**Over advertising snapshots, and only snapshots.** A capability list is a
-declaration — constants, not code — so it can name an RPC that isn't there, and
-for most of this project's life all three lists did: they described the finished
-driver rather than today's code, and a sidecar reading one would go on to call
-something that returned Unimplemented. Two of the three are now honest, and the
-third is honest about everything except the one feature this driver has
-deliberately not built:
+**Nothing is over advertised.** A capability list is a declaration —
+constants, not code — so it can name an RPC that isn't there, and for most of
+this project's life all three lists did: they described the finished driver
+rather than today's code, and a sidecar reading one would go on to call
+something that returned Unimplemented. All three are now honest:
 
 - `GetPluginCapabilities` — honest. Volume expansion (ONLINE) is the only thing
   it claims, and both halves of one are built. It correctly omits
@@ -46,23 +44,21 @@ deliberately not built:
 - `NodeGetCapabilities` — honest. Every RPC it names is built:
   STAGE_UNSTAGE_VOLUME, GET_VOLUME_STATS and EXPAND_VOLUME.
 - `ControllerGetCapabilities` — claims CREATE_DELETE_SNAPSHOT and
-  LIST_SNAPSHOTS, and neither is built: CreateSnapshot, DeleteSnapshot and
-  ListSnapshots all return Unimplemented, as does restore-from-snapshot through
+  LIST_SNAPSHOTS, and both are built: CreateSnapshot, DeleteSnapshot and
+  ListSnapshots all do real work now, as does restore-from-snapshot through
   CreateVolume's `VolumeContentSource`. CREATE_DELETE_VOLUME,
-  PUBLISH_UNPUBLISH_VOLUME and EXPAND_VOLUME are not overstated: both halves of
-  each are built.
+  PUBLISH_UNPUBLISH_VOLUME and EXPAND_VOLUME were never overstated either:
+  both halves of each are built.
 
-That last one costs nothing today, because nothing calls the RPCs it names.
-external-snapshotter is the only thing that would, the chart deliberately does
-not deploy it, and without the sidecar a VolumeSnapshotClass has nothing to act
-on. It becomes real the moment someone deploys the sidecar on the strength of
-the list, which is why it still has to be closed one way or the other before
-first release: trim the two capabilities, or land the RPCs.
+The chart still deploys external-snapshotter behind
+`controller.snapshotter.enabled`, defaulted off — that's a deployment caution
+now that the RPCs behind it have run against a real cluster but are still the
+newest and least exercised of them, not a statement that the capability is
+dishonest.
 
-Everything else on the checklist is built, which is what makes this section
-short now rather than gone. What is left is one deliberately deferred feature,
-named as such, instead of a list quietly outrunning the code. The section stays
-anyway: it exists to catch the next list that does.
+Everything on the checklist is built, which is what makes this section short
+now rather than gone. The section stays anyway: it exists to catch the next
+list that does.
 
 **Probe checks the one dependency every controller RPC has, and nothing beyond
 it.** That is the agent: a `GET /healthz` against the address this driver was
