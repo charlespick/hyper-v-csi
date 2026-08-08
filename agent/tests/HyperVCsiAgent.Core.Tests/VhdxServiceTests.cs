@@ -1266,14 +1266,15 @@ public sealed class VhdxServiceTests : IDisposable
                 // resizes it.
                 if (File.Exists(path))
                 {
-                    // Try as a minimal VHDX first (the format WriteSnapshot uses).
-                    try
+                    // Try as a minimal VHDX when the file is large enough to
+                    // carry one. A file shorter than the Region Table offset
+                    // cannot be a VHDX, so skip straight to the legacy text
+                    // fallback rather than letting the parser emit an opaque
+                    // error about a corrupt file that was never meant to be one.
+                    const long RegionTable1MinSize = 0x30000 + 16; // sig + header
+                    if (new FileInfo(path).Length >= RegionTable1MinSize)
                     {
                         return await VhdxDiskIdentity.ReadVirtualDiskSizeAsync(path, cancellationToken);
-                    }
-                    catch (InvalidDataException)
-                    {
-                        // Not a minimal VHDX; try the legacy text format.
                     }
 
                     var contents = await File.ReadAllTextAsync(path, cancellationToken);
