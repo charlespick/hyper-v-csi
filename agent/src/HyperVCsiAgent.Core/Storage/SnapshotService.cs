@@ -1268,7 +1268,8 @@ public sealed class SnapshotService : ISnapshotService
         // external-snapshotter needs, having recorded it. A restarted copy does
         // legitimately move it: the abandoned attempt's marker is discarded, and
         // the new one captures a genuinely later point in time.
-        var creationTime = await ReadCreationTimeAsync(readyToUse ? snapshotPath : copyingPath, cancellationToken)
+        var creationTime = await ReadCreationTimeAsync(
+                readyToUse ? snapshotPath : copyingPath, knownToExist: readyToUse, cancellationToken)
             .ConfigureAwait(false);
 
         var sizeFrom = readyToUse ? snapshotPath : sourcePath;
@@ -1293,7 +1294,7 @@ public sealed class SnapshotService : ISnapshotService
         // snapshot is the one guaranteed to still be there and guaranteed not to
         // be attached to anything.
         var sizeBytes = await ReadVirtualSizeAsync(path, remainingBudget, cancellationToken).ConfigureAwait(false);
-        var creationTime = await ReadCreationTimeAsync(path, cancellationToken).ConfigureAwait(false);
+        var creationTime = await ReadCreationTimeAsync(path, knownToExist: true, cancellationToken).ConfigureAwait(false);
 
         return new SnapshotResult(
             file.SnapshotId, file.SourceVolumeId, sizeBytes, creationTime, ReadyToUse: true);
@@ -1372,30 +1373,44 @@ public sealed class SnapshotService : ISnapshotService
     /// <summary>
     /// A file's creation time as Unix seconds, or 0 when it has none to report.
     /// </summary>
+    /// <param name="knownToExist">
+    /// True when the caller has already established, moments earlier and by a
+    /// different call (its own <c>File.Exists</c>, or a directory listing that
+    /// enumerated this exact path), that the file is there. In that case this
+    /// method never re-checks existence itself: on a CSV, that second
+    /// existence check is a separate query that can answer stale-false for a
+    /// file the first query just confirmed - the same class of lag
+    /// <c>CimHyperVHostClient</c> already retries around for a checkpoint's
+    /// disk re-point, just hitting <c>File.Exists</c>/<c>GetFileAttributesEx</c>
+    /// instead of a CIM call - and unlike the sentinel-timestamp case below, a
+    /// stale-false existence check used to return immediately, skipping the
+    /// retry loop and the warning entirely. False means the caller has no such
+    /// guarantee (e.g. a copy's marker that may genuinely not have been
+    /// written yet), so a single miss there is left to return 0 at once, same
+    /// as always - retrying it would turn every fast "still copying" poll into
+    /// a second-long wait for no reason.
+    /// </param>
     /// <remarks>
     /// Windows answers 1601-01-01 for a file that is not there rather than
-    /// failing, so the existence check is what keeps a missing marker from being
+    /// failing, so that sentinel is what keeps a missing marker from being
     /// reported as a real - and extremely old - timestamp. 0 travels as
     /// "unknown" and the Go side omits the field entirely.
     ///
-    /// The retry loop exists for a narrower case than "the file is not there
-    /// yet": a CSV can answer <c>File.Exists</c> true for a file whose creation
-    /// time has not finished propagating, the same beat of lag
-    /// <c>CimHyperVHostClient</c> already retries around for a checkpoint's
-    /// disk re-point - and <c>GetFileAttributesEx</c> under that condition
-    /// behaves exactly like the "not there" case above, answering 1601-01-01
-    /// rather than failing, so it reads as 0 too. For a snapshot still copying
-    /// that would self-correct on the next poll and cost nothing worth
-    /// retrying over. For the published file, once <c>ReadyToUse</c> is true
+    /// The retry loop covers a narrower case than "the file is not there yet":
+    /// a CSV can answer <c>GetCreationTimeUtc</c> with that same 1601-01-01
+    /// sentinel for a file whose creation time has not finished propagating,
+    /// even though it undeniably exists. For a snapshot still copying that
+    /// would self-correct on the next poll and cost nothing worth retrying
+    /// over. For the published file, once <c>ReadyToUse</c> is true
     /// external-snapshotter never asks again - see this file's own remarks on
     /// <see cref="DescribeAsync"/> - so a 0 caught in that exact window would
     /// otherwise be permanent, not merely wrong for a moment.
     /// </remarks>
-    private async Task<long> ReadCreationTimeAsync(string path, CancellationToken cancellationToken)
+    private async Task<long> ReadCreationTimeAsync(string path, bool knownToExist, CancellationToken cancellationToken)
     {
         for (var attempt = 1; attempt <= CreationTimeReadAttempts; attempt++)
         {
-            if (!File.Exists(path))
+            if (!knownToExist && !File.Exists(path))
             {
                 return 0;
             }
@@ -1425,9 +1440,9 @@ public sealed class SnapshotService : ISnapshotService
         }
 
         // Logged, unlike a plain "the file is not there" 0: this is a file
-        // File.Exists already confirmed is there, still refusing to answer
-        // its creation time after a second of retrying, which is a fact worth
-        // an operator seeing rather than a routine "not ready yet".
+        // the caller already confirmed is there, still refusing to answer its
+        // creation time after a second of retrying, which is a fact worth an
+        // operator seeing rather than a routine "not ready yet".
         _logger.LogWarning(
             "{Path} exists but did not report a creation time after {Attempts} attempts; reporting it as unknown",
             path, CreationTimeReadAttempts);
