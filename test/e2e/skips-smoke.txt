@@ -18,14 +18,6 @@
 # test evicts a running pod to take its volume.
 \[Serial\]
 
-# Two volumes per pod, two pods per volume, and the cross-node cases that move
-# a volume from one VM to another by detaching and reattaching it. The most
-# valuable suite in the run for a driver like this one and the first thing to
-# turn on — drop this line, or run the full profile, once the smoke profile is
-# green. Overlaps with [Slow] above, which already covers most of it; named
-# separately so turning it on is one deliberate edit.
-multiVolume
-
 # Writes and reads back files up to MaxFileSize (100 MiB) through the mount. A
 # genuine data-integrity test, and the heaviest single I/O in the run.
 volumeIO
