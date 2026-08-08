@@ -138,12 +138,24 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             var scope = ScopeFor(hostName);
             using var settings = GetActiveSettings(scope, hostName, vmId, deadline, cancellationToken);
 
-            var occupied = OccupiedAddresses(scope, settings, deadline, cancellationToken);
-
-            foreach (var controller in DeviceSettings(
-                scope, settings, "Msvm_ResourceAllocationSettingData", deadline, cancellationToken))
+            // Enumerated once and read twice. The addresses already in use and
+            // the controllers a disk can go on are both Msvm_ResourceAllocationSettingData,
+            // so asking the host for that class a second time was a wasted
+            // round-trip - and worse, two separately-fetched views that could
+            // disagree if a device appeared between them, which is how a slot
+            // that is actually taken gets handed out as free.
+            var devices = new List<ManagementObject>();
+            try
             {
-                using (controller)
+                foreach (var device in DeviceSettings(
+                    scope, settings, "Msvm_ResourceAllocationSettingData", deadline, cancellationToken))
+                {
+                    devices.Add(device);
+                }
+
+                var occupied = OccupiedAddresses(devices);
+
+                foreach (var controller in devices)
                 {
                     if ((controller["ResourceSubType"] as string) != SyntheticScsiControllerSubType)
                     {
@@ -151,9 +163,10 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                     }
 
                     var controllerPath = controller.Path.Path;
+                    var controllerKey = AddressKey(InstanceIdOf(controller));
                     for (var lun = 0; lun < AddressesPerController; lun++)
                     {
-                        if (occupied.Contains((AddressKey(InstanceIdOf(controller)), lun)))
+                        if (occupied.Contains((controllerKey, lun)))
                         {
                             continue;
                         }
@@ -161,9 +174,18 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                         return new DiskSlot(controllerPath, VmBusInstanceIdOf(controller, "a new disk"), lun);
                     }
                 }
-            }
 
-            return null;
+                return null;
+            }
+            finally
+            {
+                // Owned here rather than disposed per-iteration, since both
+                // reads above need them alive at once.
+                foreach (var device in devices)
+                {
+                    device.Dispose();
+                }
+            }
         }, cancellationToken);
 
     public Task AttachDiskAsync(
@@ -1220,26 +1242,24 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     /// kind: a DVD drive occupies an address just as a disk drive does, so
     /// filtering by subtype here would hand out a slot that is taken.
     /// </summary>
+    /// <param name="devices">
+    /// The VM's <c>Msvm_ResourceAllocationSettingData</c>, already enumerated by
+    /// the caller - which also needs them to pick a controller, and must see the
+    /// same set this does.
+    /// </param>
     private static HashSet<(string Controller, int Address)> OccupiedAddresses(
-        ManagementScope scope,
-        ManagementObject settings,
-        CimDeadline deadline,
-        CancellationToken cancellationToken)
+        IEnumerable<ManagementObject> devices)
     {
         var occupied = new HashSet<(string, int)>();
 
-        foreach (var device in DeviceSettings(
-            scope, settings, "Msvm_ResourceAllocationSettingData", deadline, cancellationToken))
+        foreach (var device in devices)
         {
-            using (device)
+            if (device["Parent"] as string is not { } parent || AddressOf(device) is not { } address)
             {
-                if (device["Parent"] as string is not { } parent || AddressOf(device) is not { } address)
-                {
-                    continue;
-                }
-
-                occupied.Add((AddressKey(InstanceIdOfPath(parent)), address));
+                continue;
             }
+
+            occupied.Add((AddressKey(InstanceIdOfPath(parent)), address));
         }
 
         return occupied;
