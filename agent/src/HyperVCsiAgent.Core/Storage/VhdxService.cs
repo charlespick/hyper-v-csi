@@ -351,6 +351,18 @@ public sealed class VhdxService : IVhdxService, IDisposable
                 await _copier.CopyAsync(
                     snapshotPath, inProgressPath, _options.SnapshotCopyTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
 
+                // A VHDX copy carries the source's VirtualDiskId (Hyper-V's
+                // DiskIdentifier), which the guest sees as its SCSI WWID.
+                // Two volumes sharing one WWID cause multipathd to group them
+                // into a single multipath device, after which a direct
+                // mount /dev/sdX fails with "device busy". Regenerate the
+                // identity before the disk is ever used.
+                var newId = await _diskManager.ResetDiskIdentifierAsync(
+                    inProgressPath, _options.SnapshotCopyTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
+                _logger.LogInformation(
+                    "CreateVolume {VolumeName}: assigned new DiskIdentifier {DiskId} to {Path}",
+                    volumeName, newId, inProgressPath);
+
                 long actualSize;
                 if (targetSize > snapshotSize)
                 {

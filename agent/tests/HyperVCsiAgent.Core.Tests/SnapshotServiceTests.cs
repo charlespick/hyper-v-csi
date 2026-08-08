@@ -1655,6 +1655,9 @@ public sealed class SnapshotServiceTests : IDisposable
         public Task<long> ResizeVhdxAsync(string path, long maxInternalSizeBytes, TimeSpan remainingBudget, CancellationToken cancellationToken) =>
             throw new NotSupportedException("snapshots never resize a disk");
 
+        public Task<Guid> ResetDiskIdentifierAsync(string path, TimeSpan remainingBudget, CancellationToken cancellationToken) =>
+            throw new NotSupportedException("snapshots never reset a disk identifier");
+
         public Task<long> GetVirtualSizeAsync(string path, TimeSpan remainingBudget, CancellationToken cancellationToken)
         {
             if (FailSizeReads)

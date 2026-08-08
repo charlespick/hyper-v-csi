@@ -19,6 +19,9 @@ public sealed class UnsupportedVirtualDiskManager : IVirtualDiskManager
     public Task<long> GetVirtualSizeAsync(string path, TimeSpan remainingBudget, CancellationToken cancellationToken) =>
         throw Unsupported();
 
+    public Task<Guid> ResetDiskIdentifierAsync(string path, TimeSpan remainingBudget, CancellationToken cancellationToken) =>
+        throw Unsupported();
+
     private static PlatformNotSupportedException Unsupported() =>
         new("VHDX operations require Windows with the Hyper-V role; this agent is running on " +
             $"{Environment.OSVersion.Platform}");
