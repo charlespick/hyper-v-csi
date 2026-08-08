@@ -316,19 +316,26 @@ public sealed class SnapshotServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task CreateAsync_BeforeTheCopyHasCreatedItsMarker_ReportsAnUnknownCreationTime()
+    public async Task CreateAsync_BeforeTheCopyHasCreatedItsMarker_ReportsTheCurrentTimeAsCreationTime()
     {
-        // 0 rather than a guess: the Go side omits creation_time for it, which
-        // is the truth, where reporting 1970 would be a timestamp that sorts and
-        // ages like a real one.
+        // Not 0: external-snapshotter's csi-snapshotter sidecar locks a
+        // VolumeSnapshotContent's creation time onto whatever its first
+        // successful CreateSnapshot call reports, ready or not, and decodes an
+        // absent creation_time as the Unix epoch rather than leaving it
+        // unknown - see ReadCreationTimeAsync's own remarks. A fresh "now" is
+        // what keeps that first, pre-marker answer from becoming a permanent
+        // 1970 on the object, since nothing later ever gets a chance to
+        // correct it.
         var harness = NewHarness();
         WriteVolume("pvc-1", 4096);
         using var release = new SemaphoreSlim(0);
         harness.Copier.BeforeCopy = _ => release.WaitAsync();
 
+        var before = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
+        var after = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
-        Assert.Equal(0, result.CreationTimeUnixSeconds);
+        Assert.InRange(result.CreationTimeUnixSeconds, before, after);
         Assert.False(result.ReadyToUse);
 
         release.Release();

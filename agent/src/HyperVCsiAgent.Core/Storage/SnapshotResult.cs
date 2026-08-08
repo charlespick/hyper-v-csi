@@ -31,11 +31,16 @@ namespace HyperVCsiAgent.Core.Storage;
 /// </param>
 /// <param name="CreationTimeUnixSeconds">
 /// When the point-in-time this snapshot captures was taken, read from the
-/// in-progress marker's own creation timestamp so it survives the rename that
-/// publishes the copy. Stable across repeat calls, which external-snapshotter
-/// records and must not see wander. 0 means unknown, and the Go side omits the
-/// field rather than reporting 1970 - a timestamp that sorts and ages like a
-/// real one is worse than none.
+/// in-progress marker's own creation timestamp once one exists, so it
+/// survives the rename that publishes the copy - stable across repeat calls
+/// from that point on. Before any marker exists, this is the current instant
+/// instead: see <see cref="SnapshotService.ReadCreationTimeAsync"/>'s own
+/// remarks for why a fresh "now" is the right answer even though nothing
+/// durable backs it yet. 0 remains a genuine "unknown" for the rarer case of
+/// a file that exists but still won't report a real timestamp after
+/// retrying, and the Go side omits the field for that case rather than
+/// reporting 1970 - a timestamp that sorts and ages like a real one is worse
+/// than none.
 /// </param>
 /// <param name="ReadyToUse">
 /// True only once the finished snapshot file exists on the CSV. Answered from

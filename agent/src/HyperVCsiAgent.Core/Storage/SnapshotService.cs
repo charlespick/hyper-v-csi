@@ -1371,7 +1371,8 @@ public sealed class SnapshotService : ISnapshotService
     private static readonly TimeSpan CreationTimeReadRetryInterval = TimeSpan.FromMilliseconds(250);
 
     /// <summary>
-    /// A file's creation time as Unix seconds, or 0 when it has none to report.
+    /// A file's creation time as Unix seconds, or the current instant when
+    /// there is no file yet to read one from.
     /// </summary>
     /// <param name="knownToExist">
     /// True when the caller has already established, moments earlier and by a
@@ -1386,15 +1387,36 @@ public sealed class SnapshotService : ISnapshotService
     /// stale-false existence check used to return immediately, skipping the
     /// retry loop and the warning entirely. False means the caller has no such
     /// guarantee (e.g. a copy's marker that may genuinely not have been
-    /// written yet), so a single miss there is left to return 0 at once, same
-    /// as always - retrying it would turn every fast "still copying" poll into
-    /// a second-long wait for no reason.
+    /// written yet), so a single miss there is answered with the current
+    /// instant at once, same as always - retrying it would turn every fast
+    /// "still copying" poll into a second-long wait for no reason.
     /// </param>
     /// <remarks>
     /// Windows answers 1601-01-01 for a file that is not there rather than
     /// failing, so that sentinel is what keeps a missing marker from being
-    /// reported as a real - and extremely old - timestamp. 0 travels as
-    /// "unknown" and the Go side omits the field entirely.
+    /// reported as a real - and extremely old - timestamp.
+    ///
+    /// A missing file answers with <c>DateTimeOffset.UtcNow</c> rather than 0
+    /// ("unknown") for the one caller that matters here:
+    /// external-snapshotter's csi-snapshotter sidecar locks a
+    /// VolumeSnapshotContent's creation time onto whatever its *first*
+    /// successful CreateSnapshot call reports, ready or not, and never
+    /// revisits it - see https://github.com/kubernetes-csi/external-snapshotter's
+    /// createSnapshotWrapper/updateSnapshotContentStatus. Worse, it decodes an
+    /// absent creation_time by calling AsTime() on a nil protobuf Timestamp,
+    /// which yields the Unix epoch rather than Go's zero time.Time, so its own
+    /// zero-value fallback never catches it either - a 0 reported here becomes
+    /// a permanent 1970 on the object, not a placeholder later replaced by the
+    /// real value from a subsequent, ready call. Since only that first answer
+    /// is ever kept, an in-memory "now" is exactly as durable as one would
+    /// need to be: nothing downstream reads it again to notice it differs from
+    /// call to call, or from a value that would have survived an agent
+    /// restart. It is also the more honest answer regardless - this is a
+    /// full-copy snapshot, so the data a finished copy holds was already fixed
+    /// at the moment reading the source began, not whenever the copy of it
+    /// happens to land - and it is no less stable than the already-accepted
+    /// rule that a copy restarted after an abandoned attempt legitimately
+    /// reports a later creation time than the one it replaced.
     ///
     /// The retry loop covers a narrower case than "the file is not there yet":
     /// a CSV can answer <c>GetCreationTimeUtc</c> with that same 1601-01-01
@@ -1412,7 +1434,7 @@ public sealed class SnapshotService : ISnapshotService
         {
             if (!knownToExist && !File.Exists(path))
             {
-                return 0;
+                return DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             }
 
             long created = 0;
