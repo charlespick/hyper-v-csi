@@ -1,8 +1,7 @@
 namespace HyperVCsiAgent.Core.Storage;
 
 /// <summary>
-/// Regenerates the disk identity (VirtualDiskId / Hyper-V DiskIdentifier) of a
-/// VHDX file in place.
+/// Reads identity and size fields out of a VHDX file's Metadata Region.
 /// </summary>
 /// <remarks>
 /// A VHDX copied from a snapshot carries the source's VirtualDiskId verbatim.
@@ -11,15 +10,15 @@ namespace HyperVCsiAgent.Core.Storage;
 /// multipathd has already claimed that WWID for the source, a straightforward
 /// <c>mount /dev/sdX</c> on the restored disk fails with "device busy".
 ///
-/// This class locates the VirtualDiskId metadata item inside the VHDX metadata
-/// region (SCSI Page 83 Data, ItemId <c>{BECA12AB-B2E6-4523-93EF-C309E000C746}</c>)
-/// and overwrites it with a freshly generated GUID.  The VHDX format does not
-/// checksum metadata item payloads, so the patch is a single in-place write with
-/// no derived fields to recompute.
-///
-/// The method must be called while the VHDX is not attached to any VM.  The
-/// restore flow in <see cref="VhdxService"/> calls it on the in-progress copy
-/// before the final rename, which satisfies that requirement.
+/// Regenerating that identity is <em>not</em> done here: Hyper-V's own
+/// <c>Msvm_ImageManagementService.SetVirtualHardDiskSettingData</c> method
+/// (see <see cref="IVirtualDiskManager.ResetDiskIdentifierAsync"/>) accepts a
+/// new <c>VirtualDiskId</c> directly and handles whatever header/log
+/// bookkeeping the format requires, which a raw byte patch here would have to
+/// reverse-engineer. This class only reads the VirtualDiskId (SCSI Page 83
+/// Data, ItemId <c>{BECA12AB-B2E6-4523-93EF-C309E000C746}</c>) and
+/// VirtualDiskSize metadata items, for diagnostics and for the test fakes
+/// that stand in for a real Hyper-V host.
 /// </remarks>
 public static class VhdxDiskIdentity
 {
@@ -36,11 +35,14 @@ public static class VhdxDiskIdentity
     private const long RegionTable1Offset = 0x30000;
 
     /// <summary>
-    /// Metadata items start 64 KB (0x10000) into the Metadata Region.  The
-    /// first 64 KB of the region holds the Metadata Table (header + entries);
-    /// item payloads follow at this offset.
+    /// The minimum legal value of a Metadata Table entry's Offset field.  Per
+    /// MS-VHDX §2.3.2, that field is "relative to the beginning of the
+    /// metadata region" and "MUST be at least 64 KB", since the region's first
+    /// 64 KB holds the Metadata Table (header + entries) itself - the value
+    /// already accounts for the header, so it is used only to validate entries
+    /// here, not added a second time when computing a file offset.
     /// </summary>
-    private const long MetadataItemsOffsetWithinRegion = 0x10000;
+    private const long MinimumMetadataItemOffset = 0x10000;
 
     // -----------------------------------------------------------------------
     // Structure sizes (bytes)
@@ -126,55 +128,6 @@ public static class VhdxDiskIdentity
         var buf = new byte[sizeof(ulong)];
         await file.ReadExactlyAsync(buf, cancellationToken).ConfigureAwait(false);
         return (long)BitConverter.ToUInt64(buf, 0);
-    }
-
-    /// <summary>
-    /// Replaces the VirtualDiskId in the VHDX at <paramref name="vhdxPath"/>
-    /// with a freshly generated GUID and returns the new identity.
-    /// </summary>
-    /// <remarks>
-    /// The file must not be attached to any VM when this is called.  On
-    /// failure the file is left unmodified; any exception thrown names the
-    /// path and describes what was missing or malformed.
-    /// </remarks>
-    /// <param name="vhdxPath">Path to the VHDX file to patch.</param>
-    /// <param name="cancellationToken">Cooperative cancellation; checked
-    /// between the I/O steps but does not interrupt a read or write already
-    /// in progress.</param>
-    /// <returns>The new <see cref="Guid"/> written to the file.</returns>
-    public static async Task<Guid> RegenerateAsync(string vhdxPath, CancellationToken cancellationToken)
-    {
-        // Open for read/write; the caller is responsible for ensuring the
-        // file is not attached.  FileShare.None keeps two concurrent agents
-        // from patching the same in-progress copy at the same time, which
-        // cannot happen in practice but would corrupt the file if it did.
-        using var file = new FileStream(
-            vhdxPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None,
-            bufferSize: 4096, FileOptions.Asynchronous);
-
-        var metadataRegionOffset = await FindMetadataRegionOffsetAsync(file, vhdxPath, cancellationToken)
-            .ConfigureAwait(false);
-
-        cancellationToken.ThrowIfCancellationRequested();
-
-        var diskIdFileOffset = await FindMetadataItemFileOffsetAsync(
-            file, vhdxPath, metadataRegionOffset, VirtualDiskIdItemGuid, "VirtualDiskId", cancellationToken)
-            .ConfigureAwait(false);
-
-        cancellationToken.ThrowIfCancellationRequested();
-
-        var newId = Guid.NewGuid();
-        file.Seek(diskIdFileOffset, SeekOrigin.Begin);
-
-        // TryWriteBytes writes the GUID in the Windows binary layout (mixed-
-        // endian) that the VHDX format and the Guid(ReadOnlySpan<byte>)
-        // constructor both use, so round-trips are exact.
-        var buf = new byte[GuidSize];
-        newId.TryWriteBytes(buf);
-        await file.WriteAsync(buf, cancellationToken).ConfigureAwait(false);
-        await file.FlushAsync(cancellationToken).ConfigureAwait(false);
-
-        return newId;
     }
 
     // -----------------------------------------------------------------------
@@ -270,10 +223,20 @@ public static class VhdxDiskIdentity
             var entryId = new Guid(entry.AsSpan(0, GuidSize));
             if (entryId == itemGuid)
             {
-                // Offset (uint32 at bytes 16-19): distance from the start of
-                // the metadata items area, which is 64 KB into the region.
+                // Offset (uint32 at bytes 16-19) is already relative to the
+                // start of the metadata region - not to the end of the
+                // Metadata Table - per MS-VHDX §2.3.2, so it is added to
+                // metadataRegionOffset directly rather than past a second
+                // 64 KB skip.
                 var itemOffset = BitConverter.ToUInt32(entry, 16);
-                return metadataRegionOffset + MetadataItemsOffsetWithinRegion + itemOffset;
+                if (itemOffset < MinimumMetadataItemOffset)
+                {
+                    throw new InvalidDataException(
+                        $"{itemName} metadata item in {vhdxPath} has Offset {itemOffset}, " +
+                        $"below the {MinimumMetadataItemOffset} minimum MS-VHDX requires; is the Metadata Region intact?");
+                }
+
+                return metadataRegionOffset + itemOffset;
             }
         }
 

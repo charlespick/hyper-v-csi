@@ -7,13 +7,10 @@ namespace HyperVCsiAgent.Core.Tests;
 /// structures that <see cref="MinimalVhdxBuilder"/> produces.
 /// </summary>
 /// <remarks>
-/// Everything here is a pure file operation that runs on any platform:
-/// reading and writing 16 bytes inside a binary file.  What this cannot
-/// establish is that the GUID Hyper-V surfaces as <c>DiskIdentifier</c> is
-/// exactly the Page 83 Data item patched here — that causal link can only
-/// be confirmed on a live Hyper-V host — but the end-to-end repro in the
-/// issue log confirms it, and the constant that routes to the right offset
-/// is taken directly from MS-VHDX §2.3.2.
+/// <see cref="MinimalVhdxBuilder"/> encodes its Metadata Table entries the
+/// same way MS-VHDX §2.3.2 requires a real Hyper-V-written VHDX to (Offset
+/// relative to the region start, already including the 64 KB table size), so
+/// these reads exercise the same offset arithmetic a real VHDX would need.
 /// </remarks>
 public sealed class VhdxDiskIdentityTests : IDisposable
 {
@@ -60,94 +57,11 @@ public sealed class VhdxDiskIdentityTests : IDisposable
     }
 
     // -----------------------------------------------------------------------
-    // RegenerateAsync
+    // Error paths
     // -----------------------------------------------------------------------
 
     [Fact]
-    public async Task RegenerateAsync_ChangesTheDiskIdentifier()
-    {
-        var originalId = Guid.NewGuid();
-        var path = WriteMinimalVhdx("subject.vhdx", virtualSizeBytes: 4096, diskId: originalId);
-
-        await VhdxDiskIdentity.RegenerateAsync(path, CancellationToken.None);
-
-        var newId = await VhdxDiskIdentity.ReadAsync(path, CancellationToken.None);
-        Assert.NotEqual(originalId, newId);
-    }
-
-    [Fact]
-    public async Task RegenerateAsync_ReturnsTheNewIdentifier()
-    {
-        // The returned value is what was written, not a stale read.
-        var path = WriteMinimalVhdx("subject.vhdx", virtualSizeBytes: 4096, diskId: Guid.NewGuid());
-
-        var returned = await VhdxDiskIdentity.RegenerateAsync(path, CancellationToken.None);
-        var readBack = await VhdxDiskIdentity.ReadAsync(path, CancellationToken.None);
-
-        Assert.Equal(returned, readBack);
-    }
-
-    [Fact]
-    public async Task RegenerateAsync_TwoCalls_ProduceDifferentIdentifiers()
-    {
-        // Each restore produces a unique disk; no two restored volumes ever
-        // share a WWID.
-        var path = WriteMinimalVhdx("subject.vhdx", virtualSizeBytes: 4096, diskId: Guid.NewGuid());
-
-        var first  = await VhdxDiskIdentity.RegenerateAsync(path, CancellationToken.None);
-        var second = await VhdxDiskIdentity.RegenerateAsync(path, CancellationToken.None);
-
-        Assert.NotEqual(first, second);
-    }
-
-    [Fact]
-    public async Task RegenerateAsync_DoesNotChangeTheVirtualDiskSize()
-    {
-        // Only the identity GUID is touched; no other metadata is perturbed.
-        var path = WriteMinimalVhdx("subject.vhdx", virtualSizeBytes: 99_000_000, diskId: Guid.NewGuid());
-
-        await VhdxDiskIdentity.RegenerateAsync(path, CancellationToken.None);
-
-        var size = await VhdxDiskIdentity.ReadVirtualDiskSizeAsync(path, CancellationToken.None);
-        Assert.Equal(99_000_000, size);
-    }
-
-    [Fact]
-    public async Task RegenerateAsync_DoesNotChangeTheBytesOutsideTheDiskIdField()
-    {
-        // Nothing besides the 16 DiskId bytes changes.
-        var id = Guid.NewGuid();
-        var path = WriteMinimalVhdx("subject.vhdx", virtualSizeBytes: 4096, diskId: id);
-        var before = await File.ReadAllBytesAsync(path);
-
-        await VhdxDiskIdentity.RegenerateAsync(path, CancellationToken.None);
-
-        var after = await File.ReadAllBytesAsync(path);
-        Assert.Equal(before.Length, after.Length);
-
-        // Find where the original DiskId is.  Both arrays are the same size;
-        // walk them byte by byte and assert that differences are confined to
-        // exactly 16 consecutive bytes.
-        var diffRanges = FindDiffRanges(before, after);
-        Assert.Single(diffRanges);
-        Assert.Equal(16, diffRanges[0].Length);
-    }
-
-    [Fact]
-    public async Task RegenerateAsync_NullNewIdentifierIsNeverProduced()
-    {
-        // Guid.NewGuid() cannot return Guid.Empty, but the contract is also
-        // important: a restored volume must never end up with an all-zero
-        // WWID that would conflict with any device that has none at all.
-        var path = WriteMinimalVhdx("subject.vhdx", virtualSizeBytes: 4096, diskId: Guid.NewGuid());
-
-        var newId = await VhdxDiskIdentity.RegenerateAsync(path, CancellationToken.None);
-
-        Assert.NotEqual(Guid.Empty, newId);
-    }
-
-    [Fact]
-    public async Task RegenerateAsync_OnAFileThatIsNotAVhdx_ThrowsInvalidDataException()
+    public async Task ReadAsync_OnAFileThatIsNotAVhdx_ThrowsInvalidDataException()
     {
         // Operator-readable error, not a raw IOException or NRE: the message
         // must name the path and say what was missing.
@@ -155,7 +69,26 @@ public sealed class VhdxDiskIdentityTests : IDisposable
         await File.WriteAllTextAsync(path, "this is not a VHDX file");
 
         var ex = await Assert.ThrowsAsync<InvalidDataException>(
-            () => VhdxDiskIdentity.RegenerateAsync(path, CancellationToken.None));
+            () => VhdxDiskIdentity.ReadAsync(path, CancellationToken.None));
+
+        Assert.Contains(path, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ReadAsync_WhenAMetadataEntrysOffsetIsBelowTheSpecMinimum_ThrowsInvalidDataException()
+    {
+        // MS-VHDX §2.3.2: a Metadata Table entry's Offset "MUST be at least
+        // 64 KB" because it is relative to the start of the region, not to
+        // the end of the 64 KB table. A file that violates this is not a
+        // conformant VHDX; the previous offset arithmetic here silently
+        // accepted (and miscomputed against) such a file instead of catching it.
+        var path = Path.Combine(_root, "bad-offset.vhdx");
+        var vhdx = MinimalVhdxBuilder.Build(virtualSizeBytes: 4096, diskId: Guid.NewGuid());
+        MinimalVhdxBuilder.CorruptVirtualDiskIdOffset(vhdx, itemOffset: 8);
+        await File.WriteAllBytesAsync(path, vhdx);
+
+        var ex = await Assert.ThrowsAsync<InvalidDataException>(
+            () => VhdxDiskIdentity.ReadAsync(path, CancellationToken.None));
 
         Assert.Contains(path, ex.Message, StringComparison.Ordinal);
     }
@@ -169,28 +102,5 @@ public sealed class VhdxDiskIdentityTests : IDisposable
         var path = Path.Combine(_root, name);
         File.WriteAllBytes(path, MinimalVhdxBuilder.Build(virtualSizeBytes, diskId));
         return path;
-    }
-
-    private static List<(int Start, int Length)> FindDiffRanges(byte[] a, byte[] b)
-    {
-        var ranges = new List<(int, int)>();
-        int i = 0;
-        while (i < a.Length)
-        {
-            if (a[i] != b[i])
-            {
-                int start = i;
-                while (i < a.Length && a[i] != b[i])
-                {
-                    i++;
-                }
-                ranges.Add((start, i - start));
-            }
-            else
-            {
-                i++;
-            }
-        }
-        return ranges;
     }
 }

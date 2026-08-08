@@ -15,13 +15,17 @@ namespace HyperVCsiAgent.Core.Tests;
 /// 0x0003_0000  Region Table 1 — one entry: Metadata at 0x0010_0000
 /// 0x0010_0000  Metadata Region
 ///   +0x0000    Metadata Table Header ("metadata", EntryCount=2)
-///   +0x0020    Entry 0: VirtualDiskSize → items+0  (8 bytes)
-///   +0x0040    Entry 1: VirtualDiskId  → items+8  (16 bytes)
+///   +0x0020    Entry 0: VirtualDiskSize, Offset=0x1_0000  (8 bytes)
+///   +0x0040    Entry 1: VirtualDiskId,  Offset=0x1_0008  (16 bytes)
 ///   +0x1_0000  (items start, 64 KB into region)
 ///   +0x1_0000  VirtualDiskSize payload  (uint64 LE)
 ///   +0x1_0008  VirtualDiskId payload    (GUID)
 /// Total: 0x0011_0018 bytes ≈ 1.06 MB
 /// </code>
+/// Per MS-VHDX §2.3.2, a Metadata Table entry's Offset field is itself
+/// relative to the start of the metadata region and must already be at least
+/// 64 KB - so entries here carry <c>0x1_0000</c> and <c>0x1_0008</c>, not
+/// <c>0</c> and <c>8</c>, matching what a real Hyper-V-written VHDX contains.
 /// </remarks>
 public static class MinimalVhdxBuilder
 {
@@ -79,6 +83,22 @@ public static class MinimalVhdxBuilder
         new(vhdx.AsSpan((int)VirtualDiskIdPayloadOffset, 16));
 
     // -----------------------------------------------------------------------
+    // Corruption helpers (used to test VhdxDiskIdentity's own validation)
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Overwrites the VirtualDiskId Metadata Table entry's Offset field
+    /// (normally <c>0x1_0008</c>, see <see cref="Build"/>) with an arbitrary
+    /// value, to produce a file that violates MS-VHDX §2.3.2's "MUST be at
+    /// least 64 KB" rule for that field.
+    /// </summary>
+    public static void CorruptVirtualDiskIdOffset(byte[] vhdx, uint itemOffset)
+    {
+        const int entryOffsetField = (int)MetadataRegionOffset + 64 + 16;
+        BitConverter.TryWriteBytes(vhdx.AsSpan(entryOffsetField), itemOffset);
+    }
+
+    // -----------------------------------------------------------------------
     // Private write helpers
     // -----------------------------------------------------------------------
 
@@ -112,11 +132,13 @@ public static class MinimalVhdxBuilder
         "metadata"u8.CopyTo(buf.AsSpan(tableBase, 8));
         BitConverter.TryWriteBytes(buf.AsSpan(tableBase + 10), (ushort)2); // entryCount at offset 10
 
-        // Entry 0: VirtualDiskSize at items+0, length 8
-        WriteMetadataEntry(buf, tableBase + 32, VirtualDiskSizeGuid, itemOffset: 0, length: 8);
+        // Entry 0: VirtualDiskSize at items+0, length 8. itemOffset is
+        // relative to the region start (MS-VHDX §2.3.2), not to the end of
+        // the Metadata Table, so it already includes the 64 KB table size.
+        WriteMetadataEntry(buf, tableBase + 32, VirtualDiskSizeGuid, itemOffset: 0x10000, length: 8);
 
         // Entry 1: VirtualDiskId (Page 83 Data) at items+8, length 16
-        WriteMetadataEntry(buf, tableBase + 64, VirtualDiskIdGuid, itemOffset: 8, length: 16);
+        WriteMetadataEntry(buf, tableBase + 64, VirtualDiskIdGuid, itemOffset: 0x10008, length: 16);
 
         // Item payloads
         BitConverter.TryWriteBytes(buf.AsSpan((int)VirtualDiskSizePayloadOffset), (ulong)virtualSizeBytes);

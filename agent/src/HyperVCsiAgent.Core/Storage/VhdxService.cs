@@ -357,8 +357,8 @@ public sealed class VhdxService : IVhdxService, IDisposable
                 // into a single multipath device, after which a direct
                 // mount /dev/sdX fails with "device busy". Regenerate the
                 // identity before the disk is ever used.
-                var newId = await VhdxDiskIdentity.RegenerateAsync(
-                    inProgressPath, attempt.Token).ConfigureAwait(false);
+                var newId = await _diskManager.ResetDiskIdentifierAsync(
+                    inProgressPath, _options.SnapshotCopyTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
                 _logger.LogInformation(
                     "CreateVolume {VolumeName}: assigned new DiskIdentifier {DiskId} to {Path}",
                     volumeName, newId, inProgressPath);

@@ -351,6 +351,9 @@ public sealed class JobsEndpointTests : IDisposable
             return Task.FromResult(maxInternalSizeBytes);
         }
 
+        public Task<Guid> ResetDiskIdentifierAsync(string path, TimeSpan remainingBudget, CancellationToken cancellationToken) =>
+            Task.FromResult(Guid.NewGuid());
+
         public Task<long> GetVirtualSizeAsync(string path, TimeSpan remainingBudget, CancellationToken cancellationToken)
         {
             // The service renames the disk into place after creating it, so

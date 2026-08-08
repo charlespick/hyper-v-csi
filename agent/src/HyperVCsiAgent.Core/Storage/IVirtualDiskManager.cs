@@ -67,4 +67,25 @@ public interface IVirtualDiskManager
     /// should bound its own request timeout by.
     /// </param>
     Task<long> GetVirtualSizeAsync(string path, TimeSpan remainingBudget, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Assigns a freshly generated VirtualDiskId (Hyper-V's <c>DiskIdentifier</c>,
+    /// the SCSI Page 83 WWID the guest sees) to an existing VHDX and returns
+    /// the new value.
+    /// </summary>
+    /// <remarks>
+    /// VHDX-only, and the disk must not be attached to a VM - both requirements
+    /// of the underlying <c>Msvm_VirtualHardDiskSettingData.VirtualDiskId</c>
+    /// property, which this exists to update. A copy made from a snapshot
+    /// otherwise carries the source's identity verbatim, which collides with
+    /// it on the guest's SCSI bus; this is what <see cref="IVhdxService"/>'s
+    /// restore path calls on the in-progress copy before publishing it.
+    /// </remarks>
+    /// <param name="remainingBudget">
+    /// How much of the caller's overall operation budget is left when this call
+    /// is made. See <see cref="CreateDynamicVhdxAsync"/> for why this - and not
+    /// just <paramref name="cancellationToken"/> - is what an implementation
+    /// should bound its own request timeout by.
+    /// </param>
+    Task<Guid> ResetDiskIdentifierAsync(string path, TimeSpan remainingBudget, CancellationToken cancellationToken);
 }

@@ -149,6 +149,40 @@ public sealed class CimVirtualDiskManager : IVirtualDiskManager
             return ReadVirtualSize(session, service, path, deadline, cancellationToken);
         }, cancellationToken);
 
+    public Task<Guid> ResetDiskIdentifierAsync(string path, TimeSpan remainingBudget, CancellationToken cancellationToken) =>
+        Task.Run(() =>
+        {
+            var deadline = CimDeadline.After(remainingBudget);
+            var newId = Guid.NewGuid();
+
+            // Msvm_VirtualHardDiskSettingData.VirtualDiskId: "a client can set
+            // the VirtualDiskId value to a new GUID and pass this ...
+            // instance to SetVirtualHardDiskSettingData to change the disk ID
+            // of the VHD" - built through System.Management for the same
+            // embedded-instance reason CreateDynamicVhdxAsync's settings are.
+            // SetVirtualHardDiskSettingData only accepts one property change
+            // per call, so this instance carries just Path and VirtualDiskId.
+            var settingsXml = BuildDiskIdentifierSettingsXml(path, newId);
+
+            using var session = CimSession.Create(null);
+            using var service = GetImageManagementService(session, deadline, cancellationToken);
+
+            var parameters = new CimMethodParametersCollection
+            {
+                CimMethodParameter.Create("VirtualDiskSettingData", settingsXml, CimType.String, CimFlags.In),
+            };
+
+            using var result = session.InvokeMethod(
+                NamespaceName, service, "SetVirtualHardDiskSettingData", parameters,
+                deadline.Options("SetVirtualHardDiskSettingData", cancellationToken));
+
+            _ = CimJobs.WaitForCompletion(
+                session, NamespaceName, result, "SetVirtualHardDiskSettingData", deadline, cancellationToken, _logger);
+
+            _logger.LogInformation("reset DiskIdentifier for VHDX {Path} to {DiskId}", path, newId);
+            return newId;
+        }, cancellationToken);
+
     /// <summary>
     /// Reads a VHDX's current virtual size using an already-open session and
     /// service instance, shared by <see cref="GetVirtualSizeAsync"/> (which
@@ -233,6 +267,26 @@ public sealed class CimVirtualDiskManager : IVirtualDiskManager
         settings["Path"] = path;
         settings["MaxInternalSize"] = (ulong)maxInternalSizeBytes;
         settings["BlockSize"] = UseDefaultBlockSize;
+
+        return settings.GetText(TextFormat.WmiDtd20);
+    }
+
+    /// <summary>
+    /// Serializes just the two properties <c>SetVirtualHardDiskSettingData</c>
+    /// needs to change a disk's identity: <c>Path</c> to name it and
+    /// <c>VirtualDiskId</c> with the new value, in the "D"-format GUID string
+    /// (no braces) WMI string-typed GUID properties elsewhere in this
+    /// namespace use.
+    /// </summary>
+    private static string BuildDiskIdentifierSettingsXml(string path, Guid diskId)
+    {
+        var scope = new ManagementScope(ScopePath);
+        using var settingsClass = new ManagementClass(scope, new ManagementPath("Msvm_VirtualHardDiskSettingData"), null);
+        using var settings = settingsClass.CreateInstance()
+            ?? throw new InvalidOperationException("could not create an Msvm_VirtualHardDiskSettingData instance");
+
+        settings["Path"] = path;
+        settings["VirtualDiskId"] = diskId.ToString();
 
         return settings.GetText(TextFormat.WmiDtd20);
     }

@@ -29,11 +29,12 @@ public sealed class VhdxServiceTests : IDisposable
 
     /// <summary>
     /// Seeds a finished snapshot directly on the CSV, the way a prior
-    /// CreateSnapshot would have left one. The virtual size and disk
-    /// identifier travel in the file's own VHDX metadata, which is what
-    /// both FakeVirtualDiskManager's fallback and VhdxDiskIdentity read.
-    /// FakeDiskCopier copies the binary byte-for-byte, so the copy also
-    /// carries a valid structure and RegenerateAsync can patch it in place.
+    /// CreateSnapshot would have left one. The virtual size travels in the
+    /// file's own VHDX metadata, which is what FakeVirtualDiskManager's
+    /// fallback and VhdxDiskIdentity read. FakeDiskCopier copies the binary
+    /// byte-for-byte, so the copy also carries a valid structure for those
+    /// reads and for FakeVirtualDiskManager.ResetDiskIdentifierAsync to be
+    /// called against.
     /// </summary>
     private void WriteSnapshot(string snapshotId, long virtualSizeBytes)
     {
@@ -320,6 +321,39 @@ public sealed class VhdxServiceTests : IDisposable
         Assert.False(result.AlreadyPresent);
         Assert.True(File.Exists(VolumePath("pvc-2")));
         Assert.Equal(InProgressPath("pvc-2"), Assert.Single(copier.Destinations));
+    }
+
+    [Fact]
+    public async Task CreateAsync_FromASnapshot_ResetsTheDiskIdentifierOnTheInProgressCopy()
+    {
+        // The copy still carries the snapshot source's VirtualDiskId at this
+        // point; the reset has to happen before the publish rename, on the
+        // in-progress file, the same way the grow-on-restore resize does.
+        var disks = new FakeVirtualDiskManager();
+        var copier = new FakeDiskCopier();
+        WriteSnapshot("pvc-1~snap-a", 4096);
+        using var service = NewService(disks, copier: copier);
+
+        await service.CreateAsync("pvc-2", 4096, "pvc-1~snap-a", CancellationToken.None);
+
+        var reset = Assert.Single(disks.DiskIdentifiersReset);
+        Assert.Equal(InProgressPath("pvc-2"), reset.Path);
+        Assert.NotEqual(Guid.Empty, reset.DiskId);
+    }
+
+    [Fact]
+    public async Task CreateAsync_FromASnapshot_WhenResettingTheDiskIdentifierFails_CleansUpAndFails()
+    {
+        var disks = new FakeVirtualDiskManager { FailNextResetDiskIdentifier = true };
+        var copier = new FakeDiskCopier();
+        WriteSnapshot("pvc-1~snap-a", 4096);
+        using var service = NewService(disks, copier: copier);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.CreateAsync("pvc-2", 4096, "pvc-1~snap-a", CancellationToken.None));
+
+        Assert.False(File.Exists(InProgressPath("pvc-2")));
+        Assert.False(File.Exists(VolumePath("pvc-2")));
     }
 
     [Fact]
@@ -1130,9 +1164,14 @@ public sealed class VhdxServiceTests : IDisposable
         /// <summary>Every resize that reached the CIM seam, with the size it asked for.</summary>
         public List<(string Path, long SizeBytes)> Resized { get; } = [];
 
+        /// <summary>Every disk identifier reset that reached the CIM seam, with the id it was set to.</summary>
+        public List<(string Path, Guid DiskId)> DiskIdentifiersReset { get; } = [];
+
         public bool FailNextCreate { get; set; }
 
         public bool FailNextResize { get; set; }
+
+        public bool FailNextResetDiskIdentifier { get; set; }
 
         public bool FailSizeReads { get; set; }
 
@@ -1287,6 +1326,31 @@ public sealed class VhdxServiceTests : IDisposable
                 }
 
                 throw new InvalidOperationException($"no such disk: {path}");
+            }
+            finally
+            {
+                Exit();
+            }
+        }
+
+        public Task<Guid> ResetDiskIdentifierAsync(string path, TimeSpan remainingBudget, CancellationToken cancellationToken)
+        {
+            Enter();
+            try
+            {
+                if (FailNextResetDiskIdentifier)
+                {
+                    FailNextResetDiskIdentifier = false;
+                    throw new InvalidOperationException("CIM said no");
+                }
+
+                var newId = Guid.NewGuid();
+                lock (_gate)
+                {
+                    DiskIdentifiersReset.Add((path, newId));
+                }
+
+                return Task.FromResult(newId);
             }
             finally
             {
