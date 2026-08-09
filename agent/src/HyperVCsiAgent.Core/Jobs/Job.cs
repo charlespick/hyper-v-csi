@@ -20,10 +20,19 @@ public sealed class Job
     public required string OperationType { get; init; }
 
     /// <summary>
-    /// The resource this job is serialized against: the VM for
-    /// attach/detach/resize, the volume for create/expand/delete.
+    /// Every resource this job is serialized against: the VM for
+    /// attach/detach/resize, the volume for create/expand/delete, and both at
+    /// once for the operations that genuinely reach both - see
+    /// <see cref="IJobStore.GetOrCreate"/>.
     /// </summary>
-    public required string Target { get; init; }
+    /// <remarks>
+    /// Reported in full rather than as whichever one is "primary". There is no
+    /// primary: a job queued behind a snapshot copy is queued behind it because
+    /// of one specific target, and an operator reading this to work out why an
+    /// attach is waiting needs to see the target that is actually holding it,
+    /// not the one this job would have named first.
+    /// </remarks>
+    public required IReadOnlyList<string> Targets { get; init; }
 
     public JobStatus Status { get; set; } = JobStatus.Pending;
 

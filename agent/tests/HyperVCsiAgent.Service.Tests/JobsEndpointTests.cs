@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using HyperVCsiAgent.Core.Storage;
@@ -66,7 +66,7 @@ public sealed class JobsEndpointTests : IDisposable
         Assert.Equal("Succeeded", root.GetProperty("status").GetString());
         Assert.Equal("CreateVolume", root.GetProperty("operationType").GetString());
         Assert.Equal("pvc-1", root.GetProperty("idempotencyKey").GetString());
-        Assert.Equal("volume:pvc-1", root.GetProperty("target").GetString());
+        Assert.Equal(["volume:pvc-1"], root.GetProperty("targets").EnumerateArray().Select(t => t.GetString()));
 
         var result = root.GetProperty("result");
         Assert.Equal("pvc-1", result.GetProperty("volumeId").GetString());
@@ -181,7 +181,9 @@ public sealed class JobsEndpointTests : IDisposable
         // snapshot, per the wire contract - the copy takes the volume target
         // instead, and never reaches this endpoint at all.
         Assert.Equal("snapshot-abc", job.RootElement.GetProperty("idempotencyKey").GetString());
-        Assert.Equal("snapshot:pvc-1~snapshot-abc", job.RootElement.GetProperty("target").GetString());
+        Assert.Equal(
+            ["snapshot:pvc-1~snapshot-abc"],
+            job.RootElement.GetProperty("targets").EnumerateArray().Select(t => t.GetString()));
 
         var result = job.RootElement.GetProperty("result");
         Assert.Equal("pvc-1~snapshot-abc", result.GetProperty("snapshotId").GetString());

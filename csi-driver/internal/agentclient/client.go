@@ -58,7 +58,7 @@ type Job struct {
 	ID             string          `json:"id"`
 	IdempotencyKey string          `json:"idempotencyKey"`
 	OperationType  string          `json:"operationType"`
-	Target         string          `json:"target"`
+	Targets        []string        `json:"targets"`
 	Status         JobStatus       `json:"status"`
 	Result         json.RawMessage `json:"result,omitempty"`
 	Error          string          `json:"error,omitempty"`

@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using HyperVCsiAgent.Core.Jobs;
 using HyperVCsiAgent.Core.Storage;
 
@@ -39,7 +39,7 @@ public class JobWireFormatTests
             Id = "abc123",
             IdempotencyKey = "pvc-1",
             OperationType = "CreateVolume",
-            Target = "vol-pvc-1",
+            Targets = ["vol-pvc-1"],
             Status = JobStatus.Failed,
             Error = "boom",
             ErrorCode = AgentErrorCodes.AlreadyExists,
@@ -51,7 +51,7 @@ public class JobWireFormatTests
         Assert.Equal("abc123", root.GetProperty("id").GetString());
         Assert.Equal("pvc-1", root.GetProperty("idempotencyKey").GetString());
         Assert.Equal("CreateVolume", root.GetProperty("operationType").GetString());
-        Assert.Equal("vol-pvc-1", root.GetProperty("target").GetString());
+        Assert.Equal(["vol-pvc-1"], root.GetProperty("targets").EnumerateArray().Select(t => t.GetString()));
         Assert.Equal("Failed", root.GetProperty("status").GetString());
         Assert.Equal("boom", root.GetProperty("error").GetString());
         Assert.Equal("AlreadyExists", root.GetProperty("errorCode").GetString());
@@ -68,7 +68,7 @@ public class JobWireFormatTests
             Id = "abc123",
             IdempotencyKey = "pvc-1",
             OperationType = "CreateVolume",
-            Target = "vol-pvc-1",
+            Targets = ["vol-pvc-1"],
             Status = JobStatus.Succeeded,
             Result = new CreateVolumeResult("pvc-1", 10737418240, AlreadyPresent: true),
         };
@@ -89,7 +89,7 @@ public class JobWireFormatTests
             Id = "abc123",
             IdempotencyKey = "pvc-1",
             OperationType = "CreateVolume",
-            Target = "vol-pvc-1",
+            Targets = ["vol-pvc-1"],
             Status = JobStatus.Running,
         };
 

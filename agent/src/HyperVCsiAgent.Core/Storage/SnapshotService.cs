@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
@@ -540,7 +540,7 @@ public sealed class SnapshotService : ISnapshotService
         _jobs.GetOrCreate(
             snapshotId,
             CopySnapshot,
-            "volume:" + sourceVolumeId,
+            ["volume:" + sourceVolumeId],
             (_, cancellationToken) =>
                 RunCopyAsync(snapshotId, sourcePath, snapshotPath, copyingPath, checkpoint: null, cancellationToken));
 
@@ -569,7 +569,7 @@ public sealed class SnapshotService : ISnapshotService
         _jobs.GetOrCreate(
             snapshotId,
             CopySnapshot,
-            "volume:" + sourceVolumeId,
+            ["volume:" + sourceVolumeId],
             (_, cancellationToken) =>
                 RunCopyAsync(snapshotId, sourcePath, snapshotPath, copyingPath, (vm, checkpointElementName), cancellationToken));
 

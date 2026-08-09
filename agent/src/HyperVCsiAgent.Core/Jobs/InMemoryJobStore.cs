@@ -26,8 +26,39 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
 
     public InMemoryJobStore(TimeProvider? clock = null) => _clock = clock ?? TimeProvider.System;
 
-    public Job GetOrCreate(string idempotencyKey, string operationType, string target, Func<Job, CancellationToken, Task> run)
+    /// <summary>
+    /// <inheritdoc cref="IJobStore.GetOrCreate" path="/summary"/>
+    /// </summary>
+    /// <remarks>
+    /// A job holding several targets becomes the tail of every one of their
+    /// chains, so anything enqueued against any of them afterwards waits for all
+    /// of this job's work - which is what makes holding two targets mean what it
+    /// says rather than merely being recorded.
+    /// <para>
+    /// <b>Deadlock freedom.</b> A job only ever awaits tasks that were installed
+    /// as some target's <c>Tail</c> strictly earlier, and every install happens
+    /// under <see cref="_gate"/>. The waits-for edges therefore always point
+    /// backwards in creation order, so no cycle can form no matter which targets
+    /// overlap - <c>{A,B}</c>, <c>{B,C}</c> and <c>{C,A}</c> enqueued together
+    /// all complete, which the tests pin.
+    /// </para>
+    /// <para>
+    /// That argument covers waits *between jobs*. It says nothing about a job
+    /// delegate blocking on something outside this store, and the one place that
+    /// happens - a snapshot copy waiting for one of
+    /// <c>SnapshotCopySlots</c> - is deliberately bounded and deliberately never
+    /// held while awaiting another job, so it cannot close a cycle this proof
+    /// does not see.
+    /// </para>
+    /// </remarks>
+    public Job GetOrCreate(
+        string idempotencyKey, string operationType, IReadOnlyCollection<string> targets, Func<Job, CancellationToken, Task> run)
     {
+        if (targets.Count == 0)
+        {
+            throw new ArgumentException("a job must name at least one target to serialize against", nameof(targets));
+        }
+
         var key = (operationType, idempotencyKey);
 
         lock (_gate)
@@ -39,25 +70,43 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
                 return existing;
             }
 
+            // Deduplicated so a caller that names one resource twice - an expand
+            // whose stale node hint happens to name the volume's own target, say
+            // - does not double-count Pending and leave a queue that never
+            // reaches zero. Ordered so the recorded Targets read the same way
+            // every time, which matters only for the operator staring at them.
+            var distinct = targets.Distinct(StringComparer.Ordinal).OrderBy(t => t, StringComparer.Ordinal).ToArray();
+
             var job = new Job
             {
                 Id = Guid.NewGuid().ToString("n"),
                 IdempotencyKey = idempotencyKey,
                 OperationType = operationType,
-                Target = target,
+                Targets = distinct,
             };
 
             _byKey[key] = job;
             _byId[job.Id] = job;
 
-            if (!_queues.TryGetValue(target, out var queue))
+            var previous = new Task[distinct.Length];
+            for (var i = 0; i < distinct.Length; i++)
             {
-                queue = new TargetQueue();
-                _queues[target] = queue;
+                if (!_queues.TryGetValue(distinct[i], out var queue))
+                {
+                    queue = new TargetQueue();
+                    _queues[distinct[i]] = queue;
+                }
+
+                previous[i] = queue.Tail;
+                queue.Pending++;
             }
 
-            queue.Pending++;
-            queue.Tail = ExecuteAsync(queue.Tail, queue, target, job, run);
+            var task = ExecuteAsync(previous, distinct, job, run);
+            foreach (var target in distinct)
+            {
+                _queues[target].Tail = task;
+            }
+
             return job;
         }
     }
@@ -90,16 +139,19 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
     /// </summary>
     public void Dispose() => _shutdown.Cancel();
 
-    private async Task ExecuteAsync(Task previous, TargetQueue queue, string target, Job job, Func<Job, CancellationToken, Task> run)
+    private async Task ExecuteAsync(Task[] previous, string[] targets, Job job, Func<Job, CancellationToken, Task> run)
     {
         // Hop off the caller's thread before touching anything user-supplied:
         // GetOrCreate still holds _gate, and a run delegate with a slow
         // synchronous prologue must not stall the whole store.
         await Task.Yield();
 
-        // previous is the prior ExecuteAsync in this target's chain; it never
-        // faults (every outcome is caught below), so this is pure sequencing.
-        await previous.ConfigureAwait(false);
+        // Each entry is the prior ExecuteAsync in one of this job's target
+        // chains; none of them ever faults (every outcome is caught below), so
+        // this is pure sequencing. WhenAll rather than a loop because the order
+        // the predecessors finish in is not this job's business - it waits for
+        // the last of them either way.
+        await Task.WhenAll(previous).ConfigureAwait(false);
 
         lock (_gate)
         {
@@ -135,9 +187,17 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
             lock (_gate)
             {
                 job.CompletedAt = _clock.GetUtcNow();
-                if (--queue.Pending == 0)
+
+                // Every target this job took a place in, released independently:
+                // one of them reaching zero says nothing about the others, and a
+                // queue left behind at zero would leak an entry per target per
+                // job rather than per job.
+                foreach (var target in targets)
                 {
-                    _queues.Remove(target);
+                    if (--_queues[target].Pending == 0)
+                    {
+                        _queues.Remove(target);
+                    }
                 }
             }
         }

@@ -1,4 +1,4 @@
-using HyperVCsiAgent.Core.Cluster;
+﻿using HyperVCsiAgent.Core.Cluster;
 using HyperVCsiAgent.Core.Configuration;
 using HyperVCsiAgent.Core.HostControl;
 using HyperVCsiAgent.Core.Jobs;
@@ -360,7 +360,7 @@ public sealed class SnapshotServiceTests : IDisposable
         var copy = Assert.Single(harness.Store.Created);
         Assert.Equal(SnapshotService.CopySnapshot, copy.OperationType);
         Assert.Equal("pvc-1~snapshot-abc", copy.IdempotencyKey);
-        Assert.Equal("volume:pvc-1", copy.Target);
+        Assert.Equal(["volume:pvc-1"], copy.Targets);
     }
 
     [Fact]
@@ -1624,9 +1624,10 @@ public sealed class SnapshotServiceTests : IDisposable
         /// <summary>Only the jobs that were newly created, not the ones returned from an in-flight lookup.</summary>
         public List<Job> Created { get; } = [];
 
-        public Job GetOrCreate(string idempotencyKey, string operationType, string target, Func<Job, CancellationToken, Task> run)
+        public Job GetOrCreate(
+            string idempotencyKey, string operationType, IReadOnlyCollection<string> targets, Func<Job, CancellationToken, Task> run)
         {
-            var job = _inner.GetOrCreate(idempotencyKey, operationType, target, run);
+            var job = _inner.GetOrCreate(idempotencyKey, operationType, targets, run);
             lock (Created)
             {
                 if (!Created.Contains(job))

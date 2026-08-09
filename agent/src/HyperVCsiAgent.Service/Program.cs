@@ -148,7 +148,7 @@ app.MapPost("/v1/jobs", (
         return Results.BadRequest(new { error = ex.Message });
     }
 
-    var job = jobStore.GetOrCreate(request.IdempotencyKey, request.OperationType, request.Target, run);
+    var job = jobStore.GetOrCreate(request.IdempotencyKey, request.OperationType, [request.Target], run);
     return Results.Accepted($"/v1/jobs/{job.Id}", job);
 });
 

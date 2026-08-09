@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using HyperVCsiAgent.Core.HostControl;
 using HyperVCsiAgent.Core.Jobs;
 using HyperVCsiAgent.Core.Storage;
@@ -297,7 +297,7 @@ public class JobDispatcherTests
         Id = "job-1",
         IdempotencyKey = "pvc-1",
         OperationType = JobDispatcher.CreateVolume,
-        Target = "volume:pvc-1",
+        Targets = ["volume:pvc-1"],
     };
 
     private sealed class RecordingVhdxService : IVhdxService
