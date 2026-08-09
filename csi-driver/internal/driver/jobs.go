@@ -43,6 +43,13 @@ func awaitJob(ctx context.Context, agent *agentclient.Client, jobID string, budg
 	defer cancel()
 
 	lastStatus := agentclient.JobPending
+
+	// The last job successfully decoded from a poll, Pending or Running -
+	// nil until the first one comes back, and never a terminal job since
+	// both terminal cases return immediately below. pollStopped reads its
+	// QueuedBehind, when there is one, to say more than "still Pending" once
+	// the budget or the caller's own deadline runs out.
+	var lastJob *agentclient.Job
 	backoff := jobPollInitialInterval
 
 	for {
@@ -59,7 +66,7 @@ func awaitJob(ctx context.Context, agent *agentclient.Client, jobID string, budg
 			// A poll that failed because we ran out of time says nothing about
 			// the agent's health, so report it as what it is.
 			if pollCtx.Err() != nil {
-				return nil, pollStopped(ctx, jobID, lastStatus, budget)
+				return nil, pollStopped(ctx, jobID, lastStatus, budget, lastJob)
 			}
 			// Otherwise, most often the clustered role is mid-failover - a
 			// brief, tolerable window per design.md. Fall through to the same
@@ -71,11 +78,12 @@ func awaitJob(ctx context.Context, agent *agentclient.Client, jobID string, budg
 			return nil, translateJobFailure(job)
 		default:
 			lastStatus = job.Status
+			lastJob = job
 		}
 
 		select {
 		case <-pollCtx.Done():
-			return nil, pollStopped(ctx, jobID, lastStatus, budget)
+			return nil, pollStopped(ctx, jobID, lastStatus, budget, lastJob)
 		case <-time.After(backoff):
 		}
 		backoff = min(backoff*2, jobPollMaxInterval)
@@ -99,9 +107,24 @@ func clampToCallerDeadline(ctx context.Context, budget time.Duration) time.Durat
 
 // pollStopped decides which of the two clocks ran out: ours, which the caller
 // should retry against, or the caller's own, which it already knows about.
-func pollStopped(ctx context.Context, jobID string, lastStatus agentclient.JobStatus, budget time.Duration) error {
+//
+// lastJob is the last job successfully polled, or nil when no poll ever
+// succeeded at all. Either way it may carry no QueuedBehind - a Running job
+// has none, and neither does one that has genuinely reached the head of its
+// own queue with nothing else recorded as running ahead of it - so the plain
+// fallback message has to remain correct on its own, not just as a stepping
+// stone to the richer one.
+func pollStopped(
+	ctx context.Context, jobID string, lastStatus agentclient.JobStatus, budget time.Duration, lastJob *agentclient.Job,
+) error {
 	if err := ctx.Err(); err != nil {
 		return status.FromContextError(err).Err()
+	}
+
+	if lastJob != nil && lastJob.QueuedBehind != nil {
+		return status.Errorf(codes.Aborted,
+			"job %s is still %s after %s (queued behind %s on %s); operation in progress, retry",
+			jobID, lastStatus, budget, lastJob.QueuedBehind.OperationType, lastJob.QueuedBehind.Target)
 	}
 
 	return status.Errorf(codes.Aborted,

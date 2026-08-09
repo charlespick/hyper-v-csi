@@ -129,7 +129,58 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
             return null;
         }
 
+        // Computed here rather than stored when the job was enqueued or when
+        // it started running, so it can never go stale: a value captured
+        // once would still name whichever job was running at that moment,
+        // long after that job finished and released the target - exactly the
+        // kind of "still Pending after 24s" mystery this field exists to
+        // replace with something true. A Running or terminal job has nothing
+        // left to be queued behind.
+        job.QueuedBehind = job.Status == JobStatus.Pending ? FindQueuedBehind(job) : null;
+
         return job;
+    }
+
+    /// <summary>
+    /// The first of <paramref name="job"/>'s targets that currently has a
+    /// different job running on it, paired with that job's operation type.
+    /// </summary>
+    /// <remarks>
+    /// A job holding several targets - <c>{vm:X, volume:Y}</c> - is not
+    /// necessarily blocked on both at once, so "the" target it is waiting on
+    /// is not automatically singular. Targets is already sorted ordinally
+    /// (see <see cref="GetOrCreate"/>), so walking it in that order and
+    /// reporting the first hit is at least a stable, deterministic choice
+    /// rather than an arbitrary one - but it is still an approximation: on
+    /// the rare occasion both targets have something running, only the first
+    /// is reported. That is judged good enough for an operator glancing at
+    /// GET /v1/jobs/{id} - naming one real, current blocker is the entire
+    /// improvement over "still Pending", and enumerating every target this
+    /// job might be contending for would be more than that glance needs.
+    /// <para>
+    /// Takes <see cref="_gate"/> only to read <see cref="_queues"/>, which is
+    /// a plain <see cref="Dictionary{TKey,TValue}"/> mutated elsewhere under
+    /// the same lock - this is a handful of dictionary lookups, never held
+    /// across an await or a run delegate, so it cannot deadlock or stall
+    /// anything slow.
+    /// </para>
+    /// </remarks>
+    private QueuedBehindInfo? FindQueuedBehind(Job job)
+    {
+        lock (_gate)
+        {
+            foreach (var target in job.Targets)
+            {
+                if (_queues.TryGetValue(target, out var queue) &&
+                    queue.Running is { } running &&
+                    !ReferenceEquals(running, job))
+                {
+                    return new QueuedBehindInfo(target, running.OperationType);
+                }
+            }
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -156,6 +207,15 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
         lock (_gate)
         {
             job.Status = JobStatus.Running;
+
+            // Recorded per target, not just once, for the same reason
+            // Targets itself is a set: a job holding {vm:, volume:} is the
+            // thing a later job on *either* queue is queued behind, so both
+            // queues need to be able to say so.
+            foreach (var target in targets)
+            {
+                _queues[target].Running = job;
+            }
         }
 
         try
@@ -203,7 +263,19 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
                 // job rather than per job.
                 foreach (var target in targets)
                 {
-                    if (--_queues[target].Pending == 0)
+                    var queue = _queues[target];
+
+                    // Cleared before the Pending check below so a queue that
+                    // is about to be removed does not leave a dangling
+                    // reference to a job that finished behind, and so a
+                    // queue that stays around does not keep reporting a
+                    // finished job as though it were still running.
+                    if (ReferenceEquals(queue.Running, job))
+                    {
+                        queue.Running = null;
+                    }
+
+                    if (--queue.Pending == 0)
                     {
                         _queues.Remove(target);
                     }
@@ -240,5 +312,13 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
     {
         public Task Tail = Task.CompletedTask;
         public int Pending;
+
+        /// <summary>
+        /// The job currently running against this target, or null between
+        /// runs. Set and cleared under <see cref="_gate"/> alongside
+        /// <see cref="Job.Status"/>, and read under the same lock by
+        /// <see cref="FindQueuedBehind"/>.
+        /// </summary>
+        public Job? Running;
     }
 }

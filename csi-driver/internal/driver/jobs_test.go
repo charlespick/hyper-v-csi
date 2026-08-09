@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -106,5 +107,61 @@ func TestAwaitJobStopsWhenTheCallerGivesUp(t *testing.T) {
 
 	if got := status.Code(err); got != codes.Canceled {
 		t.Fatalf("code = %s, want Canceled (err: %v)", got, err)
+	}
+}
+
+func TestPollStoppedNamesTheBlockerWhenQueuedBehindIsPresent(t *testing.T) {
+	// The message a kubectl describe on a stuck attach should read - not the
+	// bare "still Pending after 24s" that names nothing an operator can act
+	// on.
+	agent := newFakeAgent(t, agentclient.Job{
+		Status:       agentclient.JobPending,
+		QueuedBehind: &agentclient.QueuedBehind{Target: "vm:node-a", OperationType: "CopySnapshot"},
+	})
+	client := agentclient.New(agent.URL)
+
+	_, err := awaitJob(context.Background(), client, "job-1", 300*time.Millisecond)
+
+	if got := status.Code(err); got != codes.Aborted {
+		t.Fatalf("code = %s, want Aborted (err: %v)", got, err)
+	}
+	if want := "queued behind CopySnapshot on vm:node-a"; !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), want)
+	}
+}
+
+func TestPollStoppedFallsBackWhenQueuedBehindIsAbsent(t *testing.T) {
+	// A Running job carries no QueuedBehind at all (per the .NET side, only a
+	// Pending job ever does), and that has to degrade to the original plain
+	// message rather than panicking on a nil dereference or printing
+	// something half-formed.
+	agent := newFakeAgent(t, agentclient.Job{Status: agentclient.JobRunning})
+	client := agentclient.New(agent.URL)
+
+	_, err := awaitJob(context.Background(), client, "job-1", 300*time.Millisecond)
+
+	if got := status.Code(err); got != codes.Aborted {
+		t.Fatalf("code = %s, want Aborted (err: %v)", got, err)
+	}
+	if strings.Contains(err.Error(), "queued behind") {
+		t.Errorf("error = %q, want the plain fallback with no QueuedBehind mentioned", err.Error())
+	}
+}
+
+func TestPollStoppedFallsBackWhenNoPollEverSucceeded(t *testing.T) {
+	// Every poll fails right up until the budget runs out: lastJob is still
+	// nil at that point, which has to be as safe as a Running job with no
+	// QueuedBehind, not a nil-pointer panic in pollStopped.
+	agent := newFakeAgent(t, agentclient.Job{Status: agentclient.JobSucceeded})
+	agent.failPolls = 1000
+	client := agentclient.New(agent.URL)
+
+	_, err := awaitJob(context.Background(), client, "job-1", 300*time.Millisecond)
+
+	if got := status.Code(err); got != codes.Aborted {
+		t.Fatalf("code = %s, want Aborted (err: %v)", got, err)
+	}
+	if strings.Contains(err.Error(), "queued behind") {
+		t.Errorf("error = %q, want the plain fallback with no QueuedBehind mentioned", err.Error())
 	}
 }

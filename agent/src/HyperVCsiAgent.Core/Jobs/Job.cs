@@ -64,4 +64,28 @@ public sealed class Job
     public DateTimeOffset CreatedAt { get; init; } = DateTimeOffset.UtcNow;
 
     public DateTimeOffset? CompletedAt { get; set; }
+
+    /// <summary>
+    /// Set by <see cref="IJobStore.Get"/> while this job is Pending, to name
+    /// what it is actually waiting on. Null for a Running or terminal job -
+    /// once a job has started, nothing is left to be queued behind, and a
+    /// terminal job's targets are already released.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public QueuedBehindInfo? QueuedBehind { get; set; }
 }
+
+/// <summary>
+/// What a Pending job's <see cref="Job.QueuedBehind"/> names: one of its own
+/// <see cref="Job.Targets"/> that currently has a job running on it, and that
+/// job's operation type.
+/// </summary>
+/// <remarks>
+/// A job naming several targets is not necessarily waiting on all of them at
+/// once - see <see cref="InMemoryJobStore"/>'s own remarks on how this is
+/// chosen. This is deliberately the coarsest useful answer: enough for an
+/// operator reading <c>kubectl describe</c> to learn "queued behind
+/// CopySnapshot on vm:&lt;id&gt;" instead of a bare "still Pending", not a
+/// complete accounting of every target this job might be contending for.
+/// </remarks>
+public sealed record QueuedBehindInfo(string Target, string OperationType);

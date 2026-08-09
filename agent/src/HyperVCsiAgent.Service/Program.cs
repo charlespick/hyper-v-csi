@@ -111,6 +111,11 @@ builder.Services.AddSingleton<ISnapshotService, SnapshotService>();
 // only be one more thing to keep in sync with it.
 builder.Services.AddHostedService<OrphanedCheckpointReaper>();
 
+// Independent of OrphanedCheckpointReaper and JobIntakeGate entirely - see
+// SnapshotStorageWarningService's own remarks for why it is kept as its own
+// hosted service rather than folded into the reaper that owns the gate.
+builder.Services.AddHostedService<SnapshotStorageWarningService>();
+
 builder.Services.AddSingleton<JobDispatcher>();
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<StoreCertificateProvider>();

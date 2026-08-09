@@ -247,6 +247,93 @@ public class InMemoryJobStoreTests
     }
 
     [Fact]
+    public async Task Get_PendingJob_ReportsTheRunningJobsTargetAndOperationType()
+    {
+        var store = new InMemoryJobStore();
+        var release = new TaskCompletionSource();
+
+        var copy = store.GetOrCreate("pvc-1~snap", "CopySnapshot", ["vm:node-a", "volume:pvc-1"],
+            async (_, _) => await release.Task);
+        await WaitForStatus(copy, JobStatus.Running);
+
+        var attach = store.GetOrCreate("pvc-2+node-a", "AttachVolume", ["vm:node-a"], (_, _) => Task.CompletedTask);
+
+        var polled = store.Get(attach.Id);
+        Assert.NotNull(polled);
+        Assert.NotNull(polled!.QueuedBehind);
+        Assert.Equal("vm:node-a", polled.QueuedBehind!.Target);
+        Assert.Equal("CopySnapshot", polled.QueuedBehind.OperationType);
+
+        release.SetResult();
+        await WaitForTerminal(attach);
+    }
+
+    [Fact]
+    public async Task Get_RunningJob_ReportsNoQueuedBehind()
+    {
+        var store = new InMemoryJobStore();
+        var release = new TaskCompletionSource();
+
+        var job = store.GetOrCreate("pvc-1", "CreateVolume", ["vol-pvc-1"], async (_, _) => await release.Task);
+        await WaitForStatus(job, JobStatus.Running);
+
+        Assert.Null(store.Get(job.Id)!.QueuedBehind);
+
+        release.SetResult();
+        await WaitForTerminal(job);
+    }
+
+    [Fact]
+    public async Task Get_TerminalJob_ReportsNoQueuedBehind()
+    {
+        var store = new InMemoryJobStore();
+
+        var job = store.GetOrCreate("pvc-1", "CreateVolume", ["vol-pvc-1"], (_, _) => Task.CompletedTask);
+        await WaitForTerminal(job);
+
+        Assert.Null(store.Get(job.Id)!.QueuedBehind);
+    }
+
+    [Fact]
+    public async Task Get_PendingJob_QueuedBehindReflectsWhicheverJobIsRunningNow()
+    {
+        // The property the read-time computation exists for: a value captured
+        // once at enqueue would still name whatever was running back then,
+        // long after it finished. It has to track reality as the head of the
+        // queue changes underneath the still-Pending job.
+        var store = new InMemoryJobStore();
+        var releaseFirst = new TaskCompletionSource();
+        var releaseSecond = new TaskCompletionSource();
+
+        var first = store.GetOrCreate("pvc-1~snap-1", "CopySnapshot", ["vm:node-a"],
+            async (_, _) => await releaseFirst.Task);
+        await WaitForStatus(first, JobStatus.Running);
+
+        var second = store.GetOrCreate("pvc-1~snap-2", "CopySnapshot", ["vm:node-a"],
+            async (_, _) => await releaseSecond.Task);
+        var attach = store.GetOrCreate("pvc-2+node-a", "AttachVolume", ["vm:node-a"], (_, _) => Task.CompletedTask);
+
+        Assert.Equal("CopySnapshot", store.Get(attach.Id)!.QueuedBehind!.OperationType);
+
+        releaseFirst.SetResult();
+        await WaitForStatus(second, JobStatus.Running);
+
+        // Still queued behind vm:node-a and still behind a CopySnapshot by
+        // operation type, but the first copy is gone now - this has to be a
+        // fresh read finding the second one, not a cached answer repeating
+        // what the first read already said.
+        var queuedBehind = store.Get(attach.Id)!.QueuedBehind;
+        Assert.NotNull(queuedBehind);
+        Assert.Equal("vm:node-a", queuedBehind!.Target);
+        Assert.Equal("CopySnapshot", queuedBehind.OperationType);
+        Assert.Equal(JobStatus.Running, second.Status);
+
+        releaseSecond.SetResult();
+        await WaitForTerminal(attach);
+        Assert.Null(store.Get(attach.Id)!.QueuedBehind);
+    }
+
+    [Fact]
     public async Task Get_TerminalJobPastRetention_IsEvicted()
     {
         var clock = new FakeClock();

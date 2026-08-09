@@ -26,7 +26,19 @@ namespace HyperVCsiAgent.Core.Storage;
 /// (FILE_SUPPORTS_BLOCK_REFCOUNTING). This is the single fact that decides
 /// whether a copy costs the source's whole allocated size or almost nothing.
 /// </param>
-public sealed record DiskCopyTarget(long FreeBytes, bool SupportsBlockCloning)
+/// <param name="VolumeRoot">
+/// The mount point the inspected directory resolves to (see
+/// <c>WindowsDiskCopier.ResolveVolumeRoot</c>), or empty when the caller has
+/// no need of it. Block cloning only ever works within one volume - there is
+/// no cross-volume form of the FSCTL - so a caller deciding whether two
+/// directories can clone into each other needs this in addition to
+/// <see cref="SupportsBlockCloning"/>, which answers about one directory in
+/// isolation. Defaulted rather than added as a required parameter so the
+/// existing callers that only ever cared about space and cloning support -
+/// <see cref="VhdxService"/>'s restore path among them - do not all have to
+/// start naming a volume root they have no use for.
+/// </param>
+public sealed record DiskCopyTarget(long FreeBytes, bool SupportsBlockCloning, string VolumeRoot = "")
 {
     /// <summary>
     /// What a block clone is charged for even though it duplicates no data. The

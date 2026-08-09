@@ -99,6 +99,28 @@ public class JobWireFormatTests
         Assert.False(root.TryGetProperty("result", out _));
         Assert.False(root.TryGetProperty("error", out _));
         Assert.False(root.TryGetProperty("errorCode", out _));
+        Assert.False(root.TryGetProperty("queuedBehind", out _));
+    }
+
+    [Fact]
+    public void Job_SerializesQueuedBehindWithTheFieldNamesTheGoClientExpects()
+    {
+        // Matches QueuedBehind in csi-driver/internal/agentclient/client.go.
+        var job = new Job
+        {
+            Id = "abc123",
+            IdempotencyKey = "pvc-2+node-a",
+            OperationType = "AttachVolume",
+            Targets = ["vm:node-a"],
+            Status = JobStatus.Pending,
+            QueuedBehind = new QueuedBehindInfo("vm:node-a", "CopySnapshot"),
+        };
+
+        using var document = JsonDocument.Parse(JsonSerializer.Serialize(job, WireOptions()));
+        var queuedBehind = document.RootElement.GetProperty("queuedBehind");
+
+        Assert.Equal("vm:node-a", queuedBehind.GetProperty("target").GetString());
+        Assert.Equal("CopySnapshot", queuedBehind.GetProperty("operationType").GetString());
     }
 
     [Fact]

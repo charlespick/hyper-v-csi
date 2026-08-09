@@ -123,7 +123,7 @@ public sealed class WindowsDiskCopier : IDiskCopier
                 var volumeRoot = ResolveVolumeRoot(directoryPath);
                 var supportsCloning = SupportsBlockCloning(volumeRoot);
 
-                var target = new DiskCopyTarget(checked((long)freeToCaller), supportsCloning);
+                var target = new DiskCopyTarget(checked((long)freeToCaller), supportsCloning, volumeRoot);
                 _logger.LogInformation(
                     "{Directory} (volume {VolumeRoot}) has {FreeBytes} bytes free and {CloningState} block cloning",
                     directoryPath, volumeRoot, target.FreeBytes, supportsCloning ? "supports" : "does not support");

@@ -69,6 +69,16 @@ type Job struct {
 	Result         json.RawMessage `json:"result,omitempty"`
 	Error          string          `json:"error,omitempty"`
 	ErrorCode      string          `json:"errorCode,omitempty"`
+	QueuedBehind   *QueuedBehind   `json:"queuedBehind,omitempty"`
+}
+
+// QueuedBehind names what a Pending job is actually waiting on: one of its
+// own targets that currently has a job running against it, and that job's
+// operation type. Mirrors HyperVCsiAgent.Core.Jobs.QueuedBehindInfo — nil for
+// anything but a Pending job, per JobWireFormatTests.
+type QueuedBehind struct {
+	Target        string `json:"target"`
+	OperationType string `json:"operationType"`
 }
 
 // enqueueRequest is the POST /v1/jobs body, matching EnqueueJobRequest on the
