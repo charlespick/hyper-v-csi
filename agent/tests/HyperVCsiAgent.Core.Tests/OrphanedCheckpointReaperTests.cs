@@ -187,6 +187,69 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
     }
 
     [Fact]
+    public async Task SweepAsync_IdentityRecovery_FallsBackToTheElementNameWhenNotesNamesSomethingUnusable()
+    {
+        // Notes is read off a host, not something this process wrote and can
+        // vouch for - a checkpoint carrying the owned prefix with hand-written
+        // or future-schema Notes is all it takes. So the two halves it yields
+        // have to pass the same IsSafeName check the ElementName branch
+        // applies before they reach SnapshotNaming.ComposeId, which throws on
+        // a name it cannot turn into a file. The ElementName here is
+        // recoverable, so the right answer is to fall back to it rather than
+        // to give up on the checkpoint.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var harness = NewHarness(cluster);
+        WriteVolume("pvc-1", 4096);
+        Directory.CreateDirectory(_snapshotsRoot);
+        harness.Host.SeedRawCheckpoint(
+            "host-1", "vm-1", "hyperv-csi/pvc-1/snap-a",
+            notes: """{"schema":1,"volumeId":"../../elsewhere","snapshotName":"snap-a","createdAtUtc":"2020-01-01T00:00:00Z"}""");
+
+        await NewReaper(harness).SweepAsync(CancellationToken.None);
+
+        var resumed = Assert.Single(harness.Store.Created);
+        Assert.Equal(SnapshotNaming.ComposeId("pvc-1", "snap-a"), resumed.IdempotencyKey);
+    }
+
+    [Fact]
+    public async Task SweepAsync_ACheckpointThatCannotBeHandled_DoesNotAbortTheSweepOverEveryOtherVm()
+    {
+        // Contained per checkpoint, the same way a failing
+        // ListOwnedCheckpointsAsync is already contained per VM - and it
+        // matters more here than there. On the startup pass an escape would
+        // skip discovery for every VM not yet visited, and ExecuteAsync's
+        // finally opens JobIntakeGate regardless, so RPC-driven jobs would go
+        // on to claim the vm: targets those recovery jobs never enqueued to
+        // take: exactly the ordering the gate exists to guarantee, lost to one
+        // bad checkpoint on one VM.
+        var cluster = new FakeClusterService
+        {
+            Vms =
+            {
+                ["vm-1"] = new ClusteredVm("vm-1", "host-1"),
+                ["vm-2"] = new ClusteredVm("vm-2", "host-1"),
+            },
+        };
+        var harness = NewHarness(cluster);
+        WriteVolume("pvc-1", 4096);
+        WriteVolume("pvc-2", 4096);
+        Directory.CreateDirectory(_snapshotsRoot);
+        harness.Host.SeedOwnedCheckpoint("host-1", "vm-1", "pvc-1", "snap-a");
+        harness.Host.SeedOwnedCheckpoint("host-1", "vm-2", "pvc-2", "snap-b");
+
+        // Stands in for anything on this path that can fail - the enqueue
+        // itself is simply the one seam a test can reach deterministically.
+        harness.Store.FailEnqueueFor.Add(SnapshotNaming.ComposeId("pvc-1", "snap-a"));
+
+        await NewReaper(harness).SweepAsync(CancellationToken.None);
+
+        // Asserted without depending on which VM the sweep reached first:
+        // whichever order it took, the other VM's orphan is still enqueued.
+        var enqueued = Assert.Single(harness.Store.Created);
+        Assert.Equal(SnapshotNaming.ComposeId("pvc-2", "snap-b"), enqueued.IdempotencyKey);
+    }
+
+    [Fact]
     public async Task SweepAsync_AHostThatIsNotLive_IsSkipped()
     {
         var cluster = new FakeClusterService
@@ -435,9 +498,22 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
 
         public List<Job> Created { get; } = [];
 
+        /// <summary>
+        /// Idempotency keys this store refuses to enqueue at all, standing in
+        /// for any failure inside the reaper's per-checkpoint handling - the
+        /// path also runs SnapshotNaming.ComposeId and two ResolvePath calls,
+        /// none of which a test can make fail as directly as this.
+        /// </summary>
+        public HashSet<string> FailEnqueueFor { get; } = [];
+
         public Job GetOrCreate(
             string idempotencyKey, string operationType, IReadOnlyCollection<string> targets, Func<Job, CancellationToken, Task> run)
         {
+            if (FailEnqueueFor.Contains(idempotencyKey))
+            {
+                throw new InvalidOperationException($"this store refuses {idempotencyKey}");
+            }
+
             var job = _inner.GetOrCreate(idempotencyKey, operationType, targets, run);
             lock (Created)
             {

@@ -243,6 +243,40 @@ public sealed class SnapshotServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateAsync_AStaleMarkerUnderAJobThatMerelyReadsAsRunning_IsNotMistakenForThisCopysOwn()
+    {
+        // InMemoryJobStore sets Status to Running *before* it invokes the run
+        // delegate, so between those two moments an abandoned attempt's marker
+        // is still on disk under a job that already reads as Running - and
+        // discarding that marker means deleting a file the size of the source
+        // disk, on a CSV, so the window is wide enough for a 250ms poll to
+        // land in. Reporting that marker's creation time would hand
+        // external-snapshotter a creation_time from before whatever left it
+        // behind, for data captured long after, which csi-snapshotter then
+        // never revises: D9's failure, in the direction that matters.
+        //
+        // This store is that moment held still - a job that reads as Running
+        // with its delegate never invoked - which is what makes the property
+        // testable rather than a race to lose occasionally. The wait has to
+        // key off the copy delegate's own progress past its discard step, so
+        // with no delegate having run it must time out rather than answer from
+        // the marker sitting there.
+        WriteVolume("pvc-1", 4096);
+        var stale = WriteMarker("pvc-1~snapshot-abc");
+
+        var service = NewServiceOn(
+            new RunningButUnstartedJobStore(), snapshotCheckpointWaitTimeout: TimeSpan.FromMilliseconds(300));
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.Aborted, failure.ErrorCode);
+        // Still there: no delegate ran, so nothing discarded it - which is
+        // exactly why it must not have been reported.
+        Assert.True(File.Exists(stale));
+    }
+
+    [Fact]
     public async Task CreateAsync_AFinishedSnapshotIsNotReCheckedAgainstItsSource()
     {
         // A full copy is independent of its source the moment it is published.
@@ -983,6 +1017,40 @@ public sealed class SnapshotServiceTests : IDisposable
         await WaitForAsync(() => host.DestroyedCheckpointElementNames.Contains("hyperv-csi/pvc-1/snapshot-abc"));
         await Task.Delay(100);
         Assert.False(File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+    }
+
+    [Fact]
+    public async Task CreateAsync_AttachedVolume_AMergeWaitThatFailsStillPublishesTheCopyItFollows()
+    {
+        // The merge is already started by the time the collapse wait runs,
+        // and the copy has already read every byte, so a CIM failure here is
+        // the checkpoint's problem and not the snapshot's - the whole posture
+        // DestroyOwnedCheckpointAndWaitAsync's own remarks describe. Letting
+        // it propagate would land in RunCopyAsync's catch-all, which deletes
+        // the marker and fails the job: hours of already-read bytes thrown
+        // away, and a fresh checkpoint taken on the retry, over a merge that
+        // is very likely completing on its own. The plausible cause is the
+        // one the wait cannot re-derive its way out of - the VM live
+        // migrating during a wait that can span the whole merge, leaving the
+        // host resolved before it stale.
+        var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient { FailChainCollapsedChecks = true };
+        var harness = NewHarness(cluster: cluster, host: host);
+        WriteVolume("pvc-1", 4096);
+
+        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", "node-a", CancellationToken.None);
+
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+        Assert.False(File.Exists(MarkerPath("pvc-1~snapshot-abc")));
+
+        var copy = Assert.Single(harness.Store.Created);
+        await WaitForAsync(() => copy.Status is JobStatus.Succeeded or JobStatus.Failed);
+        Assert.Equal(JobStatus.Succeeded, copy.Status);
+
+        // The checkpoint still standing is left for OrphanedCheckpointReaper,
+        // which finds it over an already-published snapshot - its ReapOrphan
+        // case, and the one path that resolves the VM fresh.
+        Assert.Contains("hyperv-csi/pvc-1/snapshot-abc", host.DestroyedCheckpointElementNames);
     }
 
     [Fact]
@@ -1926,6 +1994,35 @@ public sealed class SnapshotServiceTests : IDisposable
         return new Harness(service, disks, copier, store, slots);
     }
 
+    /// <summary>
+    /// A service on a caller-supplied store, for the one test whose subject is
+    /// what the store does rather than what the service does with a real one.
+    /// Deliberately not folded into <see cref="NewHarness"/>, which hands back
+    /// a <see cref="RecordingJobStore"/> every other test reads.
+    /// </summary>
+    private SnapshotService NewServiceOn(IJobStore jobs, TimeSpan snapshotCheckpointWaitTimeout)
+    {
+        var copySlots = new SnapshotCopySlots(Options.Create(new AgentOptions { MaxConcurrentSnapshotCopies = 4 }));
+        _disposables.Add(copySlots);
+
+        return new SnapshotService(
+            new FakeVirtualDiskManager(),
+            new FakeDiskCopier(),
+            jobs,
+            new NeverCalledClusterService(),
+            new NeverCalledHostClient(),
+            new HostOperationSlots(Options.Create(new AgentOptions { MaxConcurrentHostOperations = 4 })),
+            copySlots,
+            Options.Create(new AgentOptions
+            {
+                CsvVolumesRoot = _volumesRoot,
+                CsvSnapshotsRoot = _snapshotsRoot,
+                DiskOperationTimeout = TimeSpan.FromMinutes(10),
+                SnapshotCheckpointWaitTimeout = snapshotCheckpointWaitTimeout,
+            }),
+            NullLogger<SnapshotService>.Instance);
+    }
+
     private void WriteVolume(string volumeId, long virtualSizeBytes)
     {
         Directory.CreateDirectory(_volumesRoot);
@@ -2001,6 +2098,35 @@ public sealed class SnapshotServiceTests : IDisposable
         public Job? Get(string id) => _inner.Get(id);
 
         public void Dispose() => _inner.Dispose();
+    }
+
+    /// <summary>
+    /// Hands back a job that already reads as <see cref="JobStatus.Running"/>
+    /// and never invokes its delegate - InMemoryJobStore's own window between
+    /// setting that status and calling <c>run</c>, held open indefinitely so a
+    /// test can assert what is true inside it rather than race for it.
+    /// </summary>
+    private sealed class RunningButUnstartedJobStore : IJobStore
+    {
+        private readonly Dictionary<string, Job> _byId = new(StringComparer.Ordinal);
+
+        public Job GetOrCreate(
+            string idempotencyKey, string operationType, IReadOnlyCollection<string> targets, Func<Job, CancellationToken, Task> run)
+        {
+            var job = new Job
+            {
+                Id = Guid.NewGuid().ToString("n"),
+                IdempotencyKey = idempotencyKey,
+                OperationType = operationType,
+                Targets = targets.ToArray(),
+                Status = JobStatus.Running,
+            };
+
+            _byId[job.Id] = job;
+            return job;
+        }
+
+        public Job? Get(string id) => _byId.GetValueOrDefault(id);
     }
 
     /// <summary>
@@ -2275,6 +2401,14 @@ public sealed class SnapshotServiceTests : IDisposable
         /// </summary>
         public bool ChainStaysUncollapsed { get; set; }
 
+        /// <summary>
+        /// Makes <see cref="IsChainCollapsedAsync"/> throw, the way it does
+        /// against a host the VM has live migrated off in the hours a merge
+        /// wait can span - <see cref="IHyperVHostClient.IsChainCollapsedAsync"/>
+        /// documents VmNotOnHostException for exactly that.
+        /// </summary>
+        public bool FailChainCollapsedChecks { get; set; }
+
         public Task<VolumeAttachment> ClassifyAttachmentAsync(
             string hostName, string vmId, string vhdxPath, string thisSnapshotElementName, CancellationToken cancellationToken)
         {
@@ -2378,8 +2512,15 @@ public sealed class SnapshotServiceTests : IDisposable
         public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             Task.FromResult(!CheckpointsNotConfigured);
 
-        public Task<bool> IsChainCollapsedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
-            Task.FromResult(!ChainStaysUncollapsed && _checkpointsByElementName.Count == 0);
+        public Task<bool> IsChainCollapsedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken)
+        {
+            if (FailChainCollapsedChecks)
+            {
+                throw new InvalidOperationException($"{vmId} is not registered on {hostName}");
+            }
+
+            return Task.FromResult(!ChainStaysUncollapsed && _checkpointsByElementName.Count == 0);
+        }
 
         public Task<long> GetDiskSizeAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
             throw new NotSupportedException(

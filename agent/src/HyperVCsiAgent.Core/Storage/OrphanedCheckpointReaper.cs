@@ -247,7 +247,27 @@ public sealed class OrphanedCheckpointReaper : BackgroundService
 
                 foreach (var checkpoint in owned)
                 {
-                    HandleOwnedCheckpoint(vm.VmId, checkpoint, host);
+                    try
+                    {
+                        HandleOwnedCheckpoint(vm.VmId, checkpoint, host);
+                    }
+                    catch (Exception ex)
+                    {
+                        // Contained per checkpoint for the same reason the
+                        // listing above is contained per VM, and it matters
+                        // more here: this runs during the startup pass, and
+                        // an escape would abort discovery for every VM not
+                        // yet visited - after which ExecuteAsync's finally
+                        // opens JobIntakeGate regardless, so RPC-driven jobs
+                        // would claim vm:<id> ahead of recovery jobs that
+                        // were never enqueued. That is exactly the ordering
+                        // the gate exists to guarantee, lost to one bad
+                        // checkpoint on one VM.
+                        _logger.LogError(ex,
+                            "OrphanedCheckpointReaper: handling checkpoint {ElementName} on {VmId} ({Host}) failed; " +
+                            "leaving it as it stands and continuing the sweep",
+                            checkpoint.ElementName, vm.VmId, host);
+                    }
                 }
             }
         }
@@ -345,7 +365,22 @@ public sealed class OrphanedCheckpointReaper : BackgroundService
             try
             {
                 var parsed = JsonSerializer.Deserialize<CheckpointNotes>(notes);
-                if (parsed is { VolumeId.Length: > 0, SnapshotName.Length: > 0 })
+
+                // Checked against the same rule the ElementName branch below
+                // applies, rather than trusted for having arrived as JSON.
+                // Both halves are about to be handed to
+                // SnapshotNaming.ComposeId, which throws on a name that is
+                // not usable in a file name - and everything reaching this
+                // method came off a host, which makes it input, not something
+                // this process wrote and can vouch for: a checkpoint carrying
+                // the owned prefix with hand-written or future-schema Notes
+                // is all it takes. Falling through to ElementName on a
+                // failed check rather than returning null, since the two
+                // halves this driver itself composed are still sitting right
+                // there and do get validated.
+                if (parsed is { VolumeId.Length: > 0, SnapshotName.Length: > 0 }
+                    && VolumeNaming.IsSafeName(parsed.VolumeId)
+                    && VolumeNaming.IsSafeName(parsed.SnapshotName))
                 {
                     return (parsed.VolumeId, parsed.SnapshotName);
                 }
