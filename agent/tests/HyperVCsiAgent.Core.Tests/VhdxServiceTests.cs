@@ -1411,8 +1411,8 @@ public sealed class VhdxServiceTests : IDisposable
         public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
             throw new NotSupportedException("ExpandAsync's fallback never checks host liveness");
 
-        public Task<IReadOnlyList<string>> ListHostNamesAsync(CancellationToken cancellationToken) =>
-            throw new NotSupportedException("ExpandAsync's fallback never lists cluster hosts");
+        public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException("ExpandAsync's fallback never lists cluster VMs");
     }
 
     /// <summary>
@@ -1468,7 +1468,7 @@ public sealed class VhdxServiceTests : IDisposable
         public Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
             throw new NotSupportedException("ExpandAsync's fallback never checkpoints anything");
 
-        public Task<IReadOnlyList<OwnedCheckpoint>> ListOwnedCheckpointsAsync(string hostName, CancellationToken cancellationToken) =>
+        public Task<IReadOnlyList<Checkpoint>> ListOwnedCheckpointsAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             throw new NotSupportedException("ExpandAsync's fallback never sweeps for owned checkpoints");
 
         public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
@@ -1492,7 +1492,7 @@ public sealed class VhdxServiceTests : IDisposable
         public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
 
-        public Task<IReadOnlyList<string>> ListHostNamesAsync(CancellationToken cancellationToken) =>
+        public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) =>
             throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
     }
 
@@ -1535,7 +1535,7 @@ public sealed class VhdxServiceTests : IDisposable
         public Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
 
-        public Task<IReadOnlyList<OwnedCheckpoint>> ListOwnedCheckpointsAsync(string hostName, CancellationToken cancellationToken) =>
+        public Task<IReadOnlyList<Checkpoint>> ListOwnedCheckpointsAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
 
         public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>

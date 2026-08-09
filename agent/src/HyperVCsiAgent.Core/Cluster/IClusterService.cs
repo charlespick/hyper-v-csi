@@ -33,17 +33,31 @@ public interface IClusterService
     Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Every host that is a member of this failover cluster, by name.
+    /// Every VM this failover cluster manages, with the host currently
+    /// running each one.
     /// </summary>
     /// <remarks>
-    /// Hosts, not VMs: a caller that wants every checkpoint this driver owns
-    /// gets the VM IDs it needs from the checkpoint enumeration itself - see
-    /// <see cref="HyperVCsiAgent.Core.HostControl.IHyperVHostClient.ListOwnedCheckpointsAsync"/> -
-    /// so asking the cluster for VMs instead would cost one WMI round trip per
-    /// VM to resolve each one's owning host, the very cost this class's own
-    /// remarks measure, to learn something a per-host sweep already knows by
-    /// construction. Hosts are O(nodes); VMs resolved this way would be
-    /// O(VMs).
+    /// <see cref="IClusterService"/> is the only thing that knows which VMs
+    /// this driver manages at all - a caller sweeping for orphaned
+    /// checkpoints has no other way to learn that a VM exists, let alone
+    /// which host currently runs it, since
+    /// <see cref="HyperVCsiAgent.Core.HostControl.IHyperVHostClient.ListOwnedCheckpointsAsync"/>
+    /// is per-VM now and needs a VM to ask about rather than discovering VMs
+    /// itself. Scoping the answer to clustered VMs is deliberate, not a gap:
+    /// <see cref="ResolveVmAsync"/> already returns null for anything this
+    /// driver does not manage, so a VM removed from the cluster mid-copy
+    /// (<c>Remove-ClusterGroup</c> leaves it registered on its host and still
+    /// running) is invisible here too - and correctly so, because neither
+    /// <c>ISnapshotService.ResumeCopy</c> nor <c>ReapOrphan</c> could act on
+    /// a VM this interface cannot resolve.
+    /// <para>
+    /// An implementation is expected to answer this cheaply: the one caller
+    /// today runs it at startup, while job intake is closed, so an
+    /// implementation that resolves each VM's owner one WMI round trip at a
+    /// time - the per-resource cost <c>MsClusterService</c>'s own remarks
+    /// measure - would turn that startup sweep into a multi-second stall on
+    /// a large cluster.
+    /// </para>
     /// </remarks>
-    Task<IReadOnlyList<string>> ListHostNamesAsync(CancellationToken cancellationToken);
+    Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken);
 }

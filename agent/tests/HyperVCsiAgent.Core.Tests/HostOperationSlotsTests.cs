@@ -158,7 +158,7 @@ public sealed class HostOperationSlotsTests : IDisposable
 
         public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) => Task.FromResult(true);
 
-        public Task<IReadOnlyList<string>> ListHostNamesAsync(CancellationToken cancellationToken) =>
+        public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) =>
             throw new NotSupportedException();
     }
 
@@ -267,7 +267,7 @@ public sealed class HostOperationSlotsTests : IDisposable
         public Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
-        public Task<IReadOnlyList<OwnedCheckpoint>> ListOwnedCheckpointsAsync(string hostName, CancellationToken cancellationToken) =>
+        public Task<IReadOnlyList<Checkpoint>> ListOwnedCheckpointsAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
         public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>

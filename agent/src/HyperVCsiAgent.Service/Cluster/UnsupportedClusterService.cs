@@ -16,7 +16,7 @@ public sealed class UnsupportedClusterService : IClusterService
     public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
         throw Unsupported();
 
-    public Task<IReadOnlyList<string>> ListHostNamesAsync(CancellationToken cancellationToken) =>
+    public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) =>
         throw Unsupported();
 
     private static PlatformNotSupportedException Unsupported() =>

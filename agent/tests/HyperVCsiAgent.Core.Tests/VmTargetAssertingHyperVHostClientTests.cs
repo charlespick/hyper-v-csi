@@ -206,8 +206,8 @@ public class VmTargetAssertingHyperVHostClientTests
             return Task.CompletedTask;
         }
 
-        public Task<IReadOnlyList<OwnedCheckpoint>> ListOwnedCheckpointsAsync(string hostName, CancellationToken cancellationToken) =>
-            Task.FromResult<IReadOnlyList<OwnedCheckpoint>>([]);
+        public Task<IReadOnlyList<Checkpoint>> ListOwnedCheckpointsAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<Checkpoint>>([]);
 
         public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             Task.FromResult(true);

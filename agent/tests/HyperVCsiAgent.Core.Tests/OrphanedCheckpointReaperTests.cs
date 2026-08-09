@@ -63,7 +63,7 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
     [Fact]
     public async Task SweepAsync_AnOwnedCheckpointWhoseSnapshotIsNotPublished_IsResumedUnderTheIdentityAFreshCreateWouldCompute()
     {
-        var cluster = new FakeClusterService(["host-1"]) { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
         var harness = NewHarness(cluster);
         WriteVolume("pvc-1", 4096);
         // A resume's copy publishes into this directory the same way a fresh
@@ -95,7 +95,7 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
     [Fact]
     public async Task SweepAsync_AnOwnedCheckpointWhoseSnapshotIsAlreadyPublished_IsReapedNotResumed()
     {
-        var cluster = new FakeClusterService(["host-1"]) { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
         var harness = NewHarness(cluster);
         WriteVolume("pvc-1", 4096);
         var snapshotId = SnapshotNaming.ComposeId("pvc-1", "snap-a");
@@ -121,7 +121,7 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
         // CimHyperVHostClient's real implementation), so a checkpoint seeded
         // with no such prefix must not even reach this sweep's own decision
         // logic.
-        var cluster = new FakeClusterService(["host-1"]) { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
         var harness = NewHarness(cluster);
         harness.Host.SeedForeignCheckpoint("host-1", "vm-1", "some-backup-products/recovery-point");
 
@@ -137,7 +137,7 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
         // Owned prefix present (so ListOwnedCheckpointsAsync returns it), but
         // no second path segment behind it and no Notes at all - neither
         // recovery path can answer, so this must not be guessed at.
-        var cluster = new FakeClusterService(["host-1"]) { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
         var harness = NewHarness(cluster);
         harness.Host.SeedRawCheckpoint("host-1", "vm-1", "hyperv-csi/only-one-segment", notes: null);
 
@@ -150,7 +150,7 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
     [Fact]
     public async Task SweepAsync_IdentityRecovery_PrefersNotesOverTheElementNameWhenBothArePresent()
     {
-        var cluster = new FakeClusterService(["host-1"]) { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
         var harness = NewHarness(cluster);
         WriteVolume("pvc-real", 4096);
         Directory.CreateDirectory(_snapshotsRoot);
@@ -174,7 +174,7 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
     [InlineData("not valid json")]
     public async Task SweepAsync_IdentityRecovery_FallsBackToTheElementNameWhenNotesIsAbsentOrUnparseable(string? notes)
     {
-        var cluster = new FakeClusterService(["host-1"]) { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
         var harness = NewHarness(cluster);
         WriteVolume("pvc-1", 4096);
         Directory.CreateDirectory(_snapshotsRoot);
@@ -189,10 +189,10 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
     [Fact]
     public async Task SweepAsync_AHostThatIsNotLive_IsSkipped()
     {
-        var cluster = new FakeClusterService(["host-down", "host-up"])
+        var cluster = new FakeClusterService
         {
             Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-down") },
-            Live = { ["host-down"] = false, ["host-up"] = true },
+            Live = { ["host-down"] = false },
         };
         var harness = NewHarness(cluster);
         harness.Host.SeedOwnedCheckpoint("host-down", "vm-1", "pvc-1", "snap-a");
@@ -200,20 +200,55 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
         await NewReaper(harness).SweepAsync(CancellationToken.None);
 
         Assert.Empty(harness.Store.Created);
-        Assert.DoesNotContain("host-down", harness.Host.ListedHosts);
+        Assert.DoesNotContain(harness.Host.ListedVms, entry => entry.Host == "host-down");
     }
 
     [Fact]
-    public async Task SweepAsync_WhenListingOwnedCheckpointsOnOneHostFails_StillSweepsTheOtherHosts()
+    public async Task SweepAsync_AVmOnAHostThatIsNotLive_IsSkippedWhileVmsOnLiveHostsAreStillSwept()
     {
-        var cluster = new FakeClusterService(["host-bad", "host-good"])
+        // The grouping-by-host in SweepAsync is new: discovery now comes from
+        // ListVmsAsync rather than a per-host checkpoint enumeration, so a VM
+        // whose host is down and a VM whose host is up have to be proven
+        // independently of each other - this is a new way for the sweep to
+        // get "skip the down host" wrong that the single-VM version of this
+        // test above cannot catch.
+        var cluster = new FakeClusterService
         {
-            Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-good") },
+            Vms =
+            {
+                ["vm-down"] = new ClusteredVm("vm-down", "host-down"),
+                ["vm-up"] = new ClusteredVm("vm-up", "host-up"),
+            },
+            Live = { ["host-down"] = false, ["host-up"] = true },
         };
         var harness = NewHarness(cluster);
         WriteVolume("pvc-1", 4096);
         Directory.CreateDirectory(_snapshotsRoot);
-        harness.Host.SeedOwnedCheckpoint("host-good", "vm-1", "pvc-1", "snap-a");
+        harness.Host.SeedOwnedCheckpoint("host-down", "vm-down", "pvc-down", "snap-a");
+        harness.Host.SeedOwnedCheckpoint("host-up", "vm-up", "pvc-1", "snap-a");
+
+        await NewReaper(harness).SweepAsync(CancellationToken.None);
+
+        var resumed = Assert.Single(harness.Store.Created);
+        Assert.Equal(["vm:vm-up", "volume:pvc-1"], resumed.Targets);
+        Assert.DoesNotContain(harness.Host.ListedVms, entry => entry.Host == "host-down");
+    }
+
+    [Fact]
+    public async Task SweepAsync_WhenListingOwnedCheckpointsForOneVmFails_StillSweepsTheOtherVms()
+    {
+        var cluster = new FakeClusterService
+        {
+            Vms =
+            {
+                ["vm-bad"] = new ClusteredVm("vm-bad", "host-bad"),
+                ["vm-good"] = new ClusteredVm("vm-good", "host-good"),
+            },
+        };
+        var harness = NewHarness(cluster);
+        WriteVolume("pvc-1", 4096);
+        Directory.CreateDirectory(_snapshotsRoot);
+        harness.Host.SeedOwnedCheckpoint("host-good", "vm-good", "pvc-1", "snap-a");
         harness.Host.FailListOwnedCheckpointsFor.Add("host-bad");
 
         await NewReaper(harness).SweepAsync(CancellationToken.None);
@@ -233,7 +268,7 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
         // resumed copy mid-flight and proving a second, unrelated job naming
         // the identical vm: target does not even start until the resume
         // finishes.
-        var cluster = new FakeClusterService(["host-1"]) { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
         var harness = NewHarness(cluster);
         WriteVolume("pvc-1", 4096);
         Directory.CreateDirectory(_snapshotsRoot);
@@ -376,7 +411,7 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
         IOptions<AgentOptions> Options,
         IClusterService Cluster);
 
-    /// <summary>Fails ListHostNamesAsync outright, standing in for a cluster database this host cannot reach at all.</summary>
+    /// <summary>Fails ListVmsAsync outright, standing in for a cluster database this host cannot reach at all.</summary>
     private sealed class ThrowingClusterService : IClusterService
     {
         public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
@@ -385,7 +420,7 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
         public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
-        public Task<IReadOnlyList<string>> ListHostNamesAsync(CancellationToken cancellationToken) =>
+        public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) =>
             throw new InvalidOperationException("the cluster database is not present, as if this host were not clustered at all");
     }
 
@@ -478,9 +513,9 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
 
     /// <summary>
     /// Stands in for the checkpoint and enumeration half of
-    /// <see cref="IHyperVHostClient"/>. Every checkpoint is keyed by (host,
-    /// element name) so <see cref="ListOwnedCheckpointsAsync"/> can filter per
-    /// host the way a real, host-scoped CIM enumeration would.
+    /// <see cref="IHyperVHostClient"/>. Every checkpoint is recorded against
+    /// (host, VM, element name) so <see cref="ListOwnedCheckpointsAsync"/>
+    /// can filter per VM the way the real, per-VM CIM enumeration would.
     /// </summary>
     private sealed class FakeHostClient : IHyperVHostClient
     {
@@ -492,7 +527,7 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
 
         public List<string> DestroyedCheckpointElementNames { get; } = [];
 
-        public List<string> ListedHosts { get; } = [];
+        public List<(string Host, string VmId)> ListedVms { get; } = [];
 
         public HashSet<string> FailListOwnedCheckpointsFor { get; } = [];
 
@@ -526,9 +561,9 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
             entries.Add(new Entry(vmId, new Checkpoint($"checkpoint:{elementName}", elementName, notes)));
         }
 
-        public Task<IReadOnlyList<OwnedCheckpoint>> ListOwnedCheckpointsAsync(string hostName, CancellationToken cancellationToken)
+        public Task<IReadOnlyList<Checkpoint>> ListOwnedCheckpointsAsync(string hostName, string vmId, CancellationToken cancellationToken)
         {
-            ListedHosts.Add(hostName);
+            ListedVms.Add((hostName, vmId));
 
             if (FailListOwnedCheckpointsFor.Contains(hostName))
             {
@@ -537,16 +572,18 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
 
             if (!_byHost.TryGetValue(hostName, out var entries))
             {
-                return Task.FromResult<IReadOnlyList<OwnedCheckpoint>>([]);
+                return Task.FromResult<IReadOnlyList<Checkpoint>>([]);
             }
 
-            // Mirrors CimHyperVHostClient's own filter (and OwnedCheckpoint's
-            // own doc comment): only checkpoints actually carrying this
-            // driver's prefix are ever returned, so a foreign one seeded via
-            // SeedForeignCheckpoint never reaches the sweep at all.
-            return Task.FromResult<IReadOnlyList<OwnedCheckpoint>>(entries
-                .Where(entry => entry.Checkpoint.ElementName.StartsWith(CheckpointMatching.OwnedPrefix, StringComparison.Ordinal))
-                .Select(entry => new OwnedCheckpoint(entry.VmId, entry.Checkpoint))
+            // Mirrors CimHyperVHostClient's own filter: only checkpoints
+            // carrying this driver's prefix, and only ones standing on the
+            // VM asked about, are ever returned - a foreign checkpoint
+            // seeded via SeedForeignCheckpoint, or one standing on some
+            // other VM on this same host, never reaches the sweep at all.
+            return Task.FromResult<IReadOnlyList<Checkpoint>>(entries
+                .Where(entry => entry.VmId == vmId
+                    && entry.Checkpoint.ElementName.StartsWith(CheckpointMatching.OwnedPrefix, StringComparison.Ordinal))
+                .Select(entry => entry.Checkpoint)
                 .ToList());
         }
 
@@ -627,8 +664,8 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
             throw new NotSupportedException();
     }
 
-    /// <summary>Resolves exactly the (host, live) map given, and lists exactly the hosts given.</summary>
-    private sealed class FakeClusterService(IReadOnlyList<string> hosts) : IClusterService
+    /// <summary>Resolves exactly the (node ID, live) maps given, and lists exactly the VMs given.</summary>
+    private sealed class FakeClusterService : IClusterService
     {
         public Dictionary<string, ClusteredVm> Vms { get; init; } = [];
 
@@ -640,7 +677,7 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
         public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
             Task.FromResult(!Live.TryGetValue(hostName, out var live) || live);
 
-        public Task<IReadOnlyList<string>> ListHostNamesAsync(CancellationToken cancellationToken) =>
-            Task.FromResult(hosts);
+        public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<ClusteredVm>>(Vms.Values.ToList());
     }
 }

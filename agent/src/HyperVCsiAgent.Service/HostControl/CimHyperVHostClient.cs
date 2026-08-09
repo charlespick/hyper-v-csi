@@ -529,29 +529,17 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                 "started merging checkpoint {ElementName} on {HostName}", checkpoint.ElementName, hostName);
         }, cancellationToken);
 
-    public Task<IReadOnlyList<OwnedCheckpoint>> ListOwnedCheckpointsAsync(string hostName, CancellationToken cancellationToken) =>
-        Task.Run<IReadOnlyList<OwnedCheckpoint>>(() =>
+    public Task<IReadOnlyList<Checkpoint>> ListOwnedCheckpointsAsync(
+        string hostName, string vmId, CancellationToken cancellationToken) =>
+        Task.Run<IReadOnlyList<Checkpoint>>(() =>
         {
             var deadline = CimDeadline.After(_hostOperationTimeout);
             var scope = ScopeFor(hostName);
-            var owned = new List<OwnedCheckpoint>();
+            using var vm = GetComputerSystem(scope, hostName, vmId, deadline, cancellationToken);
 
-            foreach (var vm in EnumerateVirtualMachines(scope, deadline, cancellationToken))
-            {
-                using (vm)
-                {
-                    var vmId = (string)vm["Name"];
-                    foreach (var checkpoint in ReadCheckpointIdentities(vm, deadline, cancellationToken))
-                    {
-                        if (checkpoint.ElementName.StartsWith(CheckpointMatching.OwnedPrefix, StringComparison.Ordinal))
-                        {
-                            owned.Add(new OwnedCheckpoint(vmId, checkpoint));
-                        }
-                    }
-                }
-            }
-
-            return owned;
+            return ReadCheckpointIdentities(vm, deadline, cancellationToken)
+                .Where(checkpoint => checkpoint.ElementName.StartsWith(CheckpointMatching.OwnedPrefix, StringComparison.Ordinal))
+                .ToList();
         }, cancellationToken);
 
     public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
@@ -572,41 +560,6 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             using var settings = GetActiveSettings(scope, hostName, vmId, deadline, cancellationToken);
             return IsChainCollapsed(scope, settings, vhdxPath, deadline, cancellationToken);
         }, cancellationToken);
-
-    /// <summary>
-    /// Every real virtual machine registered on this host - the un-keyed
-    /// counterpart to <see cref="GetComputerSystem"/>'s single-VM lookup, for
-    /// <see cref="ListOwnedCheckpointsAsync"/>'s sweep, which has no VM ID to
-    /// key on yet.
-    /// </summary>
-    /// <remarks>
-    /// <c>Msvm_ComputerSystem</c> is not only virtual machines: the host
-    /// itself has one too, representing the physical computer, and it is
-    /// this class's own root - <c>Caption</c> is <c>"Hosting Computer
-    /// System"</c> on that instance and <c>"Virtual Machine"</c> on every
-    /// actual VM, which is the standard, documented way every Hyper-V WMI
-    /// script distinguishes the two. That is a documented convention, not
-    /// something this file measures against a real host the way the timing
-    /// and checkpoint-type facts elsewhere in it are - unlike those, nothing
-    /// here depends on a number that could plausibly differ across Hyper-V
-    /// builds. <see cref="GetComputerSystem"/>'s own <c>WHERE Name = vmId</c>
-    /// filter never had to make this distinction: a caller there already
-    /// knows the specific GUID it wants, and the host's own record does not
-    /// happen to carry it.
-    /// </remarks>
-    private static IEnumerable<ManagementObject> EnumerateVirtualMachines(
-        ManagementScope scope, CimDeadline deadline, CancellationToken cancellationToken)
-    {
-        using var searcher = new ManagementObjectSearcher(scope, new SelectQuery(
-            "SELECT * FROM Msvm_ComputerSystem WHERE Caption = 'Virtual Machine'"));
-
-        using var results = WithDeadline(deadline, cancellationToken, "enumerating virtual machines", searcher.Get);
-        foreach (var instance in results)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            yield return (ManagementObject)instance;
-        }
-    }
 
     /// <summary>
     /// <see cref="IsChainCollapsedAsync"/>'s traversal. Structurally the same

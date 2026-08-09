@@ -49,7 +49,7 @@ public sealed class UnsupportedHyperVHostClient : IHyperVHostClient
     public Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
         throw Unsupported();
 
-    public Task<IReadOnlyList<OwnedCheckpoint>> ListOwnedCheckpointsAsync(string hostName, CancellationToken cancellationToken) =>
+    public Task<IReadOnlyList<Checkpoint>> ListOwnedCheckpointsAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
         throw Unsupported();
 
     public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>

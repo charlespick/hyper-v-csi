@@ -214,17 +214,29 @@ public interface IHyperVHostClient
     Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Every checkpoint on this host whose <c>ElementName</c> starts with
-    /// <see cref="CheckpointMatching.OwnedPrefix"/>, paired with the VM each
-    /// one stands on.
+    /// Every checkpoint this driver owns on this VM - one whose
+    /// <c>ElementName</c> starts with <see cref="CheckpointMatching.OwnedPrefix"/>.
     /// </summary>
     /// <remarks>
-    /// Host-scoped rather than VM-scoped, deliberately: the caller is a sweep
-    /// looking for checkpoints nothing is driving anymore, and it does not
-    /// know which VMs to ask about - that is exactly the question it is
-    /// asking. Every other checkpoint member on this interface takes a
-    /// <c>vmId</c> because its caller already has one in hand; this is the one
-    /// place that does not, and cannot.
+    /// Per-VM, not host-scoped. It used to be host-scoped, discovering VMs
+    /// itself by matching <c>Msvm_ComputerSystem.Caption</c> against the
+    /// documented, but display-only, string <c>"Virtual Machine"</c> - a
+    /// value that is not stable across a non-English Windows and, worse, is
+    /// true of every VM registered on a host whether or not this driver
+    /// manages it. VM discovery does not belong here at all:
+    /// <see cref="Cluster.IClusterService"/> is the only thing that knows
+    /// which VMs this driver manages, since it is what resolves a CSI node ID
+    /// to a VM in the first place and null from
+    /// <see cref="Cluster.IClusterService.ResolveVmAsync"/> means "no such
+    /// VM" for this driver's purposes. Scoping this sweep to the VMs
+    /// <see cref="Cluster.IClusterService.ListVmsAsync"/> reports is
+    /// deliberate, not a gap: <c>Remove-ClusterGroup</c> leaves a VM
+    /// registered on its host and still running, so a VM de-clustered while a
+    /// snapshot copy was in flight is invisible to this method now - and
+    /// that is correct, because neither <c>ISnapshotService.ResumeCopy</c>
+    /// nor <c>ReapOrphan</c> could act on a VM
+    /// <see cref="Cluster.IClusterService.ResolveVmAsync"/> cannot resolve
+    /// anyway.
     /// <para>
     /// This is also the one place <see cref="CheckpointMatching.FindAnyOwned"/>'s
     /// driver-level question - "is this checkpoint ours at all, regardless of
@@ -240,7 +252,9 @@ public interface IHyperVHostClient
     /// leave it with no way to ask anything at all.
     /// </para>
     /// </remarks>
-    Task<IReadOnlyList<OwnedCheckpoint>> ListOwnedCheckpointsAsync(string hostName, CancellationToken cancellationToken);
+    /// <exception cref="VmNotOnHostException">The VM is not registered on this host.</exception>
+    Task<IReadOnlyList<Checkpoint>> ListOwnedCheckpointsAsync(
+        string hostName, string vmId, CancellationToken cancellationToken);
 
     /// <summary>
     /// Whether the VM is configured for <c>ProductionOnly</c> checkpoints -

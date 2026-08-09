@@ -2119,7 +2119,7 @@ public sealed class SnapshotServiceTests : IDisposable
         public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("no node hint was given in this test, so nothing should resolve a VM");
 
-        public Task<IReadOnlyList<string>> ListHostNamesAsync(CancellationToken cancellationToken) =>
+        public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) =>
             throw new InvalidOperationException("no node hint was given in this test, so nothing should resolve a VM");
     }
 
@@ -2165,7 +2165,7 @@ public sealed class SnapshotServiceTests : IDisposable
         public Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
             throw Unexpected();
 
-        public Task<IReadOnlyList<OwnedCheckpoint>> ListOwnedCheckpointsAsync(string hostName, CancellationToken cancellationToken) =>
+        public Task<IReadOnlyList<Checkpoint>> ListOwnedCheckpointsAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             throw Unexpected();
 
         public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
@@ -2190,8 +2190,8 @@ public sealed class SnapshotServiceTests : IDisposable
         public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
             Task.FromResult(true);
 
-        public Task<IReadOnlyList<string>> ListHostNamesAsync(CancellationToken cancellationToken) =>
-            throw new NotSupportedException("SnapshotService never lists cluster hosts");
+        public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException("SnapshotService never lists cluster VMs");
     }
 
     /// <summary>
@@ -2240,14 +2240,6 @@ public sealed class SnapshotServiceTests : IDisposable
         public List<string> CreatedCheckpointElementNames { get; } = [];
 
         public List<string> DestroyedCheckpointElementNames { get; } = [];
-
-        /// <summary>
-        /// The VM <see cref="ListOwnedCheckpointsAsync"/> and
-        /// <see cref="IsChainCollapsedAsync"/> report against, defaulting to
-        /// the same VM ID <c>FakeClusterService</c> in this file hands out
-        /// for every test's own <c>ClusteredVm</c>.
-        /// </summary>
-        public string VmId { get; set; } = "vm-1";
 
         /// <summary>
         /// Makes <see cref="IsChainCollapsedAsync"/> report the chain as
@@ -2353,10 +2345,9 @@ public sealed class SnapshotServiceTests : IDisposable
         // read and write, per this class's own doc comment on why a test
         // cannot get the fake's seams to disagree.
 
-        public Task<IReadOnlyList<OwnedCheckpoint>> ListOwnedCheckpointsAsync(string hostName, CancellationToken cancellationToken) =>
-            Task.FromResult<IReadOnlyList<OwnedCheckpoint>>(_checkpointsByElementName.Values
+        public Task<IReadOnlyList<Checkpoint>> ListOwnedCheckpointsAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<Checkpoint>>(_checkpointsByElementName.Values
                 .Where(checkpoint => checkpoint.ElementName.StartsWith(CheckpointMatching.OwnedPrefix, StringComparison.Ordinal))
-                .Select(checkpoint => new OwnedCheckpoint(VmId, checkpoint))
                 .ToList());
 
         public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>

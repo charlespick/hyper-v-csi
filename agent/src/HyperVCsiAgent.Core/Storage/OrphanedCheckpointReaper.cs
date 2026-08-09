@@ -188,28 +188,37 @@ public sealed class OrphanedCheckpointReaper : BackgroundService
     }
 
     /// <summary>
-    /// One full discovery-and-enqueue pass over every cluster host. Internal,
-    /// not private, so a test can drive exactly this - the property under
-    /// test is what this method enqueues and in what order, not
-    /// <see cref="BackgroundService"/>'s own hosted-service lifecycle.
+    /// One full discovery-and-enqueue pass over every VM this cluster
+    /// manages. Internal, not private, so a test can drive exactly this -
+    /// the property under test is what this method enqueues and in what
+    /// order, not <see cref="BackgroundService"/>'s own hosted-service
+    /// lifecycle.
     /// </summary>
     /// <remarks>
-    /// Every seam this calls - <see cref="IClusterService.ListHostNamesAsync"/>,
+    /// Grouped by <see cref="ClusteredVm.OwningHost"/> so a host's liveness
+    /// is checked once per pass rather than once per VM on it - the same
+    /// host answers <see cref="IClusterService.IsHostLiveAsync"/> for every
+    /// VM it owns, so asking it more than once would be wasted round trips
+    /// for no different an answer.
+    /// <para>
+    /// Every seam this calls - <see cref="IClusterService.ListVmsAsync"/>,
     /// <see cref="IClusterService.IsHostLiveAsync"/>,
     /// <see cref="IHyperVHostClient.ListOwnedCheckpointsAsync"/> - already
     /// bounds itself against <see cref="AgentOptions.HostOperationTimeout"/>
     /// (see each one's own implementation), so this pass needs no timeout of
     /// its own layered on top: a host that cannot answer within that budget
-    /// already fails its call rather than hanging this sweep, and either
-    /// exception path below already treats "this host did not answer" as
-    /// "try it again next pass" rather than aborting the whole sweep.
+    /// already fails its call rather than hanging this sweep, and every
+    /// exception path below already treats "this did not answer" as "try it
+    /// again next pass" rather than aborting the whole sweep.
+    /// </para>
     /// </remarks>
     internal async Task SweepAsync(CancellationToken cancellationToken)
     {
-        var hosts = await _cluster.ListHostNamesAsync(cancellationToken).ConfigureAwait(false);
+        var vms = await _cluster.ListVmsAsync(cancellationToken).ConfigureAwait(false);
 
-        foreach (var host in hosts)
+        foreach (var vmsOnHost in vms.GroupBy(vm => vm.OwningHost, StringComparer.Ordinal))
         {
+            var host = vmsOnHost.Key;
             if (!await _cluster.IsHostLiveAsync(host, cancellationToken).ConfigureAwait(false))
             {
                 _logger.LogInformation(
@@ -217,25 +226,29 @@ public sealed class OrphanedCheckpointReaper : BackgroundService
                 continue;
             }
 
-            IReadOnlyList<OwnedCheckpoint> owned;
-            try
+            foreach (var vm in vmsOnHost)
             {
-                owned = await _host.ListOwnedCheckpointsAsync(host, cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                // A CIM call, so it can fail like any other one this agent
-                // makes. Whatever this host is holding is left for the next
-                // pass rather than aborting the sweep over every other host.
-                _logger.LogError(ex,
-                    "OrphanedCheckpointReaper: listing owned checkpoints on {Host} failed; the next pass " +
-                    "will try again", host);
-                continue;
-            }
+                IReadOnlyList<Checkpoint> owned;
+                try
+                {
+                    owned = await _host.ListOwnedCheckpointsAsync(host, vm.VmId, cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    // A CIM call, so it can fail like any other one this
+                    // agent makes. Whatever this VM is holding is left for
+                    // the next pass rather than aborting the sweep over
+                    // every other VM.
+                    _logger.LogError(ex,
+                        "OrphanedCheckpointReaper: listing owned checkpoints for VM {VmId} on {Host} failed; " +
+                        "the next pass will try again", vm.VmId, host);
+                    continue;
+                }
 
-            foreach (var entry in owned)
-            {
-                HandleOwnedCheckpoint(entry, host);
+                foreach (var checkpoint in owned)
+                {
+                    HandleOwnedCheckpoint(vm.VmId, checkpoint, host);
+                }
             }
         }
     }
@@ -245,9 +258,9 @@ public sealed class OrphanedCheckpointReaper : BackgroundService
     /// when neither recovery path answers, leaves it alone rather than
     /// guessing.
     /// </summary>
-    private void HandleOwnedCheckpoint(OwnedCheckpoint entry, string host)
+    private void HandleOwnedCheckpoint(string vmId, Checkpoint checkpoint, string host)
     {
-        if (RecoverIdentity(entry.Checkpoint) is not { } identity)
+        if (RecoverIdentity(checkpoint) is not { } identity)
         {
             // Loud on purpose: this driver never destroys, merges or copies
             // through a checkpoint it cannot name, so a checkpoint stuck here
@@ -257,7 +270,7 @@ public sealed class OrphanedCheckpointReaper : BackgroundService
             _logger.LogError(
                 "OrphanedCheckpointReaper: checkpoint {ElementName} on {VmId} ({Host}) carries no recoverable " +
                 "(volume, snapshot) identity in its Notes or its ElementName; leaving it exactly as it stands",
-                entry.Checkpoint.ElementName, entry.VmId, host);
+                checkpoint.ElementName, vmId, host);
             return;
         }
 
@@ -279,8 +292,8 @@ public sealed class OrphanedCheckpointReaper : BackgroundService
                 "OrphanedCheckpointReaper: checkpoint {ElementName} on {VmId} ({Host}) stands over the already-" +
                 "published snapshot {SnapshotId}; its merge must have outrun CheckpointMergeTimeout and " +
                 "published anyway - reaping the checkpoint",
-                entry.Checkpoint.ElementName, entry.VmId, host, snapshotId);
-            _snapshots.ReapOrphan(sourceVolumeId, snapshotName, entry.VmId);
+                checkpoint.ElementName, vmId, host, snapshotId);
+            _snapshots.ReapOrphan(sourceVolumeId, snapshotName, vmId);
         }
         else
         {
@@ -288,8 +301,8 @@ public sealed class OrphanedCheckpointReaper : BackgroundService
                 "OrphanedCheckpointReaper: checkpoint {ElementName} on {VmId} ({Host}) has no published " +
                 "snapshot behind it {SnapshotId}; an earlier copy was interrupted - resuming it under its " +
                 "own identity so it keeps the point-in-time this checkpoint already captured",
-                entry.Checkpoint.ElementName, entry.VmId, host, snapshotId);
-            _snapshots.ResumeCopy(sourceVolumeId, snapshotName, entry.VmId);
+                checkpoint.ElementName, vmId, host, snapshotId);
+            _snapshots.ResumeCopy(sourceVolumeId, snapshotName, vmId);
         }
     }
 

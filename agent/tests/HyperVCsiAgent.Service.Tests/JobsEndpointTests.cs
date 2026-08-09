@@ -19,11 +19,11 @@ namespace HyperVCsiAgent.Service.Tests;
 /// <remarks>
 /// <see cref="OrphanedCheckpointReaper"/> is a real hosted service on this
 /// host - registered in Program.cs like everything else here - and its
-/// startup sweep's <see cref="IClusterService.ListHostNamesAsync"/> call
-/// would otherwise reach the real <c>MsClusterService</c>, since this test
-/// host is built the same way the production one is and this machine really
-/// is Windows. Every test below except the two that exist to pin the gate
-/// itself supplies a <see cref="FakeClusterService"/> that answers "no hosts"
+/// startup sweep's <see cref="IClusterService.ListVmsAsync"/> call would
+/// otherwise reach the real <c>MsClusterService</c>, since this test host is
+/// built the same way the production one is and this machine really is
+/// Windows. Every test below except the two that exist to pin the gate
+/// itself supplies a <see cref="FakeClusterService"/> that answers "no VMs"
 /// immediately, so <see cref="Jobs.JobIntakeGate"/> opens before the test's
 /// own first request rather than racing a real, empty-namespace CIM query
 /// under whatever load the rest of the suite happens to be putting on the
@@ -45,7 +45,7 @@ public sealed class JobsEndpointTests : IDisposable
             builder.ConfigureTestServices(services =>
             {
                 services.AddSingleton<IVirtualDiskManager>(_disks);
-                services.AddSingleton<IClusterService>(FakeClusterService.WithNoHosts());
+                services.AddSingleton<IClusterService>(FakeClusterService.WithNoVms());
             });
         });
     }
@@ -284,8 +284,8 @@ public sealed class JobsEndpointTests : IDisposable
         // A fresh host of its own, not the class-level _factory: every other
         // test in this file wants the gate open before its first request (see
         // this class's own remarks), which is exactly the one thing this test
-        // must not have happen. The cluster fake here holds ListHostNamesAsync
-        // open until told otherwise, standing in for a startup sweep whose
+        // must not have happen. The cluster fake here holds ListVmsAsync open
+        // until told otherwise, standing in for a startup sweep whose
         // discovery is still in flight.
         var cluster = new FakeClusterService();
         using var factory = BuildFactory(cluster);
@@ -303,7 +303,7 @@ public sealed class JobsEndpointTests : IDisposable
         Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/healthz")).StatusCode);
         Assert.Equal(HttpStatusCode.NotFound, (await client.GetAsync("/v1/jobs/nosuchjob")).StatusCode);
 
-        cluster.CompleteDiscoveryWithNoHosts();
+        cluster.CompleteDiscoveryWithNoVms();
     }
 
     [Fact]
@@ -316,7 +316,7 @@ public sealed class JobsEndpointTests : IDisposable
         var closed = await client.PostAsJsonAsync("/v1/jobs", CreateVolumeRequest("pvc-1", 4096));
         Assert.Equal(HttpStatusCode.ServiceUnavailable, closed.StatusCode);
 
-        cluster.CompleteDiscoveryWithNoHosts();
+        cluster.CompleteDiscoveryWithNoVms();
 
         // The gate opens once OrphanedCheckpointReaper's own background task
         // observes the completed discovery, which is not synchronous with the
@@ -352,31 +352,31 @@ public sealed class JobsEndpointTests : IDisposable
     /// <summary>
     /// Stands in for <c>MsClusterService</c> for every test in this file.
     /// <see cref="IsHostLiveAsync"/> and <see cref="ResolveVmAsync"/> are
-    /// never reached by anything here - a host list of zero means
+    /// never reached by anything here - a VM list of zero means
     /// <c>OrphanedCheckpointReaper</c>'s own sweep never gets far enough to
     /// ask - so both throw if that ever stops being true.
     /// </summary>
     private sealed class FakeClusterService : IClusterService
     {
-        private readonly TaskCompletionSource<IReadOnlyList<string>> _discovery = new();
+        private readonly TaskCompletionSource<IReadOnlyList<ClusteredVm>> _discovery = new();
 
         /// <summary>An already-open gate: discovery completes before this constructor returns.</summary>
-        public static FakeClusterService WithNoHosts()
+        public static FakeClusterService WithNoVms()
         {
             var cluster = new FakeClusterService();
-            cluster.CompleteDiscoveryWithNoHosts();
+            cluster.CompleteDiscoveryWithNoVms();
             return cluster;
         }
 
-        public void CompleteDiscoveryWithNoHosts() => _discovery.TrySetResult(Array.Empty<string>());
+        public void CompleteDiscoveryWithNoVms() => _discovery.TrySetResult(Array.Empty<ClusteredVm>());
 
         public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
             throw new NotSupportedException("no test in this file attaches through a node hint");
 
         public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
-            throw new NotSupportedException("a host list of zero means the sweep never asks this");
+            throw new NotSupportedException("a VM list of zero means the sweep never asks this");
 
-        public Task<IReadOnlyList<string>> ListHostNamesAsync(CancellationToken cancellationToken) => _discovery.Task;
+        public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) => _discovery.Task;
     }
 
     private static object CreateVolumeRequest(string name, long sizeBytes) => new

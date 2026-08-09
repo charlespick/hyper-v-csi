@@ -105,8 +105,8 @@ public sealed class VmTargetAssertingHyperVHostClient(IHyperVHostClient inner) :
         return inner.DestroyCheckpointAsync(hostName, checkpoint, cancellationToken);
     }
 
-    public Task<IReadOnlyList<OwnedCheckpoint>> ListOwnedCheckpointsAsync(string hostName, CancellationToken cancellationToken) =>
-        inner.ListOwnedCheckpointsAsync(hostName, cancellationToken);
+    public Task<IReadOnlyList<Checkpoint>> ListOwnedCheckpointsAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
+        inner.ListOwnedCheckpointsAsync(hostName, vmId, cancellationToken);
 
     public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
         inner.CanCheckpointAsync(hostName, vmId, cancellationToken);
