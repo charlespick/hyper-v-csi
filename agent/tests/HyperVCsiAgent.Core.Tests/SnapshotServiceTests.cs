@@ -838,15 +838,40 @@ public sealed class SnapshotServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task CreateAsync_ACopyThatFinishesInsideTheWait_ReturnsReadyOnTheFirstCallWithNoError()
+    public async Task CreateAsync_ACopyThatFinishesInsideTheWait_AnswersWithoutTellingTheCallerToRetry()
     {
+        // The ReFS-shaped case: the copy is fast enough that the wait resolves
+        // on the first call, so the caller never sees the Aborted that a VM
+        // busy with another volume's copy produces. Not throwing is the whole
+        // of what distinguishes this case, and it is the assertion that
+        // matters.
+        //
+        // Deliberately does not assert ReadyToUse on this first result, which
+        // is what this test used to do and why it failed roughly one full-suite
+        // run in twenty. AwaitCheckpointAsync returns on either of two
+        // observations - the snapshot published, or the copy Running with its
+        // marker on disk - and which one a poll lands on is a race with the
+        // copy's own publish rename. Both are correct: the wait's contract is
+        // that this snapshot's checkpoint exists, never that its copy has
+        // finished, and readyToUse: false is a perfectly good answer that
+        // external-snapshotter polls past. So a first call reporting ready is a
+        // timing coincidence rather than a property, and pinning it pinned the
+        // race. What is guaranteed is asserted instead: the call answers, it
+        // carries a real creation time, and the copy converges.
         var harness = NewHarness();
         WriteVolume("pvc-1", 4096);
 
         var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
 
-        Assert.True(result.ReadyToUse);
-        Assert.True(File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+        Assert.Equal("pvc-1~snapshot-abc", result.SnapshotId);
+
+        // Never 0, whichever observation the wait returned on: a published
+        // snapshot carries its marker's timestamp, and a marker still being
+        // copied carries its own. 0 would mean "unknown", which D9 makes
+        // permanent on the CO's object.
+        Assert.True(result.CreationTimeUnixSeconds > 0);
+
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
     }
 
     [Fact]
