@@ -417,6 +417,36 @@ public sealed class SnapshotServiceTests : IDisposable
         await Task.WhenAll(creating);
     }
 
+    [Fact]
+    public async Task CreateAsync_ALongCopyDoesNotHoldAHostSlot()
+    {
+        // The property most likely to regress silently (issue #14's D4): the
+        // checkpoint step takes and releases a host slot, but the copy
+        // itself must not - it can run for hours, and holding one of a
+        // host's few slots for that long would wedge every attach on it.
+        var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient();
+        var harness = NewHarness(cluster: cluster, host: host, maxConcurrentHostOperations: 1);
+        WriteVolume("pvc-1", 4096);
+
+        using var release = new SemaphoreSlim(0);
+        harness.Copier.DuringCopy = _ => release.WaitAsync();
+
+        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", "node-a", CancellationToken.None);
+        await WaitForAsync(() => harness.Copier.Destinations.Count == 1);
+
+        // The checkpoint's own classify-then-take already ran and released
+        // its slot by the time the copy is in flight (Decision 5's
+        // ordering) - host-1's one and only slot is free for anything else,
+        // including a fresh attach, while the copy sits blocked here.
+        using var probe = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        await harness.HostSlots.WaitAsync("host-1", probe.Token);
+        harness.HostSlots.Release("host-1");
+
+        release.Release();
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+    }
+
     // -------------------------------------------------------- preconditions
 
     [Fact]
@@ -1813,7 +1843,9 @@ public sealed class SnapshotServiceTests : IDisposable
         IHyperVHostClient? host = null,
         TimeSpan? snapshotCheckpointWaitTimeout = null,
         TimeSpan? snapshotCopySlotWaitTimeout = null,
-        TimeSpan? checkpointMergeTimeout = null)
+        TimeSpan? checkpointMergeTimeout = null,
+        int maxConcurrentHostOperations = 4,
+        HostOperationSlots? hostSlots = null)
     {
         var disks = new FakeVirtualDiskManager();
         var copier = new FakeDiskCopier();
@@ -1821,6 +1853,13 @@ public sealed class SnapshotServiceTests : IDisposable
         var copySlots = new SnapshotCopySlots(Options.Create(new AgentOptions
         {
             MaxConcurrentSnapshotCopies = maxConcurrentSnapshotCopies,
+        }));
+        // Shared with the caller when one is passed in - the point of
+        // HostOperationSlots (issue #14's D4) is that it is the one cap two
+        // different services contend for, not a fresh one per harness.
+        var slots = hostSlots ?? new HostOperationSlots(Options.Create(new AgentOptions
+        {
+            MaxConcurrentHostOperations = maxConcurrentHostOperations,
         }));
         var service = new SnapshotService(
             disks,
@@ -1831,6 +1870,7 @@ public sealed class SnapshotServiceTests : IDisposable
             // VM or touch a checkpoint.
             cluster ?? new NeverCalledClusterService(),
             host ?? new NeverCalledHostClient(),
+            slots,
             copySlots,
             Options.Create(new AgentOptions
             {
@@ -1848,6 +1888,7 @@ public sealed class SnapshotServiceTests : IDisposable
                 SnapshotCheckpointWaitTimeout = snapshotCheckpointWaitTimeout ?? TimeSpan.FromSeconds(2),
                 SnapshotCopySlotWaitTimeout = snapshotCopySlotWaitTimeout ?? TimeSpan.FromSeconds(2),
                 CheckpointMergeTimeout = checkpointMergeTimeout ?? TimeSpan.FromSeconds(2),
+                MaxConcurrentHostOperations = maxConcurrentHostOperations,
             }),
             NullLogger<SnapshotService>.Instance);
 
@@ -1857,7 +1898,7 @@ public sealed class SnapshotServiceTests : IDisposable
         // that gets disposed.
         _disposables.Add(store);
         _disposables.Add(copySlots);
-        return new Harness(service, disks, copier, store);
+        return new Harness(service, disks, copier, store, slots);
     }
 
     private void WriteVolume(string volumeId, long virtualSizeBytes)
@@ -1902,7 +1943,8 @@ public sealed class SnapshotServiceTests : IDisposable
     }
 
     private sealed record Harness(
-        SnapshotService Service, FakeVirtualDiskManager Disks, FakeDiskCopier Copier, RecordingJobStore Store);
+        SnapshotService Service, FakeVirtualDiskManager Disks, FakeDiskCopier Copier, RecordingJobStore Store,
+        HostOperationSlots HostSlots);
 
     /// <summary>
     /// The real store, with a note taken of every job it actually created.

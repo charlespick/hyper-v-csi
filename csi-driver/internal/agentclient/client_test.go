@@ -165,6 +165,50 @@ func TestHealthzReportsAnUnhealthyAgent(t *testing.T) {
 	}
 }
 
+// TestNewRaisesIdleConnectionLimits pins issue #14's D8 fix on the dev/test
+// client: it must not simply inherit http.DefaultTransport's defaults, and it
+// must not share that transport with anything else in the process either.
+func TestNewRaisesIdleConnectionLimits(t *testing.T) {
+	client := New("https://agent.example")
+
+	transport, ok := client.HTTPClient.Transport.(*http.Transport)
+	if !ok || transport == nil {
+		t.Fatalf("HTTPClient.Transport = %#v, want a *http.Transport", client.HTTPClient.Transport)
+	}
+	if transport == http.DefaultTransport {
+		t.Error("New shares http.DefaultTransport rather than owning its own")
+	}
+	if transport.MaxIdleConns != maxIdleConnections {
+		t.Errorf("MaxIdleConns = %d, want %d", transport.MaxIdleConns, maxIdleConnections)
+	}
+	if transport.MaxIdleConnsPerHost != maxIdleConnections {
+		t.Errorf("MaxIdleConnsPerHost = %d, want %d", transport.MaxIdleConnsPerHost, maxIdleConnections)
+	}
+}
+
+// TestNewMutualTLSRaisesIdleConnectionLimits is TestNewRaisesIdleConnectionLimits'
+// counterpart for the client the controller actually deploys with.
+func TestNewMutualTLSRaisesIdleConnectionLimits(t *testing.T) {
+	certPEM, keyPEM, _ := selfSigned(t, "hyperv-csi-driver")
+	certFile, keyFile := writePair(t, certPEM, keyPEM)
+
+	client, err := NewMutualTLS("https://agent.example", certFile, keyFile, []string{strings.Repeat("AB", 20)})
+	if err != nil {
+		t.Fatalf("NewMutualTLS: %v", err)
+	}
+
+	transport, ok := client.HTTPClient.Transport.(*http.Transport)
+	if !ok || transport == nil {
+		t.Fatalf("HTTPClient.Transport = %#v, want a *http.Transport", client.HTTPClient.Transport)
+	}
+	if transport.MaxIdleConns != maxIdleConnections {
+		t.Errorf("MaxIdleConns = %d, want %d", transport.MaxIdleConns, maxIdleConnections)
+	}
+	if transport.MaxIdleConnsPerHost != maxIdleConnections {
+		t.Errorf("MaxIdleConnsPerHost = %d, want %d", transport.MaxIdleConnsPerHost, maxIdleConnections)
+	}
+}
+
 func TestBaseURLTrailingSlashDoesNotDoubleUpThePath(t *testing.T) {
 	var gotPath string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

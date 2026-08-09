@@ -226,6 +226,35 @@ public sealed class AttachServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task AttachAsync_NeverExceedsTheConfiguredHostOperationCap()
+    {
+        // Two attaches to the same host - the ordinary case, since a
+        // cluster's VMs concentrate on a handful of hosts - must still queue
+        // behind each other once HostOperationSlots' cap is exhausted, not
+        // just behind a per-VM lock this class does not itself hold (that
+        // serialization lives a level up, in the job store).
+        GivenVolume("pvc-1");
+        GivenVolume("pvc-2");
+        var hostSlots = new HostOperationSlots(Options.Create(new AgentOptions { MaxConcurrentHostOperations = 1 }));
+        var host = new FakeHostClient { FreeSlot = new DiskSlot("controller-path", "controller-guid", 0) };
+        using var release = new SemaphoreSlim(0);
+        host.DuringFindFreeSlot = _ => release.WaitAsync();
+        using var service = NewService(host, hostSlots: hostSlots);
+
+        var first = service.AttachAsync("pvc-1", Node, CancellationToken.None);
+        await WaitForAsync(() => host.InFlightPeak >= 1);
+
+        var second = service.AttachAsync("pvc-2", Node, CancellationToken.None);
+        await Task.Delay(50);
+        Assert.False(second.IsCompleted);
+
+        release.Release(2);
+        await Task.WhenAll(first, second);
+
+        Assert.Equal(1, host.InFlightPeak);
+    }
+
+    [Fact]
     public async Task DetachAsync_RemovesTheDiskFromTheVm()
     {
         var volume = GivenVolume("pvc-1");
@@ -442,7 +471,7 @@ public sealed class AttachServiceTests : IDisposable
     }
 
     private AttachService NewService(
-        FakeHostClient host, FakeClusterService? cluster = null, TimeSpan? timeout = null)
+        FakeHostClient host, FakeClusterService? cluster = null, TimeSpan? timeout = null, HostOperationSlots? hostSlots = null)
     {
         var options = new AgentOptions { CsvVolumesRoot = _root };
         if (timeout is { } budget)
@@ -454,7 +483,22 @@ public sealed class AttachServiceTests : IDisposable
             cluster ?? new FakeClusterService { Owner = Host },
             host,
             Options.Create(options),
+            hostSlots ?? new HostOperationSlots(Options.Create(options)),
             NullLogger<AttachService>.Instance);
+    }
+
+    private static async Task WaitForAsync(Func<bool> condition)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (!condition())
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                throw new TimeoutException("condition never became true");
+            }
+
+            await Task.Delay(10);
+        }
     }
 
     private sealed class FakeClusterService : IClusterService
@@ -540,9 +584,18 @@ public sealed class AttachServiceTests : IDisposable
 
         public int FreeSlotQueries { get; private set; }
 
+        /// <summary>Runs inside FindFreeSlotAsync, after HostOperationSlots' slot is already held.</summary>
+        public Func<CancellationToken, Task>? DuringFindFreeSlot { get; set; }
+
+        /// <summary>The most FindFreeSlotAsync calls in flight at once, for pinning the host operation cap.</summary>
+        public int InFlightPeak { get; private set; }
+
         public (string Host, string Vm, string Path, int Lun)? Attached { get; private set; }
 
         public (string Host, string Vm, string Path)? Detached { get; private set; }
+
+        private readonly object _gate = new();
+        private int _inFlight;
 
         public async Task<AttachedDisk?> FindAttachedDiskAsync(
             string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken)
@@ -581,11 +634,32 @@ public sealed class AttachServiceTests : IDisposable
             return await FindAttachedDiskAsync(hostName, vmId, vhdxPath, cancellationToken).ConfigureAwait(false) is not null;
         }
 
-        public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmId, CancellationToken cancellationToken)
+        public async Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmId, CancellationToken cancellationToken)
         {
             Migrated(hostName, vmId);
             FreeSlotQueries++;
-            return Task.FromResult(FreeSlot);
+
+            lock (_gate)
+            {
+                InFlightPeak = Math.Max(InFlightPeak, ++_inFlight);
+            }
+
+            try
+            {
+                if (DuringFindFreeSlot is not null)
+                {
+                    await DuringFindFreeSlot(cancellationToken).ConfigureAwait(false);
+                }
+
+                return FreeSlot;
+            }
+            finally
+            {
+                lock (_gate)
+                {
+                    _inFlight--;
+                }
+            }
         }
 
         public Task AttachDiskAsync(

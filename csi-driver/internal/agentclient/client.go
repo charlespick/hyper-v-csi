@@ -98,6 +98,21 @@ const defaultTimeout = 30 * time.Second
 // an error message.
 const maxErrorBody = 4 << 10
 
+// maxIdleConnections raises Go's http.Transport default of 2 idle connections
+// per host (and 100 total across all hosts, effectively the same 2 once
+// MaxIdleConnsPerHost is the binding limit). That default is sized for a
+// client that talks to many different hosts and keeps only a couple of
+// connections warm to each one — the opposite of this client's shape, which
+// talks to exactly one host, this node's own agent, repeatedly. Issue #14's
+// D8: under a burst of concurrent job RPCs, each polling GetJob on its own
+// backoff (jobPollInitialInterval through jobPollMaxInterval in
+// internal/driver/jobs.go, 100ms up to 2s), all but two of them would find
+// the pool empty on every single poll and pay a full TCP-plus-mTLS handshake
+// for it. 64 is comfortably above any concurrency this client is actually
+// asked to sustain, so idle connections end up bounded by how many the
+// client opens, not by this cap.
+const maxIdleConnections = 64
+
 // Client is a thin wrapper around the agent's job API. Retries and polling
 // backoff belong to the controller/node RPC handlers that call it, not here.
 type Client struct {
@@ -109,7 +124,17 @@ type Client struct {
 // — only for tests and local development against a Development-mode agent,
 // which is the only configuration that will serve without mutual TLS.
 func New(baseURL string) *Client {
-	return &Client{BaseURL: baseURL, HTTPClient: &http.Client{Timeout: defaultTimeout}}
+	// Its own transport rather than the shared http.DefaultTransport, for the
+	// same idle-connection reasoning NewMutualTLS gives below — this is a
+	// dev/test client, but it still talks to exactly one agent, repeatedly,
+	// and sharing the process-wide default would mean any other package
+	// touching http.DefaultTransport's fields (directly, or by another
+	// package's own init) changes this client's behavior as a side effect.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = maxIdleConnections
+	transport.MaxIdleConnsPerHost = maxIdleConnections
+
+	return &Client{BaseURL: baseURL, HTTPClient: &http.Client{Timeout: defaultTimeout, Transport: transport}}
 }
 
 // NewMutualTLS builds the client the controller actually deploys with. The
@@ -133,6 +158,8 @@ func NewMutualTLS(baseURL, certificateFile, keyFile string, serverCertificateThu
 	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = maxIdleConnections
+	transport.MaxIdleConnsPerHost = maxIdleConnections
 	transport.TLSClientConfig = &tls.Config{
 		Certificates: []tls.Certificate{certificate},
 		MinVersion:   tls.VersionTLS12,

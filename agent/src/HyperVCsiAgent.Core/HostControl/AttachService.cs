@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Diagnostics.CodeAnalysis;
 using HyperVCsiAgent.Core.Cluster;
 using HyperVCsiAgent.Core.Configuration;
@@ -20,28 +19,20 @@ public sealed class AttachService : IAttachService, IDisposable
     private readonly IClusterService _cluster;
     private readonly IHyperVHostClient _host;
     private readonly AgentOptions _options;
+    private readonly HostOperationSlots _hostSlots;
     private readonly ILogger<AttachService> _logger;
-
-    /// <summary>
-    /// Bounded concurrency per target host, per the design's third principle.
-    /// Hyper-V serializes much of VM configuration anyway, and stacking requests
-    /// against one host produces spurious failures. Per-VM serialization is
-    /// already handled a level up: the job store runs one job at a time per
-    /// target, and an attach's target is the VM - which is what keeps two
-    /// concurrent attaches from choosing the same free LUN.
-    /// </summary>
-    private readonly ConcurrentDictionary<string, SemaphoreSlim> _hostConcurrency =
-        new(StringComparer.OrdinalIgnoreCase);
 
     public AttachService(
         IClusterService cluster,
         IHyperVHostClient host,
         IOptions<AgentOptions> options,
+        HostOperationSlots hostSlots,
         ILogger<AttachService> logger)
     {
         _cluster = cluster;
         _host = host;
         _options = options.Value;
+        _hostSlots = hostSlots;
         _logger = logger;
     }
 
@@ -191,13 +182,14 @@ public sealed class AttachService : IAttachService, IDisposable
     }
 
     /// <summary>
-    /// Deliberately does not dispose the per-host semaphores. A SemaphoreSlim
-    /// holds no unmanaged resource unless its AvailableWaitHandle is touched,
-    /// which nothing here does, and disposing them would race the Release in
-    /// AttachOnHostAsync's finally: the container disposes this while jobs
-    /// cancelled by the same shutdown are still unwinding, so the last thing an
-    /// in-flight attach did on its way out would be to throw
-    /// ObjectDisposedException over the top of its real failure.
+    /// A no-op, kept only because <see cref="IAttachService"/>'s consumers -
+    /// this class's own tests included - already dispose it. This class used
+    /// to hold the per-host semaphores directly, and this comment used to
+    /// explain why disposing them here would race the Release in
+    /// AttachOnHostAsync's finally; issue #14's D4 moved both the semaphores
+    /// and that reasoning into <see cref="HostOperationSlots"/> (see its own
+    /// remarks), which is a singleton this class does not own and must not
+    /// dispose. Nothing else here holds anything that needs disposal.
     /// </summary>
     public void Dispose()
     {
@@ -228,7 +220,7 @@ public sealed class AttachService : IAttachService, IDisposable
         CancellationTokenSource attempt,
         CancellationToken callerToken)
     {
-        var slots = await AcquireHostSlotAsync(vm, "attaching", volumeId, attempt, callerToken).ConfigureAwait(false);
+        await AcquireHostSlotAsync(vm, "attaching", volumeId, attempt, callerToken).ConfigureAwait(false);
 
         try
         {
@@ -265,7 +257,7 @@ public sealed class AttachService : IAttachService, IDisposable
         }
         finally
         {
-            slots.Release();
+            _hostSlots.Release(vm.OwningHost);
         }
     }
 
@@ -276,7 +268,7 @@ public sealed class AttachService : IAttachService, IDisposable
         CancellationTokenSource attempt,
         CancellationToken callerToken)
     {
-        var slots = await AcquireHostSlotAsync(vm, "detaching", volumeId, attempt, callerToken).ConfigureAwait(false);
+        await AcquireHostSlotAsync(vm, "detaching", volumeId, attempt, callerToken).ConfigureAwait(false);
 
         try
         {
@@ -315,24 +307,23 @@ public sealed class AttachService : IAttachService, IDisposable
         }
         finally
         {
-            slots.Release();
+            _hostSlots.Release(vm.OwningHost);
         }
     }
 
     /// <summary>
-    /// Takes a slot against the target host's concurrency cap, reporting a
-    /// timeout spent *queuing* as the operation timing out. Deliberately not
-    /// inside the callers' try blocks: those release in a finally, and a failed
-    /// acquire must not release a slot it never took.
+    /// Takes a slot against <see cref="HostOperationSlots"/>' shared cap for
+    /// this VM's host, reporting a timeout spent *queuing* as the operation
+    /// timing out. Deliberately not inside the callers' try blocks: those
+    /// release in a finally, and a failed acquire must not release a slot it
+    /// never took.
     /// </summary>
-    private async Task<SemaphoreSlim> AcquireHostSlotAsync(
+    private async Task AcquireHostSlotAsync(
         ClusteredVm vm, string verb, string volumeId, CancellationTokenSource attempt, CancellationToken callerToken)
     {
-        var slots = _hostConcurrency.GetOrAdd(vm.OwningHost, _ => new SemaphoreSlim(_options.MaxConcurrentHostOperations));
-
         try
         {
-            await slots.WaitAsync(attempt.Token).ConfigureAwait(false);
+            await _hostSlots.WaitAsync(vm.OwningHost, attempt.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (attempt.IsCancellationRequested && !callerToken.IsCancellationRequested)
         {
@@ -341,7 +332,5 @@ public sealed class AttachService : IAttachService, IDisposable
                 $"{verb} volume {volumeId} on {vm.VmId} timed out after {_options.HostOperationTimeout} waiting for one of " +
                 $"{_options.MaxConcurrentHostOperations} operation slots on {vm.OwningHost}");
         }
-
-        return slots;
     }
 }

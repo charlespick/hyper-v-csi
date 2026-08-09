@@ -138,6 +138,18 @@ public sealed class SnapshotService : ISnapshotService
     /// <summary>Takes, tags and destroys the checkpoint that freezes an attached source's base VHDX.</summary>
     private readonly IHyperVHostClient _host;
 
+    /// <summary>
+    /// The same per-host cap <see cref="AttachService"/> bounds its attach and
+    /// detach against - issue #14's D4. Checkpoint take, classify, find and
+    /// destroy are host CIM calls the same as an attach is, and a merge is
+    /// heavier than one; before this they ran with no bound of their own at
+    /// all, so N concurrent snapshots across N VMs on one host were N
+    /// unbounded checkpoint operations against that host's vmms. See
+    /// <see cref="HostOperationSlots"/> for why this is one shared instance
+    /// rather than a second cap of its own.
+    /// </summary>
+    private readonly HostOperationSlots _hostSlots;
+
     private readonly AgentOptions _options;
     private readonly ILogger<SnapshotService> _logger;
 
@@ -164,6 +176,7 @@ public sealed class SnapshotService : ISnapshotService
         IJobStore jobs,
         IClusterService cluster,
         IHyperVHostClient host,
+        HostOperationSlots hostSlots,
         SnapshotCopySlots copySlots,
         IOptions<AgentOptions> options,
         ILogger<SnapshotService> logger)
@@ -173,6 +186,7 @@ public sealed class SnapshotService : ISnapshotService
         _jobs = jobs;
         _cluster = cluster;
         _host = host;
+        _hostSlots = hostSlots;
         _copySlots = copySlots;
         _options = options.Value;
         _logger = logger;
@@ -256,7 +270,7 @@ public sealed class SnapshotService : ISnapshotService
             // call found it in. A volume attached between an abandoned copy and
             // its restart is the case that makes this matter.
             var allocatedBytes = await InspectSourceAsync(
-                snapshotId, sourceVolumeId, snapshotName, sourcePath, nodeId, attempt).ConfigureAwait(false);
+                snapshotId, sourceVolumeId, snapshotName, sourcePath, nodeId, attempt, cancellationToken).ConfigureAwait(false);
 
             // Created before the volume is inspected for space, because
             // InspectTargetAsync reports a missing directory as NotFound - which
@@ -868,6 +882,13 @@ public sealed class SnapshotService : ISnapshotService
                     {
                         var elementName = CheckpointElementName(sourceVolumeId, snapshotName);
                         VolumeAttachment attachment;
+
+                        // Same shared cap InspectSourceAsync's own classify
+                        // call takes (issue #14's D4) - this is the copy
+                        // job's re-classification at run time, not a second,
+                        // different call.
+                        await AcquireHostSlotAsync(vm, "classifying", snapshotId, attempt, cancellationToken)
+                            .ConfigureAwait(false);
                         try
                         {
                             attachment = await _host.ClassifyAttachmentAsync(
@@ -877,6 +898,10 @@ public sealed class SnapshotService : ISnapshotService
                         {
                             throw JobFailureException.FailedPrecondition(
                                 $"snapshot {snapshotId} cannot be copied: {ex.Message}");
+                        }
+                        finally
+                        {
+                            _hostSlots.Release(vm.OwningHost);
                         }
 
                         switch (attachment.Kind)
@@ -978,7 +1003,8 @@ public sealed class SnapshotService : ISnapshotService
                                 // is what keeps NTFS merely slow rather than
                                 // divergent.
                                 await CreateOwnedCheckpointAsync(
-                                    vm, elementName, sourceVolumeId, snapshotName, attempt).ConfigureAwait(false);
+                                    vm, elementName, sourceVolumeId, snapshotName, snapshotId, attempt, cancellationToken)
+                                    .ConfigureAwait(false);
                                 checkpointTaken = true;
                                 break;
 
@@ -1000,6 +1026,16 @@ public sealed class SnapshotService : ISnapshotService
                 // Its existence, once created, is exactly what
                 // AwaitCheckpointAsync's Running-conjuncted predicate keys
                 // off to tell a genuinely fresh marker from a stale one.
+                //
+                // Deliberately takes no HostOperationSlots slot (issue #14's
+                // D4). This is CSV I/O, not host management - it never
+                // touches vmms at all - and it can run for hours; occupying
+                // one of MaxConcurrentHostOperations slots for that long
+                // would wedge every attach and detach on this host behind
+                // one volume's copy. _copySlots already bounds it instead.
+                // The result is the shape D4 asks for: during a copy the VM
+                // is blocked (via the vm: job-store target), but the host is
+                // not, so every other VM on it keeps attaching normally.
                 var copy = await _copier.CopyAsync(
                     sourcePath, copyingPath, _options.SnapshotCopyTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
 
@@ -1113,7 +1149,7 @@ public sealed class SnapshotService : ISnapshotService
     /// </remarks>
     private async Task<long> InspectSourceAsync(
         string snapshotId, string sourceVolumeId, string snapshotName, string sourcePath, string? nodeId,
-        CancellationTokenSource attempt)
+        CancellationTokenSource attempt, CancellationToken callerToken)
     {
         if (!File.Exists(sourcePath))
         {
@@ -1139,6 +1175,14 @@ public sealed class SnapshotService : ISnapshotService
 
         var elementName = CheckpointElementName(sourceVolumeId, snapshotName);
         VolumeAttachment attachment;
+
+        // Takes a slot on HostOperationSlots' shared cap, same as
+        // AttachService's own attach and detach do - issue #14's D4. A
+        // different question from _copySlots' own budget: ReadVirtualSizeAsync's
+        // remarks explain why the fast path must never queue behind a copy,
+        // but a host slot bounds one short CIM call, not an hours-long one, so
+        // this precondition check taking one does not reopen that question.
+        await AcquireHostSlotAsync(vm, "classifying", snapshotId, attempt, callerToken).ConfigureAwait(false);
         try
         {
             attachment = await _host.ClassifyAttachmentAsync(
@@ -1152,6 +1196,10 @@ public sealed class SnapshotService : ISnapshotService
             // fixes on its own.
             throw JobFailureException.FailedPrecondition(
                 $"snapshot {snapshotId} cannot be taken: {ex.Message}");
+        }
+        finally
+        {
+            _hostSlots.Release(vm.OwningHost);
         }
 
         switch (attachment.Kind)
@@ -1199,7 +1247,19 @@ public sealed class SnapshotService : ISnapshotService
                 // taking a checkpoint; this is a second, earlier look at the
                 // same fact for a caller that wants the answer before
                 // committing to anything at all.
-                if (!await _host.CanCheckpointAsync(vm.OwningHost, vm.VmId, attempt.Token).ConfigureAwait(false))
+                await AcquireHostSlotAsync(vm, "checking checkpoint capability for", snapshotId, attempt, callerToken)
+                    .ConfigureAwait(false);
+                bool canCheckpoint;
+                try
+                {
+                    canCheckpoint = await _host.CanCheckpointAsync(vm.OwningHost, vm.VmId, attempt.Token).ConfigureAwait(false);
+                }
+                finally
+                {
+                    _hostSlots.Release(vm.OwningHost);
+                }
+
+                if (!canCheckpoint)
                 {
                     throw JobFailureException.FailedPrecondition(
                         $"snapshot {snapshotId} cannot be taken: {vm.VmId} is not set to ProductionOnly checkpoints");
@@ -1288,8 +1348,13 @@ public sealed class SnapshotService : ISnapshotService
     /// against by the time this runs.
     /// </summary>
     private async Task<Checkpoint> CreateOwnedCheckpointAsync(
-        ClusteredVm vm, string elementName, string sourceVolumeId, string snapshotName, CancellationTokenSource attempt)
+        ClusteredVm vm, string elementName, string sourceVolumeId, string snapshotName, string snapshotId,
+        CancellationTokenSource attempt, CancellationToken callerToken)
     {
+        // Same shared cap as every other checkpoint operation (issue #14's
+        // D4) - taking one is itself a host CIM call, per CreateCheckpointAsync's
+        // own remarks on what ModifySystemSettings does after CreateSnapshot.
+        await AcquireHostSlotAsync(vm, "checkpointing", snapshotId, attempt, callerToken).ConfigureAwait(false);
         try
         {
             var notes = BuildCheckpointNotes(sourceVolumeId, snapshotName);
@@ -1305,6 +1370,10 @@ public sealed class SnapshotService : ISnapshotService
             // to.
             throw JobFailureException.FailedPrecondition(ex.Message);
         }
+        finally
+        {
+            _hostSlots.Release(vm.OwningHost);
+        }
     }
 
     /// <summary>
@@ -1318,25 +1387,36 @@ public sealed class SnapshotService : ISnapshotService
     /// nothing external observes.
     /// </summary>
     /// <remarks>
-    /// No slot to wait for anymore, unlike before this design removed
-    /// <c>_vmCheckpointSlots</c> - see this file's own remarks at the
-    /// deletion site - so the only thing left that can be cancelled here is
+    /// The only thing that can be cancelled here now is the wait for a host
+    /// slot (issue #14's D4 - the same shared cap every other checkpoint
+    /// operation in this file takes) or
     /// <see cref="IHyperVHostClient.DestroyCheckpointAsync"/> itself, and
-    /// that cannot be read as "the merge never started":
+    /// neither can be read as "the merge never started":
     /// <c>DestroyCheckpointAsync</c>'s own doc says it returns once the merge
     /// has *started*, not once it has finished, so a cancellation observed
     /// while awaiting it does not rule out vmms having already begun the
     /// merge moments before the token fired. Reported as an orphan
     /// regardless - the checkpoint is standing either way, and nothing here
     /// will revisit it - but worded so it does not assert more than is
-    /// known.
+    /// known. No message naming slot exhaustion specifically, unlike
+    /// <see cref="AcquireHostSlotAsync"/>'s: this method never throws to a
+    /// caller in the first place, so there is nothing for a more specific
+    /// message to help with beyond what LogOrphanedCheckpoint already says.
     /// </remarks>
     private async Task DestroyOwnedCheckpointAsync(
         string snapshotId, ClusteredVm vm, Checkpoint checkpoint, CancellationToken cancellationToken)
     {
         try
         {
-            await _host.DestroyCheckpointAsync(vm.OwningHost, checkpoint, cancellationToken).ConfigureAwait(false);
+            await _hostSlots.WaitAsync(vm.OwningHost, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await _host.DestroyCheckpointAsync(vm.OwningHost, checkpoint, cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                _hostSlots.Release(vm.OwningHost);
+            }
         }
         catch (OperationCanceledException)
         {
@@ -1377,8 +1457,21 @@ public sealed class SnapshotService : ISnapshotService
         Checkpoint? checkpoint;
         try
         {
-            checkpoint = await _host.FindOwnedCheckpointAsync(vm.OwningHost, vm.VmId, elementName, cancellationToken)
-                .ConfigureAwait(false);
+            // The host slot wait (issue #14's D4) shares this same catch:
+            // a timeout spent queuing for the host is no more actionable
+            // here than the CIM call itself failing outright, and both are
+            // "whatever stands is left for an operator" per this method's
+            // own remarks above.
+            await _hostSlots.WaitAsync(vm.OwningHost, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                checkpoint = await _host.FindOwnedCheckpointAsync(vm.OwningHost, vm.VmId, elementName, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            finally
+            {
+                _hostSlots.Release(vm.OwningHost);
+            }
         }
         catch (Exception ex)
         {
@@ -1467,10 +1560,14 @@ public sealed class SnapshotService : ISnapshotService
     /// <c>IsChainCollapsedAsync</c> is a device-settings enumeration plus a
     /// chain walk per attached disk, not a cheap call, and this can run for
     /// the whole merge - which for a multi-hour copy can itself be hours -
-    /// across every VM mid-merge on a host. There is no <c>HostOperationSlots</c>
-    /// yet to bound that against (a later slice), which is why the loop holds
-    /// nothing across its wait rather than a slot it would have to release
-    /// each iteration - written so introducing one later is natural.
+    /// across every VM mid-merge on a host. It now takes a
+    /// <see cref="HostOperationSlots"/> slot for each individual poll (issue
+    /// #14's D4) rather than across the whole wait: a merge can run for as
+    /// long as the copy that preceded it, and holding one of the host's few
+    /// slots for that entire span would wedge every attach on it, which is
+    /// exactly the failure the copy itself avoids by never holding a slot
+    /// either - see <see cref="RunCopyAsync"/>'s own remarks on
+    /// <c>_copier.CopyAsync</c> for the same shape of argument one level up.
     /// </para>
     /// <para>
     /// A merge that has not finished collapsing within
@@ -1508,8 +1605,31 @@ public sealed class SnapshotService : ISnapshotService
         var interval = TimeSpan.FromSeconds(5);
         try
         {
-            while (!await _host.IsChainCollapsedAsync(vm.OwningHost, vm.VmId, sourcePath, mergeWait.Token).ConfigureAwait(false))
+            while (true)
             {
+                // Taken and released around this one call, not held across
+                // the Task.Delay below: a merge can run as long as the copy
+                // that preceded it, and holding one of the host's few slots
+                // for that whole span would wedge every attach on it, the
+                // same reasoning RunCopyAsync's own remarks give for why the
+                // copy itself never takes one.
+                await _hostSlots.WaitAsync(vm.OwningHost, mergeWait.Token).ConfigureAwait(false);
+                bool collapsed;
+                try
+                {
+                    collapsed = await _host.IsChainCollapsedAsync(vm.OwningHost, vm.VmId, sourcePath, mergeWait.Token)
+                        .ConfigureAwait(false);
+                }
+                finally
+                {
+                    _hostSlots.Release(vm.OwningHost);
+                }
+
+                if (collapsed)
+                {
+                    break;
+                }
+
                 await Task.Delay(interval, mergeWait.Token).ConfigureAwait(false);
                 interval = TimeSpan.FromSeconds(Math.Min(interval.TotalSeconds * 2, 30));
             }
@@ -1858,6 +1978,36 @@ public sealed class SnapshotService : ISnapshotService
                 $"copying snapshot {snapshotId} could not get one of {_options.MaxConcurrentSnapshotCopies} " +
                 $"snapshot copy slots within {_options.SnapshotCopySlotWaitTimeout}; retrying re-enqueues from " +
                 "the back of the copy queue rather than holding this one's place");
+        }
+    }
+
+    /// <summary>
+    /// Takes a slot against <see cref="HostOperationSlots"/>' shared cap
+    /// before a checkpoint operation, reporting a timeout spent *queuing* as
+    /// the operation timing out - the same treatment
+    /// <see cref="AttachService"/>'s own AcquireHostSlotAsync gives this, and
+    /// now genuinely the same cap: issue #14's D4 is exactly this
+    /// classify/checkpoint path having had no bound of its own before.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately outside the caller's try, which releases the slot in a
+    /// finally: a failed acquire must not release a slot it never took - the
+    /// same reasoning <see cref="AcquireCopySlotAsync"/> gives for the same
+    /// shape.
+    /// </remarks>
+    private async Task AcquireHostSlotAsync(
+        ClusteredVm vm, string verb, string snapshotId, CancellationTokenSource attempt, CancellationToken callerToken)
+    {
+        try
+        {
+            await _hostSlots.WaitAsync(vm.OwningHost, attempt.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (attempt.IsCancellationRequested && !callerToken.IsCancellationRequested)
+        {
+            throw new JobFailureException(
+                AgentErrorCodes.Internal,
+                $"{verb} snapshot {snapshotId} on {vm.VmId} timed out after {_options.HostOperationTimeout} waiting " +
+                $"for one of {_options.MaxConcurrentHostOperations} operation slots on {vm.OwningHost}");
         }
     }
 

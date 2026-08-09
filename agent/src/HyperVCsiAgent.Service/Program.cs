@@ -86,6 +86,12 @@ builder.Services.AddSingleton<IHyperVHostClient>(services => new VmTargetAsserti
 // See SnapshotCopySlots for why two separate semaphores would double it.
 builder.Services.AddSingleton<SnapshotCopySlots>();
 
+// Shared by AttachService's attach/detach and SnapshotService's checkpoint
+// take, classify, find and destroy: one cap per Hyper-V host, not one per
+// caller. See HostOperationSlots for why two separate caps would double it -
+// issue #14's D4.
+builder.Services.AddSingleton<HostOperationSlots>();
+
 builder.Services.AddSingleton<IVhdxService, VhdxService>();
 builder.Services.AddSingleton<IAttachService, AttachService>();
 

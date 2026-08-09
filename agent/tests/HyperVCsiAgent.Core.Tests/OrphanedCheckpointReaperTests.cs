@@ -318,6 +318,7 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
         var store = new RecordingJobStore();
         var host = new FakeHostClient();
         var copySlots = new SnapshotCopySlots(Options.Create(new AgentOptions { MaxConcurrentSnapshotCopies = 4 }));
+        var hostSlots = new HostOperationSlots(Options.Create(new AgentOptions { MaxConcurrentHostOperations = 4 }));
         var options = Options.Create(new AgentOptions
         {
             CsvVolumesRoot = _volumesRoot,
@@ -327,10 +328,11 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
             SnapshotCheckpointWaitTimeout = TimeSpan.FromSeconds(2),
             SnapshotCopySlotWaitTimeout = TimeSpan.FromSeconds(2),
             CheckpointMergeTimeout = TimeSpan.FromSeconds(2),
+            MaxConcurrentHostOperations = 4,
         });
 
         var service = new SnapshotService(
-            disks, copier, store, cluster, host, copySlots, options, NullLogger<SnapshotService>.Instance);
+            disks, copier, store, cluster, host, hostSlots, copySlots, options, NullLogger<SnapshotService>.Instance);
 
         _disposables.Add(store);
         _disposables.Add(copySlots);
