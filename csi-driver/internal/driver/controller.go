@@ -283,6 +283,9 @@ func validateVolumeCapabilities(capabilities []*csi.VolumeCapability) error {
 			return status.Errorf(codes.InvalidArgument,
 				"access mode %s is not supported; a VHDX attaches to one node at a time", mode)
 		}
+		if _, err := requireMountVolume(capability); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -637,11 +640,6 @@ func (s *controllerServer) ValidateVolumeCapabilities(ctx context.Context, req *
 // capability and treats an unsupported one as a malformed request, while this
 // RPC is *asked* about one and owes a plain answer — an error there would say
 // the question couldn't be evaluated, not that the answer was no.
-//
-// It is also stricter in one respect. A block volume is a "no" here, because
-// nothing in this driver formats or mounts a raw block device; CreateVolume
-// still accepts one without complaint, which is a gap already named in CSI
-// Spec.md and its own piece of work rather than a side effect of this one.
 func unsupportedCapability(capability *csi.VolumeCapability) string {
 	if capability.GetMount() == nil {
 		return "only mount volumes are supported; block volumes are not implemented"

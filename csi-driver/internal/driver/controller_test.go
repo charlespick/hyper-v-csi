@@ -253,6 +253,18 @@ func TestCreateVolumeRejectsUnusableRequests(t *testing.T) {
 			want:    codes.InvalidArgument,
 		},
 		{
+			// Nothing in this driver formats or mounts a raw block device, so
+			// a block volume must be rejected before a job is ever enqueued
+			// for it.
+			name: "a block volume",
+			request: func() *csi.CreateVolumeRequest {
+				req := createVolumeRequest("pvc-1", gibibyte, 0)
+				req.VolumeCapabilities[0].AccessType = &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}}
+				return req
+			}(),
+			want: codes.InvalidArgument,
+		},
+		{
 			// An impossible range is OUT_OF_RANGE per the CSI error table,
 			// not INVALID_ARGUMENT.
 			name:    "required bytes above the limit",

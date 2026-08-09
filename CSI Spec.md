@@ -139,12 +139,9 @@ would break the RPC on exactly the volumes it is most often asked about. A disk
 still being created reads as absent, which is correct: it only reaches its real
 path via the rename that publishes it.
 
-Two things it deliberately does not confirm. `parameters` are not echoed back,
+One thing it deliberately does not confirm: `parameters` are not echoed back,
 because CreateVolume ignores StorageClass parameters (below), and confirming
-them would turn a documented gap into a guarantee nothing keeps. And a block
-volume is a "no", even though CreateVolume still accepts one: this is the RPC
-whose entire job is answering honestly, so it answers, and tightening create is
-its own piece of work rather than a side effect of this one.
+them would turn a documented gap into a guarantee nothing keeps.
 
 Confirmed against a real deployment, all three answers it is built to give: a
 real volume asked about a supported capability (SINGLE_NODE_WRITER, mount, ext4)
@@ -154,9 +151,9 @@ about MULTI_NODE_MULTI_WRITER comes back with `confirmed` unset and the
 access-mode reason in `message`, not an error.
 
 **CreateVolume gaps.** StorageClass `parameters` are ignored rather than
-consumed or rejected, the access *type* (mount vs block) is not validated, and
-`volume_context` is left empty. `VolumeContentSource` returns Unimplemented by
-design; restore-from-snapshot is a separate slice.
+consumed or rejected, and `volume_context` is left empty.
+`VolumeContentSource` returns Unimplemented by design; restore-from-snapshot
+is a separate slice.
 
 **DeleteVolume deliberately does not check that the volume is detached.** It
 deletes the file. By the time CSI calls DeleteVolume, ControllerUnpublishVolume
