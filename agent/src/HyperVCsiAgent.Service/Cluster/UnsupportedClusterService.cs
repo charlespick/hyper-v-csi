@@ -16,6 +16,9 @@ public sealed class UnsupportedClusterService : IClusterService
     public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
         throw Unsupported();
 
+    public Task<IReadOnlyList<string>> ListHostNamesAsync(CancellationToken cancellationToken) =>
+        throw Unsupported();
+
     private static PlatformNotSupportedException Unsupported() =>
         new("Failover Cluster queries require Windows; this agent is running on " +
             $"{Environment.OSVersion.Platform}");

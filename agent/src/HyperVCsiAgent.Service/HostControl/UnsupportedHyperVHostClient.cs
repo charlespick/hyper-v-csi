@@ -49,6 +49,15 @@ public sealed class UnsupportedHyperVHostClient : IHyperVHostClient
     public Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
         throw Unsupported();
 
+    public Task<IReadOnlyList<OwnedCheckpoint>> ListOwnedCheckpointsAsync(string hostName, CancellationToken cancellationToken) =>
+        throw Unsupported();
+
+    public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
+        throw Unsupported();
+
+    public Task<bool> IsChainCollapsedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+        throw Unsupported();
+
     private static PlatformNotSupportedException Unsupported() =>
         new("VM configuration requires Windows with the Hyper-V role; this agent is running on " +
             $"{Environment.OSVersion.Platform}");

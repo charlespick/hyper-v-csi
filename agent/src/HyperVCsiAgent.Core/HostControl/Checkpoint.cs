@@ -19,4 +19,14 @@ namespace HyperVCsiAgent.Core.HostControl;
 /// <see cref="IHyperVHostClient.FindOwnedCheckpointAsync"/> does not need a
 /// second read to log or reason about which snapshot it belongs to.
 /// </param>
-public sealed record Checkpoint(string SettingsPath, string ElementName);
+/// <param name="Notes">
+/// The JSON <c>SnapshotService.BuildCheckpointNotes</c> wrote onto the
+/// checkpoint's <c>Notes</c> property alongside its identity, carried back
+/// so a recovery path can recover a checkpoint's original (volumeId,
+/// snapshotName, createdAtUtc) without depending on <see cref="ElementName"/>
+/// being parseable, or un-truncated. Nullable for two reasons: a checkpoint
+/// this driver did not tag at all has none, and a checkpoint tagged by an
+/// older build of this driver, before this property existed, may not carry
+/// one either.
+/// </param>
+public sealed record Checkpoint(string SettingsPath, string ElementName, string? Notes);

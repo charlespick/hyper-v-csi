@@ -31,4 +31,19 @@ public interface IClusterService
     Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken);
 
     Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Every host that is a member of this failover cluster, by name.
+    /// </summary>
+    /// <remarks>
+    /// Hosts, not VMs: a caller that wants every checkpoint this driver owns
+    /// gets the VM IDs it needs from the checkpoint enumeration itself - see
+    /// <see cref="HyperVCsiAgent.Core.HostControl.IHyperVHostClient.ListOwnedCheckpointsAsync"/> -
+    /// so asking the cluster for VMs instead would cost one WMI round trip per
+    /// VM to resolve each one's owning host, the very cost this class's own
+    /// remarks measure, to learn something a per-host sweep already knows by
+    /// construction. Hosts are O(nodes); VMs resolved this way would be
+    /// O(VMs).
+    /// </remarks>
+    Task<IReadOnlyList<string>> ListHostNamesAsync(CancellationToken cancellationToken);
 }

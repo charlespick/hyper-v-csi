@@ -212,4 +212,79 @@ public interface IHyperVHostClient
     /// </remarks>
     /// <exception cref="VmNotOnHostException">The VM is not registered on this host.</exception>
     Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Every checkpoint on this host whose <c>ElementName</c> starts with
+    /// <see cref="CheckpointMatching.OwnedPrefix"/>, paired with the VM each
+    /// one stands on.
+    /// </summary>
+    /// <remarks>
+    /// Host-scoped rather than VM-scoped, deliberately: the caller is a sweep
+    /// looking for checkpoints nothing is driving anymore, and it does not
+    /// know which VMs to ask about - that is exactly the question it is
+    /// asking. Every other checkpoint member on this interface takes a
+    /// <c>vmId</c> because its caller already has one in hand; this is the one
+    /// place that does not, and cannot.
+    /// <para>
+    /// This is also the one place <see cref="CheckpointMatching.FindAnyOwned"/>'s
+    /// driver-level question - "is this checkpoint ours at all, regardless of
+    /// which (volume, snapshot) it names" - is exposed through this interface.
+    /// <see cref="FindOwnedCheckpointAsync"/>'s own remarks deliberately keep
+    /// that question internal to <c>CimHyperVHostClient</c> rather than
+    /// letting it out through the public seam, because every caller of that
+    /// method already has a specific snapshot in mind and the exact match is
+    /// all it needs. A sweep has no specific snapshot in mind by construction
+    /// - that is the whole reason it is sweeping - so the driver-level
+    /// question is the only one it can ask, and narrowing this method to an
+    /// exact match the way <see cref="FindOwnedCheckpointAsync"/> does would
+    /// leave it with no way to ask anything at all.
+    /// </para>
+    /// </remarks>
+    Task<IReadOnlyList<OwnedCheckpoint>> ListOwnedCheckpointsAsync(string hostName, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Whether the VM is configured for <c>ProductionOnly</c> checkpoints -
+    /// the one precondition <see cref="CreateCheckpointAsync"/> requires and
+    /// refuses to proceed without.
+    /// </summary>
+    /// <remarks>
+    /// Read-only, so a fast <c>CreateSnapshot</c> job can refuse a
+    /// misconfigured VM synchronously, rather than leaving the caller to
+    /// discover the same fact from a long-running copy job that nothing
+    /// polls. <see cref="CreateCheckpointAsync"/> still checks this itself
+    /// before taking a checkpoint - this method exists beside it, not instead
+    /// of it, for a caller that wants the answer before committing to that
+    /// call at all.
+    /// </remarks>
+    /// <exception cref="VmNotOnHostException">The VM is not registered on this host.</exception>
+    Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Whether the VM's configuration currently references
+    /// <paramref name="vhdxPath"/> directly, or does not reference anything
+    /// built on it at all - true either way. False only while a differencing
+    /// disk is still stacked on top of it.
+    /// </summary>
+    /// <remarks>
+    /// The post-merge wait's predicate. <see cref="DestroyCheckpointAsync"/>
+    /// is fire-and-forget and returns once the merge has *started*, and -
+    /// measured, per the comment already in <c>ClassifyAttachmentAsync</c>'s
+    /// own retry loop - the checkpoint's configuration object can disappear a
+    /// moment *before* the VM's disk actually re-points to the base. So "the
+    /// checkpoint object is gone" is not the same question as "the chain has
+    /// collapsed", and only the second one tells a caller it is safe to
+    /// release its hold on the VM.
+    /// <para>
+    /// Deliberately non-throwing and deliberately not judging ownership,
+    /// unlike <see cref="ClassifyAttachmentAsync"/>: that method's callers -
+    /// attach, detach, expand, snapshot - each have a specific reason to
+    /// treat an unresolved or foreign chain as a hard failure requiring an
+    /// operator. This method's one caller only ever asks whether the chain
+    /// it already knows about, from a merge it already started, has finished
+    /// collapsing yet - an unresolved chain simply means "not collapsed yet",
+    /// not "something is wrong", so this returns false rather than throwing.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="VmNotOnHostException">The VM is not registered on this host.</exception>
+    Task<bool> IsChainCollapsedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken);
 }

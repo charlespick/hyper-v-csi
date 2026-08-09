@@ -482,7 +482,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
 
             _logger.LogInformation(
                 "created checkpoint {ElementName} of {VmId} on {HostName}", elementName, vmId, hostName);
-            return new Checkpoint(taggedPath, elementName);
+            return new Checkpoint(taggedPath, elementName, notesJson);
         }, cancellationToken);
 
     public Task<Checkpoint?> FindOwnedCheckpointAsync(
@@ -528,6 +528,196 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             _logger.LogInformation(
                 "started merging checkpoint {ElementName} on {HostName}", checkpoint.ElementName, hostName);
         }, cancellationToken);
+
+    public Task<IReadOnlyList<OwnedCheckpoint>> ListOwnedCheckpointsAsync(string hostName, CancellationToken cancellationToken) =>
+        Task.Run<IReadOnlyList<OwnedCheckpoint>>(() =>
+        {
+            var deadline = CimDeadline.After(_hostOperationTimeout);
+            var scope = ScopeFor(hostName);
+            var owned = new List<OwnedCheckpoint>();
+
+            foreach (var vm in EnumerateVirtualMachines(scope, deadline, cancellationToken))
+            {
+                using (vm)
+                {
+                    var vmId = (string)vm["Name"];
+                    foreach (var checkpoint in ReadCheckpointIdentities(vm, deadline, cancellationToken))
+                    {
+                        if (checkpoint.ElementName.StartsWith(CheckpointMatching.OwnedPrefix, StringComparison.Ordinal))
+                        {
+                            owned.Add(new OwnedCheckpoint(vmId, checkpoint));
+                        }
+                    }
+                }
+            }
+
+            return owned;
+        }, cancellationToken);
+
+    public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
+        Task.Run(() =>
+        {
+            var deadline = CimDeadline.After(_hostOperationTimeout);
+            var scope = ScopeFor(hostName);
+            using var activeSettings = GetActiveSettings(scope, hostName, vmId, deadline, cancellationToken);
+            return IsProductionOnlyCheckpoints(activeSettings);
+        }, cancellationToken);
+
+    public Task<bool> IsChainCollapsedAsync(
+        string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+        Task.Run(() =>
+        {
+            var deadline = CimDeadline.After(_hostOperationTimeout);
+            var scope = ScopeFor(hostName);
+            using var settings = GetActiveSettings(scope, hostName, vmId, deadline, cancellationToken);
+            return IsChainCollapsed(scope, settings, vhdxPath, deadline, cancellationToken);
+        }, cancellationToken);
+
+    /// <summary>
+    /// Every real virtual machine registered on this host - the un-keyed
+    /// counterpart to <see cref="GetComputerSystem"/>'s single-VM lookup, for
+    /// <see cref="ListOwnedCheckpointsAsync"/>'s sweep, which has no VM ID to
+    /// key on yet.
+    /// </summary>
+    /// <remarks>
+    /// <c>Msvm_ComputerSystem</c> is not only virtual machines: the host
+    /// itself has one too, representing the physical computer, and it is
+    /// this class's own root - <c>Caption</c> is <c>"Hosting Computer
+    /// System"</c> on that instance and <c>"Virtual Machine"</c> on every
+    /// actual VM, which is the standard, documented way every Hyper-V WMI
+    /// script distinguishes the two. That is a documented convention, not
+    /// something this file measures against a real host the way the timing
+    /// and checkpoint-type facts elsewhere in it are - unlike those, nothing
+    /// here depends on a number that could plausibly differ across Hyper-V
+    /// builds. <see cref="GetComputerSystem"/>'s own <c>WHERE Name = vmId</c>
+    /// filter never had to make this distinction: a caller there already
+    /// knows the specific GUID it wants, and the host's own record does not
+    /// happen to carry it.
+    /// </remarks>
+    private static IEnumerable<ManagementObject> EnumerateVirtualMachines(
+        ManagementScope scope, CimDeadline deadline, CancellationToken cancellationToken)
+    {
+        using var searcher = new ManagementObjectSearcher(scope, new SelectQuery(
+            "SELECT * FROM Msvm_ComputerSystem WHERE Caption = 'Virtual Machine'"));
+
+        using var results = WithDeadline(deadline, cancellationToken, "enumerating virtual machines", searcher.Get);
+        foreach (var instance in results)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            yield return (ManagementObject)instance;
+        }
+    }
+
+    /// <summary>
+    /// <see cref="IsChainCollapsedAsync"/>'s traversal. Structurally the same
+    /// walk <see cref="ClassifyAttachment"/> does, and deliberately its own
+    /// copy rather than a shared one, for the same reason
+    /// <see cref="ClassifyAttachment"/>'s own remarks give for not sharing
+    /// with <see cref="LocateDisk"/>: this method must never throw on an
+    /// unresolved chain, and every other walk in this file must keep doing
+    /// exactly that.
+    /// </summary>
+    private static bool IsChainCollapsed(
+        ManagementScope scope,
+        ManagementObject settings,
+        string vhdxPath,
+        CimDeadline deadline,
+        CancellationToken cancellationToken)
+    {
+        var otherDisks = new List<string>();
+
+        foreach (var disk in DeviceSettings(scope, settings, "Msvm_StorageAllocationSettingData", deadline, cancellationToken))
+        {
+            using (disk)
+            {
+                if ((disk["ResourceSubType"] as string) != VirtualHardDiskSubType)
+                {
+                    continue;
+                }
+
+                if (disk["HostResource"] is not string[] { Length: > 0 } hostResource)
+                {
+                    continue;
+                }
+
+                if (SamePath(hostResource[0], vhdxPath))
+                {
+                    return true;
+                }
+
+                otherDisks.Add(hostResource[0]);
+            }
+        }
+
+        // Nothing else references vhdxPath at all, so there is no chain left
+        // to collapse - the same answer a VHDX that was never behind a
+        // checkpoint in the first place gets.
+        if (otherDisks.Count == 0)
+        {
+            return true;
+        }
+
+        using var imageService = GetImageManagementService(scope, deadline, cancellationToken);
+
+        foreach (var attached in otherDisks)
+        {
+            var descendant = attached;
+            var depth = 0;
+
+            for (; depth < MaxDifferencingChainDepth; depth++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                string? parent;
+                try
+                {
+                    parent = ParentPathOf(imageService, descendant, deadline, cancellationToken);
+                }
+                catch (InvalidOperationException)
+                {
+                    // ParentPathOf could not read this disk's setting data,
+                    // so whether it is still built on vhdxPath is unknown.
+                    // Every throwing walk in this file treats an unreadable
+                    // disk as a reason to refuse the whole operation; this
+                    // one instead answers "not collapsed yet" - its one
+                    // caller is polling a merge already under way, and a
+                    // momentarily unreadable disk is exactly what polling
+                    // during an active reconfiguration looks like.
+                    return false;
+                }
+
+                if (parent is null)
+                {
+                    break;
+                }
+
+                if (SamePath(parent, vhdxPath))
+                {
+                    // Still stacked on vhdxPath - whoever the checkpoint at
+                    // the root of this chain belongs to is not this
+                    // method's question. The merge this caller is waiting on
+                    // has not re-pointed the chain yet.
+                    return false;
+                }
+
+                descendant = parent;
+            }
+
+            if (depth == MaxDifferencingChainDepth)
+            {
+                // Unresolved within the bound. GuardAgainstDifferencingChain
+                // and ClassifyAttachment both refuse to guess past this and
+                // throw, because their callers are deciding whether an
+                // operation is safe to start. This method's one caller is
+                // polling a merge it already started, not deciding whether
+                // to start one, so an unresolved chain reads the same way an
+                // ordinary in-progress merge does: not collapsed yet.
+                return false;
+            }
+        }
+
+        return true;
+    }
 
     /// <summary>
     /// <see cref="ClassifyAttachmentAsync"/>'s traversal. Structurally the same
@@ -676,12 +866,24 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
 
     private static void EnsureProductionOnlyCheckpoints(string vmId, ManagementObject activeSettings)
     {
-        var userSnapshotType = activeSettings["UserSnapshotType"] is { } raw ? Convert.ToUInt16(raw) : (ushort)0;
-        if (userSnapshotType != ProductionOnlyUserSnapshotType)
+        if (!IsProductionOnlyCheckpoints(activeSettings))
         {
-            throw new CheckpointsNotConfiguredException(vmId, userSnapshotType);
+            throw new CheckpointsNotConfiguredException(vmId, ReadUserSnapshotType(activeSettings));
         }
     }
+
+    /// <summary>
+    /// The same test <see cref="EnsureProductionOnlyCheckpoints"/> makes
+    /// before <see cref="CreateCheckpointAsync"/> proceeds, pulled out so
+    /// <see cref="CanCheckpointAsync"/> can ask the identical question
+    /// without restating the rule - and without the <c>vmId</c> that method
+    /// needs only to build the exception this one never throws.
+    /// </summary>
+    private static bool IsProductionOnlyCheckpoints(ManagementObject activeSettings) =>
+        ReadUserSnapshotType(activeSettings) == ProductionOnlyUserSnapshotType;
+
+    private static ushort ReadUserSnapshotType(ManagementObject activeSettings) =>
+        activeSettings["UserSnapshotType"] is { } raw ? Convert.ToUInt16(raw) : (ushort)0;
 
     /// <summary>
     /// Builds the embedded <c>Msvm_VirtualSystemSnapshotSettingData</c> instance
@@ -822,13 +1024,24 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             {
                 if (checkpoint["ElementName"] is string { Length: > 0 } elementName)
                 {
-                    checkpoints.Add(new Checkpoint(checkpoint.Path.Path, elementName));
+                    checkpoints.Add(new Checkpoint(checkpoint.Path.Path, elementName, ReadNotes(checkpoint)));
                 }
             }
         }
 
         return checkpoints;
     }
+
+    /// <summary>
+    /// The first non-empty element of <c>Notes</c>, or null. <c>TagCheckpoint</c>
+    /// writes exactly one element - see its own call site - but the property
+    /// is a string array on the schema regardless of how many elements
+    /// anything writes to it, and a checkpoint this driver never tagged, or
+    /// one tagged before <see cref="Checkpoint.Notes"/> existed, carries none
+    /// at all.
+    /// </summary>
+    private static string? ReadNotes(ManagementObject checkpoint) =>
+        checkpoint["Notes"] is string[] notes ? notes.FirstOrDefault(note => !string.IsNullOrEmpty(note)) : null;
 
     /// <summary>
     /// Every checkpoint currently associated with the VM, finished or not -

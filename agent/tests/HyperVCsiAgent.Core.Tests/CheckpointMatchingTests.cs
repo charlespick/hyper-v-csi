@@ -10,7 +10,7 @@ namespace HyperVCsiAgent.Core.Tests;
 /// </summary>
 public sealed class CheckpointMatchingTests
 {
-    private static Checkpoint Checkpoint(string elementName) => new($"settings:{elementName}", elementName);
+    private static Checkpoint Checkpoint(string elementName) => new($"settings:{elementName}", elementName, null);
 
     // -------------------------------------------------------------- FindExact
 

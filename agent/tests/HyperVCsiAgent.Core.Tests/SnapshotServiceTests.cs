@@ -1784,6 +1784,9 @@ public sealed class SnapshotServiceTests : IDisposable
 
         public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("no node hint was given in this test, so nothing should resolve a VM");
+
+        public Task<IReadOnlyList<string>> ListHostNamesAsync(CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("no node hint was given in this test, so nothing should resolve a VM");
     }
 
     /// <summary>NeverCalledClusterService's counterpart for IHyperVHostClient.</summary>
@@ -1827,6 +1830,15 @@ public sealed class SnapshotServiceTests : IDisposable
 
         public Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
             throw Unexpected();
+
+        public Task<IReadOnlyList<OwnedCheckpoint>> ListOwnedCheckpointsAsync(string hostName, CancellationToken cancellationToken) =>
+            throw Unexpected();
+
+        public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
+            throw Unexpected();
+
+        public Task<bool> IsChainCollapsedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+            throw Unexpected();
     }
 
     /// <summary>
@@ -1843,6 +1855,9 @@ public sealed class SnapshotServiceTests : IDisposable
 
         public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
             Task.FromResult(true);
+
+        public Task<IReadOnlyList<string>> ListHostNamesAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException("SnapshotService never lists cluster hosts");
     }
 
     /// <summary>
@@ -1891,6 +1906,23 @@ public sealed class SnapshotServiceTests : IDisposable
         public List<string> CreatedCheckpointElementNames { get; } = [];
 
         public List<string> DestroyedCheckpointElementNames { get; } = [];
+
+        /// <summary>
+        /// The VM <see cref="ListOwnedCheckpointsAsync"/> and
+        /// <see cref="IsChainCollapsedAsync"/> report against, defaulting to
+        /// the same VM ID <c>FakeClusterService</c> in this file hands out
+        /// for every test's own <c>ClusteredVm</c>.
+        /// </summary>
+        public string VmId { get; set; } = "vm-1";
+
+        /// <summary>
+        /// Makes <see cref="IsChainCollapsedAsync"/> report the chain as
+        /// still standing no matter what, for a test that needs a post-merge
+        /// wait built on this member to time out rather than observe a
+        /// collapse that never happens on a fake with no real merge to wait
+        /// for.
+        /// </summary>
+        public bool ChainStaysUncollapsed { get; set; }
 
         public Task<VolumeAttachment> ClassifyAttachmentAsync(
             string hostName, string vmId, string vhdxPath, string thisSnapshotElementName, CancellationToken cancellationToken)
@@ -1941,7 +1973,7 @@ public sealed class SnapshotServiceTests : IDisposable
                 throw new InvalidOperationException("CreateSnapshot said no");
             }
 
-            var checkpoint = new Checkpoint($"checkpoint:{elementName}", elementName);
+            var checkpoint = new Checkpoint($"checkpoint:{elementName}", elementName, notesJson);
             _checkpointsByElementName[elementName] = checkpoint;
             CreatedCheckpointElementNames.Add(elementName);
             return Task.FromResult(checkpoint);
@@ -1980,6 +2012,24 @@ public sealed class SnapshotServiceTests : IDisposable
             DestroyedCheckpointElementNames.Add(checkpoint.ElementName);
             return Task.CompletedTask;
         }
+
+        // Unit D's tests read these for real rather than throwing, unlike
+        // every attach/detach/resize member below - routed through the same
+        // _checkpointsByElementName dictionary the checkpoint members above
+        // read and write, per this class's own doc comment on why a test
+        // cannot get the fake's seams to disagree.
+
+        public Task<IReadOnlyList<OwnedCheckpoint>> ListOwnedCheckpointsAsync(string hostName, CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<OwnedCheckpoint>>(_checkpointsByElementName.Values
+                .Where(checkpoint => checkpoint.ElementName.StartsWith(CheckpointMatching.OwnedPrefix, StringComparison.Ordinal))
+                .Select(checkpoint => new OwnedCheckpoint(VmId, checkpoint))
+                .ToList());
+
+        public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
+            Task.FromResult(!CheckpointsNotConfigured);
+
+        public Task<bool> IsChainCollapsedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+            Task.FromResult(!ChainStaysUncollapsed && _checkpointsByElementName.Count == 0);
 
         public Task<long> GetDiskSizeAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
             throw new NotSupportedException(

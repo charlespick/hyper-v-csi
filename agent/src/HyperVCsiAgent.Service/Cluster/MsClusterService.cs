@@ -230,4 +230,40 @@ public sealed class MsClusterService : IClusterService
         throw new NotSupportedException(
             "node liveness is only needed for forced detach from a failed node, which is not implemented yet; " +
             "an unpublish whose owning host is down fails and is retried rather than fenced");
+
+    public Task<IReadOnlyList<string>> ListHostNamesAsync(CancellationToken cancellationToken) =>
+        // Same synchronous-API trade every other method here makes: WMI has
+        // no async surface, so the call runs on a pool thread.
+        Task.Run<IReadOnlyList<string>>(() =>
+        {
+            var deadline = CimDeadline.After(_hostOperationTimeout);
+            var names = new List<string>();
+
+            using var session = CimSession.Create(null);
+            var options = deadline.Options("reading MSCluster_Node.Name", cancellationToken);
+            foreach (var node in session.QueryInstances(NamespaceName, "WQL", "SELECT Name FROM MSCluster_Node", options))
+            {
+                if (node.CimInstanceProperties["Name"]?.Value as string is { Length: > 0 } name)
+                {
+                    names.Add(name);
+                }
+            }
+
+            if (names.Count == 0)
+            {
+                // Not "an empty cluster": a caller sweeping for owned
+                // checkpoints across every host would read that as "nothing
+                // to sweep" and quietly skip every VM on the cluster. A
+                // cluster this agent is deployed against has at least the
+                // node it is running on, so no nodes back means the query
+                // could not be answered - the same reading FindResourceName
+                // gives a missing cluster database, and for the same reason:
+                // an unanswerable question must not be mistaken for an
+                // answer of zero.
+                throw new InvalidOperationException(
+                    "MSCluster_Node reported no nodes at all, which should not be possible for a cluster this agent is deployed against");
+            }
+
+            return names;
+        }, cancellationToken);
 }

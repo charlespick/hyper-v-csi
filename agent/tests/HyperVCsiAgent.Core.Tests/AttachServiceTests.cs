@@ -501,6 +501,9 @@ public sealed class AttachServiceTests : IDisposable
 
         public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
+
+        public Task<IReadOnlyList<string>> ListHostNamesAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
     }
 
     private sealed class FakeHostClient : IHyperVHostClient
@@ -625,6 +628,15 @@ public sealed class AttachServiceTests : IDisposable
             throw new NotSupportedException();
 
         public Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<IReadOnlyList<OwnedCheckpoint>> ListOwnedCheckpointsAsync(string hostName, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<bool> IsChainCollapsedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
         private void Migrated(string hostName, string vmId)
