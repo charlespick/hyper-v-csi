@@ -48,7 +48,7 @@ func TestMutualTLSPresentsTheClientCertificate(t *testing.T) {
 		t.Fatalf("NewMutualTLS: %v", err)
 	}
 
-	if _, err := client.EnqueueJob(context.Background(), "pvc-1", "CreateVolume", "volume:pvc-1", nil); err != nil {
+	if _, err := client.EnqueueJob(context.Background(), "pvc-1", "CreateVolume", nil); err != nil {
 		t.Fatalf("EnqueueJob: %v", err)
 	}
 
@@ -80,7 +80,7 @@ func TestMutualTLSRejectsAnUnpinnedServerCertificate(t *testing.T) {
 		t.Fatalf("NewMutualTLS: %v", err)
 	}
 
-	if _, err := client.EnqueueJob(context.Background(), "pvc-1", "CreateVolume", "volume:pvc-1", nil); err == nil {
+	if _, err := client.EnqueueJob(context.Background(), "pvc-1", "CreateVolume", nil); err == nil {
 		t.Fatal("connected to an agent certificate that was not pinned")
 	}
 }
@@ -113,7 +113,7 @@ func TestMutualTLSRejectsAnExpiredServerCertificate(t *testing.T) {
 		t.Fatalf("NewMutualTLS: %v", err)
 	}
 
-	if _, err := client.EnqueueJob(context.Background(), "pvc-1", "CreateVolume", "volume:pvc-1", nil); err == nil {
+	if _, err := client.EnqueueJob(context.Background(), "pvc-1", "CreateVolume", nil); err == nil {
 		t.Fatal("connected to an agent certificate outside its validity window")
 	}
 }

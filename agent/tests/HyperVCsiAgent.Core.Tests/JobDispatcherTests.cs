@@ -13,12 +13,13 @@ public class JobDispatcherTests
     public async Task Resolve_CreateVolume_RunsTheCreateAndPublishesItsResult()
     {
         var vhdx = new RecordingVhdxService();
-        var run = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService()).Resolve(
+        var resolved = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService()).Resolve(
             JobDispatcher.CreateVolume, Payload("""{"name":"pvc-1","sizeBytes":2048}"""), WireOptions);
 
         var job = NewJob();
-        await run(job, CancellationToken.None);
+        await resolved.Run(job, CancellationToken.None);
 
+        Assert.Equal(["volume:pvc-1"], resolved.Targets);
         Assert.Equal(("pvc-1", 2048L, (string?)null), vhdx.LastCreate);
         Assert.Equal(new CreateVolumeResult("pvc-1", 2048, AlreadyPresent: false), job.Result);
     }
@@ -30,12 +31,12 @@ public class JobDispatcherTests
         // the wire contract adds sourceSnapshotId to the same payload rather than
         // growing a CreateVolumeFromSnapshot operation.
         var vhdx = new RecordingVhdxService();
-        var run = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService()).Resolve(
+        var resolved = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService()).Resolve(
             JobDispatcher.CreateVolume,
             Payload("""{"name":"pvc-2","sizeBytes":2048,"sourceSnapshotId":"pvc-1~snap-a"}"""),
             WireOptions);
 
-        await run(NewJob(), CancellationToken.None);
+        await resolved.Run(NewJob(), CancellationToken.None);
 
         Assert.Equal(("pvc-2", 2048L, "pvc-1~snap-a"), vhdx.LastCreate);
     }
@@ -44,12 +45,13 @@ public class JobDispatcherTests
     public async Task Resolve_DeleteVolume_RunsTheDeleteAndPublishesNoResult()
     {
         var vhdx = new RecordingVhdxService();
-        var run = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService()).Resolve(
+        var resolved = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService()).Resolve(
             JobDispatcher.DeleteVolume, Payload("""{"volumeId":"pvc-1"}"""), WireOptions);
 
         var job = NewJob();
-        await run(job, CancellationToken.None);
+        await resolved.Run(job, CancellationToken.None);
 
+        Assert.Equal(["volume:pvc-1"], resolved.Targets);
         Assert.Equal("pvc-1", vhdx.LastDelete);
         // A deleted volume has nothing left to describe, so the job carries no
         // result and the controller reads only its status.
@@ -60,12 +62,13 @@ public class JobDispatcherTests
     public async Task Resolve_ExpandVolume_RunsTheExpandAndPublishesTheNewCapacity()
     {
         var vhdx = new RecordingVhdxService();
-        var run = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService()).Resolve(
+        var resolved = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService()).Resolve(
             JobDispatcher.ExpandVolume, Payload("""{"volumeId":"pvc-1","sizeBytes":4096}"""), WireOptions);
 
         var job = NewJob();
-        await run(job, CancellationToken.None);
+        await resolved.Run(job, CancellationToken.None);
 
+        Assert.Equal(["volume:pvc-1"], resolved.Targets);
         Assert.Equal(("pvc-1", 4096L, (string?)null), vhdx.LastExpand);
         // Unlike a delete, this one does carry a result: CSI requires
         // ControllerExpandVolume to report the capacity the volume ended up with.
@@ -78,12 +81,12 @@ public class JobDispatcherTests
         // The driver's own lookup, not re-derived here - see
         // VhdxService.ExpandAsync for when it actually gets consulted.
         var vhdx = new RecordingVhdxService();
-        var run = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService()).Resolve(
+        var resolved = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService()).Resolve(
             JobDispatcher.ExpandVolume,
             Payload("""{"volumeId":"pvc-1","sizeBytes":4096,"nodeId":"7a446141-becd-4c7e-968a-65257139f98c"}"""),
             WireOptions);
 
-        await run(NewJob(), CancellationToken.None);
+        await resolved.Run(NewJob(), CancellationToken.None);
 
         Assert.Equal(("pvc-1", 4096L, "7a446141-becd-4c7e-968a-65257139f98c"), vhdx.LastExpand);
     }
@@ -92,12 +95,13 @@ public class JobDispatcherTests
     public async Task Resolve_VolumeExists_RunsTheLookupAndPublishesNoResult()
     {
         var vhdx = new RecordingVhdxService();
-        var run = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService()).Resolve(
+        var resolved = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService()).Resolve(
             JobDispatcher.VolumeExists, Payload("""{"volumeId":"pvc-1"}"""), WireOptions);
 
         var job = NewJob();
-        await run(job, CancellationToken.None);
+        await resolved.Run(job, CancellationToken.None);
 
+        Assert.Equal(["volume:pvc-1"], resolved.Targets);
         Assert.Equal("pvc-1", vhdx.LastConfirmExists);
         // The answer is the job's own outcome - a succeeded job means the disk
         // is there - so there is nothing for a result to carry.
@@ -108,12 +112,13 @@ public class JobDispatcherTests
     public async Task Resolve_AttachVolume_RunsTheAttachAndPublishesWhereItLanded()
     {
         var attach = new RecordingAttachService();
-        var run = new JobDispatcher(new RecordingVhdxService(), attach, new RecordingSnapshotService()).Resolve(
+        var resolved = new JobDispatcher(new RecordingVhdxService(), attach, new RecordingSnapshotService()).Resolve(
             JobDispatcher.AttachVolume, Payload("""{"volumeId":"pvc-1","nodeId":"node-a"}"""), WireOptions);
 
         var job = NewJob();
-        await run(job, CancellationToken.None);
+        await resolved.Run(job, CancellationToken.None);
 
+        Assert.Equal(["vm:node-a"], resolved.Targets);
         Assert.Equal(("pvc-1", "node-a"), attach.LastAttach);
         // The slot is the whole point of the result: it is the only way the node
         // plugin can tell this disk from the others attached to the VM.
@@ -126,12 +131,13 @@ public class JobDispatcherTests
     public async Task Resolve_DetachVolume_RunsTheDetachAndPublishesNoResult()
     {
         var attach = new RecordingAttachService();
-        var run = new JobDispatcher(new RecordingVhdxService(), attach, new RecordingSnapshotService()).Resolve(
+        var resolved = new JobDispatcher(new RecordingVhdxService(), attach, new RecordingSnapshotService()).Resolve(
             JobDispatcher.DetachVolume, Payload("""{"volumeId":"pvc-1","nodeId":"node-a"}"""), WireOptions);
 
         var job = NewJob();
-        await run(job, CancellationToken.None);
+        await resolved.Run(job, CancellationToken.None);
 
+        Assert.Equal(["vm:node-a"], resolved.Targets);
         Assert.Equal(("pvc-1", "node-a"), attach.LastDetach);
         Assert.Null(job.Result);
     }
@@ -140,14 +146,17 @@ public class JobDispatcherTests
     public async Task Resolve_CreateSnapshot_RunsTheCreateAndPublishesItsObservedState()
     {
         var snapshots = new RecordingSnapshotService();
-        var run = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), snapshots).Resolve(
+        var resolved = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), snapshots).Resolve(
             JobDispatcher.CreateSnapshot,
             Payload("""{"sourceVolumeId":"pvc-1","snapshotName":"snapshot-abc"}"""),
             WireOptions);
 
         var job = NewJob();
-        await run(job, CancellationToken.None);
+        await resolved.Run(job, CancellationToken.None);
 
+        // The snapshot, not the source volume: a CreateSnapshot that queued
+        // behind its own copy would never answer.
+        Assert.Equal(["snapshot:pvc-1~snapshot-abc"], resolved.Targets);
         Assert.Equal(("pvc-1", "snapshot-abc", (string?)null), snapshots.LastCreate);
         // A result even though the copy has not finished: readyToUse is part of
         // it, so "not done yet" is a succeeded job with something to say rather
@@ -164,12 +173,12 @@ public class JobDispatcherTests
         // see SnapshotService.InspectSourceAsync - so it has to survive the
         // wire decode intact.
         var snapshots = new RecordingSnapshotService();
-        var run = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), snapshots).Resolve(
+        var resolved = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), snapshots).Resolve(
             JobDispatcher.CreateSnapshot,
             Payload("""{"sourceVolumeId":"pvc-1","snapshotName":"snapshot-abc","nodeId":"node-a"}"""),
             WireOptions);
 
-        await run(NewJob(), CancellationToken.None);
+        await resolved.Run(NewJob(), CancellationToken.None);
 
         Assert.Equal(("pvc-1", "snapshot-abc", "node-a"), snapshots.LastCreate);
     }
@@ -178,12 +187,15 @@ public class JobDispatcherTests
     public async Task Resolve_DeleteSnapshot_RunsTheDeleteAndPublishesNoResult()
     {
         var snapshots = new RecordingSnapshotService();
-        var run = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), snapshots).Resolve(
+        var resolved = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), snapshots).Resolve(
             JobDispatcher.DeleteSnapshot, Payload("""{"snapshotId":"pvc-1~snapshot-abc"}"""), WireOptions);
 
         var job = NewJob();
-        await run(job, CancellationToken.None);
+        await resolved.Run(job, CancellationToken.None);
 
+        // The same string CreateSnapshot derives from (source, name), or a
+        // delete could interleave with a create of the snapshot it is removing.
+        Assert.Equal(["snapshot:pvc-1~snapshot-abc"], resolved.Targets);
         Assert.Equal("pvc-1~snapshot-abc", snapshots.LastDelete);
         Assert.Null(job.Result);
     }
@@ -192,14 +204,15 @@ public class JobDispatcherTests
     public async Task Resolve_ListSnapshots_PassesEveryFilterAndPageFieldThrough()
     {
         var snapshots = new RecordingSnapshotService();
-        var run = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), snapshots).Resolve(
+        var resolved = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), snapshots).Resolve(
             JobDispatcher.ListSnapshots,
             Payload("""{"snapshotId":"pvc-1~a","sourceVolumeId":"pvc-1","startingToken":"3","maxEntries":10}"""),
             WireOptions);
 
         var job = NewJob();
-        await run(job, CancellationToken.None);
+        await resolved.Run(job, CancellationToken.None);
 
+        Assert.Equal(["snapshots"], resolved.Targets);
         Assert.Equal(("pvc-1~a", "pvc-1", "3", 10), snapshots.LastList);
         Assert.IsType<ListSnapshotsResult>(job.Result);
     }
@@ -210,10 +223,10 @@ public class JobDispatcherTests
         // Every field is optional and mirrors one of CSI's own, so an empty
         // object is an unfiltered listing rather than a malformed request.
         var snapshots = new RecordingSnapshotService();
-        var run = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), snapshots).Resolve(
+        var resolved = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), snapshots).Resolve(
             JobDispatcher.ListSnapshots, Payload("{}"), WireOptions);
 
-        await run(NewJob(), CancellationToken.None);
+        await resolved.Run(NewJob(), CancellationToken.None);
 
         Assert.Equal((null, null, null, 0), snapshots.LastList);
     }
@@ -288,6 +301,46 @@ public class JobDispatcherTests
         Assert.Null(snapshots.LastCreate);
         Assert.Null(snapshots.LastDelete);
         Assert.Null(snapshots.LastList);
+    }
+
+    [Fact]
+    public void Resolve_VmTargets_AgreeOnOneSpellingOfANodeId()
+    {
+        // The reason targets are derived here at all. A VM's ID reaches this
+        // agent braced from one direction and bare from another, in either case,
+        // and two spellings of one VM would be two FIFO queues - which is not a
+        // weaker serialization but none, arrived at without a symptom. Attach and
+        // detach happen to be the pair that would go wrong first.
+        var dispatcher = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), new RecordingSnapshotService());
+
+        var attach = dispatcher.Resolve(
+            JobDispatcher.AttachVolume,
+            Payload("""{"volumeId":"pvc-1","nodeId":"{4B2C1F0E-1111-2222-3333-444455556666}"}"""),
+            WireOptions);
+        var detach = dispatcher.Resolve(
+            JobDispatcher.DetachVolume,
+            Payload("""{"volumeId":"pvc-2","nodeId":"4b2c1f0e-1111-2222-3333-444455556666"}"""),
+            WireOptions);
+
+        Assert.Equal(attach.Targets, detach.Targets);
+        Assert.Equal(["vm:4b2c1f0e-1111-2222-3333-444455556666"], attach.Targets);
+    }
+
+    [Fact]
+    public void Resolve_CreateSnapshot_WithAnUnusableName_StillResolves()
+    {
+        // The name is validated by SnapshotService, which fails the job with an
+        // InvalidArgument the controller turns into a terminal gRPC status.
+        // Refusing here instead would fail the *enqueue*, which the controller
+        // can only read as "the agent is unreachable" and retry forever - a
+        // terminal fault rendered as a transient one.
+        var snapshots = new RecordingSnapshotService();
+        var resolved = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), snapshots).Resolve(
+            JobDispatcher.CreateSnapshot,
+            Payload("""{"sourceVolumeId":"pvc-1","snapshotName":"not/a/name"}"""),
+            WireOptions);
+
+        Assert.Equal(["snapshot:pvc-1~not/a/name"], resolved.Targets);
     }
 
     private static JsonElement Payload(string json) => JsonDocument.Parse(json).RootElement;

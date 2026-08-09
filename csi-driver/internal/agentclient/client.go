@@ -67,10 +67,17 @@ type Job struct {
 
 // enqueueRequest is the POST /v1/jobs body, matching EnqueueJobRequest on the
 // .NET side.
+//
+// There is deliberately no target field. The resources a job must not
+// interleave with are derived by the agent from this payload — see
+// JobDispatcher and JobTargets over there. This side named them once and it was
+// the wrong place for two reasons: it duplicated the agent's snapshot-ID rule,
+// and it left the spelling of a VM ID to whichever caller happened to build the
+// string, when the agent has to match that spelling against a VM ID the cluster
+// database gives it in a different one.
 type enqueueRequest struct {
 	OperationType  string `json:"operationType"`
 	IdempotencyKey string `json:"idempotencyKey"`
-	Target         string `json:"target"`
 	Payload        any    `json:"payload"`
 }
 
@@ -140,13 +147,12 @@ func NewMutualTLS(baseURL, certificateFile, keyFile string, serverCertificateThu
 // CSI Spec.md's "Idempotency Key" column — the operation is never baked into
 // it; the agent dedupes on the (operationType, idempotencyKey) pair, so a
 // controller retry attaches to the in-flight job instead of starting a
-// duplicate. target names the resource the agent serializes jobs against:
-// the VM for attach/detach/resize, the volume for create/expand/delete.
-func (c *Client) EnqueueJob(ctx context.Context, idempotencyKey, operationType, target string, payload any) (*Job, error) {
+// duplicate. What the job serializes against is the agent's to decide from the
+// payload; see enqueueRequest.
+func (c *Client) EnqueueJob(ctx context.Context, idempotencyKey, operationType string, payload any) (*Job, error) {
 	body, err := json.Marshal(enqueueRequest{
 		OperationType:  operationType,
 		IdempotencyKey: idempotencyKey,
-		Target:         target,
 		Payload:        payload,
 	})
 	if err != nil {

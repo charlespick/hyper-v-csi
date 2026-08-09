@@ -147,12 +147,11 @@ public sealed class JobsEndpointTests : IDisposable
     }
 
     [Theory]
-    [InlineData("""{"idempotencyKey":"pvc-1","target":"volume:pvc-1","payload":{"name":"pvc-1","sizeBytes":4096}}""")]
-    [InlineData("""{"operationType":"CreateVolume","target":"volume:pvc-1","payload":{"name":"pvc-1","sizeBytes":4096}}""")]
-    [InlineData("""{"operationType":"CreateVolume","idempotencyKey":"pvc-1","payload":{"name":"pvc-1","sizeBytes":4096}}""")]
-    [InlineData("""{"operationType":"Nope","idempotencyKey":"pvc-1","target":"volume:pvc-1","payload":{}}""")]
-    [InlineData("""{"operationType":"CreateVolume","idempotencyKey":"pvc-1","target":"volume:pvc-1","payload":{"sizeBytes":4096}}""")]
-    [InlineData("""{"operationType":"DeleteVolume","idempotencyKey":"pvc-1","target":"volume:pvc-1","payload":{}}""")]
+    [InlineData("""{"idempotencyKey":"pvc-1","payload":{"name":"pvc-1","sizeBytes":4096}}""")]
+    [InlineData("""{"operationType":"CreateVolume","payload":{"name":"pvc-1","sizeBytes":4096}}""")]
+    [InlineData("""{"operationType":"Nope","idempotencyKey":"pvc-1","payload":{}}""")]
+    [InlineData("""{"operationType":"CreateVolume","idempotencyKey":"pvc-1","payload":{"sizeBytes":4096}}""")]
+    [InlineData("""{"operationType":"DeleteVolume","idempotencyKey":"pvc-1","payload":{}}""")]
     public async Task PostJobs_UnusableRequest_IsRejectedWithoutCreatingAJob(string body)
     {
         var client = _factory.CreateClient();
@@ -177,9 +176,9 @@ public sealed class JobsEndpointTests : IDisposable
 
         Assert.Equal("Succeeded", job.RootElement.GetProperty("status").GetString());
         Assert.Equal("CreateSnapshot", job.RootElement.GetProperty("operationType").GetString());
-        // The idempotency key is the snapshot name and the target is the
-        // snapshot, per the wire contract - the copy takes the volume target
-        // instead, and never reaches this endpoint at all.
+        // The idempotency key is the snapshot name, and the target the agent
+        // derived is the snapshot - the copy takes the volume target instead,
+        // and never reaches this endpoint at all.
         Assert.Equal("snapshot-abc", job.RootElement.GetProperty("idempotencyKey").GetString());
         Assert.Equal(
             ["snapshot:pvc-1~snapshot-abc"],
@@ -242,7 +241,6 @@ public sealed class JobsEndpointTests : IDisposable
         {
             operationType = "CopySnapshot",
             idempotencyKey = "pvc-1~snapshot-abc",
-            target = "volume:pvc-1",
             payload = new { sourceVolumeId = "pvc-1" },
         });
 
@@ -263,7 +261,6 @@ public sealed class JobsEndpointTests : IDisposable
     {
         operationType = "CreateVolume",
         idempotencyKey = name,
-        target = "volume:" + name,
         payload = new { name, sizeBytes },
     };
 
@@ -271,20 +268,18 @@ public sealed class JobsEndpointTests : IDisposable
     {
         operationType = "DeleteVolume",
         idempotencyKey = volumeId,
-        target = "volume:" + volumeId,
         payload = new { volumeId },
     };
 
     /// <summary>
     /// Composed exactly as csi-driver/internal/driver/controller.go composes it:
-    /// the snapshot name as the idempotency key, and snapshot:&lt;id&gt; as the
-    /// target.
+    /// the snapshot name as the idempotency key, and no target at all - the
+    /// agent derives snapshot:&lt;id&gt; from this payload itself.
     /// </summary>
     private static object CreateSnapshotRequest(string sourceVolumeId, string snapshotName) => new
     {
         operationType = "CreateSnapshot",
         idempotencyKey = snapshotName,
-        target = $"snapshot:{sourceVolumeId}~{snapshotName}",
         payload = new { sourceVolumeId, snapshotName },
     };
 
@@ -292,7 +287,6 @@ public sealed class JobsEndpointTests : IDisposable
     {
         operationType = "ListSnapshots",
         idempotencyKey = "///0",
-        target = "snapshots",
         payload = new { },
     };
 

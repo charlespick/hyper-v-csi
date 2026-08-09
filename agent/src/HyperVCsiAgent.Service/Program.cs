@@ -133,22 +133,20 @@ app.MapPost("/v1/jobs", (
         return Results.BadRequest(new { error = "idempotencyKey is required" });
     }
 
-    if (string.IsNullOrWhiteSpace(request.Target))
-    {
-        return Results.BadRequest(new { error = "target is required" });
-    }
-
-    Func<Job, CancellationToken, Task> run;
+    // No target is read from the request: the dispatcher derives what this job
+    // must not interleave with from the payload it is already decoding. See
+    // EnqueueJobRequest for why that is not the controller's to say.
+    JobDispatcher.ResolvedJob resolved;
     try
     {
-        run = dispatcher.Resolve(request.OperationType, request.Payload, jsonOptions.Value.SerializerOptions);
+        resolved = dispatcher.Resolve(request.OperationType, request.Payload, jsonOptions.Value.SerializerOptions);
     }
     catch (InvalidJobRequestException ex)
     {
         return Results.BadRequest(new { error = ex.Message });
     }
 
-    var job = jobStore.GetOrCreate(request.IdempotencyKey, request.OperationType, [request.Target], run);
+    var job = jobStore.GetOrCreate(request.IdempotencyKey, request.OperationType, resolved.Targets, resolved.Run);
     return Results.Accepted($"/v1/jobs/{job.Id}", job);
 });
 

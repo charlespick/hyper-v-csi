@@ -31,7 +31,7 @@ func TestEnqueueJobPostsTheEnvelopeTheAgentExpects(t *testing.T) {
 	defer server.Close()
 
 	job, err := New(server.URL).EnqueueJob(
-		context.Background(), "pvc-1", "CreateVolume", "volume:pvc-1", map[string]any{"name": "pvc-1"})
+		context.Background(), "pvc-1", "CreateVolume", map[string]any{"name": "pvc-1"})
 	if err != nil {
 		t.Fatalf("EnqueueJob: %v", err)
 	}
@@ -47,11 +47,15 @@ func TestEnqueueJobPostsTheEnvelopeTheAgentExpects(t *testing.T) {
 	for field, want := range map[string]any{
 		"operationType":  "CreateVolume",
 		"idempotencyKey": "pvc-1",
-		"target":         "volume:pvc-1",
 	} {
 		if gotBody[field] != want {
 			t.Errorf("body[%q] = %v, want %v", field, gotBody[field], want)
 		}
+	}
+	// No target: the agent derives what this job serializes against from the
+	// payload, so sending one would be this side guessing at the answer.
+	if _, present := gotBody["target"]; present {
+		t.Errorf("body carries a target field: %v", gotBody["target"])
 	}
 	if payload, ok := gotBody["payload"].(map[string]any); !ok || payload["name"] != "pvc-1" {
 		t.Errorf("body[payload] = %v, want the operation payload", gotBody["payload"])
@@ -122,7 +126,7 @@ func TestUnexpectedStatusIncludesTheAgentsDetail(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, err := New(server.URL).EnqueueJob(context.Background(), "pvc-1", "CreateVolume", "volume:pvc-1", nil)
+	_, err := New(server.URL).EnqueueJob(context.Background(), "pvc-1", "CreateVolume", nil)
 
 	if err == nil || !strings.Contains(err.Error(), "payload.name is required") {
 		t.Errorf("err = %v, want it to carry the agent's explanation", err)

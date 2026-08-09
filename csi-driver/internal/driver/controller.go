@@ -141,7 +141,7 @@ func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	// The CSI volume name is the idempotency key per CSI Spec.md, so a
 	// provisioner retry for the same PVC re-attaches to this job instead of
 	// racing a second create for the same file.
-	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetName(), operationCreateVolume, volumeTarget(req.GetName()), createVolumePayload{
+	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetName(), operationCreateVolume, createVolumePayload{
 		Name:             req.GetName(),
 		SizeBytes:        sizeBytes,
 		SourceSnapshotID: sourceSnapshotID,
@@ -344,13 +344,6 @@ func pickVolumeSize(capacityRange *csi.CapacityRange) (int64, error) {
 	return size, nil
 }
 
-// volumeTarget names the resource the agent serializes this job against. For
-// volume-level work that's the volume itself, so two operations on one VHDX
-// never interleave while unrelated volumes still provision in parallel.
-func volumeTarget(volumeName string) string {
-	return "volume:" + volumeName
-}
-
 // deleteVolumePayload is the operation-specific half of the agent's job
 // envelope, matching DeleteVolumePayload on the .NET side. There is no result
 // half: a volume that's gone has nothing left to report about it.
@@ -377,7 +370,7 @@ func (s *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 
 	// The volume ID is the idempotency key per CSI Spec.md, and it doubles as
 	// the target so a delete can't interleave with other work on the same disk.
-	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetVolumeId(), operationDeleteVolume, volumeTarget(req.GetVolumeId()), deleteVolumePayload{
+	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetVolumeId(), operationDeleteVolume, deleteVolumePayload{
 		VolumeID: req.GetVolumeId(),
 	})
 	if err != nil {
@@ -452,11 +445,11 @@ func (s *controllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			"read-only publishing is not supported; the node plugin mounts read-only when asked")
 	}
 
-	// Volume ID + node ID per CSI Spec.md. The target is the VM, not the
-	// volume: what must not race is slot allocation on one VM, and the agent
-	// runs one job at a time per target.
+	// Volume ID + node ID per CSI Spec.md. The agent serializes this against the
+	// VM, not the volume: what must not race is slot allocation on one VM, and
+	// it runs one job at a time per target.
 	job, err := s.driver.Agent.EnqueueJob(ctx, publishKey(req.GetVolumeId(), req.GetNodeId()), operationAttachVolume,
-		vmTarget(req.GetNodeId()), attachVolumePayload{
+		attachVolumePayload{
 			VolumeID: req.GetVolumeId(),
 			NodeID:   req.GetNodeId(),
 		})
@@ -507,13 +500,6 @@ func escapeKeyComponent(s string) string {
 	return strings.ReplaceAll(s, "/", "%2F")
 }
 
-// vmTarget names the resource the agent serializes VM-level work against. Two
-// attaches to one VM must not run at once — they would race for the same free
-// LUN — while attaches to different VMs are free to proceed in parallel.
-func vmTarget(nodeID string) string {
-	return "vm:" + nodeID
-}
-
 // detachVolumePayload is the operation-specific half of the agent's job
 // envelope, matching DetachVolumePayload on the .NET side. There is no result
 // half: a volume that is no longer attached has nothing left to report.
@@ -551,14 +537,15 @@ func (s *controllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 			"node id is required; unpublishing from every node at once is not supported")
 	}
 
-	// Same key and target as publish. The target is what stops an attach and a
-	// detach for one VM from interleaving — the agent runs one job at a time per
-	// target — and the operation type keeps them from deduping onto each other,
+	// Same key as publish, and the agent derives the same VM target for both.
+	// That target is what stops an attach and a detach for one VM from
+	// interleaving — the agent runs one job at a time per target — and the
+	// operation type keeps them from deduping onto each other,
 	// since the agent keys in-flight jobs on the pair. The shared key does
 	// neither of those; it is here so a retry of this detach finds the job
 	// already running rather than starting a second one.
 	job, err := s.driver.Agent.EnqueueJob(ctx, publishKey(req.GetVolumeId(), req.GetNodeId()), operationDetachVolume,
-		vmTarget(req.GetNodeId()), detachVolumePayload{
+		detachVolumePayload{
 			VolumeID: req.GetVolumeId(),
 			NodeID:   req.GetNodeId(),
 		})
@@ -607,7 +594,7 @@ func (s *controllerServer) ValidateVolumeCapabilities(ctx context.Context, req *
 		return nil, status.Error(codes.InvalidArgument, "volume capabilities are required")
 	}
 
-	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetVolumeId(), operationVolumeExists, volumeTarget(req.GetVolumeId()), volumeExistsPayload{
+	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetVolumeId(), operationVolumeExists, volumeExistsPayload{
 		VolumeID: req.GetVolumeId(),
 	})
 	if err != nil {
@@ -736,7 +723,7 @@ func (s *controllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 		return nil, status.Errorf(codes.Internal, "finding which node has %s attached: %v", req.GetVolumeId(), err)
 	}
 
-	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetVolumeId(), operationExpandVolume, volumeTarget(req.GetVolumeId()), expandVolumePayload{
+	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetVolumeId(), operationExpandVolume, expandVolumePayload{
 		VolumeID:  req.GetVolumeId(),
 		SizeBytes: sizeBytes,
 		NodeID:    nodeID,
@@ -801,37 +788,6 @@ func pickExpandSize(capacityRange *csi.CapacityRange) (int64, error) {
 	return pickVolumeSize(capacityRange)
 }
 
-// snapshotIDSeparator joins a source volume ID and a snapshot name into the
-// snapshot ID the agent derives its CSV path from. It appears here for one
-// purpose only — naming the serialization target of a CreateSnapshot job, which
-// has to be the same string DeleteSnapshot derives from the ID or the two would
-// not serialize against each other. The ID this driver *reports* is never
-// computed here; it is read out of the agent's result, because the path rule is
-// the agent's to own and two copies of it could drift. A local copy that drifted
-// would cost serialization between a create and a delete for one snapshot, not a
-// wrong path handed back to Kubernetes, which is why the trade is acceptable in
-// this one place and nowhere else.
-const snapshotIDSeparator = "~"
-
-// snapshotTarget names the resource the agent serializes snapshot-level work
-// against. Repeat CreateSnapshot and DeleteSnapshot calls for one snapshot
-// queue behind each other while snapshots of different volumes proceed in
-// parallel.
-//
-// Deliberately not the source volume's target. The long-running copy the agent
-// starts internally takes volume:<sourceVolumeId> so it cannot interleave with
-// a resize or delete of the disk it is reading; putting these fast RPCs on that
-// same target would park every CreateSnapshot behind a copy that can run for
-// hours, and CreateSnapshot's whole design is that it stays fast.
-func snapshotTarget(snapshotID string) string {
-	return "snapshot:" + snapshotID
-}
-
-// snapshotsTarget is the target for the read-only enumeration. Listing
-// serializes against nothing — it observes the CSV and changes none of it — but
-// the agent's job store requires a target, so every listing shares one constant.
-const snapshotsTarget = "snapshots"
-
 // createSnapshotPayload is the operation-specific half of the agent's job
 // envelope, matching CreateSnapshotPayload on the .NET side.
 type createSnapshotPayload struct {
@@ -878,8 +834,9 @@ type snapshotResult struct {
 // the truth.
 func (r snapshotResult) csiSnapshot() *csi.Snapshot {
 	snapshot := &csi.Snapshot{
-		// The snapshot ID comes from the agent verbatim; see snapshotIDSeparator
-		// for why this side does not derive it. The source volume ID is the
+		// The snapshot ID comes from the agent verbatim: composing a snapshot's
+		// path is the agent's rule to own, and this side never re-derives it.
+		// The source volume ID is the
 		// agent's echo rather than the request's, so that a snapshot looks
 		// identical whether it arrived through CreateSnapshot or ListSnapshots —
 		// only the former has a request to fall back on anyway.
@@ -947,7 +904,7 @@ func (s *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 	// external-snapshotter for the same VolumeSnapshot re-attaches to the job in
 	// flight instead of starting a second copy of the same disk.
 	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetName(), operationCreateSnapshot,
-		snapshotTarget(req.GetSourceVolumeId()+snapshotIDSeparator+req.GetName()), createSnapshotPayload{
+		createSnapshotPayload{
 			SourceVolumeID: req.GetSourceVolumeId(),
 			SnapshotName:   req.GetName(),
 			NodeID:         nodeID,
@@ -1000,12 +957,12 @@ func (s *controllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteSn
 		return nil, status.Error(codes.InvalidArgument, "snapshot id is required")
 	}
 
-	// The snapshot ID is the idempotency key per CSI Spec.md, and it doubles as
-	// the target — the same target a CreateSnapshot for this snapshot derives
-	// from its source and name — so a delete can't interleave with a create of
-	// the snapshot it is removing.
+	// The snapshot ID is the idempotency key per CSI Spec.md, and the agent
+	// derives its target from it — the same target a CreateSnapshot for this
+	// snapshot derives from its source and name — so a delete can't interleave
+	// with a create of the snapshot it is removing.
 	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetSnapshotId(), operationDeleteSnapshot,
-		snapshotTarget(req.GetSnapshotId()), deleteSnapshotPayload{
+		deleteSnapshotPayload{
 			SnapshotID: req.GetSnapshotId(),
 		})
 	if err != nil {
@@ -1052,7 +1009,7 @@ type listSnapshotsResult struct {
 // would turn a completed deletion into a stuck one.
 func (s *controllerServer) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
 	job, err := s.driver.Agent.EnqueueJob(ctx, listSnapshotsKey(req), operationListSnapshots,
-		snapshotsTarget, listSnapshotsPayload{
+		listSnapshotsPayload{
 			SnapshotID:     req.GetSnapshotId(),
 			SourceVolumeID: req.GetSourceVolumeId(),
 			StartingToken:  req.GetStartingToken(),

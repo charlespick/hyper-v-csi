@@ -58,9 +58,6 @@ func TestCreateVolumeEnqueuesUnderTheVolumeNameAsIdempotencyKey(t *testing.T) {
 	if enqueued.OperationType != operationCreateVolume {
 		t.Errorf("operation type = %q, want %q", enqueued.OperationType, operationCreateVolume)
 	}
-	if enqueued.Target != "volume:pvc-1" {
-		t.Errorf("target = %q, want volume:pvc-1", enqueued.Target)
-	}
 	if enqueued.Payload.Name != "pvc-1" || enqueued.Payload.SizeBytes != 10*gibibyte {
 		t.Errorf("payload = %+v, want the name and resolved size", enqueued.Payload)
 	}
@@ -567,10 +564,6 @@ func TestDeleteVolumeEnqueuesUnderTheVolumeIDAsIdempotencyKey(t *testing.T) {
 	if enqueued.OperationType != operationDeleteVolume {
 		t.Errorf("operation type = %q, want %q", enqueued.OperationType, operationDeleteVolume)
 	}
-	// Same target as a create for this volume, so the two can never interleave.
-	if enqueued.Target != "volume:pvc-1" {
-		t.Errorf("target = %q, want volume:pvc-1", enqueued.Target)
-	}
 	if enqueued.Payload.VolumeID != "pvc-1" {
 		t.Errorf("payload = %+v, want the volume id", enqueued.Payload)
 	}
@@ -713,10 +706,6 @@ func TestControllerPublishVolumeEnqueuesUnderTheVolumeAndNodeAsIdempotencyKey(t 
 	}
 	if enqueued.OperationType != operationAttachVolume {
 		t.Errorf("operation type = %q, want %q", enqueued.OperationType, operationAttachVolume)
-	}
-	// The VM, not the volume: what must not race is slot allocation on one VM.
-	if enqueued.Target != "vm:node-a" {
-		t.Errorf("target = %q, want vm:node-a", enqueued.Target)
 	}
 	if enqueued.Payload.VolumeID != "pvc-1" || enqueued.Payload.NodeID != "node-a" {
 		t.Errorf("payload = %+v, want the volume and node ids", enqueued.Payload)
@@ -893,7 +882,7 @@ func TestControllerPublishVolumeUnreachableAgentIsRetryable(t *testing.T) {
 	}
 }
 
-func TestControllerUnpublishVolumeEnqueuesUnderTheSameKeyAndTargetAsPublish(t *testing.T) {
+func TestControllerUnpublishVolumeEnqueuesUnderTheSameKeyAsPublish(t *testing.T) {
 	agent := newFakeAgent(t, agentclient.Job{Status: agentclient.JobSucceeded})
 	server := newControllerServer(agent)
 
@@ -911,9 +900,6 @@ func TestControllerUnpublishVolumeEnqueuesUnderTheSameKeyAndTargetAsPublish(t *t
 	}
 	if enqueued.OperationType != operationDetachVolume {
 		t.Errorf("operation type = %q, want %q", enqueued.OperationType, operationDetachVolume)
-	}
-	if enqueued.Target != "vm:node-a" {
-		t.Errorf("target = %q, want vm:node-a", enqueued.Target)
 	}
 	if enqueued.Payload.VolumeID != "pvc-1" || enqueued.Payload.NodeID != "node-a" {
 		t.Errorf("payload = %+v, want the volume id and node id", enqueued.Payload)
@@ -1042,7 +1028,7 @@ func TestValidateVolumeCapabilitiesConfirmsWhatAVhdxCanBack(t *testing.T) {
 	}
 }
 
-func TestValidateVolumeCapabilitiesEnqueuesUnderTheVolumeIDAsIdempotencyKeyAndTarget(t *testing.T) {
+func TestValidateVolumeCapabilitiesEnqueuesUnderTheVolumeIDAsIdempotencyKey(t *testing.T) {
 	agent := newFakeAgent(t, agentclient.Job{Status: agentclient.JobSucceeded})
 	server := newControllerServer(agent)
 
@@ -1056,11 +1042,6 @@ func TestValidateVolumeCapabilitiesEnqueuesUnderTheVolumeIDAsIdempotencyKeyAndTa
 	}
 	if enqueued.OperationType != operationVolumeExists {
 		t.Errorf("operation type = %q, want %q", enqueued.OperationType, operationVolumeExists)
-	}
-	// Same target as create, delete and expand, so a lookup answers about a
-	// finished operation rather than racing one on the same disk.
-	if enqueued.Target != "volume:pvc-1" {
-		t.Errorf("target = %q, want volume:pvc-1", enqueued.Target)
 	}
 	if enqueued.Payload.VolumeID != "pvc-1" {
 		t.Errorf("payload = %+v, want the volume id", enqueued.Payload)
@@ -1218,7 +1199,7 @@ func TestControllerExpandVolumeReturnsTheNewCapacityAndAsksForANodeExpansion(t *
 	}
 }
 
-func TestControllerExpandVolumeEnqueuesUnderTheVolumeIDAsIdempotencyKeyAndTarget(t *testing.T) {
+func TestControllerExpandVolumeEnqueuesUnderTheVolumeIDAsIdempotencyKey(t *testing.T) {
 	agent := newFakeAgent(t, expanded(4*gibibyte, false))
 	server := newControllerServer(agent)
 
@@ -1233,11 +1214,6 @@ func TestControllerExpandVolumeEnqueuesUnderTheVolumeIDAsIdempotencyKeyAndTarget
 	}
 	if enqueued.IdempotencyKey != "pvc-1" {
 		t.Errorf("idempotencyKey = %q, want the volume ID", enqueued.IdempotencyKey)
-	}
-	// The volume, not a VM: what must not interleave is two operations on one
-	// disk, and an expand racing a delete is exactly that pair.
-	if enqueued.Target != "volume:pvc-1" {
-		t.Errorf("target = %q, want volume:pvc-1", enqueued.Target)
 	}
 	if enqueued.Payload.VolumeID != "pvc-1" || enqueued.Payload.SizeBytes != 4*gibibyte {
 		t.Errorf("payload = %+v, want volumeId pvc-1 and sizeBytes %d", enqueued.Payload, 4*gibibyte)
@@ -1479,11 +1455,6 @@ func TestCreateSnapshotEnqueuesUnderTheSnapshotNameAsIdempotencyKey(t *testing.T
 	if enqueued.OperationType != operationCreateSnapshot {
 		t.Errorf("operation type = %q, want %q", enqueued.OperationType, operationCreateSnapshot)
 	}
-	// The snapshot, not the source volume: this job is fast and must not queue
-	// behind the hours-long copy that takes the volume target.
-	if enqueued.Target != "snapshot:pvc-1~snap-1" {
-		t.Errorf("target = %q, want snapshot:pvc-1~snap-1", enqueued.Target)
-	}
 	if enqueued.Payload.SourceVolumeID != "pvc-1" || enqueued.Payload.SnapshotName != "snap-1" {
 		t.Errorf("payload = %+v, want the source volume id and snapshot name", enqueued.Payload)
 	}
@@ -1542,27 +1513,6 @@ func TestCreateSnapshotFailsRatherThanSilentlyDroppingAKubernetesLookupError(t *
 	}
 	if n := agent.enqueueCount(); n != 0 {
 		t.Errorf("enqueued %d jobs, want none once the node lookup failed", n)
-	}
-}
-
-func TestCreateSnapshotDeleteSnapshotShareATarget(t *testing.T) {
-	// The two have to serialize against each other, and they only do if the
-	// target a create derives from its source and name is the same string a
-	// delete derives from the snapshot id.
-	createAgent := newFakeAgent(t, succeeded(snapshotJSON("pvc-1~snap-1", "pvc-1", gibibyte, 1770000000, true)))
-	if _, err := newControllerServer(createAgent).CreateSnapshot(context.Background(),
-		createSnapshotRequest("pvc-1", "snap-1")); err != nil {
-		t.Fatalf("CreateSnapshot: %v", err)
-	}
-
-	deleteAgent := newFakeAgent(t, agentclient.Job{Status: agentclient.JobSucceeded})
-	if _, err := newControllerServer(deleteAgent).DeleteSnapshot(context.Background(),
-		&csi.DeleteSnapshotRequest{SnapshotId: "pvc-1~snap-1"}); err != nil {
-		t.Fatalf("DeleteSnapshot: %v", err)
-	}
-
-	if created, deleted := createAgent.onlyEnqueued(t).Target, deleteAgent.onlyEnqueued(t).Target; created != deleted {
-		t.Errorf("create targeted %q but delete targeted %q; the two would not serialize", created, deleted)
 	}
 }
 
@@ -1762,7 +1712,7 @@ func TestCreateSnapshotUnreachableAgentIsRetryable(t *testing.T) {
 	}
 }
 
-func TestDeleteSnapshotEnqueuesUnderTheSnapshotIDAsIdempotencyKeyAndTarget(t *testing.T) {
+func TestDeleteSnapshotEnqueuesUnderTheSnapshotIDAsIdempotencyKey(t *testing.T) {
 	agent := newFakeAgent(t, agentclient.Job{Status: agentclient.JobSucceeded})
 	server := newControllerServer(agent)
 
@@ -1777,9 +1727,6 @@ func TestDeleteSnapshotEnqueuesUnderTheSnapshotIDAsIdempotencyKeyAndTarget(t *te
 	}
 	if enqueued.OperationType != operationDeleteSnapshot {
 		t.Errorf("operation type = %q, want %q", enqueued.OperationType, operationDeleteSnapshot)
-	}
-	if enqueued.Target != "snapshot:pvc-1~snap-1" {
-		t.Errorf("target = %q, want snapshot:pvc-1~snap-1", enqueued.Target)
 	}
 	if enqueued.Payload.SnapshotID != "pvc-1~snap-1" {
 		t.Errorf("payload = %+v, want the snapshot id", enqueued.Payload)
@@ -1926,11 +1873,6 @@ func TestListSnapshotsPassesTheFiltersAndPagingThrough(t *testing.T) {
 	enqueued := agent.onlyEnqueued(t)
 	if enqueued.OperationType != operationListSnapshots {
 		t.Errorf("operation type = %q, want %q", enqueued.OperationType, operationListSnapshots)
-	}
-	// A constant target: a read-only enumeration serializes against nothing, but
-	// the agent's job store requires a target all the same.
-	if enqueued.Target != "snapshots" {
-		t.Errorf("target = %q, want snapshots", enqueued.Target)
 	}
 	payload := enqueued.Payload
 	if payload.SnapshotID != "pvc-1~snap-1" || payload.SourceVolumeID != "pvc-1" ||
@@ -2157,11 +2099,13 @@ func created(sizeBytes int64) agentclient.Job {
 	return succeeded(fmt.Sprintf(`{"volumeId":"pvc-1","actualSizeBytes":%d,"alreadyPresent":false}`, sizeBytes))
 }
 
-// enqueuedJob is what the agent sees on POST /v1/jobs.
+// enqueuedJob is what the agent sees on POST /v1/jobs. Deliberately no target
+// field: the agent derives what a job serializes against from the payload, so
+// what these tests can assert about this side is the key, the operation and the
+// payload. The targets themselves are pinned in the agent's JobDispatcherTests.
 type enqueuedJob struct {
 	OperationType  string `json:"operationType"`
 	IdempotencyKey string `json:"idempotencyKey"`
-	Target         string `json:"target"`
 	// The union of every operation's payload, so one decode covers whichever
 	// one the test under way enqueued.
 	Payload struct {

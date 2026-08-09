@@ -540,7 +540,7 @@ public sealed class SnapshotService : ISnapshotService
         _jobs.GetOrCreate(
             snapshotId,
             CopySnapshot,
-            ["volume:" + sourceVolumeId],
+            [JobTargets.Volume(sourceVolumeId)],
             (_, cancellationToken) =>
                 RunCopyAsync(snapshotId, sourcePath, snapshotPath, copyingPath, checkpoint: null, cancellationToken));
 
@@ -569,7 +569,7 @@ public sealed class SnapshotService : ISnapshotService
         _jobs.GetOrCreate(
             snapshotId,
             CopySnapshot,
-            ["volume:" + sourceVolumeId],
+            [JobTargets.Volume(sourceVolumeId)],
             (_, cancellationToken) =>
                 RunCopyAsync(snapshotId, sourcePath, snapshotPath, copyingPath, (vm, checkpointElementName), cancellationToken));
 

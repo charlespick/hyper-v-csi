@@ -585,9 +585,9 @@ avoids everywhere else — or a cache to be invalidated. The KVP dependency buys
 the O(1) lookup.
 
 The node ID stays opaque above the resolution, which is what kept this swap
-local. Nothing but `IClusterService.ResolveVmAsync` interprets it: the Go
-controller only concatenates it into an idempotency key and a job target, and no
-PV field records it, because the driver advertises no topology and
+local. Nothing but `IClusterService.ResolveVmAsync` interprets it, and
+`JobTargets.Vm` canonicalizes it: the Go controller only concatenates it into an
+idempotency key, and no PV field records it, because the driver advertises no topology and
 `VOLUME_ACCESSIBILITY_CONSTRAINTS` would put a node identity into
 `PV.spec.nodeAffinity`, where it is immutable for the life of the volume. The
 only persisted copy is in `CSINode`, which kubelet rewrites whenever the node
