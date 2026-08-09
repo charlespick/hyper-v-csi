@@ -142,6 +142,13 @@ func translateJobFailure(job *agentclient.Job) error {
 		// purpose: retrying cannot bring either into existence, so treating it
 		// as transient would loop until an operator noticed.
 		return status.Error(codes.NotFound, detail)
+	case agentclient.ErrorCodeAborted:
+		// Nothing is misconfigured and there is nothing for an operator to
+		// fix - a snapshot copy queued behind another one on the same VM is
+		// the case that matters here. Distinguished from the Internal default
+		// because Internal is retryable too but reads as an unclassified
+		// fault worth investigating, which this specifically is not.
+		return status.Error(codes.Aborted, detail)
 	default:
 		return status.Error(codes.Internal, detail)
 	}

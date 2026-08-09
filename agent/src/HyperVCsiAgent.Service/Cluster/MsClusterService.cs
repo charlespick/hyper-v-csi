@@ -226,10 +226,46 @@ public sealed class MsClusterService : IClusterService
         return null;
     }
 
+    /// <summary>
+    /// Whether MSCluster_Node reports this host Up. Issue #14's Phase 3 is the
+    /// first caller: the orphaned-checkpoint sweep has to skip a host that is
+    /// still rebooting or draining rather than let a CIM call to it hang for
+    /// its full <see cref="AgentOptions.HostOperationTimeout"/> budget on every
+    /// pass, and the next interval pass picks the host back up once it settles
+    /// - see <c>OrphanedCheckpointReaper</c>'s own remarks.
+    /// </summary>
     public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
-        throw new NotSupportedException(
-            "node liveness is only needed for forced detach from a failed node, which is not implemented yet; " +
-            "an unpublish whose owning host is down fails and is retried rather than fenced");
+        Task.Run(() =>
+        {
+            var deadline = CimDeadline.After(_hostOperationTimeout);
+
+            // Keyed on Name, MSCluster_Node's key property, so this does not
+            // scan - the same reasoning ReadOwnerNode gives for
+            // MSCluster_Resource. hostName is not caller-supplied in
+            // practice (every value in existence comes back from this
+            // service's own ListHostNamesAsync), but escaped anyway rather
+            // than trusted to stay that way.
+            var query = $"SELECT State FROM MSCluster_Node WHERE Name = '{WqlNames.EscapeLiteral(hostName)}'";
+
+            using var session = CimSession.Create(null);
+            var options = deadline.Options("reading MSCluster_Node.State", cancellationToken);
+            foreach (var node in session.QueryInstances(NamespaceName, "WQL", query, options))
+            {
+                // ClusterNodeState: 0 Up, 1 Down, 2 Paused, 3 Joining. Only Up
+                // counts as live - Paused and Joining both mean "do not route
+                // new work here yet", which for a sweep is indistinguishable
+                // from Down: either way this pass skips the host and the next
+                // interval pass tries again once it settles.
+                return node.CimInstanceProperties["State"]?.Value is { } state
+                    && Convert.ToInt32(state) == 0;
+            }
+
+            // No such node in the cluster database - stale or renamed since
+            // ListHostNamesAsync last enumerated it. Not live is the safe
+            // answer: skip it this pass rather than asking a host that may
+            // not exist to enumerate anything.
+            return false;
+        }, cancellationToken);
 
     public Task<IReadOnlyList<string>> ListHostNamesAsync(CancellationToken cancellationToken) =>
         // Same synchronous-API trade every other method here makes: WMI has

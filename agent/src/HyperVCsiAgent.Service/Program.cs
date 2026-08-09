@@ -43,6 +43,12 @@ builder.Services.ConfigureHttpJsonOptions(options => AgentJson.Apply(options.Ser
 builder.Services.AddSingleton(Options.Create(agentOptions));
 builder.Services.AddSingleton<IJobStore, InMemoryJobStore>();
 
+// Closed until OrphanedCheckpointReaper's startup sweep has finished
+// discovery-and-enqueue - see that class's own remarks, and the gate check
+// on POST /v1/jobs below, for why a job store that will happily accept
+// anything still needs one.
+builder.Services.AddSingleton<JobIntakeGate>();
+
 if (OperatingSystem.IsWindows())
 {
     builder.Services.AddSingleton<IVirtualDiskManager, CimVirtualDiskManager>();
@@ -58,6 +64,23 @@ else
     builder.Services.AddSingleton<IDiskCopier, UnsupportedDiskCopier>();
 }
 
+#if DEBUG
+// Converts issue #14's D10 invariant - every operation that resolves a VM and
+// issues a call against it holds vm:<nodeId> for the entire duration of those
+// calls - into a thrown InvalidOperationException the moment it is violated,
+// rather than a race a real host might only occasionally lose. Wraps
+// whichever IHyperVHostClient the branch above registered instead of asking
+// again which branch that was, so this cannot drift from it. Not in Release:
+// the cost there is a pointless allocation and comparison on the hot path of
+// every VM mutation, for a check whose only job is turning "we remembered to
+// reason about this" into "the test suite fails if someone forgets" during
+// development.
+var hostClientDescriptor = builder.Services.Single(d => d.ServiceType == typeof(IHyperVHostClient));
+builder.Services.Remove(hostClientDescriptor);
+builder.Services.AddSingleton<IHyperVHostClient>(services => new VmTargetAssertingHyperVHostClient(
+    (IHyperVHostClient)ActivatorUtilities.CreateInstance(services, hostClientDescriptor.ImplementationType!)));
+#endif
+
 // Shared by VhdxService's restore-from-snapshot copy and SnapshotService's own
 // copy: one cap on concurrent bulk copies against the CSV, not one per caller.
 // See SnapshotCopySlots for why two separate semaphores would double it.
@@ -71,6 +94,17 @@ builder.Services.AddSingleton<IAttachService, AttachService>();
 // copy inline. The dependency runs one way only - JobDispatcher sits above both
 // - so there is no cycle for the container to resolve.
 builder.Services.AddSingleton<ISnapshotService, SnapshotService>();
+
+// Depends on ISnapshotService (registered just above) for ResumeCopy and
+// ReapOrphan, and on JobIntakeGate to open once its startup sweep is done -
+// no dependency runs the other way, so there is no cycle for the container
+// to resolve. It deliberately does not also take IJobStore directly:
+// everything it needs to enqueue is already reachable through
+// ISnapshotService, which is the one thing that actually knows how to build
+// a copy or a merge job, so a second, narrower path to the same store would
+// only be one more thing to keep in sync with it.
+builder.Services.AddHostedService<OrphanedCheckpointReaper>();
+
 builder.Services.AddSingleton<JobDispatcher>();
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<StoreCertificateProvider>();
@@ -121,8 +155,26 @@ app.MapPost("/v1/jobs", (
     EnqueueJobRequest request,
     IJobStore jobStore,
     JobDispatcher dispatcher,
+    JobIntakeGate gate,
     IOptions<Microsoft.AspNetCore.Http.Json.JsonOptions> jsonOptions) =>
 {
+    // Closed until OrphanedCheckpointReaper's startup sweep has finished
+    // discovery-and-enqueue for every orphan it found (see that class's own
+    // remarks) - a window that has to close before this handler enqueues
+    // anything, or an RPC-driven job could claim vm:<id> ahead of a recovery
+    // job the sweep has not enqueued yet, reopening the exact race issue
+    // #14's second comment describes. 503 rather than blocking the request:
+    // csi-driver/internal/driver/jobs.go's enqueueFailed maps any non-2xx
+    // response here to codes.Unavailable, which every CSI sidecar already
+    // retries with backoff - so a brief window of these is a handful of
+    // retries, not a fault, and Kestrel itself keeps answering the
+    // connection rather than this handler hanging until the gate opens.
+    if (!gate.IsOpen)
+    {
+        return Results.Json(new { error = "the agent is still recovering orphaned checkpoints; retry shortly" },
+            statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+
     if (string.IsNullOrWhiteSpace(request.OperationType))
     {
         return Results.BadRequest(new { error = "operationType is required" });

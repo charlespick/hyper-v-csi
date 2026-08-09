@@ -44,4 +44,17 @@ public static class AgentErrorCodes
 
     /// <summary>Anything else - transient by assumption, so retryable.</summary>
     public const string Internal = "Internal";
+
+    /// <summary>
+    /// The operation cannot proceed right now, but nothing is misconfigured
+    /// and no operator needs to look at anything - retry with backoff. CSI's
+    /// ABORTED is exactly this case: a snapshot copy queued behind another
+    /// one on the same VM, or shut out of every
+    /// <see cref="Configuration.AgentOptions.MaxConcurrentSnapshotCopies"/>
+    /// slot, is not broken and is not waiting on an operator, it is simply
+    /// waiting its turn. Without this code such a failure falls through to
+    /// <see cref="Internal"/>, which is retryable too but tells the wrong
+    /// story about why.
+    /// </summary>
+    public const string Aborted = "Aborted";
 }

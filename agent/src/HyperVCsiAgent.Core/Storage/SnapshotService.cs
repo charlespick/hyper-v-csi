@@ -1,5 +1,4 @@
-﻿using System.Collections.Concurrent;
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
 using HyperVCsiAgent.Core.Cluster;
@@ -24,18 +23,28 @@ namespace HyperVCsiAgent.Core.Storage;
 ///
 /// <list type="bullet">
 /// <item>
-/// The <c>CreateSnapshot</c> job the controller drives is fast. It checks the
-/// preconditions - which, for an attached source, includes taking the
-/// checkpoint that freezes the base VHDX - ensures a copy is underway or
-/// already finished, and reports what the CSV shows. It never waits for a copy.
+/// The <c>CreateSnapshot</c> job the controller drives is fast, but not
+/// instant. It checks the preconditions, ensures a copy is underway or
+/// already finished, and then waits - bounded by
+/// <see cref="AgentOptions.SnapshotCheckpointWaitTimeout"/> - for that copy to
+/// reach the head of its VM's queue and take the checkpoint that freezes an
+/// attached source's base VHDX, or to fail outright. It never waits for the
+/// copy itself, only for the checkpoint: D9 requires no less, since a
+/// snapshot must never report success before the point-in-time it claims
+/// actually exists.
 /// </item>
 /// <item>
 /// The copy is a second job this service starts through
-/// <see cref="IJobStore"/>, targeted at the *source volume* so it cannot
-/// interleave with a create, expand or delete of the disk it is reading. It can
-/// run for hours and nothing polls it; its only observable output is the file it
-/// publishes. For an attached source, this job also starts the checkpoint's
-/// merge - fire-and-forget, see
+/// <see cref="IJobStore"/>, targeted at the *source volume* - and, for an
+/// attached source, the *VM* as well, so nothing else can touch that VM while
+/// a checkpoint stands on it - so it cannot interleave with a create, expand
+/// or delete of the disk it is reading, or with any other operation on the
+/// same VM. It can run for hours and nothing polls it once the fast job's own
+/// wait above is over; its only observable output from then on is the file it
+/// publishes. For an attached source, this job takes the checkpoint itself -
+/// immediately before the copy starts, never sooner, see
+/// <see cref="RunCopyAsync"/>'s own remarks for why - and also starts the
+/// checkpoint's merge - fire-and-forget, see
 /// <see cref="IHyperVHostClient.DestroyCheckpointAsync"/> for why - once the
 /// copy has read everything it needs, and deliberately before the publish
 /// rename rather than after: see <see cref="RunCopyAsync"/>'s own remarks for
@@ -78,6 +87,22 @@ public sealed class SnapshotService : ISnapshotService
     public const string CopySnapshot = "CopySnapshot";
 
     /// <summary>
+    /// The operation type <see cref="ReapOrphan"/> enqueues under.
+    ///
+    /// Deliberately its own constant rather than a second caller of
+    /// <see cref="CopySnapshot"/>: <see cref="IJobStore.GetOrCreate"/> dedupes
+    /// on the (operationType, idempotencyKey) pair together, and a merge with
+    /// nothing left to copy must never collapse onto - or be mistaken for - an
+    /// actual copy of the same snapshot id. Also absent from
+    /// <see cref="JobDispatcher.Resolve"/> for the same reason
+    /// <see cref="CopySnapshot"/> is: this is never an operation the
+    /// controller may enqueue over HTTP, only something
+    /// <c>OrphanedCheckpointReaper</c> starts once it has already decided a
+    /// checkpoint has nothing left to resume.
+    /// </summary>
+    public const string ReapOrphanedCheckpoint = "ReapOrphanedCheckpoint";
+
+    /// <summary>
     /// ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION and ERROR_USER_MAPPED_FILE
     /// as HRESULTs - the same three <see cref="VhdxService"/> defines, and with
     /// the same caveat: they say the file was busy, not that a VM has it
@@ -115,31 +140,6 @@ public sealed class SnapshotService : ISnapshotService
 
     private readonly AgentOptions _options;
     private readonly ILogger<SnapshotService> _logger;
-
-    /// <summary>
-    /// True mutual exclusion (a slot count of 1, not a bound like
-    /// <see cref="AgentOptions.MaxConcurrentHostOperations"/>) around taking and
-    /// destroying a checkpoint on one VM, keyed by VM ID. A checkpoint is
-    /// VM-wide - it rides every disk the VM has, not just the one being
-    /// snapshotted - so two snapshots of different volumes on the same VM must
-    /// not take or destroy a checkpoint at the same time.
-    /// </summary>
-    /// <remarks>
-    /// Deliberately a plain semaphore dictionary, the same shape
-    /// <see cref="HostControl.AttachService"/> already uses per host, rather
-    /// than routing through <see cref="IJobStore"/>'s <c>vm:&lt;nodeId&gt;</c>
-    /// target the way AttachVolume/DetachVolume do: this only needs mutual
-    /// exclusion between checkpoint calls, not the dedupe-and-resume machinery
-    /// jobs give every other per-target operation, and a checkpoint call is
-    /// synchronous work this method can simply wait its turn for. One residual
-    /// gap worth naming: because of that choice, a checkpoint take/destroy does
-    /// not also serialize against a concurrent attach or detach on the same VM
-    /// the way it would if it shared their job-store target - a narrow window
-    /// for a spurious, retryable CIM failure that CSI's own retry semantics
-    /// already absorb.
-    /// </remarks>
-    private readonly ConcurrentDictionary<string, SemaphoreSlim> _vmCheckpointSlots =
-        new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// Bounds copies only, and is deliberately separate from
@@ -243,27 +243,19 @@ public sealed class SnapshotService : ISnapshotService
                     _options.DiskOperationTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
             }
 
-            // Preconditions, in order, each with its own message - except the
-            // checkpoint that freezes an attached source's base, which is
-            // deliberately the *last* one satisfied rather than the first.
-            // InspectSourceAsync below only classifies and measures the
-            // source; it does not take one. Every precondition after it -
-            // the target/space check and the name check - can still refuse
-            // the snapshot, and nothing on this path ever merges a checkpoint
-            // back except the copy job EnsureCheckpointedCopyUnderway starts.
-            // A checkpoint taken here and then abandoned to one of those
-            // refusals would sit there un-mergeable, and being VM-wide, would
-            // take every other disk on the VM down with it - see this file's
-            // own remarks on RunCopyAsync for why that outcome is not merely
-            // untidy. So the checkpoint itself waits until right before that
-            // call, once nothing left can throw.
+            // Preconditions, in order, each with its own message. None of them
+            // takes the checkpoint anymore: Decision 5 moved that into
+            // RunCopyAsync, immediately before the copy actually starts, so
+            // nothing here can strand one on a later refusal - the failure
+            // mode the old ordering existed to guard against is gone along
+            // with the thing it was protecting against.
             //
             // Re-run on every call rather than only on the first: the per-volume
             // job queue does not span an agent restart, so a copy resumed after
             // one cannot assume the volume is still in the state the original
             // call found it in. A volume attached between an abandoned copy and
             // its restart is the case that makes this matter.
-            var source = await InspectSourceAsync(
+            var allocatedBytes = await InspectSourceAsync(
                 snapshotId, sourceVolumeId, snapshotName, sourcePath, nodeId, attempt).ConfigureAwait(false);
 
             // Created before the volume is inspected for space, because
@@ -279,41 +271,51 @@ public sealed class SnapshotService : ISnapshotService
             // the copy actually has to move. SnapshotResult.SizeBytes is the
             // source's *virtual* size, what a restore will need. Mixing them up
             // refuses every snapshot of a sparsely used dynamic disk.
-            target.EnsureRoomFor(source.AllocatedBytes, sourcePath, _options.CsvSnapshotsRoot);
+            target.EnsureRoomFor(allocatedBytes, sourcePath, _options.CsvSnapshotsRoot);
 
             EnsureNameIsFree(snapshotId, sourceVolumeId, snapshotName);
 
-            if (source.CheckpointPending)
-            {
-                // Nothing left can refuse this snapshot, so this is the one
-                // place in this method it is safe to take the checkpoint:
-                // EnsureCheckpointedCopyUnderway, right below, is what
-                // guarantees a copy job exists to merge it back. Only the
-                // element name travels on from here, not the Checkpoint this
-                // call returns - see EnsureCheckpointedCopyUnderway's own
-                // remarks for why.
-                await CreateOwnedCheckpointAsync(
-                    source.Vm!, CheckpointElementName(sourceVolumeId, snapshotName), sourceVolumeId, snapshotName, attempt)
-                    .ConfigureAwait(false);
-                EnsureCheckpointedCopyUnderway(
-                    snapshotId, sourceVolumeId, sourcePath, snapshotPath, copyingPath, source.Vm!,
-                    CheckpointElementName(sourceVolumeId, snapshotName));
-            }
-            else if (source.Checkpoint is not null)
-            {
-                EnsureCheckpointedCopyUnderway(
-                    snapshotId, sourceVolumeId, sourcePath, snapshotPath, copyingPath, source.Vm!,
-                    CheckpointElementName(sourceVolumeId, snapshotName));
-            }
-            else
-            {
-                EnsureCopyUnderway(snapshotId, sourceVolumeId, sourcePath, snapshotPath, copyingPath);
-            }
+            // The node hint, not InspectSourceAsync's own classification: this
+            // job may or may not end up needing the VM - an attached source
+            // does, an unattached one (or no hint at all) does not - and
+            // RunCopyAsync re-derives which at the point it actually matters
+            // rather than trusting what was true at enqueue time. Taking the
+            // hint at face value here means a hint that is stale by the time
+            // the copy runs over-serializes slightly - a vm: target held
+            // against a VM this copy turns out not to touch - which is
+            // harmless and strictly the safe direction to be wrong in.
+            var targets = nodeId is null
+                ? new[] { JobTargets.Volume(sourceVolumeId) }
+                : new[] { JobTargets.Vm(nodeId), JobTargets.Volume(sourceVolumeId) };
+
+            // IJobStore.GetOrCreate is doing the recovery reasoning here, not
+            // this method, and the mapping is close to exact:
+            //
+            // A copy that is Pending or Running comes back as the existing
+            // job and this delegate is never invoked - nothing restarts, and
+            // AwaitCheckpointAsync below reports whatever that job's own
+            // progress already is.
+            //
+            // A copy that Failed, or that the store has since evicted, or
+            // that a restart erased along with the whole store, produces a
+            // *fresh* job whose delegate does run - the abandoned-copy row:
+            // no job exists for a marker on disk, so the marker is by
+            // definition abandoned. Safe precisely because the agent is a
+            // single clustered role - if this process holds no job for that
+            // snapshot, no process does.
+            var copy = _jobs.GetOrCreate(
+                snapshotId, CopySnapshot, targets,
+                (_, ct) => RunCopyAsync(
+                    snapshotId, sourceVolumeId, snapshotName, nodeId, sourcePath, snapshotPath, copyingPath, ct));
+
+            await AwaitCheckpointAsync(copy, snapshotId, snapshotPath, copyingPath, attempt.Token).ConfigureAwait(false);
 
             // Read back from the CSV rather than reporting what was just
-            // arranged. The copy may already have created its marker, may
-            // already have finished if the disk is small, or may not have
-            // started - and the honest answer is whatever is actually there.
+            // arranged. The copy may already have finished if the disk is
+            // small, or may only just have written its marker -
+            // AwaitCheckpointAsync above guarantees one of the two by the
+            // time this runs, but which one is exactly the question the CSV,
+            // not this method's own bookkeeping, should answer.
             return await DescribeAsync(
                 snapshotId, sourceVolumeId, snapshotPath, copyingPath, sourcePath,
                 _options.DiskOperationTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
@@ -324,6 +326,73 @@ public sealed class SnapshotService : ISnapshotService
                 AgentErrorCodes.Internal,
                 $"creating snapshot {snapshotId} timed out after {_options.DiskOperationTimeout}");
         }
+    }
+
+    /// <summary>
+    /// <see cref="ISnapshotService.ResumeCopy"/>: re-enqueues this snapshot's
+    /// own copy job under exactly the identity a fresh <see cref="CreateAsync"/>
+    /// would compute for it.
+    /// </summary>
+    /// <remarks>
+    /// Reuses <see cref="RunCopyAsync"/> unchanged rather than duplicating any
+    /// part of it. That method already re-resolves the VM, re-classifies the
+    /// attachment, and reuses a checkpoint standing under its own element
+    /// name (<c>VolumeAttachmentKind.BehindOwnedCheckpoint</c>) - which is
+    /// exactly the resume behaviour wanted here, since this method's one
+    /// caller (<c>OrphanedCheckpointReaper</c>) only ever calls it for a
+    /// checkpoint it has already confirmed is standing and unpublished.
+    /// Skipping straight to the enqueue, with none of <see cref="CreateAsync"/>'s
+    /// own preconditions re-run, is deliberate too: those exist to decide
+    /// whether a *new* copy may start, and this one already started once - if
+    /// a fresh CreateSnapshot for the same (volume, name) does arrive, it
+    /// still runs every precondition itself and then reaches this exact job
+    /// through <see cref="IJobStore.GetOrCreate"/> rather than a second one.
+    /// <para>
+    /// <c>sourceVolumeId</c> and <c>snapshotName</c> are the only two inputs
+    /// <see cref="SnapshotNaming.ComposeId"/> takes, so the <c>snapshotId</c>
+    /// computed here is identical to the one a live client's retry of the
+    /// original CreateSnapshot would compute independently - which is what
+    /// lets that retry attach to this same job through GetOrCreate instead of
+    /// starting a second, parallel copy.
+    /// </para>
+    /// </remarks>
+    public Job ResumeCopy(string sourceVolumeId, string snapshotName, string nodeId)
+    {
+        var snapshotId = SnapshotNaming.ComposeId(sourceVolumeId, snapshotName);
+        var snapshotPath = SnapshotNaming.ResolvePath(_options.CsvSnapshotsRoot, snapshotId);
+        var copyingPath = SnapshotNaming.InProgressPathFor(snapshotPath);
+        var sourcePath = VolumeNaming.ResolvePath(_options.CsvVolumesRoot, sourceVolumeId);
+
+        return _jobs.GetOrCreate(
+            snapshotId, CopySnapshot, [JobTargets.Vm(nodeId), JobTargets.Volume(sourceVolumeId)],
+            (_, ct) => RunCopyAsync(
+                snapshotId, sourceVolumeId, snapshotName, nodeId, sourcePath, snapshotPath, copyingPath, ct));
+    }
+
+    /// <summary>
+    /// <see cref="ISnapshotService.ReapOrphan"/>: merges a checkpoint that has
+    /// nothing left to resume and waits for its chain to finish collapsing.
+    /// </summary>
+    /// <remarks>
+    /// Reuses <see cref="DestroyOwnedCheckpointAndWaitAsync"/> unchanged - the
+    /// same merge-and-wait path <see cref="RunCopyAsync"/>'s own post-copy
+    /// step already relies on - rather than a second implementation of
+    /// "merge this VM's checkpoint and wait for the chain to collapse".
+    /// Enqueued under <see cref="ReapOrphanedCheckpoint"/>, never
+    /// <see cref="CopySnapshot"/>: this snapshot's own copy already
+    /// published, so there is no copy left to run, and colliding with that
+    /// job's idempotency key would either be a same-operation no-op every
+    /// caller here already knows is wrong, or - worse - shadow a genuine
+    /// retry of the copy behind a merge that never runs one.
+    /// </remarks>
+    public Job ReapOrphan(string sourceVolumeId, string snapshotName, string nodeId)
+    {
+        var snapshotId = SnapshotNaming.ComposeId(sourceVolumeId, snapshotName);
+        var sourcePath = VolumeNaming.ResolvePath(_options.CsvVolumesRoot, sourceVolumeId);
+
+        return _jobs.GetOrCreate(
+            snapshotId, ReapOrphanedCheckpoint, [JobTargets.Vm(nodeId), JobTargets.Volume(sourceVolumeId)],
+            (_, ct) => DestroyOwnedCheckpointAndWaitAsync(snapshotId, sourceVolumeId, snapshotName, nodeId, sourcePath, ct));
     }
 
     public async Task DeleteAsync(string snapshotId, CancellationToken cancellationToken)
@@ -506,89 +575,164 @@ public sealed class SnapshotService : ISnapshotService
     }
 
     /// <summary>
-    /// Starts the copy, or attaches to the one already running.
+    /// How often <see cref="AwaitCheckpointAsync"/> polls the copy job's
+    /// status and the marker. The same shape as
+    /// <see cref="CreationTimeReadRetryInterval"/> - short enough that the
+    /// poll itself contributes nothing measurable against
+    /// <see cref="AgentOptions.SnapshotCheckpointWaitTimeout"/>'s own budget.
     /// </summary>
-    /// <remarks>
-    /// <see cref="IJobStore.GetOrCreate"/> is doing the recovery reasoning here,
-    /// not this method, and the mapping is close to exact:
-    ///
-    /// <list type="bullet">
-    /// <item>
-    /// A copy that is Pending or Running comes back as the existing job and its
-    /// delegate is never invoked. Nothing restarts, and the caller reports
-    /// <c>readyToUse: false</c> - the crash matrix's "copy in flight" row.
-    /// </item>
-    /// <item>
-    /// A copy that Failed, or that the store has since evicted, or that a
-    /// restart erased along with the whole store, produces a *fresh* job whose
-    /// delegate does run. That is the abandoned-copy row: no job exists for a
-    /// marker on disk, so the marker is by definition abandoned. Safe precisely
-    /// because the agent is a single clustered role - if this process holds no
-    /// job for that snapshot, no process does.
-    /// </item>
-    /// </list>
-    ///
-    /// The target is the *source volume*, not the snapshot. A copy reading a
-    /// disk must not interleave with a create, expand or delete of that same
-    /// disk. It deliberately is not the target the controller's own
-    /// CreateSnapshot and DeleteSnapshot jobs use - those take
-    /// <c>snapshot:&lt;id&gt;</c> - because putting the fast RPCs behind a
-    /// multi-hour copy would undo the split entirely.
-    /// </remarks>
-    private void EnsureCopyUnderway(
-        string snapshotId, string sourceVolumeId, string sourcePath, string snapshotPath, string copyingPath) =>
-        _jobs.GetOrCreate(
-            snapshotId,
-            CopySnapshot,
-            [JobTargets.Volume(sourceVolumeId)],
-            (_, cancellationToken) =>
-                RunCopyAsync(snapshotId, sourcePath, snapshotPath, copyingPath, checkpoint: null, cancellationToken));
+    private static readonly TimeSpan CheckpointWaitPollInterval = TimeSpan.FromMilliseconds(250);
 
     /// <summary>
-    /// <see cref="EnsureCopyUnderway"/>'s attached-source counterpart: the same
-    /// job, on the same target, with one addition - once the copy has read
-    /// everything it needs, this drives the checkpoint's merge, before the
-    /// snapshot is published rather than after.
+    /// Waits for <paramref name="copy"/> to reach the head of its VM's queue
+    /// and take this snapshot's checkpoint - or, for an unattached source, to
+    /// make the equivalent progress of having started to write its marker -
+    /// or for it to fail outright, before <see cref="CreateAsync"/> answers.
+    /// Bounded by <see cref="AgentOptions.SnapshotCheckpointWaitTimeout"/>,
+    /// deliberately shorter than the controller's own polling budget
+    /// (<c>jobPollBudget</c>, 24s effective, in
+    /// csi-driver/internal/driver/jobs.go) so a caller waiting on a busy VM
+    /// gets this method's own explanation rather than the generic "job still
+    /// Pending" the controller's poll would otherwise time out with first.
     /// </summary>
     /// <remarks>
-    /// Takes <paramref name="checkpointElementName"/>, not a <see cref="Checkpoint"/>,
-    /// and that is deliberate: this identity is all <see cref="RunCopyAsync"/>
-    /// needs to re-derive the checkpoint via <see cref="IHyperVHostClient.FindOwnedCheckpointAsync"/>
-    /// when it actually reaches its destroy step, rather than merging whatever
-    /// this call happened to find. A real <see cref="Checkpoint"/> closed over
-    /// here would sometimes never even be looked at:
-    /// <see cref="IJobStore.GetOrCreate"/> silently drops this whole delegate -
-    /// checkpoint included - whenever a job for this snapshot is already
-    /// Pending or Running, which stranded a checkpoint no code path would ever
-    /// revisit. See <see cref="DestroyOwnedCheckpointIfAnyAsync"/> for the
-    /// re-derivation this makes possible instead.
+    /// <para>
+    /// Waiting-then-failing is the only honest shape available here. D9
+    /// requires that CreateSnapshot never report success before the
+    /// checkpoint that freezes the data actually exists, because
+    /// external-snapshotter's csi-snapshotter sidecar locks a
+    /// VolumeSnapshotContent's <c>creation_time</c> onto whichever
+    /// CreateSnapshot call first succeeds and never revises it - so an early,
+    /// hopeful success would let a since-failed copy get quietly forgotten
+    /// under a timestamp nothing actually captured. An error is the only
+    /// answer this method can give that external-snapshotter records nothing
+    /// from.
+    /// </para>
+    /// <para>
+    /// The error is <see cref="AgentErrorCodes.Aborted"/>, not
+    /// <see cref="AgentErrorCodes.FailedPrecondition"/>: nothing here is
+    /// misconfigured and there is nothing for an operator to fix - the copy
+    /// is exactly where FIFO queuing put it, and it will get its turn. CSI
+    /// reads Aborted as "retry with backoff", which is precisely what a
+    /// caller should do. The copy job itself is deliberately left queued
+    /// when this expires rather than cancelled: cancelling it would drop
+    /// this snapshot's place in the VM's queue, and a retry would re-enqueue
+    /// from the back rather than resume waiting at the position it already
+    /// earned.
+    /// </para>
+    /// <para>
+    /// The <c>Running</c> conjunct below is the crux of the predicate, not
+    /// belt-and-braces. A marker on its own can be a stale one left by an
+    /// abandoned attempt, and under this design that marker can sit there for
+    /// as long as this exact copy is queued on <c>vm:</c> - hours, not
+    /// milliseconds. Reporting its creation time would advertise a
+    /// <c>creation_time</c> from before whatever left it behind, for data
+    /// actually captured long after - D9's failure, in the dangerous
+    /// direction, reintroduced by D9's own fix. <c>Running</c> is what rules
+    /// that out: <see cref="RunCopyAsync"/> discards any abandoned marker
+    /// before it does anything else, and that discard runs before the
+    /// job's own status is even set to <c>Running</c> (see
+    /// <see cref="InMemoryJobStore.ExecuteAsync"/>) - so a marker observed
+    /// while this job is Running was necessarily created by *this* run,
+    /// which per Decision 5 means after this run's own checkpoint.
+    /// </para>
+    /// <para>
+    /// Reading this job's own <see cref="Job.Status"/> is not the
+    /// cross-restart job-state dependency this design otherwise rules out.
+    /// That rule exists so that *readiness* survives a failover, and
+    /// readiness is still answered from the files alone, via
+    /// <see cref="DescribeAsync"/>, never from here. What this method asks
+    /// is narrower: has the work this exact call just enqueued (or attached
+    /// to) started - a question about this process a moment ago, not about
+    /// state expected to survive its restart.
+    /// </para>
     /// </remarks>
-    private void EnsureCheckpointedCopyUnderway(
-        string snapshotId, string sourceVolumeId, string sourcePath, string snapshotPath, string copyingPath,
-        ClusteredVm vm, string checkpointElementName) =>
-        _jobs.GetOrCreate(
-            snapshotId,
-            CopySnapshot,
-            [JobTargets.Volume(sourceVolumeId)],
-            (_, cancellationToken) =>
-                RunCopyAsync(snapshotId, sourcePath, snapshotPath, copyingPath, (vm, checkpointElementName), cancellationToken));
+    private async Task AwaitCheckpointAsync(
+        Job copy, string snapshotId, string snapshotPath, string copyingPath, CancellationToken cancellationToken)
+    {
+        using var wait = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        wait.CancelAfter(_options.SnapshotCheckpointWaitTimeout);
+
+        while (true)
+        {
+            if (File.Exists(snapshotPath))
+            {
+                // A copy small enough to finish inside this wait has already
+                // renamed its marker away - a success, not a missed one.
+                return;
+            }
+
+            if (copy.Status == JobStatus.Failed)
+            {
+                // Surfaced immediately rather than sitting out the rest of
+                // this wait and reporting a generic timeout over the top of
+                // it - the slot-exhaustion message from AcquireCopySlotAsync
+                // is the one that actually matters when that is why the copy
+                // never got moving.
+                throw new JobFailureException(
+                    copy.ErrorCode ?? AgentErrorCodes.Internal, copy.Error ?? "the copy failed with no detail");
+            }
+
+            if (copy.Status == JobStatus.Running && File.Exists(copyingPath))
+            {
+                return;
+            }
+
+            if (copy.Status == JobStatus.Succeeded)
+            {
+                // Nothing left for this copy to do; DescribeAsync answers
+                // from the CSV either way, so there is nothing more to wait
+                // for.
+                return;
+            }
+
+            try
+            {
+                await Task.Delay(CheckpointWaitPollInterval, wait.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (wait.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                throw new JobFailureException(
+                    AgentErrorCodes.Aborted,
+                    $"snapshot {snapshotId} is queued behind another copy on the same VM; a Hyper-V checkpoint " +
+                    "is VM-wide, so only one volume on a VM can be snapshotted at a time. Retrying ordinarily " +
+                    "succeeds once that copy finishes. If this persists, the copy ahead is likely streaming " +
+                    "rather than block cloning - see the ReFS guidance in README.md");
+            }
+        }
+    }
 
     /// <summary>
     /// The long-running half: copy into the marker, then - for an attached
-    /// source - start merging the checkpoint that froze it, then publish by
-    /// atomic rename. Nothing polls this, so every outcome has to be legible
-    /// in the log.
+    /// source - take the checkpoint that freezes it and start merging it back
+    /// once the copy has read everything, then publish by atomic rename.
+    /// Nothing polls this once <see cref="AwaitCheckpointAsync"/> has
+    /// returned, so every outcome has to be legible in the log.
     /// </summary>
+    /// <remarks>
+    /// This method's own ordering is load-bearing from top to bottom, and
+    /// each step below is commented where it stands for why it is there and
+    /// not somewhere else - see in particular the remarks on the checkpoint
+    /// step (Decision 5) for the single most important choice in this file.
+    /// </remarks>
     private async Task RunCopyAsync(
-        string snapshotId, string sourcePath, string snapshotPath, string copyingPath,
-        (ClusteredVm Vm, string ElementName)? checkpoint, CancellationToken cancellationToken)
+        string snapshotId, string sourceVolumeId, string snapshotName, string? nodeId,
+        string sourcePath, string snapshotPath, string copyingPath, CancellationToken cancellationToken)
     {
         using var attempt = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         attempt.CancelAfter(_options.SnapshotCopyTimeout);
 
         var elapsed = Stopwatch.StartNew();
 
-        await AcquireCopySlotAsync(attempt, cancellationToken, snapshotId).ConfigureAwait(false);
+        // Steps 2-4 below - the published check, the tombstone check, and
+        // discarding an abandoned marker - run before the copy slot is
+        // acquired, and before any checkpoint is touched. They are three
+        // cheap CSV reads, and a call that finds nothing left to do here
+        // must not be made to wait out slot exhaustion (Decision 6) to
+        // learn that; discarding the stale marker this early is also what
+        // makes AwaitCheckpointAsync's Running-conjuncted predicate sound -
+        // see that method's own remarks for why the ordering here is
+        // load-bearing there too, not just here.
         try
         {
             // A CreateSnapshot that ran while this job sat in the queue may have
@@ -599,18 +743,22 @@ public sealed class SnapshotService : ISnapshotService
                 _logger.LogInformation(
                     "CopySnapshot {SnapshotId}: {Path} is already published; nothing to copy", snapshotId, snapshotPath);
 
-                // Defensive, not the expected path: the merge is issued
-                // *before* the publish rename below now, so reaching here
-                // with a checkpoint still to destroy means something odd
-                // happened - a crash between the two calls in a prior run of
-                // this exact code, or debris from before that ordering was
-                // fixed. Re-derived rather than assumed gone: whatever
-                // currently stands under this element name - if anything - is
-                // what DestroyOwnedCheckpointIfAnyAsync merges, the same
-                // re-derivation the ordinary post-copy call below relies on.
-                if (checkpoint is { } stale)
+                // Defensive, not the expected path: this job's own
+                // checkpoint-and-merge step (below) already runs before the
+                // publish rename, so reaching here with a checkpoint still
+                // standing under this identity means an earlier run's merge
+                // either has not finished collapsing yet (which logs the
+                // orphan and lets the publish through regardless - see
+                // DestroyOwnedCheckpointAndWaitAsync's own remarks) or never
+                // got a chance to be retried after some other failure.
+                // Merged the same way the ordinary post-copy step does,
+                // waiting for the collapse before this delegate returns,
+                // rather than left standing: nothing else will ever revisit
+                // it.
+                if (nodeId is not null)
                 {
-                    await DestroyOwnedCheckpointIfAnyAsync(snapshotId, stale.Vm, stale.ElementName, attempt.Token).ConfigureAwait(false);
+                    await DestroyOwnedCheckpointAndWaitAsync(
+                        snapshotId, sourceVolumeId, snapshotName, nodeId, sourcePath, attempt.Token).ConfigureAwait(false);
                 }
 
                 return;
@@ -639,14 +787,15 @@ public sealed class SnapshotService : ISnapshotService
 
                 // The checkpoint still needs freeing even though nothing
                 // will ever restore from what this copy would have
-                // produced: CreateAsync took it in good faith, and once this
-                // delegate returns, nothing else will ever revisit it - the
-                // same reasoning that makes the ordinary post-copy call below
-                // unconditional, not skippable just because there is nothing
-                // left to publish.
-                if (checkpoint is { } abandoned)
+                // produced: an earlier run of this exact job may have taken
+                // it in good faith, and once this delegate returns, nothing
+                // else will ever revisit it - the same reasoning that makes
+                // the ordinary post-copy call below unconditional, not
+                // skippable just because there is nothing left to publish.
+                if (nodeId is not null)
                 {
-                    await DestroyOwnedCheckpointIfAnyAsync(snapshotId, abandoned.Vm, abandoned.ElementName, attempt.Token).ConfigureAwait(false);
+                    await DestroyOwnedCheckpointAndWaitAsync(
+                        snapshotId, sourceVolumeId, snapshotName, nodeId, sourcePath, attempt.Token).ConfigureAwait(false);
                 }
 
                 // The tombstone's own job is done: a fresh CreateSnapshot for
@@ -681,43 +830,218 @@ public sealed class SnapshotService : ISnapshotService
                 File.Delete(copyingPath);
             }
 
-            _logger.LogInformation(
-                "CopySnapshot {SnapshotId}: copying {Source} to {Marker}", snapshotId, sourcePath, copyingPath);
-
-            var copy = await _copier.CopyAsync(
-                sourcePath, copyingPath, _options.SnapshotCopyTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
-
-            // Started before the publish, not after. The copy no longer needs
-            // the checkpoint once it has read every byte - the base is not
-            // touched again below, only the destination gets renamed - so
-            // there is nothing left for the checkpoint to protect from here.
-            // Issuing the merge now instead of after publishing means a crash
-            // in the gap between this call and the rename below loses at most
-            // the copy, which a retry redoes from a fresh checkpoint. The
-            // order this replaced put the merge *after* the rename, which put
-            // the one truly unsafe outcome - an unmerged checkpoint nothing
-            // ever revisits, since a published snapshot short-circuits every
-            // later CreateSnapshot before it looks at the checkpoint again -
-            // behind the crash window instead of in front of it. A checkpoint
-            // is VM-wide, so that outcome does not just sit there harmlessly:
-            // GuardAgainstDifferencingChain does not know this driver's tag,
-            // so every other disk on the VM would start refusing attach,
-            // detach and expand until an operator deleted it by hand.
-            if (checkpoint is { } taken)
+            // Step 5: the copy slot, bounded separately from the rest of
+            // this job's own SnapshotCopyTimeout (Decision 6) so a VM is
+            // never held hostage to an unrelated VM's I/O budget. Kept
+            // outside the try below whose finally releases it, exactly as
+            // AcquireCopySlotAsync's own remarks require, so a failed
+            // acquire never releases a slot it did not take.
+            await AcquireCopySlotAsync(attempt, snapshotId).ConfigureAwait(false);
+            try
             {
-                await DestroyOwnedCheckpointIfAnyAsync(snapshotId, taken.Vm, taken.ElementName, attempt.Token).ConfigureAwait(false);
+                var checkpointTaken = false;
+
+                // Re-derived here, not carried from CreateAsync's own
+                // classification: this job can have sat queued on vm: for
+                // hours by the time it reaches this line, long enough for
+                // the VM to have live migrated onto a different host, or for
+                // the volume to have been detached entirely. Acting on a
+                // stale VM or a stale classification would checkpoint (or
+                // fail to checkpoint) the wrong host, or the wrong reality.
+                if (nodeId is not null)
+                {
+                    var vm = await _cluster.ResolveVmAsync(nodeId, attempt.Token).ConfigureAwait(false);
+                    if (vm is null)
+                    {
+                        // Go's hint no longer resolves to a VM at all -
+                        // detached, most plausibly, in the time this copy
+                        // spent queued. The copy proceeds with no
+                        // checkpoint; if the disk really is still open by
+                        // something, the copy below fails on a sharing
+                        // violation, which is the honest outcome rather
+                        // than a guess.
+                        _logger.LogInformation(
+                            "CopySnapshot {SnapshotId}: {NodeId} no longer resolves to a VM; copying with no checkpoint",
+                            snapshotId, nodeId);
+                    }
+                    else
+                    {
+                        var elementName = CheckpointElementName(sourceVolumeId, snapshotName);
+                        VolumeAttachment attachment;
+                        try
+                        {
+                            attachment = await _host.ClassifyAttachmentAsync(
+                                vm.OwningHost, vm.VmId, sourcePath, elementName, attempt.Token).ConfigureAwait(false);
+                        }
+                        catch (InvalidOperationException ex)
+                        {
+                            throw JobFailureException.FailedPrecondition(
+                                $"snapshot {snapshotId} cannot be copied: {ex.Message}");
+                        }
+
+                        switch (attachment.Kind)
+                        {
+                            case VolumeAttachmentKind.NotAttached:
+                                // Detached since InspectSourceAsync last
+                                // looked. Nothing to freeze; the copy below
+                                // reads whatever a plain file read finds.
+                                break;
+
+                            case VolumeAttachmentKind.BehindOwnedCheckpoint:
+                                // Resuming: an earlier attempt already froze
+                                // the base, and it is still standing under
+                                // this exact identity. Nothing to take - the
+                                // copy reads through what is already there.
+                                checkpointTaken = true;
+                                break;
+
+                            case VolumeAttachmentKind.BehindOtherSnapshotsCheckpoint:
+                                // This job holds vm: for its entire run, and
+                                // took that hold before it could even reach
+                                // this line - so no *other* copy job can be
+                                // mid-flight on this VM right now. A
+                                // checkpoint standing under a different
+                                // (volume, snapshot) identity is therefore
+                                // not a sibling's still-running copy (the
+                                // fast job's own InspectSourceAsync reads
+                                // this same classification differently,
+                                // because there it genuinely can be one); it
+                                // is an orphan nothing is driving anymore.
+                                // Copying through it would silently backdate
+                                // this snapshot to whenever that checkpoint
+                                // was actually taken - a checkpoint is
+                                // VM-wide, so this volume's base was already
+                                // frozen at that instant no matter which
+                                // checkpoint this job merges - and taking a
+                                // second checkpoint on top would leave the
+                                // VM two chains deep besides. Refused rather
+                                // than adopted or stacked (issue #14's
+                                // C1/C2): the only correct responses are
+                                // reap-then-restart or refuse, and nothing
+                                // here reaps.
+                                throw new JobFailureException(
+                                    AgentErrorCodes.Internal,
+                                    $"snapshot {snapshotId} cannot be copied: {sourcePath} sits behind checkpoint " +
+                                    $"{attachment.OwnedCheckpoint!.ElementName}, which this driver took for a " +
+                                    "different snapshot; since this job holds this VM's checkpoint lock for its " +
+                                    "entire run, no other copy can be driving that checkpoint right now, so it " +
+                                    "is an orphan an operator needs to clear rather than something safe to copy " +
+                                    "through or stack a second checkpoint on top of");
+
+                            case VolumeAttachmentKind.Direct:
+                                // Nothing frozen yet, and this is the one
+                                // place in the whole operation that takes it.
+                                //
+                                // Taken here - after the copy slot above,
+                                // immediately before the copy actually
+                                // starts below - and nowhere earlier. This
+                                // is issue #14's Decision 5, and it is the
+                                // single most important ordering choice in
+                                // this method.
+                                //
+                                // The reason is a feedback loop, not a
+                                // preference. A checkpoint that stands while
+                                // its copy waits for a slot is one the guest
+                                // keeps writing through, and every byte
+                                // written while it stands is a byte the
+                                // merge has to write back. A checkpoint that
+                                // waits therefore makes its own merge
+                                // longer; a longer merge holds vm: longer;
+                                // holding vm: longer makes the next snapshot
+                                // on that VM wait longer for its own slot;
+                                // and its checkpoint then stands longer
+                                // still. The loop is positive and has no
+                                // ceiling short of SnapshotCopyTimeout.
+                                // Taking the checkpoint only once the copy
+                                // is about to start cuts it: the
+                                // checkpoint's lifetime becomes the copy
+                                // plus its merge, and nothing about queuing
+                                // can add to that.
+                                //
+                                // The cost, stated plainly rather than
+                                // buried: the point-in-time a snapshot
+                                // captures is the moment its copy *starts*,
+                                // not the moment it was requested, and on
+                                // NTFS those can be far apart. D9 is still
+                                // satisfied exactly - creation_time is
+                                // derived from the marker, which is written
+                                // after the checkpoint, so the reported time
+                                // still cannot precede the captured data -
+                                // what widens is the gap between request and
+                                // capture, which is visible and honest, not
+                                // the gap between capture and reported time,
+                                // which would not be. This is accepted
+                                // because the alternative degrades without
+                                // bound, which is worse at any distance;
+                                // ReFS collapses the gap to seconds and
+                                // remains the real answer, and this ordering
+                                // is what keeps NTFS merely slow rather than
+                                // divergent.
+                                await CreateOwnedCheckpointAsync(
+                                    vm, elementName, sourceVolumeId, snapshotName, attempt).ConfigureAwait(false);
+                                checkpointTaken = true;
+                                break;
+
+                            default:
+                                throw new JobFailureException(
+                                    AgentErrorCodes.Internal,
+                                    $"unrecognized attachment classification {attachment.Kind}");
+                        }
+                    }
+                }
+
+                _logger.LogInformation(
+                    "CopySnapshot {SnapshotId}: copying {Source} to {Marker}", snapshotId, sourcePath, copyingPath);
+
+                // The copier itself creates copyingPath, via CREATE_NEW (see
+                // WindowsDiskCopier's own remarks on why an occupied
+                // destination must stay a hard failure rather than a
+                // fallback to streaming) - nothing above may pre-create it.
+                // Its existence, once created, is exactly what
+                // AwaitCheckpointAsync's Running-conjuncted predicate keys
+                // off to tell a genuinely fresh marker from a stale one.
+                var copy = await _copier.CopyAsync(
+                    sourcePath, copyingPath, _options.SnapshotCopyTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
+
+                // Started before the publish, not after. The copy no longer
+                // needs the checkpoint once it has read every byte - the
+                // base is not touched again below, only the destination
+                // gets renamed - so there is nothing left for the
+                // checkpoint to protect from here. Issuing the merge now
+                // instead of after publishing means a crash in the gap
+                // between this call and the rename below loses at most the
+                // copy, which a retry redoes from a fresh checkpoint.
+                // Putting the merge *after* the rename instead would put the
+                // one truly unsafe outcome - an unmerged checkpoint nothing
+                // ever revisits, since a published snapshot short-circuits
+                // every later CreateSnapshot before it looks at the
+                // checkpoint again - behind the crash window instead of in
+                // front of it. A checkpoint is VM-wide, so that outcome does
+                // not just sit there harmlessly: GuardAgainstDifferencingChain
+                // does not know this driver's tag, so every other disk on
+                // the VM would start refusing attach, detach and expand
+                // until an operator deleted it by hand.
+                if (checkpointTaken)
+                {
+                    await DestroyOwnedCheckpointAndWaitAsync(
+                        snapshotId, sourceVolumeId, snapshotName, nodeId, sourcePath, attempt.Token).ConfigureAwait(false);
+                }
+
+                // The publish. Until this rename the snapshot does not exist as far
+                // as anything else is concerned, which is what makes a crash at any
+                // earlier point leave debris rather than a plausible-looking lie.
+                // The marker's creation timestamp travels with it, which is where
+                // creationTimeUnixSeconds comes from.
+                File.Move(copyingPath, snapshotPath);
+
+                _logger.LogInformation(
+                    "CopySnapshot {SnapshotId}: published {Path} after copying {Bytes} bytes ({Method}) in {Elapsed}",
+                    snapshotId, snapshotPath, copy.BytesCopied, copy.BlockCloned ? "block clone" : "streamed", elapsed.Elapsed);
             }
-
-            // The publish. Until this rename the snapshot does not exist as far
-            // as anything else is concerned, which is what makes a crash at any
-            // earlier point leave debris rather than a plausible-looking lie.
-            // The marker's creation timestamp travels with it, which is where
-            // creationTimeUnixSeconds comes from.
-            File.Move(copyingPath, snapshotPath);
-
-            _logger.LogInformation(
-                "CopySnapshot {SnapshotId}: published {Path} after copying {Bytes} bytes ({Method}) in {Elapsed}",
-                snapshotId, snapshotPath, copy.BytesCopied, copy.BlockCloned ? "block clone" : "streamed", elapsed.Elapsed);
+            finally
+            {
+                _copySlots.Release();
+            }
         }
         catch (TimeoutException ex)
         {
@@ -753,28 +1077,14 @@ public sealed class SnapshotService : ISnapshotService
             _logger.LogError(ex, "CopySnapshot {SnapshotId}: copying {Source} failed", snapshotId, sourcePath);
             throw;
         }
-        finally
-        {
-            _copySlots.Release();
-        }
     }
 
     /// <summary>
-    /// What preconditions 1-3 found: how much room the copy needs and, for an
-    /// attached source, the VM it is on. <see cref="Checkpoint"/> is set only
-    /// when there already is one to reuse - the BehindOwnedCheckpoint resume
-    /// case. <see cref="CheckpointPending"/> marks the Direct case instead,
-    /// where a checkpoint is still owed but deliberately not taken here - see
-    /// <see cref="CreateAsync"/> for why that has to wait.
-    /// </summary>
-    private sealed record SourceInspection(long AllocatedBytes, ClusteredVm? Vm, Checkpoint? Checkpoint, bool CheckpointPending);
-
-    /// <summary>
     /// Preconditions 1 and 2, and the measurement precondition 3 needs - all
-    /// without taking a checkpoint of its own. An attached source with
-    /// nothing frozen yet comes back with <see cref="SourceInspection.CheckpointPending"/>
-    /// set instead of already holding one; see <see cref="CreateAsync"/> for
-    /// why taking it is deferred past this method.
+    /// without taking a checkpoint. Taking one, when one is owed, is
+    /// RunCopyAsync's job now (Decision 5); this method only ever classifies
+    /// and measures the source, and - for any attached source - refuses one
+    /// whose VM cannot take a checkpoint at all.
     /// </summary>
     /// <remarks>
     /// With no node hint, this is exactly the local-open check it always was:
@@ -788,21 +1098,20 @@ public sealed class SnapshotService : ISnapshotService
     /// way, attached behind a checkpoint this driver already took for this
     /// exact snapshot, and attached behind one this driver took for a
     /// different snapshot entirely - a checkpoint is VM-wide, so a sibling
-    /// volume's snapshot can put this one behind a chain too. The
-    /// this-exact-snapshot case is a resume, not a fresh start: its checkpoint
-    /// is reused rather than a new one taken. Being read-only, this
-    /// classification is safe to run this early regardless of which case it
-    /// turns out to be - unlike taking a checkpoint, it cannot itself strand
-    /// anything. Both attached cases measure with <see cref="FileInfo.Length"/>
-    /// on <paramref name="sourcePath"/> directly, which needs no checkpoint to
-    /// work either: it reads the file's directory entry rather than opening
-    /// it, so - unlike <see cref="OpenSourceLocally"/>'s <see cref="FileStream"/>,
-    /// which a running VM's own exclusive handle blocks - it answers correctly
-    /// whether or not a checkpoint exists yet. That is what lets the Direct
-    /// case call it before a checkpoint is taken, exactly as the resumed case
-    /// calls it after one already exists.
+    /// volume's snapshot can put this one behind a chain too. Every attached
+    /// case measures with <see cref="FileInfo.Length"/> on
+    /// <paramref name="sourcePath"/> directly, which needs no checkpoint to
+    /// work: it reads the file's directory entry rather than opening it, so -
+    /// unlike <see cref="OpenSourceLocally"/>'s <see cref="FileStream"/>, which
+    /// a running VM's own exclusive handle blocks - it answers correctly
+    /// whether or not a checkpoint stands. Being read-only, this
+    /// classification is also safe to run this early regardless of which case
+    /// it turns out to be: unlike taking a checkpoint, it cannot itself
+    /// strand anything, which is exactly why the fast job no longer judges
+    /// whether the VM is free to be copied - the copy queue (via <c>vm:</c>)
+    /// decides that instead, and this method just measures.
     /// </remarks>
-    private async Task<SourceInspection> InspectSourceAsync(
+    private async Task<long> InspectSourceAsync(
         string snapshotId, string sourceVolumeId, string snapshotName, string sourcePath, string? nodeId,
         CancellationTokenSource attempt)
     {
@@ -814,8 +1123,7 @@ public sealed class SnapshotService : ISnapshotService
 
         if (string.IsNullOrEmpty(nodeId))
         {
-            var allocatedBytes = OpenSourceLocally(snapshotId, sourceVolumeId, sourcePath);
-            return new SourceInspection(allocatedBytes, null, null, false);
+            return OpenSourceLocally(snapshotId, sourceVolumeId, sourcePath);
         }
 
         var vm = await _cluster.ResolveVmAsync(nodeId, attempt.Token).ConfigureAwait(false);
@@ -826,8 +1134,7 @@ public sealed class SnapshotService : ISnapshotService
             // way: it succeeds if the volume is genuinely unattached (a stale
             // VolumeAttachment, most plausibly) and reports the same refusal
             // as always if something else still has it open.
-            var allocatedBytes = OpenSourceLocally(snapshotId, sourceVolumeId, sourcePath);
-            return new SourceInspection(allocatedBytes, null, null, false);
+            return OpenSourceLocally(snapshotId, sourceVolumeId, sourcePath);
         }
 
         var elementName = CheckpointElementName(sourceVolumeId, snapshotName);
@@ -852,64 +1159,53 @@ public sealed class SnapshotService : ISnapshotService
             case VolumeAttachmentKind.NotAttached:
                 // Go's hint did not pan out - answer from a local read, same
                 // as having no hint at all.
-                var unattachedBytes = OpenSourceLocally(snapshotId, sourceVolumeId, sourcePath);
-                return new SourceInspection(unattachedBytes, null, null, false);
+                return OpenSourceLocally(snapshotId, sourceVolumeId, sourcePath);
 
             case VolumeAttachmentKind.BehindOwnedCheckpoint:
-                // Resuming: an earlier attempt already froze the base. Reuse
-                // that checkpoint rather than taking a second one.
-                var resumedBytes = new FileInfo(sourcePath).Length;
-                return new SourceInspection(resumedBytes, vm, attachment.OwnedCheckpoint, false);
-
+                // Resuming: an earlier attempt already froze the base.
+                // Measured the same way as every other attached case below -
+                // see the comment on Direct for why all three share this one
+                // body.
             case VolumeAttachmentKind.BehindOtherSnapshotsCheckpoint:
                 // Ours, but a different (volume, snapshot) attempt's - see
                 // VolumeAttachmentKind's own remarks for why a checkpoint
-                // being VM-wide makes this reachable for a perfectly innocent
-                // sibling volume, not just a stuck retry of this one.
-                // Retryable rather than FailedPrecondition: nothing here is
-                // broken, and there is nothing an operator should delete -
-                // the checkpoint in the way *ordinarily* belongs to that
-                // other attempt's still-running copy job and clears on its
-                // own, via that job's own DestroyOwnedCheckpointAsync call,
-                // once its copy finishes.
-                //
-                // "Ordinarily" is doing real work in that sentence: the job
-                // driving that merge lives only in this process's memory and
-                // does not survive an agent restart, and the only thing that
-                // ever restarts that other snapshot's copy is a CreateSnapshot
-                // call for it. If the agent has restarted since that job
-                // started, and that other snapshot's VolumeSnapshot has since
-                // been deleted, external-snapshotter has no reason left to
-                // ever send it another CreateSnapshot - so nothing will drive
-                // that copy again, and this checkpoint will not clear on its
-                // own. Promising otherwise unconditionally is what the old
-                // single "foreign checkpoint, delete it" message got wrong in
-                // the opposite direction: at least that one pointed at
-                // something to act on. The message below keeps this retryable
-                // and states the ordinary case still resolves itself, but
-                // gives an operator seeing it persist something concrete to
-                // check instead of a bare "no action needed" - whether that
-                // other snapshot still exists, and whether its copy is still
-                // running. Detecting the gap mechanically - an orphan sweep,
-                // or tracking whether a job still exists for that other
-                // attempt - is not built here.
-                throw new JobFailureException(
-                    AgentErrorCodes.Internal,
-                    $"snapshot {snapshotId} cannot be taken yet: {sourcePath} sits behind checkpoint " +
-                    $"{attachment.OwnedCheckpoint!.ElementName}, which this driver took for a different " +
-                    "snapshot that is still copying; retrying ordinarily succeeds on its own once that " +
-                    "snapshot's copy finishes and its checkpoint merges back. If this persists, check whether " +
-                    "that other snapshot still exists and its copy is still running - if the agent restarted " +
-                    "and that snapshot has since been deleted, nothing will ever drive its copy again and " +
-                    "this will not clear on its own");
-
+                // being VM-wide makes this reachable for a perfectly
+                // innocent sibling volume, not just a stuck retry of this
+                // one. No longer refused here: whether an orphan is actually
+                // standing is a question only a job holding vm: for its
+                // entire take-to-destroy lifetime can answer soundly, and
+                // this fast job holds no such thing - see RunCopyAsync's own
+                // remarks on this same classification for where that
+                // judgment moved to.
             case VolumeAttachmentKind.Direct:
-                // Nothing frozen yet, and nothing taken here: nothing about
-                // this measurement needs a checkpoint, so taking one is left
-                // to CreateAsync, once nothing else can still refuse the
-                // snapshot.
-                var freshBytes = new FileInfo(sourcePath).Length;
-                return new SourceInspection(freshBytes, vm, null, true);
+                // Nothing frozen yet. Taking the checkpoint is deferred to
+                // RunCopyAsync now (Decision 5: only once the copy is about
+                // to move bytes), so nothing here does more than measure -
+                // which is also why this case and the two above it share
+                // this one body.
+                //
+                // The §1.4 check: refuses a snapshot of an attached source
+                // whose VM cannot take a checkpoint at all, before anything
+                // is queued. Checked here rather than left to the copy job
+                // for the same reason every other precondition in this
+                // method runs before a job is enqueued - RunCopyAsync can
+                // sit queued behind another volume's copy for hours, and
+                // waiting until it gets there to discover a VM was never
+                // configured for ProductionOnly checkpoints would turn a
+                // configuration mistake an operator could fix in a minute
+                // into a failure nothing surfaces until a long-running job
+                // nothing polls finally reaches it and logs it.
+                // CreateCheckpointAsync still checks this itself before
+                // taking a checkpoint; this is a second, earlier look at the
+                // same fact for a caller that wants the answer before
+                // committing to anything at all.
+                if (!await _host.CanCheckpointAsync(vm.OwningHost, vm.VmId, attempt.Token).ConfigureAwait(false))
+                {
+                    throw JobFailureException.FailedPrecondition(
+                        $"snapshot {snapshotId} cannot be taken: {vm.VmId} is not set to ProductionOnly checkpoints");
+                }
+
+                return new FileInfo(sourcePath).Length;
 
             default:
                 throw new JobFailureException(
@@ -979,26 +1275,23 @@ public sealed class SnapshotService : ISnapshotService
         });
 
     /// <summary>
-    /// Takes and tags this snapshot's checkpoint, holding the VM's mutual-
-    /// exclusion slot for the whole call - see <see cref="_vmCheckpointSlots"/>.
+    /// Takes and tags this snapshot's checkpoint. Called from exactly one
+    /// place - RunCopyAsync's own checkpoint step - which already holds this
+    /// VM's <c>vm:</c> job-store target for its entire run before this is
+    /// ever reached and keeps holding it long past this call returns; that
+    /// hold is the mutual exclusion now, in place of the
+    /// <c>_vmCheckpointSlots</c> semaphore this design used to need (removed
+    /// alongside this change - see this file's own remarks at the deletion
+    /// site). No re-check against an existing checkpoint under a lock either,
+    /// for the same reason: only one job can ever be taking or destroying a
+    /// checkpoint on this VM at a time, so there is nothing left to race
+    /// against by the time this runs.
     /// </summary>
     private async Task<Checkpoint> CreateOwnedCheckpointAsync(
         ClusteredVm vm, string elementName, string sourceVolumeId, string snapshotName, CancellationTokenSource attempt)
     {
-        var slot = _vmCheckpointSlots.GetOrAdd(vm.VmId, _ => new SemaphoreSlim(1, 1));
-        await AcquireVmSlotAsync(slot, vm, attempt).ConfigureAwait(false);
         try
         {
-            // Re-check under the lock: a concurrent CreateSnapshot replay for
-            // this exact (volume, name) pair may have taken and tagged the
-            // checkpoint while this call was waiting its turn.
-            var existing = await _host.FindOwnedCheckpointAsync(
-                vm.OwningHost, vm.VmId, elementName, attempt.Token).ConfigureAwait(false);
-            if (existing is not null)
-            {
-                return existing;
-            }
-
             var notes = BuildCheckpointNotes(sourceVolumeId, snapshotName);
             return await _host.CreateCheckpointAsync(
                 vm.OwningHost, vm.VmId, elementName, notes, attempt.Token).ConfigureAwait(false);
@@ -1012,90 +1305,41 @@ public sealed class SnapshotService : ISnapshotService
             // to.
             throw JobFailureException.FailedPrecondition(ex.Message);
         }
-        finally
-        {
-            slot.Release();
-        }
     }
 
     /// <summary>
-    /// Starts merging this snapshot's checkpoint back into its base, holding
-    /// the VM's mutual-exclusion slot for the call. Never throws, for either
-    /// step it takes: not for a cancellation encountered while waiting for
-    /// that slot, and not for a cancellation - or any other failure -
-    /// encountered starting the merge itself. A failure here is the
-    /// checkpoint's problem, not the snapshot's - the copy already published
-    /// successfully by the time this runs, so nothing polls this job for the
-    /// outcome and the only place a failure can usefully go is the log, the
-    /// same posture <see cref="RunCopyAsync"/>'s own catch blocks take for
-    /// everything else nothing external observes.
+    /// Starts merging this snapshot's checkpoint back into its base. Never
+    /// throws: a failure here is the checkpoint's problem, not the
+    /// snapshot's - by the time this runs the copy has already read
+    /// everything it needs and is about to publish or is abandoning cleanly,
+    /// so nothing polls this job for the outcome and the only place a
+    /// failure can usefully go is the log, the same posture
+    /// <see cref="RunCopyAsync"/>'s own catch blocks take for everything else
+    /// nothing external observes.
     /// </summary>
     /// <remarks>
-    /// <paramref name="cancellationToken"/> is <c>RunCopyAsync</c>'s single
-    /// <c>attempt.Token</c> - the caller's own token linked with
-    /// <see cref="AgentOptions.SnapshotCopyTimeout"/> - so there is no way
-    /// from here to tell a copy that ran out of its budget apart from the
-    /// agent shutting down. Both lead to the same right action: the
-    /// checkpoint is standing, nothing here will retry its merge, and an
-    /// operator needs to be told which one and where - so any cancellation,
-    /// whether waiting for the slot or waiting for
-    /// <see cref="IHyperVHostClient.DestroyCheckpointAsync"/> itself to
-    /// return, is reported as an orphan rather than left to propagate: if
-    /// either escaped, it would land in <c>RunCopyAsync</c>'s own
-    /// <see cref="OperationCanceledException"/> handler, which deletes the
-    /// marker and fails the job - discarding a copy that had already
-    /// finished reading, over a checkpoint problem that does not change once
-    /// the copy is retried.
-    /// <para>
-    /// The two cancellations are worded differently in the log, though,
-    /// because they are not the same fact. A cancellation on the slot wait
-    /// means the merge genuinely never started - <see cref="SemaphoreSlim.WaitAsync(CancellationToken)"/>
-    /// only ever reaches this VM's own checkpoint operation, not the merge
-    /// itself. <c>DestroyCheckpointAsync</c>'s own doc says it returns once
-    /// the merge has *started*, not once it has finished, so a cancellation
-    /// observed while awaiting that specific call does not reliably mean the
-    /// merge never began: vmms may already have started it, independently of
-    /// this process, before the token fired. The log line for that case says
-    /// only what is actually known.
-    /// </para>
+    /// No slot to wait for anymore, unlike before this design removed
+    /// <c>_vmCheckpointSlots</c> - see this file's own remarks at the
+    /// deletion site - so the only thing left that can be cancelled here is
+    /// <see cref="IHyperVHostClient.DestroyCheckpointAsync"/> itself, and
+    /// that cannot be read as "the merge never started":
+    /// <c>DestroyCheckpointAsync</c>'s own doc says it returns once the merge
+    /// has *started*, not once it has finished, so a cancellation observed
+    /// while awaiting it does not rule out vmms having already begun the
+    /// merge moments before the token fired. Reported as an orphan
+    /// regardless - the checkpoint is standing either way, and nothing here
+    /// will revisit it - but worded so it does not assert more than is
+    /// known.
     /// </remarks>
     private async Task DestroyOwnedCheckpointAsync(
         string snapshotId, ClusteredVm vm, Checkpoint checkpoint, CancellationToken cancellationToken)
     {
-        var slot = _vmCheckpointSlots.GetOrAdd(vm.VmId, _ => new SemaphoreSlim(1, 1));
-        try
-        {
-            await slot.WaitAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            // Not filtered on cancellationToken.IsCancellationRequested: this
-            // token is the only one SemaphoreSlim.WaitAsync was given, so it
-            // throws OperationCanceledException *because* that token was
-            // cancelled - by the time this runs, IsCancellationRequested is
-            // always true, and a filter that checked for it being false could
-            // never match. Whether the cause was the copy's own timeout or
-            // the agent shutting down, the merge never started, so this is an
-            // orphan either way.
-            LogOrphanedCheckpoint(snapshotId, checkpoint.ElementName, vm, "was cancelled before it could start merging it");
-            return;
-        }
-
         try
         {
             await _host.DestroyCheckpointAsync(vm.OwningHost, checkpoint, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
-            // Unlike the slot wait above, this cannot be read as "the merge
-            // never started": DestroyCheckpointAsync is fire-and-forget and
-            // returns once the merge has *started*, not once it has
-            // finished, so the token firing while this call was still being
-            // awaited does not rule out vmms having already begun the merge
-            // moments before. Reported as an orphan regardless - the
-            // checkpoint is standing either way, and nothing here will
-            // revisit it - but worded so it does not assert more than is
-            // known.
             LogOrphanedCheckpoint(
                 snapshotId, checkpoint.ElementName, vm,
                 "was cancelled while starting its merge (whether the merge itself had already begun is not known)");
@@ -1104,36 +1348,28 @@ public sealed class SnapshotService : ISnapshotService
         {
             LogOrphanedCheckpoint(snapshotId, checkpoint.ElementName, vm, "starting its merge failed", ex);
         }
-        finally
-        {
-            slot.Release();
-        }
     }
 
     /// <summary>
-    /// <see cref="RunCopyAsync"/>'s entire post-copy checkpoint step:
-    /// re-derives whatever currently stands for this snapshot's checkpoint
+    /// Re-derives whatever currently stands for this snapshot's checkpoint
     /// identity and merges it, rather than merging a <see cref="Checkpoint"/>
-    /// remembered from when the job started.
+    /// remembered from an earlier step.
     /// </summary>
     /// <remarks>
     /// Re-deriving, not remembering, for the reason <see cref="Checkpoint"/>'s
     /// own doc gives: a checkpoint is not persisted anywhere, so anything that
     /// needs one again is expected to ask
     /// <see cref="IHyperVHostClient.FindOwnedCheckpointAsync"/> rather than
-    /// hold on to what an earlier call returned. Closing over an actual
-    /// <see cref="Checkpoint"/> in the job delegate
-    /// <see cref="EnsureCheckpointedCopyUnderway"/> builds is exactly the kind
-    /// of remembering that doc rules out: <see cref="IJobStore.GetOrCreate"/>
-    /// silently drops that delegate - and everything it captured - whenever a
-    /// job for this snapshot is already Pending or Running, which a poll
-    /// landing between this job's own destroy step and its publish rename can
-    /// make true for a *second*, freshly-taken checkpoint under the identical
-    /// identity string, once an idle checkpoint's merge has already completed.
-    /// Looking the checkpoint up here instead means whichever job's delegate
-    /// actually reaches this step finds whatever currently stands under
-    /// <paramref name="elementName"/>, not whatever happened to exist when its
-    /// own job was created.
+    /// hold on to what an earlier call returned. This method's one caller,
+    /// <see cref="DestroyOwnedCheckpointAndWaitAsync"/>, could in principle
+    /// pass down the <see cref="Checkpoint"/> <see cref="RunCopyAsync"/>'s own
+    /// checkpoint step already resolved, but deliberately does not: that step
+    /// can have run hours before this one, long enough for the checkpoint to
+    /// have already been merged by an earlier, defensive pass over this exact
+    /// snapshot id (see <c>RunCopyAsync</c>'s published and tombstone
+    /// branches), which would make a remembered <see cref="Checkpoint"/> stale
+    /// in exactly the way this whole design avoids remembering anything
+    /// checkpoint-shaped across a call boundary.
     /// </remarks>
     private async Task DestroyOwnedCheckpointIfAnyAsync(
         string snapshotId, ClusteredVm vm, string elementName, CancellationToken cancellationToken)
@@ -1191,23 +1427,106 @@ public sealed class SnapshotService : ISnapshotService
             snapshotId, what, elementName, vm.VmId, vm.OwningHost);
 
     /// <summary>
-    /// Takes the VM's checkpoint slot, reporting a timeout spent queuing as the
-    /// checkpoint operation timing out rather than a bare cancellation - the
-    /// same reasoning <see cref="AcquireCopySlotAsync"/> and
-    /// <see cref="HostControl.AttachService"/>'s own host slot give.
+    /// <see cref="RunCopyAsync"/>'s step 8: merges this snapshot's checkpoint
+    /// back into its base, then waits for the differencing chain built on top
+    /// of it to finish collapsing before returning - which is what makes it
+    /// safe for the caller to release its hold on the VM once this returns.
     /// </summary>
-    private async Task AcquireVmSlotAsync(SemaphoreSlim slot, ClusteredVm vm, CancellationTokenSource attempt)
+    /// <remarks>
+    /// <para>
+    /// Re-resolves the VM again rather than reusing whatever RunCopyAsync's
+    /// own checkpoint step resolved (issue #14's fifth-comment correction
+    /// C4): the copy this follows can have run for hours, long enough for the
+    /// VM to have live migrated onto a different host in the meantime, which
+    /// would leave that earlier <see cref="ClusteredVm"/>'s
+    /// <see cref="ClusteredVm.OwningHost"/> stale. The checkpoint itself is
+    /// re-derived the same way, by element name, via
+    /// <see cref="DestroyOwnedCheckpointIfAnyAsync"/> - extending the same
+    /// re-derive-don't-remember rule that method already applies to the
+    /// checkpoint, to the host it lives on.
+    /// </para>
+    /// <para>
+    /// <see cref="IHyperVHostClient.DestroyCheckpointAsync"/> is fire-and-forget
+    /// and returns once the merge has *started*, not once it has finished.
+    /// Returning as soon as it does would release this job's hold on the VM
+    /// while the AVHDX is still merging, and the very next attach or detach on
+    /// that VM would then hit <c>GuardAgainstDifferencingChain</c> against a
+    /// chain that is on its way out but not yet gone - exactly the failure
+    /// this method exists to prevent. So this waits for
+    /// <see cref="IHyperVHostClient.IsChainCollapsedAsync"/> to report true
+    /// before returning, rather than for <see cref="IHyperVHostClient.FindOwnedCheckpointAsync"/>
+    /// to report the checkpoint's configuration object gone:
+    /// <see cref="HostControl.CimHyperVHostClient.ClassifyAttachmentAsync"/>'s
+    /// own retry loop already measured that the object can disappear a moment
+    /// *before* the disk actually re-points to the base, so "the object is
+    /// gone" and "the chain has collapsed" are different questions, and only
+    /// the second one is safe to act on here.
+    /// </para>
+    /// <para>
+    /// The poll backs off from 5s to a 30s ceiling rather than running flat:
+    /// <c>IsChainCollapsedAsync</c> is a device-settings enumeration plus a
+    /// chain walk per attached disk, not a cheap call, and this can run for
+    /// the whole merge - which for a multi-hour copy can itself be hours -
+    /// across every VM mid-merge on a host. There is no <c>HostOperationSlots</c>
+    /// yet to bound that against (a later slice), which is why the loop holds
+    /// nothing across its wait rather than a slot it would have to release
+    /// each iteration - written so introducing one later is natural.
+    /// </para>
+    /// <para>
+    /// A merge that has not finished collapsing within
+    /// <see cref="AgentOptions.CheckpointMergeTimeout"/> is not a copy
+    /// failure: the copy has already read everything it needs and can still
+    /// publish, so this logs the orphan and returns normally rather than
+    /// throwing - the same posture every other <see cref="LogOrphanedCheckpoint"/>
+    /// caller in this file takes.
+    /// </para>
+    /// </remarks>
+    private async Task DestroyOwnedCheckpointAndWaitAsync(
+        string snapshotId, string sourceVolumeId, string snapshotName, string? nodeId, string sourcePath,
+        CancellationToken cancellationToken)
     {
+        var vm = await _cluster.ResolveVmAsync(nodeId!, cancellationToken).ConfigureAwait(false);
+        if (vm is null)
+        {
+            // The cluster no longer resolves this hint at all - the VM was
+            // removed, most plausibly. Nothing here can name a host to look
+            // a checkpoint up on, so there is nothing left to do; if a
+            // checkpoint genuinely stands somewhere, an operator finding the
+            // VM gone entirely has a bigger problem than this one snapshot.
+            _logger.LogWarning(
+                "CopySnapshot {SnapshotId}: {NodeId} no longer resolves to a VM; skipping the merge-collapse wait",
+                snapshotId, nodeId);
+            return;
+        }
+
+        var elementName = CheckpointElementName(sourceVolumeId, snapshotName);
+        await DestroyOwnedCheckpointIfAnyAsync(snapshotId, vm, elementName, cancellationToken).ConfigureAwait(false);
+
+        using var mergeWait = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        mergeWait.CancelAfter(_options.CheckpointMergeTimeout);
+
+        var interval = TimeSpan.FromSeconds(5);
         try
         {
-            await slot.WaitAsync(attempt.Token).ConfigureAwait(false);
+            while (!await _host.IsChainCollapsedAsync(vm.OwningHost, vm.VmId, sourcePath, mergeWait.Token).ConfigureAwait(false))
+            {
+                await Task.Delay(interval, mergeWait.Token).ConfigureAwait(false);
+                interval = TimeSpan.FromSeconds(Math.Min(interval.TotalSeconds * 2, 30));
+            }
         }
-        catch (OperationCanceledException) when (attempt.IsCancellationRequested)
+        catch (OperationCanceledException) when (mergeWait.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
         {
-            throw new JobFailureException(
-                AgentErrorCodes.Internal,
-                $"taking a checkpoint of {vm.VmId} timed out after {_options.DiskOperationTimeout} waiting for " +
-                "another checkpoint operation on the same VM to finish");
+            LogOrphanedCheckpoint(
+                snapshotId, elementName, vm, $"had not finished collapsing after {_options.CheckpointMergeTimeout}");
+        }
+        catch (OperationCanceledException)
+        {
+            // The copy's own SnapshotCopyTimeout ran out, or the agent is
+            // shutting down - either way this is the same "orphan, not a
+            // copy failure" outcome DestroyOwnedCheckpointAsync's own
+            // cancellation catch gives the merge-start step, extended to the
+            // wait that follows it.
+            LogOrphanedCheckpoint(snapshotId, elementName, vm, "the wait for its merge to collapse was cancelled");
         }
     }
 
@@ -1500,28 +1819,45 @@ public sealed class SnapshotService : ISnapshotService
     }
 
     /// <summary>
-    /// Takes a slot against the copy cap, reporting a timeout spent *queuing* as
-    /// the copy timing out. Without this the wait throws a bare
-    /// OperationCanceledException, which reads as the agent shutting down and
-    /// names neither the snapshot nor how long it waited.
+    /// Takes a slot against the copy cap, bounded by
+    /// <see cref="AgentOptions.SnapshotCopySlotWaitTimeout"/> rather than the
+    /// rest of this job's own <see cref="AgentOptions.SnapshotCopyTimeout"/>
+    /// budget - issue #14's Decision 6. Blocking on the slot for as long as
+    /// the copy itself is allowed to run would hold this job's <c>vm:</c> and
+    /// <c>volume:</c> targets hostage to whichever unrelated copies hold the
+    /// slots ahead of it, which is exactly the failure this bound exists to
+    /// refuse: on expiry this fails outright, which releases both targets, so
+    /// attach, detach and expand on this VM proceed immediately and this
+    /// snapshot's own retry re-enqueues from the back of the copy queue
+    /// rather than holding its place.
     /// </summary>
     /// <remarks>
+    /// The failure is <see cref="AgentErrorCodes.Aborted"/> and names slot
+    /// exhaustion specifically, distinct from <see cref="AwaitCheckpointAsync"/>'s
+    /// own VM-contention message: the two have different fixes - more copy
+    /// slots, or ReFS block cloning to make each copy shorter, versus waiting
+    /// out whatever is holding this particular VM's checkpoint.
+    /// <para>
     /// Deliberately outside the caller's try, which releases the semaphore in a
     /// finally: a failed acquire must not release a slot it never took.
+    /// </para>
     /// </remarks>
-    private async Task AcquireCopySlotAsync(
-        CancellationTokenSource attempt, CancellationToken callerToken, string snapshotId)
+    private async Task AcquireCopySlotAsync(CancellationTokenSource attempt, string snapshotId)
     {
+        using var slotWait = CancellationTokenSource.CreateLinkedTokenSource(attempt.Token);
+        slotWait.CancelAfter(_options.SnapshotCopySlotWaitTimeout);
+
         try
         {
-            await _copySlots.WaitAsync(attempt.Token).ConfigureAwait(false);
+            await _copySlots.WaitAsync(slotWait.Token).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (attempt.IsCancellationRequested && !callerToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (slotWait.IsCancellationRequested && !attempt.IsCancellationRequested)
         {
             throw new JobFailureException(
-                AgentErrorCodes.Internal,
-                $"copying snapshot {snapshotId} timed out after {_options.SnapshotCopyTimeout} waiting for one of " +
-                $"{_options.MaxConcurrentSnapshotCopies} snapshot copy slots");
+                AgentErrorCodes.Aborted,
+                $"copying snapshot {snapshotId} could not get one of {_options.MaxConcurrentSnapshotCopies} " +
+                $"snapshot copy slots within {_options.SnapshotCopySlotWaitTimeout}; retrying re-enqueues from " +
+                "the back of the copy queue rather than holding this one's place");
         }
     }
 

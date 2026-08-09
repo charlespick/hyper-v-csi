@@ -42,6 +42,12 @@ const (
 	ErrorCodeFailedPrecondition = "FailedPrecondition"
 	ErrorCodeNotFound           = "NotFound"
 	ErrorCodeInternal           = "Internal"
+
+	// ErrorCodeAborted is CSI's "retry with backoff" case: nothing is
+	// misconfigured and no operator needs to look at anything, the caller
+	// just needs to wait its turn - a snapshot copy queued behind another
+	// one on the same VM, for example.
+	ErrorCodeAborted = "Aborted"
 )
 
 // ErrJobNotFound is what GetJob returns for a 404. The agent's job store is

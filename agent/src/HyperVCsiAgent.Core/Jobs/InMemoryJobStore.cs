@@ -167,7 +167,16 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
             // around each assignment is for cross-thread visibility, not
             // ordering - it is never held across the run(...) await, so it
             // does not serialize job execution.
-            await run(job, _shutdown.Token).ConfigureAwait(false);
+            //
+            // JobExecutionContext.Enter wraps only this call, and only this
+            // call: it exists so issue #14's D10 guard rail can assert that a
+            // VM-mutating call happens while this job's own targets are held,
+            // and holding starts and ends exactly where the run delegate does.
+            using (JobExecutionContext.Enter(targets))
+            {
+                await run(job, _shutdown.Token).ConfigureAwait(false);
+            }
+
             lock (_gate)
             {
                 job.Status = JobStatus.Succeeded;

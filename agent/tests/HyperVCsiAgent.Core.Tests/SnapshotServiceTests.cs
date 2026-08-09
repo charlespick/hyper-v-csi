@@ -18,11 +18,11 @@ namespace HyperVCsiAgent.Core.Tests;
 /// stub, because it is not incidental to what is being tested - the whole
 /// abandoned-versus-in-flight distinction is its GetOrCreate semantics, and a
 /// stub that answered them differently would prove nothing about the design.
-///
-/// What no test here can reach: every crash-matrix row involving a Hyper-V
-/// checkpoint. Rows 0, 2, 5 and 6 are the unattached ones and are all covered
-/// below; rows 1, 3, 4, 7 and 8 cannot occur without a VM and are not
-/// implemented in this slice.
+/// Since the checkpoint moved into the copy job (issue #14, Unit D), the
+/// <c>vm:</c> job-store target this store enforces is itself part of what is
+/// under test - not only for an unattached source, but for the VM-wide
+/// serialization that keeps two volumes on one VM from ever taking or
+/// destroying a checkpoint at the same time.
 /// </remarks>
 public sealed class SnapshotServiceTests : IDisposable
 {
@@ -315,32 +315,21 @@ public sealed class SnapshotServiceTests : IDisposable
         Assert.Equal(whileCopying.CreationTimeUnixSeconds, published.CreationTimeUnixSeconds);
     }
 
-    [Fact]
-    public async Task CreateAsync_BeforeTheCopyHasCreatedItsMarker_ReportsTheCurrentTimeAsCreationTime()
-    {
-        // Not 0: external-snapshotter's csi-snapshotter sidecar locks a
-        // VolumeSnapshotContent's creation time onto whatever its first
-        // successful CreateSnapshot call reports, ready or not, and decodes an
-        // absent creation_time as the Unix epoch rather than leaving it
-        // unknown - see ReadCreationTimeAsync's own remarks. A fresh "now" is
-        // what keeps that first, pre-marker answer from becoming a permanent
-        // 1970 on the object, since nothing later ever gets a chance to
-        // correct it.
-        var harness = NewHarness();
-        WriteVolume("pvc-1", 4096);
-        using var release = new SemaphoreSlim(0);
-        harness.Copier.BeforeCopy = _ => release.WaitAsync();
-
-        var before = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
-        var after = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-
-        Assert.InRange(result.CreationTimeUnixSeconds, before, after);
-        Assert.False(result.ReadyToUse);
-
-        release.Release();
-        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
-    }
+    // Deleted: CreateAsync_BeforeTheCopyHasCreatedItsMarker_ReportsTheCurrentTimeAsCreationTime.
+    // Its scenario - CreateAsync answering before the copy has even created
+    // its marker - is no longer reachable through CreateAsync's own control
+    // flow. AwaitCheckpointAsync now blocks the fast job until the copy job
+    // it just enqueued (or attached to) is Running with a marker on disk, is
+    // Succeeded, or fails outright (Decision 8); it never returns success
+    // while nothing has been written yet. A copy that never gets that far
+    // within SnapshotCheckpointWaitTimeout now surfaces as an Aborted
+    // failure - see AwaitCheckpointAsync_WhenTheVmIsBusy_ThrowsAbortedAndNeverReturnsSuccess
+    // below - rather than a speculative "now" answer. The current-time
+    // fallback ReadCreationTimeAsync still has for a path that genuinely
+    // does not exist yet remains reachable (a CSV metadata read that
+    // transiently answers stale-false for a marker AwaitCheckpointAsync just
+    // confirmed exists), just not from a scenario this test could drive from
+    // an in-memory fake.
 
     // -------------------------------------------------------- the copy's job
 
@@ -368,12 +357,18 @@ public sealed class SnapshotServiceTests : IDisposable
     {
         // The other half of the GetOrCreate mapping: a terminal job is never
         // reused, so a copy that failed is retried from zero on the next call
-        // rather than being remembered as having been attempted.
+        // rather than being remembered as having been attempted. The first
+        // call itself now throws - Decision 8 has CreateAsync surface a
+        // failed copy's own error immediately rather than answering
+        // "not ready yet" over the top of it - so the retry is a second,
+        // separate call, not a poll of the first one's result.
         var harness = NewHarness();
         WriteVolume("pvc-1", 4096);
         harness.Copier.FailNextCopy = true;
 
-        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None));
+        Assert.Contains("the copy said no", failure.Message, StringComparison.Ordinal);
         await WaitForAsync(() => harness.Store.Created.Count == 1 && harness.Store.Created[0].Status == JobStatus.Failed);
 
         await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
@@ -388,16 +383,26 @@ public sealed class SnapshotServiceTests : IDisposable
         // Separate from MaxConcurrentDiskOperations on purpose: a copy holds its
         // slot for hours, so sharing a cap with creates would let a handful of
         // snapshots wedge every CreateVolume on the agent.
-        var harness = NewHarness(maxConcurrentSnapshotCopies: 2);
+        var harness = NewHarness(
+            maxConcurrentSnapshotCopies: 2,
+            snapshotCheckpointWaitTimeout: TimeSpan.FromSeconds(10),
+            snapshotCopySlotWaitTimeout: TimeSpan.FromSeconds(10));
         using var release = new SemaphoreSlim(0);
         harness.Copier.DuringCopy = _ => release.WaitAsync();
-        for (var i = 0; i < 5; i++)
+
+        // Started concurrently, not awaited one at a time: three of these
+        // five volumes' copies cannot get a slot until the first two release
+        // theirs below, and CreateAsync itself now waits out that same
+        // contention (Decision 6/8) rather than returning immediately - a
+        // sequential loop of awaited calls would block on the third one
+        // before this test ever got to call Release.
+        var creating = Enumerable.Range(0, 5).Select(i =>
         {
             // Distinct snapshot names, because one name across five volumes is
             // the collision the AlreadyExists precondition exists to refuse.
             WriteVolume($"pvc-{i}", 4096);
-            await harness.Service.CreateAsync($"pvc-{i}", $"snapshot-{i}", null, CancellationToken.None);
-        }
+            return harness.Service.CreateAsync($"pvc-{i}", $"snapshot-{i}", null, CancellationToken.None);
+        }).ToList();
 
         await WaitForAsync(() => harness.Copier.InFlightPeak >= 2);
         await Task.Delay(50);
@@ -406,6 +411,10 @@ public sealed class SnapshotServiceTests : IDisposable
         release.Release(5);
         await WaitForAsync(() => Enumerable.Range(0, 5).All(i => File.Exists(SnapshotPath($"pvc-{i}~snapshot-{i}"))));
         Assert.Equal(2, harness.Copier.InFlightPeak);
+
+        // None of the five ever answered with an error over the top of the
+        // slot contention: all five simply waited their turn.
+        await Task.WhenAll(creating);
     }
 
     // -------------------------------------------------------- preconditions
@@ -573,14 +582,20 @@ public sealed class SnapshotServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task CreateAsync_SiblingVolumeBehindAnotherSnapshotsCheckpoint_FailsRetryablyWithoutTouchingAnything()
+    public async Task CreateAsync_SiblingVolumeBehindAnOrphanedCheckpoint_FailsInsideTheCopyJobRatherThanAdoptingOrStackingOne()
     {
-        // Finding A: a checkpoint is VM-wide. pvc-1's own checkpoint - taken
-        // for a snapshot of pvc-1 that is still copying - re-points every
-        // disk on the VM, pvc-2 included, so pvc-2's own CreateSnapshot must
-        // not read that as a foreign checkpoint to be hand-deleted. It has to
-        // wait, not fail hard: pvc-1's checkpoint clears on its own once
-        // pvc-1's copy finishes.
+        // Issue #14's C1/C2 correction: hyperv-csi/pvc-1/snapA is standing,
+        // pre-seeded directly on the fake rather than taken through a
+        // still-running copy - modeling an orphan an earlier agent process
+        // left behind rather than a sibling's live work. pvc-2's own copy
+        // job holds vm:node-a for its entire run before it can even reach
+        // this classification, so no *other* copy job can be driving that
+        // checkpoint concurrently - which is what proves it an orphan rather
+        // than a sibling still in flight, and is why RunCopyAsync refuses
+        // rather than waiting: copying through it would silently backdate
+        // this snapshot to whenever pvc-1's checkpoint was actually taken,
+        // and taking a second checkpoint on top would leave the VM two
+        // chains deep besides.
         var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
         var host = new FakeHostClient();
         await host.CreateCheckpointAsync("host-1", "vm-1", "hyperv-csi/pvc-1/snapA", "{}", CancellationToken.None);
@@ -601,14 +616,15 @@ public sealed class SnapshotServiceTests : IDisposable
     [Fact]
     public async Task CreateAsync_AnotherSnapshotsCheckpointThatHappensToShareANamePrefix_IsNotAdoptedOrDestroyed()
     {
-        // Finding B: hyperv-csi/pvc-1/snap-2 is standing (snap-2's copy is
-        // still reading through it) when a request for "snap" - a
-        // *different* snapshot of the same volume, whose full element name
-        // is a string prefix of snap-2's - comes in. Prefix-matching the
-        // whole element name, as this driver used to, would treat snap-2's
-        // checkpoint as snap's own: snap would "resume" through it, and once
-        // snap's copy finished, destroy snap-2's checkpoint out from under
-        // snap-2's still-running copy.
+        // Finding B: hyperv-csi/pvc-1/snap-2 is standing (pre-seeded
+        // directly, modeling an orphan the way the test above does) when a
+        // request for "snap" - a *different* snapshot of the same volume,
+        // whose full element name is a string prefix of snap-2's - comes
+        // in. Prefix-matching the whole element name, as this driver used
+        // to, would treat snap-2's checkpoint as snap's own: snap would
+        // "resume" through it, and once snap's copy finished, destroy
+        // snap-2's checkpoint out from under whatever actually still needs
+        // it.
         var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
         var host = new FakeHostClient();
         await host.CreateCheckpointAsync("host-1", "vm-1", "hyperv-csi/pvc-1/snap-2", "{}", CancellationToken.None);
@@ -629,13 +645,15 @@ public sealed class SnapshotServiceTests : IDisposable
     [Fact]
     public async Task CreateAsync_AttachedVolumeWithNoRoomForTheCopy_FailsWithoutStrandingACheckpoint()
     {
-        // The bug this pins: taking the checkpoint before every precondition
-        // that can still refuse the snapshot has passed would strand it - no
-        // copy job gets started, and nothing but RunCopyAsync's own merge
-        // ever destroys one. A stranded checkpoint is VM-wide, so it would
-        // take every other disk on the VM down with it until an operator
-        // deleted it by hand. CreateCheckpointAsync must therefore never be
-        // called when ResourceExhausted is what ends up refusing this.
+        // The checkpoint is now taken only inside RunCopyAsync, immediately
+        // before the copy starts (Decision 5) - which this precondition
+        // fails long before any copy job is even enqueued. A checkpoint
+        // taken here and then abandoned to this refusal would strand it -
+        // nothing but RunCopyAsync's own merge ever destroys one, and being
+        // VM-wide, it would take every other disk on the VM down with it
+        // until an operator deleted it by hand. CreateCheckpointAsync must
+        // therefore never be called when ResourceExhausted is what ends up
+        // refusing this.
         var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
         var host = new FakeHostClient();
         var harness = NewHarness(cluster: cluster, host: host);
@@ -673,105 +691,357 @@ public sealed class SnapshotServiceTests : IDisposable
         await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
     }
 
-    [Fact]
-    public async Task DestroyOwnedCheckpointAsync_WhenTheMergeCannotEvenBeStarted_StillPublishesAndOrphansTheCheckpoint()
-    {
-        // Pins the fix to DestroyOwnedCheckpointAsync's dead exception filter.
-        //
-        // Both pvc-1 and pvc-2 already have their own owned checkpoint -
-        // each a resumed snapshot - pre-seeded directly on the fake rather
-        // than taken through CreateAsync: a checkpoint is VM-wide, and this
-        // driver now refuses to take a *second* one while a first still
-        // stands on the same VM (see VolumeAttachmentKind.BehindOtherSnapshotsCheckpoint),
-        // so two independently-owned checkpoints coexisting here models a
-        // state left behind by an agent that crashed and restarted between
-        // taking each one - not a state this driver's own logic would walk
-        // into on a live run. Either way, neither CreateAsync call below
-        // touches the VM's checkpoint slot at all: each finds its own exact
-        // checkpoint by ClassifyAttachment's exact match and resumes past
-        // it, so only the copy job each one starts - specifically the merge
-        // each starts once its copy has read everything - ever reaches
-        // DestroyOwnedCheckpointAsync.
-        //
-        // pvc-1's merge is deliberately held inside DestroyCheckpointAsync -
-        // which holds the VM's checkpoint slot the whole time, since
-        // DestroyOwnedCheckpointAsync releases it only once that call
-        // returns - for far longer than pvc-2's own SnapshotCopyTimeout.
-        // pvc-2's own merge attempt is therefore guaranteed to still be
-        // waiting for the same slot when its own cancellation fires,
-        // deterministically reaching the fix rather than racing for it.
-        //
-        // That must not throw pvc-2's job or discard the copy it already
-        // finished reading: it must still publish, with the checkpoint it
-        // never got to merge left standing rather than thrown away with it.
-        var cluster = new FakeClusterService
-        {
-            Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") },
-        };
-        var host = new FakeHostClient();
-        await host.CreateCheckpointAsync("host-1", "vm-1", "hyperv-csi/pvc-1/snapshot-a", "{}", CancellationToken.None);
-        await host.CreateCheckpointAsync("host-1", "vm-1", "hyperv-csi/pvc-2/snapshot-b", "{}", CancellationToken.None);
+    // ----------------------------------------------------- Unit D: the checkpoint moves into the copy job
 
-        var slotHeld = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var releaseSlot = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        host.DuringDestroy = checkpoint =>
+    [Fact]
+    public async Task CreateAsync_TwoVolumesOnOneVm_TakeCheckpointsOneAtATimeNeverConcurrently()
+    {
+        // The vm: job-store target is what makes this true now: two copy
+        // jobs on the same VM cannot run at once, so their checkpoint steps
+        // cannot overlap either - the property the removed per-VM semaphore
+        // used to provide on its own.
+        var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient();
+        var gate = new object();
+        var concurrentCheckpoints = 0;
+        var maxConcurrentCheckpoints = 0;
+        host.DuringCreate = () =>
         {
-            if (checkpoint.ElementName == "hyperv-csi/pvc-1/snapshot-a")
+            lock (gate)
             {
-                slotHeld.TrySetResult();
-                releaseSlot.Task.Wait(TimeSpan.FromSeconds(10));
+                concurrentCheckpoints++;
+                maxConcurrentCheckpoints = Math.Max(maxConcurrentCheckpoints, concurrentCheckpoints);
+            }
+
+            Thread.Sleep(50);
+
+            lock (gate)
+            {
+                concurrentCheckpoints--;
             }
         };
-
-        var harness = NewHarness(cluster: cluster, host: host, snapshotCopyTimeout: TimeSpan.FromMilliseconds(200));
+        var harness = NewHarness(cluster: cluster, host: host);
         WriteVolume("pvc-1", 4096);
         WriteVolume("pvc-2", 4096);
 
-        // pvc-1 resumes past its own checkpoint, and its copy job's eventual
-        // merge attempt is what takes - and, via the hook above, holds - the
-        // VM's slot.
-        var creatingPvc1 = Task.Run(
-            () => harness.Service.CreateAsync("pvc-1", "snapshot-a", "node-a", CancellationToken.None));
-        await slotHeld.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await Task.WhenAll(
+            harness.Service.CreateAsync("pvc-1", "snapshot-a", "node-a", CancellationToken.None),
+            harness.Service.CreateAsync("pvc-2", "snapshot-b", "node-a", CancellationToken.None));
+
+        await WaitForAsync(() =>
+            File.Exists(SnapshotPath("pvc-1~snapshot-a")) && File.Exists(SnapshotPath("pvc-2~snapshot-b")));
+
+        Assert.Equal(1, maxConcurrentCheckpoints);
+        Assert.Equal(2, host.CreatedCheckpointElementNames.Count);
+    }
+
+    [Fact]
+    public async Task CreateAsync_WhenTheVmIsBusy_ThrowsAbortedAfterTheCheckpointWaitAndNeverReturnsSuccess()
+    {
+        // The D9 regression test, and the one that matters most: if the
+        // wait ever returned success while the copy that would freeze the
+        // data was still stuck behind another volume's checkpoint on the
+        // same VM, external-snapshotter would lock in a creation_time
+        // nothing backs.
+        var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient();
+        var harness = NewHarness(
+            cluster: cluster, host: host, snapshotCheckpointWaitTimeout: TimeSpan.FromMilliseconds(300));
+        WriteVolume("pvc-1", 4096);
+        WriteVolume("pvc-2", 4096);
+        using var release = new SemaphoreSlim(0);
+        harness.Copier.DuringCopy = _ => release.WaitAsync();
+
+        // pvc-1's copy takes vm-1's checkpoint lock and holds it - via the
+        // blocked copier - for the whole test.
+        await harness.Service.CreateAsync("pvc-1", "snapshot-a", "node-a", CancellationToken.None);
+        await WaitForAsync(() => harness.Copier.Destinations.Count == 1);
 
         try
         {
-            // pvc-2 resumes past its own checkpoint too, so this never
-            // touches the slot itself - only the copy job it starts does,
-            // once it tries to merge.
-            var result = await harness.Service.CreateAsync("pvc-2", "snapshot-b", "node-a", CancellationToken.None);
-            Assert.Equal("pvc-2~snapshot-b", result.SnapshotId);
+            var failure = await Assert.ThrowsAsync<JobFailureException>(
+                () => harness.Service.CreateAsync("pvc-2", "snapshot-b", "node-a", CancellationToken.None));
 
-            await WaitForAsync(() => File.Exists(SnapshotPath("pvc-2~snapshot-b")));
-
-            // The checkpoint pvc-2's copy could not even start merging stays
-            // standing - it was never thrown away along with a failed job.
-            Assert.DoesNotContain("hyperv-csi/pvc-2/snapshot-b", host.DestroyedCheckpointElementNames);
+            Assert.Equal(AgentErrorCodes.Aborted, failure.ErrorCode);
+            Assert.False(File.Exists(SnapshotPath("pvc-2~snapshot-b")));
         }
         finally
         {
-            releaseSlot.TrySetResult();
-            await creatingPvc1;
+            release.Release(2);
         }
 
         await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-a")));
-        // pvc-1's own merge was only delayed, not abandoned: once the hook
-        // released it, its checkpoint went too.
-        await WaitForAsync(() => host.DestroyedCheckpointElementNames.Contains("hyperv-csi/pvc-1/snapshot-a"));
+    }
+
+    [Fact]
+    public async Task CreateAsync_AfterTheCheckpointWaitTimesOut_TheCopyJobIsStillQueuedAndTheNextCallReattaches()
+    {
+        var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient();
+        var harness = NewHarness(
+            cluster: cluster, host: host, snapshotCheckpointWaitTimeout: TimeSpan.FromMilliseconds(300));
+        WriteVolume("pvc-1", 4096);
+        WriteVolume("pvc-2", 4096);
+        using var release = new SemaphoreSlim(0);
+        harness.Copier.DuringCopy = _ => release.WaitAsync();
+
+        await harness.Service.CreateAsync("pvc-1", "snapshot-a", "node-a", CancellationToken.None);
+        await WaitForAsync(() => harness.Copier.Destinations.Count == 1);
+
+        await Assert.ThrowsAsync<JobFailureException>(
+            () => harness.Service.CreateAsync("pvc-2", "snapshot-b", "node-a", CancellationToken.None));
+
+        // The timeout above stopped waiting on the job; it did not abandon
+        // it. Exactly one copy job exists for pvc-2 so far.
+        Assert.Single(harness.Store.Created, job => job.IdempotencyKey == "pvc-2~snapshot-b");
+
+        // A second call for the identical snapshot, made while that job is
+        // still queued: GetOrCreate hands back the same Pending job rather
+        // than starting a duplicate copy of pvc-2.
+        var reattached = harness.Service.CreateAsync("pvc-2", "snapshot-b", "node-a", CancellationToken.None);
+
+        release.Release(2);
+        var result = await reattached;
+
+        Assert.True(result.ReadyToUse);
+        Assert.Single(harness.Store.Created, job => job.IdempotencyKey == "pvc-2~snapshot-b");
+    }
+
+    [Fact]
+    public async Task CreateAsync_ACopyThatFinishesInsideTheWait_ReturnsReadyOnTheFirstCallWithNoError()
+    {
+        var harness = NewHarness();
+        WriteVolume("pvc-1", 4096);
+
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", null, CancellationToken.None);
+
+        Assert.True(result.ReadyToUse);
+        Assert.True(File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+    }
+
+    [Fact]
+    public async Task CreateAsync_AStaleMarkerFromAnAbandonedCopy_DoesNotSatisfyTheCheckpointWait()
+    {
+        // The regression test for the Running conjunct in
+        // AwaitCheckpointAsync's predicate: a marker's mere existence is
+        // not enough, because it can be debris from an abandoned attempt
+        // sitting there for as long as the new copy is queued on vm: -
+        // which, blocked behind another volume's copy here, is for the
+        // whole span of this test.
+        var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient();
+        var harness = NewHarness(
+            cluster: cluster, host: host, snapshotCheckpointWaitTimeout: TimeSpan.FromMilliseconds(300));
+        WriteVolume("pvc-1", 4096);
+        WriteVolume("pvc-2", 4096);
+
+        // A stale marker for pvc-2's own snapshot, stamped with an old
+        // creation time - the shape an abandoned copy from a previous
+        // agent process leaves behind.
+        Directory.CreateDirectory(_snapshotsRoot);
+        var stalePath = MarkerPath("pvc-2~snapshot-b");
+        await File.WriteAllTextAsync(stalePath, "half of an abandoned attempt");
+        File.SetCreationTimeUtc(stalePath, DateTime.UtcNow.AddDays(-1));
+
+        using var release = new SemaphoreSlim(0);
+        harness.Copier.DuringCopy = _ => release.WaitAsync();
+
+        // pvc-1's copy takes vm-1's checkpoint lock and holds it for the
+        // whole test, so pvc-2's own copy job never even starts - it stays
+        // Pending, which is exactly the state the stale marker must not be
+        // mistaken for Running-and-fresh.
+        await harness.Service.CreateAsync("pvc-1", "snapshot-a", "node-a", CancellationToken.None);
+        await WaitForAsync(() => harness.Copier.Destinations.Count == 1);
+
+        try
+        {
+            var failure = await Assert.ThrowsAsync<JobFailureException>(
+                () => harness.Service.CreateAsync("pvc-2", "snapshot-b", "node-a", CancellationToken.None));
+
+            Assert.Equal(AgentErrorCodes.Aborted, failure.ErrorCode);
+        }
+        finally
+        {
+            release.Release(2);
+        }
+
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-a")));
+    }
+
+    [Fact]
+    public async Task CreateAsync_CopyReResolvesTheVmAtRunTimeRatherThanWhatWasTrueAtEnqueue()
+    {
+        // Issue #14's correction C4, applied at the checkpoint step rather
+        // than the merge step it was first raised against: a copy can sit
+        // queued on vm: for a long time, and the VM a node hint names can
+        // change in the meantime - live migrate, or here, simply not exist
+        // yet when the fast job ran. The checkpoint step re-resolves at the
+        // point it actually takes one, not from whatever InspectSourceAsync
+        // saw at enqueue.
+        var cluster = new FakeClusterService();
+        var host = new FakeHostClient();
+        var harness = NewHarness(cluster: cluster, host: host, snapshotCheckpointWaitTimeout: TimeSpan.FromSeconds(3));
+        WriteVolume("pvc-0", 4096);
+        WriteVolume("pvc-1", 4096);
+
+        // node-a is unresolvable at first, so pvc-0's own fast job treats it
+        // as unattached (a local read, no checkpoint) - but its copy job
+        // still takes vm:node-a as a target, since that target is built
+        // from the node hint, not the classification.
+        using var release = new SemaphoreSlim(0);
+        harness.Copier.DuringCopy = _ => release.WaitAsync();
+        await harness.Service.CreateAsync("pvc-0", "snapshot-0", "node-a", CancellationToken.None);
+        await WaitForAsync(() => harness.Copier.Destinations.Count == 1);
+
+        // pvc-1's own copy queues behind pvc-0's on vm:node-a, still with
+        // node-a unresolvable.
+        var creatingPvc1 = harness.Service.CreateAsync("pvc-1", "snapshot-1", "node-a", CancellationToken.None);
+        await WaitForAsync(() => harness.Store.Created.Count == 2);
+
+        // node-a resolves to a real VM only now, after both jobs already
+        // enqueued.
+        cluster.Vms["node-a"] = new ClusteredVm("vm-1", "host-1");
+
+        release.Release(2);
+        var result = await creatingPvc1;
+        Assert.True(result.ReadyToUse);
+
+        // The checkpoint was taken - only possible if pvc-1's copy job
+        // re-resolved node-a at the point it actually ran, long after
+        // InspectSourceAsync's own answer of "unattached".
+        Assert.Contains("hyperv-csi/pvc-1/snapshot-1", host.CreatedCheckpointElementNames);
+    }
+
+    [Fact]
+    public async Task CreateAsync_AttachedVolume_DoesNotPublishUntilTheChainReportsCollapsed()
+    {
+        var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient { ChainStaysUncollapsed = true };
+        var harness = NewHarness(cluster: cluster, host: host, checkpointMergeTimeout: TimeSpan.FromSeconds(2));
+        WriteVolume("pvc-1", 4096);
+
+        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", "node-a", CancellationToken.None);
+
+        // The checkpoint's destroy call went through, but the chain never
+        // reports collapsed - a merge stuck exactly at this point must not
+        // let the publish through yet.
+        await WaitForAsync(() => host.DestroyedCheckpointElementNames.Contains("hyperv-csi/pvc-1/snapshot-abc"));
+        await Task.Delay(100);
+        Assert.False(File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+    }
+
+    [Fact]
+    public async Task CreateAsync_SourceDetachedBetweenEnqueueAndRun_CopiesWithNoCheckpoint()
+    {
+        // Modeled here by the VM never resolving at all by the time
+        // RunCopyAsync's own re-resolve runs - the same "vm is null" branch
+        // a genuine detach, or a cluster hiccup, would produce.
+        var cluster = new FakeClusterService();
+        var host = new FakeHostClient();
+        var harness = NewHarness(cluster: cluster, host: host);
+        WriteVolume("pvc-1", 4096);
+
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", "node-a", CancellationToken.None);
+
+        Assert.Equal("pvc-1~snapshot-abc", result.SnapshotId);
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+        Assert.Empty(host.CreatedCheckpointElementNames);
+    }
+
+    [Fact]
+    public async Task RunCopyAsync_WhenNoSlotIsAvailable_FailsAbortedAndReleasesItsTargetsForAnUnrelatedJobOnTheSameVm()
+    {
+        var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient();
+        var harness = NewHarness(
+            maxConcurrentSnapshotCopies: 1,
+            cluster: cluster,
+            host: host,
+            snapshotCheckpointWaitTimeout: TimeSpan.FromSeconds(2),
+            snapshotCopySlotWaitTimeout: TimeSpan.FromMilliseconds(300));
+        WriteVolume("pvc-1", 4096);
+        WriteVolume("pvc-2", 4096);
+
+        using var release = new SemaphoreSlim(0);
+        harness.Copier.DuringCopy = _ => release.WaitAsync();
+
+        // pvc-1 takes the one available copy slot and holds it. No node
+        // hint, so it never touches vm:node-a at all.
+        await harness.Service.CreateAsync("pvc-1", "snapshot-a", null, CancellationToken.None);
+        await WaitForAsync(() => harness.Copier.Destinations.Count == 1);
+
+        // pvc-2's own copy job gets its vm: and volume: targets
+        // immediately - nothing else holds vm:node-a - but cannot get a
+        // slot within SnapshotCopySlotWaitTimeout: it fails outright rather
+        // than holding vm:node-a hostage to pvc-1's unrelated I/O.
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => harness.Service.CreateAsync("pvc-2", "snapshot-b", "node-a", CancellationToken.None));
+        Assert.Equal(AgentErrorCodes.Aborted, failure.ErrorCode);
+        Assert.Contains("copy slots", failure.Message, StringComparison.Ordinal);
+
+        // Failing released both of pvc-2's targets - an unrelated job on
+        // the same vm:node-a target (an attach, say) is free to run
+        // immediately rather than queueing behind a copy that no longer
+        // holds anything.
+        var unrelatedRan = false;
+        harness.Store.GetOrCreate(
+            "unrelated", "Attach", [JobTargets.Vm("node-a")], (_, _) =>
+            {
+                unrelatedRan = true;
+                return Task.CompletedTask;
+            });
+        await WaitForAsync(() => unrelatedRan);
+
+        release.Release();
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-a")));
+    }
+
+    // Replaced: DestroyOwnedCheckpointAsync_WhenTheMergeCannotEvenBeStarted_StillPublishesAndOrphansTheCheckpoint.
+    // Its premise was two copy jobs on the *same* VM contending for the old
+    // per-VM checkpoint semaphore while running concurrently. That semaphore
+    // is gone: the vm: job-store target now serializes the two jobs
+    // entirely, so pvc-2's copy cannot even start until pvc-1's whole job -
+    // merge-collapse wait included - has finished, and the race this test
+    // drove no longer exists to pin. The behaviour it cared about (a merge
+    // that cannot complete still publishes rather than failing the job) is
+    // covered below by a single VM whose chain never reports collapsed.
+    [Fact]
+    public async Task CreateAsync_AttachedVolumeWhoseMergeNeverFinishesCollapsing_StillPublishesAndOrphansTheCheckpoint()
+    {
+        // DestroyCheckpointAsync is fire-and-forget and returns once the
+        // merge has *started*, not once the AVHDX has actually finished
+        // collapsing - ChainStaysUncollapsed models a merge that never
+        // finishes within CheckpointMergeTimeout. The copy already read
+        // everything it needs by this point, so this must not fail the job:
+        // it publishes anyway and leaves the checkpoint for an operator.
+        var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient { ChainStaysUncollapsed = true };
+        var harness = NewHarness(cluster: cluster, host: host, checkpointMergeTimeout: TimeSpan.FromMilliseconds(200));
+        WriteVolume("pvc-1", 4096);
+
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", "node-a", CancellationToken.None);
+        Assert.Equal("pvc-1~snapshot-abc", result.SnapshotId);
+
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+
+        // The merge did start (DestroyCheckpointAsync ran and removed the
+        // checkpoint from the fake's own registry) - it is the collapse the
+        // fake refuses to ever report that timed out, not the destroy call
+        // itself.
+        Assert.Contains("hyperv-csi/pvc-1/snapshot-abc", host.DestroyedCheckpointElementNames);
     }
 
     [Fact]
     public async Task CreateAsync_WhenTheCheckpointHasAlreadyMergedBeforeTheCopyReachesItsDestroyStep_DoesNotTryAgain()
     {
-        // Pins the fix to RunCopyAsync's closure. It used to carry the actual
-        // Checkpoint captured when the job started and would merge *that*
-        // object unconditionally once the copy finished, even if the
-        // checkpoint it names had, by then, already gone - the case that
-        // makes the discarded-delegate window (see this file's remarks on
-        // EnsureCheckpointedCopyUnderway) land a checkpoint nothing revisits.
-        // Re-deriving via FindOwnedCheckpointAsync instead means a checkpoint
-        // already gone by the time this job's own destroy step runs answers
-        // null, not a redundant DestroyCheckpointAsync call.
+        // Pins DestroyOwnedCheckpointIfAnyAsync's re-derivation: it looks up
+        // whatever currently stands under this snapshot's element name
+        // rather than merging a Checkpoint remembered from when the job's
+        // own checkpoint step ran, so a checkpoint already gone by the time
+        // the destroy step runs - here, merged out from under this job by a
+        // direct call the test makes to simulate some other path having
+        // already done it - answers null, not a redundant DestroyCheckpointAsync
+        // call.
         var cluster = new FakeClusterService { Vms = { ["node-a"] = new ClusteredVm("vm-1", "host-1") } };
         var host = new FakeHostClient();
         var seeded = await host.CreateCheckpointAsync(
@@ -1157,7 +1427,12 @@ public sealed class SnapshotServiceTests : IDisposable
         await harness.Service.CreateAsync("pvc-1", "snapshot-a", null, CancellationToken.None);
         await WaitForAsync(() => harness.Copier.Destinations.Count == 1);
 
-        await harness.Service.CreateAsync("pvc-1", "snapshot-b", null, CancellationToken.None);
+        // Not awaited directly: snapshot-b's own copy job queues behind
+        // snapshot-a's on volume:pvc-1 and does not even start until
+        // snapshot-a's is released below, so CreateAsync's own
+        // AwaitCheckpointAsync wait would otherwise block this test on the
+        // very call it needs to keep going past.
+        var creatingSnapshotB = harness.Service.CreateAsync("pvc-1", "snapshot-b", null, CancellationToken.None);
         await WaitForAsync(() => harness.Store.Created.Count == 2);
         // Confirms snapshot-b's copy really is still queued, not running,
         // at the moment the delete below fires - the shape the leak needs.
@@ -1170,6 +1445,11 @@ public sealed class SnapshotServiceTests : IDisposable
         release.Release(2);
         await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-a")));
         await WaitForAsync(() => harness.Store.Created[1].Status is JobStatus.Succeeded or JobStatus.Failed);
+
+        // Abandoning cleanly on the tombstone is success, not a failure -
+        // CreateAsync's own wait must not report an error over the top of it.
+        var snapshotBResult = await creatingSnapshotB;
+        Assert.False(snapshotBResult.ReadyToUse);
 
         Assert.False(File.Exists(SnapshotPath("pvc-1~snapshot-b")));
         Assert.False(File.Exists(MarkerPath("pvc-1~snapshot-b")));
@@ -1530,7 +1810,10 @@ public sealed class SnapshotServiceTests : IDisposable
         int maxConcurrentSnapshotCopies = 4,
         TimeSpan? snapshotCopyTimeout = null,
         IClusterService? cluster = null,
-        IHyperVHostClient? host = null)
+        IHyperVHostClient? host = null,
+        TimeSpan? snapshotCheckpointWaitTimeout = null,
+        TimeSpan? snapshotCopySlotWaitTimeout = null,
+        TimeSpan? checkpointMergeTimeout = null)
     {
         var disks = new FakeVirtualDiskManager();
         var copier = new FakeDiskCopier();
@@ -1556,6 +1839,15 @@ public sealed class SnapshotServiceTests : IDisposable
                 DiskOperationTimeout = TimeSpan.FromMinutes(10),
                 MaxConcurrentSnapshotCopies = maxConcurrentSnapshotCopies,
                 SnapshotCopyTimeout = snapshotCopyTimeout ?? TimeSpan.FromHours(6),
+                // Real defaults are 20s/15s/1h - far too slow for a test
+                // suite that deliberately drives some of these waits to
+                // their end. A two-second default here is long enough that
+                // nothing in-memory ever trips it by accident, and a test
+                // that wants to see one of these waits actually expire
+                // overrides it to something shorter still.
+                SnapshotCheckpointWaitTimeout = snapshotCheckpointWaitTimeout ?? TimeSpan.FromSeconds(2),
+                SnapshotCopySlotWaitTimeout = snapshotCopySlotWaitTimeout ?? TimeSpan.FromSeconds(2),
+                CheckpointMergeTimeout = checkpointMergeTimeout ?? TimeSpan.FromSeconds(2),
             }),
             NullLogger<SnapshotService>.Instance);
 
@@ -1900,7 +2192,7 @@ public sealed class SnapshotServiceTests : IDisposable
         /// </summary>
         public Action<Checkpoint>? DuringDestroy { get; set; }
 
-        /// <summary>Runs synchronously inside CreateCheckpointAsync, before it records the call - the VM's checkpoint slot is held for as long as this blocks, since CreateOwnedCheckpointAsync releases it only after this call returns.</summary>
+        /// <summary>Runs synchronously inside CreateCheckpointAsync, before it records the call - the copy job's vm: job-store target is held for as long as this blocks, since nothing releases that target until RunCopyAsync's whole delegate returns.</summary>
         public Action? DuringCreate { get; set; }
 
         public List<string> CreatedCheckpointElementNames { get; } = [];

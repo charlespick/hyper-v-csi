@@ -110,6 +110,12 @@ controller:
   # would fight whichever driver got there first. Without them the sidecar
   # starts and finds nothing to watch, and the VolumeSnapshotClass this chart
   # renders fails to apply for want of its CRD.
+  #
+  # A snapshot freezes the whole VM its source volume is attached to for the
+  # duration of the copy behind it — see README.md's "Snapshot storage
+  # requirements". Use ReFS for the CSV, or expect CreateSnapshot to spend a
+  # long time returning ABORTED for every volume on a node queued behind
+  # another volume's copy.
   snapshotter:
     enabled: false
 
@@ -125,6 +131,12 @@ controller:
     # resizer: a Hyper-V checkpoint is a metadata operation whose cost does not
     # scale with the size of the disk, so it has no reason to need the longer
     # budget an expansion does.
+    #
+    # Tuned as a pair with the agent's SnapshotCheckpointWaitTimeout, which is
+    # kept deliberately shorter than this so a caller waiting on a busy VM
+    # gets the agent's own explanation rather than a generic sidecar timeout.
+    # Neither side can discover the other's value — change one, check the
+    # other.
     timeout: 30s
     extraArgs: []
 

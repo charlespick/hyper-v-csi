@@ -1,4 +1,4 @@
-using HyperVCsiAgent.Core.Storage;
+﻿using HyperVCsiAgent.Core.Storage;
 
 namespace HyperVCsiAgent.Core.Jobs;
 
@@ -48,7 +48,16 @@ public static class JobTargets
     /// a consistent, harmless key of its own and fails where the failure is
     /// legible.
     /// </remarks>
-    public static string Vm(string nodeId) => "vm:" + Canonical(nodeId);
+    public static string Vm(string nodeId) => VmPrefix + Canonical(nodeId);
+
+    /// <summary>
+    /// What every <see cref="Vm"/> target starts with. Exposed for the one
+    /// caller that has to recognize a VM target without knowing which VM -
+    /// the D10 assertion decorator, for a call that names no VM of its own -
+    /// rather than letting it write the literal out a second time, which is
+    /// the duplication this whole class exists to remove.
+    /// </summary>
+    public const string VmPrefix = "vm:";
 
     /// <summary>
     /// A VM ID in the one spelling this agent serializes on. Public because the

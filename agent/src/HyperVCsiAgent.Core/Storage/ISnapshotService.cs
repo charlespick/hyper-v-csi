@@ -1,3 +1,5 @@
+using HyperVCsiAgent.Core.Jobs;
+
 namespace HyperVCsiAgent.Core.Storage;
 
 /// <summary>
@@ -90,4 +92,21 @@ public interface ISnapshotService
     /// </exception>
     Task<ListSnapshotsResult> ListAsync(
         string? snapshotId, string? sourceVolumeId, string? startingToken, int maxEntries, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Re-enqueues a snapshot's own copy job under exactly the identity a
+    /// fresh <see cref="CreateAsync"/> would compute, so it resumes through
+    /// the checkpoint already standing rather than losing the point-in-time
+    /// that checkpoint captured. <c>Storage.OrphanedCheckpointReaper</c>'s one
+    /// caller - see its own remarks for the crash this repairs.
+    /// </summary>
+    Job ResumeCopy(string sourceVolumeId, string snapshotName, string nodeId);
+
+    /// <summary>
+    /// Merges a checkpoint left behind by a copy that already published, and
+    /// waits for the chain it stacked to finish collapsing.
+    /// <c>Storage.OrphanedCheckpointReaper</c>'s other caller - see its own
+    /// remarks for why a published snapshot means reap rather than resume.
+    /// </summary>
+    Job ReapOrphan(string sourceVolumeId, string snapshotName, string nodeId);
 }

@@ -7,8 +7,18 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Only for BackgroundService (OrphanedCheckpointReaper): the rest of
+         this project has no reason to depend on the generic host. -->
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.10" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.10" />
     <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.10" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Lets the D10 guard rail's own tests drive JobExecutionContext.Enter
+         directly (see its own remarks for why that stays internal rather
+         than public) instead of only through a real job store. -->
+    <InternalsVisibleTo Include="HyperVCsiAgent.Core.Tests" />
   </ItemGroup>
 
 </Project>

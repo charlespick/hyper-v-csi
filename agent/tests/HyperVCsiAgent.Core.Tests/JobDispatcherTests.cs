@@ -92,6 +92,79 @@ public class JobDispatcherTests
     }
 
     [Fact]
+    public void Resolve_ExpandVolume_WithANodeHint_AlsoResolvesTheVm()
+    {
+        // Issue #14's D10 / §1.7: VhdxService.ExpandAsync falls through to
+        // ExpandAttachedAsync - which resolves the VM and issues calls
+        // against it - on a sharing violation, so an expand with a node hint
+        // has to hold that VM's target for exactly the same reason attach and
+        // detach do. volume: comes first because that is the target every
+        // expand holds regardless of the hint; vm: is the one this slice adds.
+        var resolved = new JobDispatcher(
+            new RecordingVhdxService(), new RecordingAttachService(), new RecordingSnapshotService()).Resolve(
+            JobDispatcher.ExpandVolume,
+            Payload("""{"volumeId":"pvc-1","sizeBytes":4096,"nodeId":"{4B2C1F0E-1111-2222-3333-444455556666}"}"""),
+            WireOptions);
+
+        // Canonical spelling - braces stripped, lowercased - the same one
+        // AttachVolume and DetachVolume derive for the identical node, so a
+        // stale hint over-serializes against a real FIFO queue rather than
+        // one no other operation ever enqueues against.
+        Assert.Equal(["volume:pvc-1", "vm:4b2c1f0e-1111-2222-3333-444455556666"], resolved.Targets);
+    }
+
+    [Fact]
+    public void Resolve_ExpandVolume_WithNoNodeHint_ResolvesOnlyTheVolume()
+    {
+        // The other half of the same pin: no hint means nothing was ever
+        // attached as far as the controller could tell, so ExpandAsync never
+        // reaches ExpandAttachedAsync and there is no VM to hold.
+        var resolved = new JobDispatcher(
+            new RecordingVhdxService(), new RecordingAttachService(), new RecordingSnapshotService()).Resolve(
+            JobDispatcher.ExpandVolume, Payload("""{"volumeId":"pvc-1","sizeBytes":4096}"""), WireOptions);
+
+        Assert.Equal(["volume:pvc-1"], resolved.Targets);
+    }
+
+    [Fact]
+    public async Task Resolve_ExpandVolumeWithNodeHint_AndAttachVolume_ShareTheVmQueue()
+    {
+        // The property that makes the second target real serialization
+        // rather than a label nobody checks: an attached-volume expand's vm:
+        // target has to be the identical FIFO queue AttachVolume enqueues
+        // against for the same node, so the two actually block each other.
+        var dispatcher = new JobDispatcher(
+            new RecordingVhdxService(), new RecordingAttachService(), new RecordingSnapshotService());
+        using var store = new InMemoryJobStore();
+        var release = new TaskCompletionSource();
+
+        var expandResolved = dispatcher.Resolve(
+            JobDispatcher.ExpandVolume,
+            Payload("""{"volumeId":"pvc-1","sizeBytes":4096,"nodeId":"node-a"}"""),
+            WireOptions);
+        var expandJob = store.GetOrCreate("pvc-1", JobDispatcher.ExpandVolume, expandResolved.Targets,
+            async (job, ct) =>
+            {
+                await release.Task;
+                await expandResolved.Run(job, ct);
+            });
+
+        await WaitForStatus(expandJob, JobStatus.Running);
+
+        var attachResolved = dispatcher.Resolve(
+            JobDispatcher.AttachVolume, Payload("""{"volumeId":"pvc-2","nodeId":"node-a"}"""), WireOptions);
+        var attachJob = store.GetOrCreate("pvc-2+node-a", JobDispatcher.AttachVolume, attachResolved.Targets,
+            (job, ct) => attachResolved.Run(job, ct));
+
+        await Task.Delay(50);
+        Assert.Equal(JobStatus.Pending, attachJob.Status);
+
+        release.SetResult();
+        await WaitForTerminal(attachJob);
+        Assert.Equal(JobStatus.Succeeded, attachJob.Status);
+    }
+
+    [Fact]
     public async Task Resolve_VolumeExists_RunsTheLookupAndPublishesNoResult()
     {
         var vhdx = new RecordingVhdxService();
@@ -343,6 +416,34 @@ public class JobDispatcherTests
         Assert.Equal(["snapshot:pvc-1~not/a/name"], resolved.Targets);
     }
 
+    private static async Task WaitForStatus(Job job, JobStatus status)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(2);
+        while (job.Status != status)
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                throw new TimeoutException($"job never reached {status}, stuck at {job.Status}");
+            }
+
+            await Task.Delay(10);
+        }
+    }
+
+    private static async Task WaitForTerminal(Job job)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(2);
+        while (job.Status is JobStatus.Pending or JobStatus.Running)
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                throw new TimeoutException($"job never reached a terminal state, stuck at {job.Status}");
+            }
+
+            await Task.Delay(10);
+        }
+    }
+
     private static JsonElement Payload(string json) => JsonDocument.Parse(json).RootElement;
 
     private static Job NewJob() => new()
@@ -437,5 +538,14 @@ public class JobDispatcherTests
             LastList = (snapshotId, sourceVolumeId, startingToken, maxEntries);
             return Task.FromResult(new ListSnapshotsResult([], string.Empty));
         }
+
+        // Neither is reachable through JobDispatcher.Resolve - both are
+        // OrphanedCheckpointReaper's own entry points, never something a
+        // POST /v1/jobs payload can name - so nothing here exercises them.
+        public Job ResumeCopy(string sourceVolumeId, string snapshotName, string nodeId) =>
+            throw new NotSupportedException("JobDispatcher never resolves an operation onto ResumeCopy");
+
+        public Job ReapOrphan(string sourceVolumeId, string snapshotName, string nodeId) =>
+            throw new NotSupportedException("JobDispatcher never resolves an operation onto ReapOrphan");
     }
 }

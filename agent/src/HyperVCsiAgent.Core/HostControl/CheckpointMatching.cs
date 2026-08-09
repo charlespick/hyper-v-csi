@@ -49,10 +49,12 @@ public static class CheckpointMatching
     /// <exception cref="InvalidOperationException">
     /// More than one checkpoint carries this exact name. <paramref name="elementName"/>
     /// is unique per (volume, snapshot) pair by construction, and this
-    /// driver's own checkpoint calls are serialized per VM, so two checkpoints
-    /// with the identical exact name should be impossible - refused rather
-    /// than guessed past, the same as every other "this should not happen"
-    /// state <c>CimHyperVHostClient</c> checks for.
+    /// driver's own checkpoint calls are serialized per VM by the
+    /// <c>vm:</c> job-store target every copy job holds for its entire
+    /// take-to-destroy lifetime (<c>SnapshotService.RunCopyAsync</c>), so two
+    /// checkpoints with the identical exact name should be impossible -
+    /// refused rather than guessed past, the same as every other "this
+    /// should not happen" state <c>CimHyperVHostClient</c> checks for.
     /// </exception>
     public static Checkpoint? FindExact(IEnumerable<Checkpoint> checkpoints, string elementName)
     {

@@ -32,14 +32,18 @@ public enum VolumeAttachmentKind
     /// included, at a fresh differencing disk - which is what puts this VHDX
     /// behind a chain it never asked to be part of.
     /// <para>
-    /// Retryable, not a failure for an operator to act on: the checkpoint in
-    /// the way belongs to that other attempt's copy job, and clears on its
-    /// own - via that job's own eventual <c>DestroyCheckpointAsync</c> call -
-    /// once its copy finishes reading everything it needs. Reporting this any
-    /// other way would tell an operator to go delete a checkpoint this driver
-    /// still needs, which is exactly the outcome the genuinely-foreign message
-    /// exists to describe when it is true and must not describe when it is
-    /// not.
+    /// What this means depends on who is asking. The fast CreateSnapshot job
+    /// holds no <c>vm:</c> target when it observes this, so a sibling
+    /// volume's copy can genuinely still be running - retryable, not a
+    /// failure for an operator to act on, since that checkpoint clears on its
+    /// own once the other copy finishes and merges it. A copy job that
+    /// observes this, though, already holds <c>vm:</c> for its entire run -
+    /// which no other copy job can be doing at the same time - so for that
+    /// caller this classification proves the checkpoint in the way is an
+    /// orphan nothing is driving anymore, not a sibling's live work. See
+    /// <c>SnapshotService.RunCopyAsync</c>'s own remarks on this
+    /// classification for why that makes it a hard refusal there, even
+    /// though <c>InspectSourceAsync</c>'s use of it just below is not.
     /// </para>
     /// <para>
     /// Recorded but deliberately not built here: in principle this snapshot's

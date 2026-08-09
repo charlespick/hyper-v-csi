@@ -138,6 +138,36 @@ public class AgentOptionsValidationTests
     }
 
     [Fact]
+    public void Validate_NonPositiveSnapshotCheckpointWaitTimeout_IsRejected()
+    {
+        var options = NewOptions();
+        options.SnapshotCheckpointWaitTimeout = TimeSpan.Zero;
+
+        var failure = Assert.Throws<InvalidOperationException>(options.Validate);
+        Assert.Contains(nameof(AgentOptions.SnapshotCheckpointWaitTimeout), failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_NonPositiveSnapshotCopySlotWaitTimeout_IsRejected()
+    {
+        var options = NewOptions();
+        options.SnapshotCopySlotWaitTimeout = TimeSpan.Zero;
+
+        var failure = Assert.Throws<InvalidOperationException>(options.Validate);
+        Assert.Contains(nameof(AgentOptions.SnapshotCopySlotWaitTimeout), failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_NonPositiveCheckpointMergeTimeout_IsRejected()
+    {
+        var options = NewOptions();
+        options.CheckpointMergeTimeout = TimeSpan.Zero;
+
+        var failure = Assert.Throws<InvalidOperationException>(options.Validate);
+        Assert.Contains(nameof(AgentOptions.CheckpointMergeTimeout), failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Validate_SnapshotCopyTimeout_IsNotTheDiskOperationTimeout()
     {
         // A copy is bulk I/O over a CSV, not a management call. Defaulting the

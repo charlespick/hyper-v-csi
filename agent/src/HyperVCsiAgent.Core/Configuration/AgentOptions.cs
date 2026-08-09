@@ -54,7 +54,14 @@ public sealed class AgentOptions
 
     /// <summary>
     /// Cap on snapshot copies running at once, deliberately separate from
-    /// <see cref="MaxConcurrentDiskOperations"/>.
+    /// <see cref="MaxConcurrentDiskOperations"/> - and, as of issue #14's
+    /// Decision 6, a snapshot *admission* limit as much as an I/O bound.
+    /// Exceeding it no longer means a copy merely queues behind the ones
+    /// ahead of it: a copy that cannot get a slot within
+    /// <see cref="SnapshotCopySlotWaitTimeout"/> fails outright and
+    /// releases its targets, so CreateSnapshot answers with a retryable
+    /// failure instead of leaving the caller (and the VM it holds) parked
+    /// behind an unrelated volume's copy.
     /// </summary>
     /// <remarks>
     /// A copy holds its slot for hours where a create holds one for seconds, so
@@ -63,9 +70,77 @@ public sealed class AgentOptions
     /// actually runs into is the CSV's throughput, not the agent's: two copies
     /// of a multi-hundred-gigabyte disk running at once finish at very nearly
     /// the same time as two run in sequence, while doing considerably more to
-    /// the latency of every VM on that volume.
+    /// the latency of every VM on that volume. Raising it now trades that same
+    /// CSV throughput for a shorter retry loop under contention - an operator's
+    /// call to make with real numbers in hand, not a default to guess at.
     /// </remarks>
     public int MaxConcurrentSnapshotCopies { get; set; } = 2;
+
+    /// <summary>
+    /// How long CreateSnapshot waits for this snapshot's copy to reach the
+    /// head of its VM's queue and take a checkpoint, before giving up and
+    /// telling the caller to retry.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately shorter than the controller's own polling budget
+    /// (<c>jobPollBudget</c>, 24s effective, in
+    /// csi-driver/internal/driver/jobs.go) so a caller waiting on a busy VM
+    /// gets this method's own explanation - which names the VM contention and
+    /// points at the ReFS guidance - rather than the generic "job still
+    /// Pending" the controller's own poll would otherwise time out with
+    /// first. Raising this past that budget buys nothing: the controller
+    /// gives up and reports its own generic timeout before this one would
+    /// ever fire.
+    /// <para>
+    /// Not a knob for tolerating slow copies. A wait that expires routinely
+    /// means snapshots on that VM are contending for the one checkpoint a VM
+    /// can carry at a time, and the fix is ReFS block cloning - see the
+    /// README - not a larger number here.
+    /// </para>
+    /// <para>
+    /// Tuned as a pair with <c>controller.snapshotter.timeout</c> in
+    /// values.yaml, and neither side can discover the other's value: change
+    /// one, check the other.
+    /// </para>
+    /// </remarks>
+    public TimeSpan SnapshotCheckpointWaitTimeout { get; set; } = TimeSpan.FromSeconds(20);
+
+    /// <summary>
+    /// How long a copy that has already been granted its VM and volume
+    /// targets waits for one of the <see cref="MaxConcurrentSnapshotCopies"/>
+    /// slots before giving up.
+    /// </summary>
+    /// <remarks>
+    /// Issue #14's Decision 6. Blocking on the slot while still holding
+    /// <c>vm:</c> would hold an entire VM hostage to an *unrelated* VM's I/O
+    /// budget - defect D3's symptom, caused by this driver's own bounding
+    /// rather than by Hyper-V, which is the worst version of that failure to
+    /// ship. Failing instead releases both targets, so attach, detach and
+    /// expand on that VM proceed while this snapshot waits its turn, and the
+    /// snapshot's own retry re-enqueues from the back of the copy queue
+    /// rather than holding the place it already had.
+    /// </remarks>
+    public TimeSpan SnapshotCopySlotWaitTimeout { get; set; } = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// How long a copy waits for its checkpoint's merge to finish collapsing
+    /// before giving up and reporting an orphan.
+    /// </summary>
+    /// <remarks>
+    /// Separate from <see cref="SnapshotCopyTimeout"/> rather than carved out
+    /// of it: a copy that had already spent its entire budget reading the
+    /// disk would leave nothing left over for the merge, and the two have
+    /// different causes and different fixes when they expire - a copy that
+    /// times out means the CSV or the source disk is too slow, a merge that
+    /// times out means the guest wrote a great deal through the checkpoint
+    /// while it stood. The merge's own cost scales with how much the guest
+    /// wrote while the checkpoint stood, not with the disk's size, which is
+    /// why it gets a budget of its own rather than sharing one sized for bulk
+    /// I/O.
+    /// </remarks>
+    // pending Phase 0 item V5: this default is provisional and unmeasured
+    // against a real host's merge times.
+    public TimeSpan CheckpointMergeTimeout { get; set; } = TimeSpan.FromHours(1);
 
     /// <summary>
     /// How long a single snapshot copy may run before it is abandoned and
@@ -96,6 +171,23 @@ public sealed class AgentOptions
     /// and one that hasn't answered in this long is stuck rather than slow.
     /// </summary>
     public TimeSpan HostOperationTimeout { get; set; } = TimeSpan.FromMinutes(2);
+
+    /// <summary>
+    /// How often <see cref="Storage.OrphanedCheckpointReaper"/> re-sweeps every
+    /// cluster host for a checkpoint this driver took that no live job is
+    /// resuming or reaping, beyond the one pass it always runs at startup.
+    /// </summary>
+    /// <remarks>
+    /// The startup pass alone would miss two cases the interval pass exists
+    /// for: a copy whose merge exceeded <see cref="CheckpointMergeTimeout"/>
+    /// already published and exited cleanly, with no restart involved to
+    /// trigger a fresh startup sweep, and a host that was still rebooting -
+    /// and so skipped as not live - during that one startup pass. Fifteen
+    /// minutes is short enough that either case does not sit unmerged for
+    /// long, and long enough that a sweep is not running continuously against
+    /// every host in the cluster.
+    /// </remarks>
+    public TimeSpan OrphanedCheckpointSweepInterval { get; set; } = TimeSpan.FromMinutes(15);
 
     public TlsOptions Tls { get; set; } = new();
 
@@ -136,6 +228,24 @@ public sealed class AgentOptions
                 $"{SectionName}:{nameof(SnapshotCopyTimeout)} must be positive");
         }
 
+        if (SnapshotCheckpointWaitTimeout <= TimeSpan.Zero)
+        {
+            throw new InvalidOperationException(
+                $"{SectionName}:{nameof(SnapshotCheckpointWaitTimeout)} must be positive");
+        }
+
+        if (SnapshotCopySlotWaitTimeout <= TimeSpan.Zero)
+        {
+            throw new InvalidOperationException(
+                $"{SectionName}:{nameof(SnapshotCopySlotWaitTimeout)} must be positive");
+        }
+
+        if (CheckpointMergeTimeout <= TimeSpan.Zero)
+        {
+            throw new InvalidOperationException(
+                $"{SectionName}:{nameof(CheckpointMergeTimeout)} must be positive");
+        }
+
         if (DiskOperationTimeout <= TimeSpan.Zero)
         {
             throw new InvalidOperationException(
@@ -152,6 +262,12 @@ public sealed class AgentOptions
         {
             throw new InvalidOperationException(
                 $"{SectionName}:{nameof(HostOperationTimeout)} must be positive");
+        }
+
+        if (OrphanedCheckpointSweepInterval <= TimeSpan.Zero)
+        {
+            throw new InvalidOperationException(
+                $"{SectionName}:{nameof(OrphanedCheckpointSweepInterval)} must be positive");
         }
     }
 }

@@ -536,6 +536,30 @@ mounted. Its RBAC needs one permission the provisioner's role does not already
 carry, `persistentvolumeclaims/status` patch, which is how the new capacity gets
 written back, plus a pods read for the in-use check.
 
+**CreateSnapshot returns ABORTED, not a fault, when another volume on the same
+VM is mid-snapshot.** A Hyper-V checkpoint is VM-wide, so only one volume on a
+VM can be snapshotted at a time; this driver's own serialization (see
+design.md's "Snapshots and VM serialization") makes every other snapshot on
+that VM queue behind whichever copy currently holds it. ABORTED is CSI's
+"operation already in progress for this resource, retry with backoff" case,
+which is exactly this — nothing is misconfigured, there is no operator fix,
+and the call succeeds once the copy ahead of it finishes.
+
+It cannot instead answer `ready_to_use: false` and let the copy proceed in the
+background. external-snapshotter fixes a VolumeSnapshotContent's
+`creation_time` from the first `CreateSnapshot` response that succeeds and
+never revises it, so an early not-ready success would permanently record a
+timestamp from before the checkpoint that will eventually back the snapshot
+even exists. Waiting, then failing if the wait expires, is the only shape that
+leaves the timestamp to a later, successful attempt instead.
+
+`SnapshotCheckpointWaitTimeout` (the agent's own setting) and
+`controller.snapshotter.timeout` (this chart's `values.yaml`) are tuned as a
+pair: the former is deliberately kept shorter than the driver's own polling
+budget derived from the latter, so a caller waiting on a busy VM gets this
+driver's own explanation rather than a generic timeout. Neither side can
+discover the other's value — raise one, check the other.
+
 **ControllerPublishVolume identifies a node by its Hyper-V VM ID, end to end.**
 The node plugin reads `VirtualMachineId` out of the guest's Hyper-V key-value
 pools — the values the host publishes through the Data Exchange integration
