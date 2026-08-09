@@ -703,6 +703,52 @@ DeleteVolume.
 CreateVolume (one failing the safe filename rule) reports success rather than
 INVALID_ARGUMENT: no such volume can exist, CSI requires OK for a volume that
 isn't there, and failing would strand the PV in Terminating on a retry nothing
-could satisfy. Deleting a volume that still has snapshots is not considered,
-because snapshots are not built yet. The FAILED_PRECONDITION mapping needs
-mandatory file locking to exercise, so its test is skipped off Windows.
+could satisfy. The FAILED_PRECONDITION mapping needs mandatory file locking to
+exercise, so its test is skipped off Windows.
+
+**Deleting a volume that still has snapshots is allowed, and leaves them
+standing.** `VhdxService.DeleteAsync` removes exactly two paths under
+`CsvVolumesRoot` — the volume's own VHDX and the `~creating` marker a dead
+create may have left behind — and never so much as enumerates
+`CsvSnapshotsRoot`. Nothing checks for snapshots because nothing needs to: this
+driver's snapshots are full byte-for-byte copies, not differencing children, so
+once `SnapshotService`'s copy job has published one by its atomic rename, the
+file shares no block with the disk it was read from and the source's continued
+existence stops being a fact about it. Both of the things a surviving snapshot
+has to keep doing were built to hold up under exactly that. A listing entry's
+size and creation time come off the snapshot file itself rather than off its
+source — `DescribeFinishedAsync` says so where it reads them, on the grounds
+that the snapshot is the copy guaranteed to still be there — so ListSnapshots
+keeps reporting a snapshot whose source is long gone. And
+`CreateFromSnapshotAsync` restores by copying the snapshot, consulting the
+source volume at no point at all, so a restore keeps succeeding too. The same
+independence is why CreateSnapshot short-circuits on an already-published file
+*before* running any of its preconditions: a finished snapshot must not start
+reporting FailedPrecondition because something happened to a source it no
+longer depends on.
+
+Refusing the delete with FAILED_PRECONDITION while snapshots exist was
+rejected. That is the rule a copy-on-write driver needs, where a snapshot
+genuinely is pinned to its source's extents and deleting underneath it
+corrupts it; adopting it here would strand PVs in Terminating over a dependency
+this driver does not have, and would make the reclaim of a volume hostage to
+retention policy on objects with a lifecycle of their own. Cascading the delete
+into the snapshots was rejected for the mirror-image reason: those back
+VolumeSnapshotContent objects Kubernetes still owns and reclaims through
+DeleteSnapshot, and DeleteVolume has no licence to reclaim them on their
+behalf.
+
+What does matter is a copy still in flight, and the job targets already handle
+it. The internal CopySnapshot job holds `volume:<sourceVolumeId>` for its
+entire run, and jobs sharing a target run strictly in order, so a DeleteVolume
+for that volume queues behind the copy rather than pulling the file out from
+under a read in progress — for as long as the copy takes, which for a streamed
+copy on NTFS can be hours. The controller's poll budget expires long before
+that and external-provisioner retries, which re-attaches to the same queued
+job rather than starting a second delete. Only the internal copy takes that
+target; the fast CreateSnapshot RPC is on `snapshot:`, so it never delays a
+delete. In the other order — the delete running first, with a copy queued
+behind it — the copy finds no source and fails loudly in the agent's log, and
+nothing half-written reaches the snapshots directory, because a snapshot does
+not exist until the rename that publishes it. A CreateSnapshot arriving after
+the delete is an ordinary NOT_FOUND from the source inspection.
