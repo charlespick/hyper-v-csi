@@ -43,12 +43,35 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
     /// all complete, which the tests pin.
     /// </para>
     /// <para>
-    /// That argument covers waits *between jobs*. It says nothing about a job
-    /// delegate blocking on something outside this store, and the one place that
-    /// happens - a snapshot copy waiting for one of
-    /// <c>SnapshotCopySlots</c> - is deliberately bounded and deliberately never
-    /// held while awaiting another job, so it cannot close a cycle this proof
-    /// does not see.
+    /// That argument covers the waits this store installs itself. It says
+    /// nothing about a job delegate blocking on something outside it, and there
+    /// are two such places. Both are bounded, and the bound is what carries
+    /// them - not the argument above, which does not reach either.
+    /// </para>
+    /// <para>
+    /// The first is a snapshot copy waiting for one of <c>SnapshotCopySlots</c>,
+    /// bounded by <c>AgentOptions.SnapshotCopySlotWaitTimeout</c> and never held
+    /// while awaiting another job, so it cannot close a cycle at all.
+    /// </para>
+    /// <para>
+    /// The second is sharper. The fast <c>CreateSnapshot</c> job's delegate
+    /// enqueues its own copy job here and then waits - in
+    /// <c>SnapshotService.AwaitCheckpointAsync</c> - for that copy to get
+    /// moving. That is a waits-for edge pointing *forwards* in creation order,
+    /// a job waiting on one created after it, which is precisely the direction
+    /// the argument above excludes. It does not deadlock as things stand,
+    /// because the two jobs share no target - the fast job holds
+    /// <c>snapshot:</c>, its copy holds <c>vm:</c> and <c>volume:</c> - and
+    /// everything that can queue behind the fast job's target holds that target
+    /// alone, so nothing ahead of the copy can be waiting on the fast job in
+    /// turn. But that is a fact about which targets today's operations happen
+    /// to take, re-established by reading <see cref="JobDispatcher"/> and
+    /// <see cref="JobTargets"/>, not a property of this store. What holds
+    /// regardless is the bound:
+    /// <c>AgentOptions.SnapshotCheckpointWaitTimeout</c> makes the wait give up
+    /// and fail rather than wait indefinitely, releasing the fast job's own
+    /// target on the way out. Anything else that comes to wait on a job it
+    /// enqueued needs the same bound, for the same reason.
     /// </para>
     /// </remarks>
     public Job GetOrCreate(
