@@ -22,15 +22,23 @@ var builder = WebApplication.CreateBuilder(args);
 // unaffected.
 builder.Services.AddWindowsService(options => options.ServiceName = "hyperv-csi-agent");
 
-// Config comes from a file on the CSV named by --config, not from
-// appsettings-next-to-the-exe or per-host environment variables: the clustered
-// role's command line has to resolve identically on whichever host starts the
-// process. Added last so it wins over the built-in sources.
-var configPath = builder.Configuration["config"];
-if (!string.IsNullOrWhiteSpace(configPath))
-{
-    builder.Configuration.AddJsonFile(Path.GetFullPath(configPath), optional: false, reloadOnChange: false);
-}
+// Config is local to this node - C:\ProgramData\HyperVCsiAgent\agent.config.json
+// by default - not a file shared across the cluster on the CSV. That is what
+// lets an operator pilot a config change the way SQL Server's FCI does: edit
+// the file on the node that currently owns the role, fail over onto it, and
+// only touch the other node once the change is proven. --config overrides the
+// default path for dev/test, where each profile already names its own file.
+// Added last so it wins over the built-in sources. The default path is
+// optional - the installer writes it before the service ever starts, but
+// a host with nothing installed yet (or a test host driving Agent:* settings
+// through other configuration sources entirely) should not fail here just
+// because nothing has been installed. An explicit --config is a deliberate
+// choice of file, so a typo there still fails loudly instead of silently
+// falling through to defaults.
+var explicitConfigPath = builder.Configuration["config"];
+var configPath = explicitConfigPath
+    ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "HyperVCsiAgent", "agent.config.json");
+builder.Configuration.AddJsonFile(Path.GetFullPath(configPath), optional: explicitConfigPath is null, reloadOnChange: false);
 
 // Bound once and shared: Kestrel has to be configured before the container
 // exists, so binding a second copy for it would let the startup guards below

@@ -1,11 +1,17 @@
 namespace HyperVCsiAgent.Core.Configuration;
 
 /// <summary>
-/// Agent configuration, read from the JSON file named by <c>--config</c> rather
-/// than from appsettings-next-to-the-exe or environment variables. That file
-/// lives on the CSV alongside the agent's binaries, so the clustered role's
-/// command line resolves identically on every host it can fail over to and
-/// there is no per-host provisioning step to keep in sync.
+/// Agent configuration, read from a JSON file local to this node -
+/// <c>C:\ProgramData\HyperVCsiAgent\agent.config.json</c> by default, or the
+/// path named by <c>--config</c> - rather than from appsettings-next-to-the-exe
+/// or environment variables. Deliberately local rather than a file shared on
+/// the CSV: an operator can edit it on the node that currently owns the
+/// clustered role, fail over onto that node to pilot the change, and only
+/// touch the other node once it is proven - the same reason SQL Server's
+/// Failover Cluster Instance keeps its own configuration per node. The
+/// installer is what keeps the file in sync across nodes when a value
+/// (CSV paths, certificate thumbprints) needs to match everywhere; nothing
+/// here requires it to.
 /// </summary>
 public sealed class AgentOptions
 {
@@ -201,13 +207,15 @@ public sealed class AgentOptions
         if (string.IsNullOrWhiteSpace(CsvVolumesRoot))
         {
             throw new InvalidOperationException(
-                $"{SectionName}:{nameof(CsvVolumesRoot)} is required; pass --config <path to agent.config.json>");
+                $"{SectionName}:{nameof(CsvVolumesRoot)} is required; set it in agent.config.json " +
+                "(C:\\ProgramData\\HyperVCsiAgent\\agent.config.json by default, or the path passed via --config)");
         }
 
         if (string.IsNullOrWhiteSpace(CsvSnapshotsRoot))
         {
             throw new InvalidOperationException(
-                $"{SectionName}:{nameof(CsvSnapshotsRoot)} is required; pass --config <path to agent.config.json>");
+                $"{SectionName}:{nameof(CsvSnapshotsRoot)} is required; set it in agent.config.json " +
+                "(C:\\ProgramData\\HyperVCsiAgent\\agent.config.json by default, or the path passed via --config)");
         }
 
         if (MaxConcurrentDiskOperations < 1)
