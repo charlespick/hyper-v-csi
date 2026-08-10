@@ -342,7 +342,10 @@ public class InMemoryJobStoreTests
         var job = store.GetOrCreate("pvc-1", "CreateVolume", ["vol-pvc-1"], (_, _) => Task.CompletedTask);
         await WaitForTerminal(job);
 
-        Assert.Same(job, store.Get(job.Id));
+        // Not Assert.Same: Get now returns a snapshot, not the shared cached
+        // instance, so only the job's identity/status carry over here.
+        Assert.Equal(job.Id, store.Get(job.Id)!.Id);
+        Assert.Equal(JobStatus.Succeeded, store.Get(job.Id)!.Status);
 
         clock.Advance(InMemoryJobStore.Retention + TimeSpan.FromSeconds(1));
 

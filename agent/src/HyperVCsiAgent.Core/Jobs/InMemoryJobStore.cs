@@ -142,26 +142,55 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
             return null;
         }
 
-        if (IsExpired(job, _clock.GetUtcNow()))
+        // Everything past this point - the expiry check and the fields
+        // handed back - reads the same mutable Status/Result/Error/
+        // ErrorCode/CompletedAt ExecuteAsync writes under this lock. Reading
+        // them under it too is what the class's own remarks on ExecuteAsync
+        // promise ("the lock ... is for cross-thread visibility"), and it
+        // only actually holds if the reader takes the same lock - a plain
+        // unsynchronized read a moment after ExecuteAsync's writer thread
+        // sets Status is exactly the "saw Succeeded before Result landed"
+        // failure those remarks warn about, just moved to this side.
+        lock (_gate)
         {
-            lock (_gate)
+            if (IsExpired(job, _clock.GetUtcNow()))
             {
                 EvictExpired();
+                return null;
             }
 
-            return null;
+            // A snapshot, not the shared cached instance: QueuedBehind used
+            // to be written onto job itself, which every concurrent poll of
+            // the same Pending job raced to overwrite with no synchronization
+            // at all, on the very object ExecuteAsync is also mutating. The
+            // copy this returns is unshared, so nothing about serializing it
+            // afterward - which happens outside this lock, in the response
+            // pipeline - can race a future write here.
+            var snapshot = new Job
+            {
+                Id = job.Id,
+                IdempotencyKey = job.IdempotencyKey,
+                OperationType = job.OperationType,
+                Targets = job.Targets,
+                CreatedAt = job.CreatedAt,
+                Status = job.Status,
+                Result = job.Result,
+                Error = job.Error,
+                ErrorCode = job.ErrorCode,
+                CompletedAt = job.CompletedAt,
+            };
+
+            // Computed here rather than stored when the job was enqueued or
+            // when it started running, so it can never go stale: a value
+            // captured once would still name whichever job was running at
+            // that moment, long after that job finished and released the
+            // target - exactly the kind of "still Pending after 24s" mystery
+            // this field exists to replace with something true. A Running or
+            // terminal job has nothing left to be queued behind.
+            snapshot.QueuedBehind = snapshot.Status == JobStatus.Pending ? FindQueuedBehind(job) : null;
+
+            return snapshot;
         }
-
-        // Computed here rather than stored when the job was enqueued or when
-        // it started running, so it can never go stale: a value captured
-        // once would still name whichever job was running at that moment,
-        // long after that job finished and released the target - exactly the
-        // kind of "still Pending after 24s" mystery this field exists to
-        // replace with something true. A Running or terminal job has nothing
-        // left to be queued behind.
-        job.QueuedBehind = job.Status == JobStatus.Pending ? FindQueuedBehind(job) : null;
-
-        return job;
     }
 
     /// <summary>
