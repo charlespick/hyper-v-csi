@@ -666,6 +666,29 @@ guessing wrong would stage the wrong disk — that path remains exercised only b
 unit tests, not real hardware, since it did not come up on the one guest tested
 so far.
 
+**Host CIM calls are bounded per call, unlike the cases below.**
+`CimDeadline` sets `CimOperationOptions.Timeout` from the operation's remaining
+budget, and the WMI protocol layer itself enforces that timeout — it is not a
+`CancellationToken` layered on top, and the difference is measured rather than
+assumed. Against an unreachable host, a query given no timeout returned after
+21.2s, and every mechanism System.Management offers was tried and ignored en
+route: `EnumerationOptions.Timeout` returned at 21.0s, `ConnectionOptions.Timeout`
+at 21.1s, `ManagementOperationObserver.Cancel()` called from another thread at
+21.1s, all three outlasted by the RPC layer's own failure. Only
+`CimOperationOptions.Timeout` actually bounded the call, returning at 3.0s for a
+3s budget, because a token is cooperative: it stops work that has not started,
+and does nothing to a thread already parked inside a blocked RPC. That still
+only bounds the *wait*, not the *work* — a call that times out on the agent
+side may still be running to completion, or hung, on the Hyper-V host
+underneath, a leaked operation there rather than a stuck thread here. A handful
+of pre-existing call sites the migration left alone — reading a new
+checkpoint's settings back, an attached disk's controller and drive settings,
+and building a snapshot's settings text — still go through System.Management
+guarded only by that same ineffective token. Everywhere else, System.Management
+remains only for embedded-instance serialization and path parsing, neither of
+which blocks on the network; everything that does now takes its timeout from
+`CimDeadline`.
+
 **A wedged delete is conceded, not prevented.** `File.Delete` takes no
 cancellation token, so a delete stuck on a CSV in redirected mode cannot be
 called off. The timeout is therefore *observed* rather than enforced: the job
