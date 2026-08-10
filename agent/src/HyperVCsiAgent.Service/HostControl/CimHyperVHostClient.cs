@@ -172,7 +172,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                         continue;
                     }
 
-                    var controllerPath = controller.CimSystemProperties.Path;
+                    var controllerPath = FullPathTextOf(controller);
                     var controllerKey = AddressKey(InstanceIdOf(controller));
                     for (var lun = 0; lun < AddressesPerController; lun++)
                     {
@@ -217,7 +217,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             {
                 addedDrivePath = AddResource(
                     hostName,
-                    settings.CimSystemProperties.Path,
+                    FullPathTextOf(settings),
                     drive.GetText(TextFormat.WmiDtd20),
                     deadline,
                     cancellationToken,
@@ -295,7 +295,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
 
                 _ = AddResource(
                     hostName,
-                    settings.CimSystemProperties.Path,
+                    FullPathTextOf(settings),
                     disk.GetText(TextFormat.WmiDtd20),
                     deadline,
                     cancellationToken,
@@ -909,7 +909,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                 {
                     if (!before.Contains((string)checkpoint.CimInstanceProperties["InstanceID"].Value))
                     {
-                        found.Add(checkpoint.CimSystemProperties.Path);
+                        found.Add(FullPathTextOf(checkpoint));
                     }
                 }
             }
@@ -998,7 +998,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             {
                 if (checkpoint.CimInstanceProperties["ElementName"]?.Value is string { Length: > 0 } elementName)
                 {
-                    checkpoints.Add(new Checkpoint(checkpoint.CimSystemProperties.Path, elementName, ReadNotes(checkpoint)));
+                    checkpoints.Add(new Checkpoint(FullPathTextOf(checkpoint), elementName, ReadNotes(checkpoint)));
                 }
             }
         }
@@ -1224,7 +1224,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                 // it was found by: the two are the same object, but only this
                 // one has the same provenance as the disk path beside it, and
                 // both are handed straight back to vmms as REFs.
-                return new DiskLocation(disk.CimSystemProperties.Path, drive.Path.Path, controllerPath, AddressOf(drive));
+                return new DiskLocation(FullPathTextOf(disk), drive.Path.Path, controllerPath, AddressOf(drive));
             }
         }
 
@@ -1407,7 +1407,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
 
                 if (AddressOf(drive) == slot.Lun)
                 {
-                    return drive.CimSystemProperties.Path;
+                    return FullPathTextOf(drive);
                 }
             }
         }
@@ -1804,7 +1804,16 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
 
     private static string InstanceIdOf(CimInstance device) =>
         device.CimInstanceProperties["InstanceID"]?.Value as string
-            ?? new ManagementPath(device.CimSystemProperties.Path).RelativePath;
+            // Not a CimSystemProperties.Path fallback: MI leaves that property
+            // null for every instance CimSession.QueryInstances returns (see
+            // RelativePathTextOf's remarks), so a path-based fallback here
+            // would silently produce an empty string rather than the InstanceID
+            // it used to recover under System.Management. InstanceID is a
+            // required key property of every resource-setting-data class this
+            // is called against, so failing loudly if it is somehow absent is
+            // more honest than pretending a path-derived substitute exists.
+            ?? throw new InvalidOperationException(
+                $"a {device.CimSystemProperties.ClassName} instance has no InstanceID property");
 
     /// <summary>
     /// Builds an MI reference instance - a class name plus key properties, no
@@ -1857,14 +1866,37 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     /// <summary>
     /// The relative path text <c>ASSOCIATORS OF {...}</c> needs for a
     /// single-InstanceID-keyed instance already in hand (a
-    /// Msvm_VirtualSystemSettingData, in every current caller). Reuses
-    /// System.Management's path parser against MI's own
-    /// <c>CimSystemProperties.Path</c> the same way <see cref="InstanceIdOfPath"/>
-    /// already parses a WMI path string for other purposes, rather than
-    /// re-deriving the key by hand.
+    /// Msvm_VirtualSystemSettingData, in every current caller). Built directly
+    /// from the instance's own <c>ClassName</c> and <c>InstanceID</c>, not
+    /// parsed out of <c>CimSystemProperties.Path</c>: measured against a live
+    /// host, MI leaves that property null for every instance
+    /// <c>CimSession.QueryInstances</c> returns - unlike System.Management's
+    /// <c>ManagementObject.Path.Path</c>, which always synthesizes one - so
+    /// parsing it here silently produced an empty string instead of failing
+    /// loudly, and every caller downstream of that (this method, plus every
+    /// other <c>CimSystemProperties.Path</c> read this class made before this
+    /// fix) built a malformed WMI path/reference that the provider rejected
+    /// with WBEM_E_INVALID_OBJECT_PATH (0x8004103A). <c>ClassName</c> is not
+    /// affected - only <c>Path</c> itself comes back unset - so building the
+    /// same relative-path text by hand from the instance's own key property is
+    /// both correct and immune to whatever MI does or does not populate.
     /// </summary>
     private static string RelativePathTextOf(CimInstance instance) =>
-        new ManagementPath(instance.CimSystemProperties.Path).RelativePath;
+        $"{instance.CimSystemProperties.ClassName}.InstanceID=\"{InstanceIdOf(instance).Replace(@"\", @"\\")}\"";
+
+    /// <summary>
+    /// The full <c>\\server\namespace:Class.Key="value"</c> path text for a
+    /// keyed instance already in hand - the same shape
+    /// <c>ManagementObject.Path.Path</c> always produced, and what every
+    /// caller that used to read <c>CimSystemProperties.Path</c> off an MI
+    /// instance actually needed. Built from <see cref="RelativePathTextOf"/>
+    /// plus the instance's own (correctly-populated) <c>ServerName</c>, so
+    /// <see cref="InstanceIdOfPath"/> and <see cref="ReferenceToPath"/> - both
+    /// already written against System.Management's full-path shape - keep
+    /// working unchanged for text built this way.
+    /// </summary>
+    private static string FullPathTextOf(CimInstance instance) =>
+        $@"\\{instance.CimSystemProperties.ServerName}\{NamespaceName}:{RelativePathTextOf(instance)}";
 
     /// <summary>
     /// Pulls the InstanceID out of a Parent reference so a child can be matched
