@@ -141,6 +141,17 @@ func enqueueFailed(ctx context.Context, err error, format string, args ...any) e
 	return status.Errorf(codes.Unavailable, format+": %v", append(args, err)...)
 }
 
+// findAttachedNodeFailed maps a findAttachedNode error onto a gRPC status,
+// the same way enqueueFailed does for EnqueueJob: the caller's own context
+// ending is Canceled/DeadlineExceeded, not Internal, since a Kubernetes API
+// timeout mid-lookup is an ordinary retry rather than an unclassified fault.
+func findAttachedNodeFailed(ctx context.Context, err error, format string, args ...any) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return status.FromContextError(ctxErr).Err()
+	}
+	return status.Errorf(codes.Internal, format+": %v", append(args, err)...)
+}
+
 // translateJobFailure maps the agent's coarse error classification onto gRPC
 // codes. Unclassified failures become INTERNAL, which the sidecars retry —
 // the design's default posture, since the agent re-derives what still needs

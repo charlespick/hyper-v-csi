@@ -1281,6 +1281,28 @@ func TestControllerExpandVolumeFailsRatherThanSilentlyDroppingAKubernetesLookupE
 	}
 }
 
+func TestControllerExpandVolumeCanceledCallerContextDuringNodeLookupIsNotInternal(t *testing.T) {
+	// The caller's own context ending while the VolumeAttachments lookup is in
+	// flight says nothing about whether Kubernetes is reachable, so it must not
+	// come back looking like the "API server unreachable" case above does -
+	// the same distinction enqueueFailed/pollStopped already make elsewhere.
+	client := fake.NewSimpleClientset()
+	client.PrependReactor("list", "volumeattachments", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("connection refused")
+	})
+	agent := newFakeAgent(t, expanded(4*gibibyte, false))
+	server := &controllerServer{driver: New("", agentclient.New(agent.URL), client)}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := server.ControllerExpandVolume(ctx, expandRequest("pvc-1", 4*gibibyte, 0))
+
+	if got := status.Code(err); got != codes.Canceled {
+		t.Fatalf("code = %s, want Canceled (err: %v)", got, err)
+	}
+}
+
 func TestControllerExpandVolumeAlreadyLargeEnoughIsStillASuccess(t *testing.T) {
 	// A replay of a finished expand, or a volume that already outgrew the
 	// request. Either way the caller got what it asked for.
@@ -1525,6 +1547,27 @@ func TestCreateSnapshotFailsRatherThanSilentlyDroppingAKubernetesLookupError(t *
 	}
 	if n := agent.enqueueCount(); n != 0 {
 		t.Errorf("enqueued %d jobs, want none once the node lookup failed", n)
+	}
+}
+
+func TestCreateSnapshotCanceledCallerContextDuringNodeLookupIsNotInternal(t *testing.T) {
+	// Same reasoning as ControllerExpandVolume's own version of this test: a
+	// caller context that ends mid-lookup is an ordinary retry, not an
+	// unclassified fault.
+	client := fake.NewSimpleClientset()
+	client.PrependReactor("list", "volumeattachments", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("connection refused")
+	})
+	agent := newFakeAgent(t, succeeded(snapshotJSON("pvc-1~snap-1", "pvc-1", gibibyte, 1770000000, true)))
+	server := &controllerServer{driver: New("", agentclient.New(agent.URL), client)}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := server.CreateSnapshot(ctx, createSnapshotRequest("pvc-1", "snap-1"))
+
+	if got := status.Code(err); got != codes.Canceled {
+		t.Fatalf("code = %s, want Canceled (err: %v)", got, err)
 	}
 }
 

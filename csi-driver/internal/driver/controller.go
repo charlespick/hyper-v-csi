@@ -718,7 +718,7 @@ func (s *controllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 	// a retry, not correctness.
 	nodeID, err := findAttachedNode(ctx, s.driver.KubeClient, req.GetVolumeId())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "finding which node has %s attached: %v", req.GetVolumeId(), err)
+		return nil, findAttachedNodeFailed(ctx, err, "finding which node has %s attached", req.GetVolumeId())
 	}
 
 	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetVolumeId(), operationExpandVolume, expandVolumePayload{
@@ -895,7 +895,7 @@ func (s *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 	// case without any hint at all.
 	nodeID, err := findAttachedNode(ctx, s.driver.KubeClient, req.GetSourceVolumeId())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "finding which node has %s attached: %v", req.GetSourceVolumeId(), err)
+		return nil, findAttachedNodeFailed(ctx, err, "finding which node has %s attached", req.GetSourceVolumeId())
 	}
 
 	// The snapshot name is the idempotency key per CSI Spec.md, so a retry from
