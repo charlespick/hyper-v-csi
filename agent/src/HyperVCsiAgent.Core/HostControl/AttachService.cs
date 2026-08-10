@@ -80,6 +80,17 @@ public sealed class AttachService : IAttachService, IDisposable
                 return await AttachOnHostAsync(current, volumeId, path, attempt, cancellationToken).ConfigureAwait(false);
             }
         }
+        catch (TimeoutException ex)
+        {
+            // The host client's own CIM budget, spent mid-call. A
+            // CancellationToken cannot interrupt a call already blocked in an
+            // RPC - see issue #2 - so this, not OperationCanceledException, is
+            // what actually reports a wedged host call.
+            throw new JobFailureException(
+                AgentErrorCodes.Internal,
+                $"attaching volume {volumeId} to {nodeId} timed out after {_options.HostOperationTimeout}: {ex.Message}",
+                ex);
+        }
         catch (OperationCanceledException) when (attempt.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
         {
             throw new JobFailureException(
@@ -136,6 +147,17 @@ public sealed class AttachService : IAttachService, IDisposable
 
                 await DetachOnHostAsync(current, volumeId, path, attempt, cancellationToken).ConfigureAwait(false);
             }
+        }
+        catch (TimeoutException ex)
+        {
+            // The host client's own CIM budget, spent mid-call. Same reasoning
+            // as AttachAsync's mirror of this catch: a CancellationToken
+            // cannot interrupt a call already blocked in an RPC - see issue
+            // #2 - so this is what actually reports a wedged host call.
+            throw new JobFailureException(
+                AgentErrorCodes.Internal,
+                $"detaching volume {volumeId} from {nodeId} timed out after {_options.HostOperationTimeout}: {ex.Message}",
+                ex);
         }
         catch (OperationCanceledException) when (attempt.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
         {

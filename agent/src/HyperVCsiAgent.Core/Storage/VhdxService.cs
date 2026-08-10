@@ -210,6 +210,21 @@ public sealed class VhdxService : IVhdxService, IDisposable
                 "CreateVolume {VolumeName}: created {Path} at {ActualSize} bytes", volumeName, path, actualSize);
             return new CreateVolumeResult(volumeName, actualSize, AlreadyPresent: false);
         }
+        catch (TimeoutException ex)
+        {
+            // The disk manager's own CIM budget, spent mid-call - see the
+            // remark above on why a token cannot bound this once a call is in
+            // flight. This, not OperationCanceledException, is what actually
+            // reports a wedged CIM provider.
+            TryDeleteInProgress(inProgressPath);
+            _logger.LogError(ex,
+                "CreateVolume {VolumeName}: creating {Path} ran out of its {Budget} budget",
+                volumeName, path, _options.DiskOperationTimeout);
+            throw new JobFailureException(
+                AgentErrorCodes.Internal,
+                $"creating volume {volumeName} timed out after {_options.DiskOperationTimeout}: {ex.Message}",
+                ex);
+        }
         catch (OperationCanceledException) when (attempt.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
         {
             TryDeleteInProgress(inProgressPath);

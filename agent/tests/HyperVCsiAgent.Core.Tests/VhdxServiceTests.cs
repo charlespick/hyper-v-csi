@@ -212,9 +212,18 @@ public sealed class VhdxServiceTests : IDisposable
     public async Task CreateAsync_WhenTheDiskOperationHangs_TimesOutAndCleansUp()
     {
         // A CIM job that never settles would otherwise pin this volume's job
-        // queue - and everything queued behind it - forever.
+        // queue - and everything queued behind it - forever. The fake here
+        // ignores cancellationToken entirely, exactly like a real wedged CIM
+        // call, and fails via TimeoutException - its own native timeout, not
+        // the .NET token - which is the shape a genuinely wedged CIM call
+        // takes in production (see the remark on VhdxService's own
+        // attempt/CancelAfter near CreateEmptyAsync).
         var disks = new FakeVirtualDiskManager();
-        disks.BeforeCreate = cancellationToken => Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        disks.BeforeCreate = async _ =>
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(5), CancellationToken.None).ConfigureAwait(false);
+            throw new TimeoutException("the fake disk operation's native timeout elapsed");
+        };
         using var service = NewService(disks, diskOperationTimeout: TimeSpan.FromMilliseconds(100));
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(

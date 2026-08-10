@@ -158,9 +158,11 @@ public sealed class AttachServiceTests : IDisposable
     [Fact]
     public async Task AttachAsync_CooperativeFakeHostHang_TimesOutAsInternal()
     {
-        // Classification test only: this fake hang observes cancellation. It
-        // pins how a timeout is translated, not whether a real host call can be
-        // interrupted mid-RPC.
+        // The fake host call ignores cancellationToken entirely, the same as
+        // a real wedged WMI/CIM call, and fails via TimeoutException - its own
+        // native timeout, not the .NET token - exactly the shape a genuinely
+        // wedged host call takes in production. This pins that AttachService
+        // catches that TimeoutException and classifies it as Internal.
         GivenVolume("pvc-1");
         var host = new FakeHostClient { HangsForever = true };
         using var service = NewService(host, timeout: TimeSpan.FromMilliseconds(50));
@@ -194,16 +196,39 @@ public sealed class AttachServiceTests : IDisposable
     public async Task AttachAsync_CallerCancelling_IsNotReportedAsATimeout()
     {
         // The caller going away is the agent shutting down, not this operation
-        // running long, and it must not be dressed up as the latter.
+        // running long, and it must not be dressed up as the latter. A wedged
+        // host call cannot stand in for this any more: nothing preempts one of
+        // those once it is physically in flight (issue #2), so cancelling the
+        // caller's token would not do anything observable to it either. What
+        // genuinely is preemptible is queuing for a host operation slot -
+        // HostOperationSlots.WaitAsync is a plain SemaphoreSlim.WaitAsync
+        // (CancellationToken) - so this fills the only slot with an attach
+        // that is blocked inside FindFreeSlotAsync, queues a second attach
+        // behind it, and cancels that second attach's own token while it is
+        // still waiting for the slot.
         GivenVolume("pvc-1");
-        var host = new FakeHostClient { HangsForever = true };
-        using var service = NewService(host);
+        GivenVolume("pvc-2");
+        var hostSlots = new HostOperationSlots(Options.Create(new AgentOptions { MaxConcurrentHostOperations = 1 }));
+        var host = new FakeHostClient { FreeSlot = new DiskSlot("controller-path", "controller-guid", 0) };
+        using var holdFirst = new SemaphoreSlim(0);
+        host.DuringFindFreeSlot = _ => holdFirst.WaitAsync();
+        using var service = NewService(host, hostSlots: hostSlots);
         using var caller = new CancellationTokenSource();
 
-        var attach = service.AttachAsync("pvc-1", Node, caller.Token);
+        var first = service.AttachAsync("pvc-1", Node, CancellationToken.None);
+        await WaitForAsync(() => host.InFlightPeak >= 1);
+
+        var second = service.AttachAsync("pvc-2", Node, caller.Token);
+        await Task.Delay(50);
+        Assert.False(second.IsCompleted);
+
         await caller.CancelAsync();
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => attach);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => second);
+        Assert.Null(host.Attached);
+
+        holdFirst.Release();
+        await first;
     }
 
     [Fact]
@@ -722,12 +747,24 @@ public sealed class AttachServiceTests : IDisposable
         }
 
         /// <summary>
-        /// Never answers unless cancelled. This is intentionally cooperative so
-        /// timeout translation paths can be asserted quickly in unit tests.
+        /// Simulates a real blocked RPC, not a cooperative one: cancellationToken
+        /// does nothing to it, exactly like a wedged WMI/CIM call once it is
+        /// physically in flight (issue #2). Only the call's own native timeout
+        /// bounds it - which .NET sees as <see cref="TimeoutException"/>, never
+        /// <see cref="OperationCanceledException"/>, see <c>CimDeadline</c> -
+        /// so this waits a short, fixed, uncancellable delay standing in for
+        /// that budget elapsing, then throws it, regardless of what happens to
+        /// cancellationToken.
         /// </summary>
-        private Task HangIfAskedTo(CancellationToken cancellationToken) =>
-            HangsForever || (HangsAfterMigrating && NotOnHost is not null)
-                ? Task.Delay(Timeout.Infinite, cancellationToken)
-                : Task.CompletedTask;
+        private async Task HangIfAskedTo(CancellationToken cancellationToken)
+        {
+            if (!(HangsForever || (HangsAfterMigrating && NotOnHost is not null)))
+            {
+                return;
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(5), CancellationToken.None).ConfigureAwait(false);
+            throw new TimeoutException("the fake host call's native timeout elapsed");
+        }
     }
 }
