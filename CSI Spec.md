@@ -680,14 +680,17 @@ at 21.1s, `ManagementOperationObserver.Cancel()` called from another thread at
 and does nothing to a thread already parked inside a blocked RPC. That still
 only bounds the *wait*, not the *work* — a call that times out on the agent
 side may still be running to completion, or hung, on the Hyper-V host
-underneath, a leaked operation there rather than a stuck thread here. A handful
-of pre-existing call sites the migration left alone — reading a new
-checkpoint's settings back, an attached disk's controller and drive settings,
-and building a snapshot's settings text — still go through System.Management
-guarded only by that same ineffective token. Everywhere else, System.Management
-remains only for embedded-instance serialization and path parsing, neither of
-which blocks on the network; everything that does now takes its timeout from
-`CimDeadline`.
+underneath, a leaked operation there rather than a stuck thread here.
+System.Management remains only for embedded-instance serialization and path
+parsing, neither of which blocks on the network; everything that touches the
+network, including the handful of sites — reading a new checkpoint's settings
+back, an attached disk's controller and drive settings — that a first pass at
+this migration left on System.Management guarded only by that same
+ineffective token, now takes its timeout from `CimDeadline`. Building a
+snapshot's settings text needed no such migration: it has no remote template
+to fetch, so it builds its blank instance against the local namespace
+instead, the same way `BuildLocalInstance` does for a resource template's
+mutate-then-serialize step — no remote call, bounded or not, either way.
 
 **A wedged delete is conceded, not prevented.** `File.Delete` takes no
 cancellation token, so a delete stuck on a CSV in redirected mode cannot be

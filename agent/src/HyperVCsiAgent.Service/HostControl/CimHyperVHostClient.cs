@@ -33,10 +33,12 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     private const string NamespaceName = @"root\virtualization\v2";
 
     /// <summary>
-    /// The same namespace addressed locally, used only to build a blank local
+    /// The same namespace addressed locally, used to build a blank local
     /// instance for <see cref="BuildLocalInstance"/> to populate - see its own
     /// remarks for why that step stays local even though the template it
-    /// populates from was fetched from the remote host.
+    /// populates from was fetched from the remote host - and for
+    /// <see cref="BuildSnapshotSettingsText"/>, which has no remote template at
+    /// all.
     /// </summary>
     private const string LocalScopePath = @"\\.\root\virtualization\v2";
 
@@ -124,10 +126,9 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         Task.Run<AttachedDisk?>(() =>
         {
             var deadline = CimDeadline.After(_hostOperationTimeout);
-            var scope = ScopeFor(hostName);
             using var session = CimSession.Create(hostName);
             using var settings = GetActiveSettings(session, hostName, vmId, deadline, cancellationToken);
-            return FindAttachedDisk(scope, session, settings, vmId, vhdxPath, deadline, cancellationToken);
+            return FindAttachedDisk(session, settings, vmId, vhdxPath, deadline, cancellationToken);
         }, cancellationToken);
 
     public Task<bool> IsDiskAttachedAsync(
@@ -135,10 +136,9 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         Task.Run(() =>
         {
             var deadline = CimDeadline.After(_hostOperationTimeout);
-            var scope = ScopeFor(hostName);
             using var session = CimSession.Create(hostName);
             using var settings = GetActiveSettings(session, hostName, vmId, deadline, cancellationToken);
-            return LocateDisk(scope, session, settings, vmId, vhdxPath, deadline, cancellationToken) is not null;
+            return LocateDisk(session, settings, vmId, vhdxPath, deadline, cancellationToken) is not null;
         }, cancellationToken);
 
     public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
@@ -318,12 +318,11 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
-            var scope = ScopeFor(hostName);
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
             using var settings = GetActiveSettings(session, hostName, vmId, deadline, cancellationToken);
 
-            var located = LocateDisk(scope, session, settings, vmId, vhdxPath, deadline, cancellationToken);
+            var located = LocateDisk(session, settings, vmId, vhdxPath, deadline, cancellationToken);
             if (located is null)
             {
                 _logger.LogInformation(
@@ -458,7 +457,6 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         Task.Run(() =>
         {
             var deadline = CimDeadline.After(_hostOperationTimeout);
-            var scope = ScopeFor(hostName);
             using var session = CimSession.Create(hostName);
 
             using var activeSettings = GetActiveSettings(session, hostName, vmId, deadline, cancellationToken);
@@ -473,7 +471,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             using var vm = GetComputerSystem(session, hostName, vmId, deadline, cancellationToken);
             var before = ExistingCheckpointInstanceIds(session, vmId, deadline, cancellationToken);
 
-            var settingsText = BuildSnapshotSettingsText(scope, deadline, cancellationToken);
+            var settingsText = BuildSnapshotSettingsText();
 
             using var snapshotService = GetSnapshotService(session, deadline, cancellationToken);
 
@@ -492,10 +490,12 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                 session, NamespaceName, result, "CreateSnapshot", deadline, cancellationToken, _logger);
 
             var createdPath = FindNewCheckpoint(session, vmId, before, deadline, cancellationToken);
-            using var created = new ManagementObject(scope, new ManagementPath(createdPath), null);
-            WithDeadline(deadline, cancellationToken, "reading the new checkpoint's settings", created.Get);
+            using var created = session.GetInstance(
+                NamespaceName,
+                ReferenceToPath(createdPath),
+                deadline.Options("reading the new checkpoint's settings", cancellationToken));
 
-            var taggedPath = TagCheckpoint(hostName, created, elementName, notesJson, deadline, cancellationToken);
+            var taggedPath = TagCheckpoint(hostName, created, createdPath, elementName, notesJson, deadline, cancellationToken);
 
             _logger.LogInformation(
                 "created checkpoint {ElementName} of {VmId} on {HostName}", elementName, vmId, hostName);
@@ -868,10 +868,20 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     /// same way <see cref="GetDefaultSettings"/>'s templates do for
     /// AddResourceSettings.
     /// </summary>
-    private static string BuildSnapshotSettingsText(ManagementScope scope, CimDeadline deadline, CancellationToken cancellationToken)
+    /// <remarks>
+    /// Built against the local scope rather than the host's, with no remote
+    /// call at all: this instance has no template to start from - every
+    /// property besides <c>ConsistencyLevel</c> is left at its schema default
+    /// - so there is nothing here a remote <c>CreateInstance</c> would supply
+    /// that a local one does not, the same reasoning <see cref="BuildLocalInstance"/>'s
+    /// own remarks give for why its blank instance is built locally too.
+    /// </remarks>
+    private static string BuildSnapshotSettingsText()
     {
-        using var settingsClass = new ManagementClass(scope, new ManagementPath("Msvm_VirtualSystemSnapshotSettingData"), null);
-        using var instance = WithDeadline(deadline, cancellationToken, "building snapshot settings", settingsClass.CreateInstance);
+        using var settingsClass = new ManagementClass(
+            new ManagementScope(LocalScopePath), new ManagementPath("Msvm_VirtualSystemSnapshotSettingData"), null);
+        using var instance = settingsClass.CreateInstance()
+            ?? throw new InvalidOperationException("could not create a local Msvm_VirtualSystemSnapshotSettingData instance");
         instance["ConsistencyLevel"] = CrashConsistentLevel;
         return instance.GetText(TextFormat.WmiDtd20);
     }
@@ -946,16 +956,18 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     /// </summary>
     private string TagCheckpoint(
         string hostName,
-        ManagementObject checkpointSettings,
+        CimInstance checkpointSettings,
+        string checkpointPath,
         string elementName,
         string notesJson,
         CimDeadline deadline,
         CancellationToken cancellationToken)
     {
-        // A clone carries the original's InstanceID as its key property, which
-        // is what tells ModifySystemSettings to update this instance in place
-        // rather than attempt to create a new one.
-        using var clone = (ManagementObject)checkpointSettings.Clone();
+        // A local rebuild carries the original's InstanceID as a regular
+        // property value, which is what tells ModifySystemSettings to update
+        // this instance in place rather than attempt to create a new one -
+        // the same trick BuildLocalInstance's own remarks describe.
+        using var clone = BuildLocalInstance(checkpointSettings);
         clone["ElementName"] = elementName;
         clone["Notes"] = new[] { notesJson };
         var text = clone.GetText(TextFormat.WmiDtd20);
@@ -975,7 +987,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         _ = CimJobs.WaitForCompletion(
             session, NamespaceName, result, "ModifySystemSettings", deadline, cancellationToken, _logger);
 
-        return checkpointSettings.Path.Path;
+        return checkpointPath;
     }
 
     /// <summary>
@@ -1123,11 +1135,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         return checked((long)maxInternalSize);
     }
 
-    private static ManagementScope ScopeFor(string hostName) =>
-        new($@"\\{hostName}\root\virtualization\v2");
-
     private static AttachedDisk? FindAttachedDisk(
-        ManagementScope scope,
         CimSession session,
         CimInstance settings,
         string vmId,
@@ -1135,13 +1143,15 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         CimDeadline deadline,
         CancellationToken cancellationToken)
     {
-        if (LocateDisk(scope, session, settings, vmId, vhdxPath, deadline, cancellationToken) is not { } located)
+        if (LocateDisk(session, settings, vmId, vhdxPath, deadline, cancellationToken) is not { } located)
         {
             return null;
         }
 
-        using var controller = new ManagementObject(scope, new ManagementPath(located.ControllerPath), null);
-        WithDeadline(deadline, cancellationToken, $"reading controller settings for {vhdxPath}", controller.Get);
+        using var controller = session.GetInstance(
+            NamespaceName,
+            ReferenceToPath(located.ControllerPath),
+            deadline.Options($"reading controller settings for {vhdxPath}", cancellationToken));
 
         // Both halves have to be real. Defaulting either one would send the node
         // plugin to a plausible-looking wrong disk - LUN 0 on the first
@@ -1163,7 +1173,6 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     /// cannot disagree about what "attached" means.
     /// </summary>
     private static DiskLocation? LocateDisk(
-        ManagementScope scope,
         CimSession session,
         CimInstance settings,
         string vmId,
@@ -1211,10 +1220,12 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                         $"{vhdxPath} is in the VM's configuration but its disk setting names no drive");
                 }
 
-                using var drive = new ManagementObject(scope, new ManagementPath(drivePath), null);
-                WithDeadline(deadline, cancellationToken, $"reading drive settings for {vhdxPath}", drive.Get);
+                using var drive = session.GetInstance(
+                    NamespaceName,
+                    ReferenceToPath(drivePath),
+                    deadline.Options($"reading drive settings for {vhdxPath}", cancellationToken));
 
-                if (drive["Parent"] as string is not { } controllerPath)
+                if (drive.CimInstanceProperties["Parent"]?.Value as string is not { } controllerPath)
                 {
                     throw new InvalidOperationException(
                         $"the drive holding {vhdxPath} names no controller");
@@ -1224,7 +1235,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                 // it was found by: the two are the same object, but only this
                 // one has the same provenance as the disk path beside it, and
                 // both are handed straight back to vmms as REFs.
-                return new DiskLocation(FullPathTextOf(disk), drive.Path.Path, controllerPath, AddressOf(drive));
+                return new DiskLocation(FullPathTextOf(disk), FullPathTextOf(drive), controllerPath, AddressOf(drive));
             }
         }
 
@@ -1732,7 +1743,22 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
 
         foreach (CimProperty property in template.CimInstanceProperties)
         {
-            instance[property.Name] = property.Value;
+            // MI surfaces a CIM datetime-typed property as a .NET DateTime
+            // (a point in time) or TimeSpan (an interval), but the classic
+            // WMI COM API this ManagementObject wraps has no native datetime
+            // type - it represents one as a DMTF-format string, and assigning
+            // the raw .NET value through the indexer below trips a type
+            // mismatch at Put() time. This went uncaught while this method's
+            // only callers were resource-allocation templates, none of which
+            // have a datetime property; TagCheckpoint's use of it against a
+            // checkpoint's own Msvm_VirtualSystemSettingData - which does,
+            // e.g. CreationTime - is what first requires the conversion.
+            instance[property.Name] = property.Value switch
+            {
+                DateTime absolute => ManagementDateTimeConverter.ToDmtfDateTime(absolute),
+                TimeSpan interval => ManagementDateTimeConverter.ToDmtfTimeInterval(interval),
+                var value => value,
+            };
         }
 
         return instance;
@@ -1757,11 +1783,6 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         }
     }
 
-    private static int? AddressOf(ManagementObject device) =>
-        int.TryParse(device["AddressOnParent"] as string, CultureInfo.InvariantCulture, out var address)
-            ? address
-            : null;
-
     private static int? AddressOf(CimInstance device) =>
         int.TryParse(device.CimInstanceProperties["AddressOnParent"]?.Value as string, CultureInfo.InvariantCulture, out var address)
             ? address
@@ -1778,14 +1799,6 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     /// path, reads the same empty value, and fails identically forever. Failing
     /// here instead means it happens while the attach can still be rolled back.
     /// </remarks>
-    private static string VmBusInstanceIdOf(ManagementObject controller, string disk) =>
-        controller["VirtualSystemIdentifiers"] is string[] { Length: > 0 } identifiers
-         && !string.IsNullOrWhiteSpace(identifiers[0])
-            ? identifiers[0].Trim('{', '}').ToLowerInvariant()
-            : throw new InvalidOperationException(
-                $"the SCSI controller for {disk} reports no VMBus instance identifier, " +
-                "so the guest could not be told which disk this is");
-
     private static string VmBusInstanceIdOf(CimInstance controller, string disk) =>
         controller.CimInstanceProperties["VirtualSystemIdentifiers"]?.Value is string[] { Length: > 0 } identifiers
          && !string.IsNullOrWhiteSpace(identifiers[0])
@@ -1935,36 +1948,4 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     /// </remarks>
     private static bool SamePath(string left, string right) =>
         string.Equals(left.Trim(), right.Trim(), StringComparison.OrdinalIgnoreCase);
-
-    private static T WithDeadline<T>(
-        CimDeadline deadline,
-        CancellationToken cancellationToken,
-        string operation,
-        Func<T> work)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-
-        var remaining = deadline.Remaining;
-        if (remaining == TimeSpan.Zero)
-        {
-            throw new TimeoutException(
-                $"the operation's time budget was exhausted before {operation} could be issued");
-        }
-
-        return Task.Run(work, CancellationToken.None)
-            .WaitAsync(remaining, cancellationToken)
-            .GetAwaiter()
-            .GetResult();
-    }
-
-    private static void WithDeadline(
-        CimDeadline deadline,
-        CancellationToken cancellationToken,
-        string operation,
-        Action work) =>
-        _ = WithDeadline(deadline, cancellationToken, operation, () =>
-        {
-            work();
-            return 0;
-        });
 }
