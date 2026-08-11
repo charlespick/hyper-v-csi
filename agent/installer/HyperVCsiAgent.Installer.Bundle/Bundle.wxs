@@ -1,0 +1,58 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+  <Bundle
+    Name="Hyper-V CSI Agent"
+    Version="1.0.0"
+    Manufacturer="Hyper-V CSI Driver"
+    UpgradeCode="A6D1E4B2-3F7C-4A18-9E2D-5B8C0F1A7D33"
+    DisableModify="yes">
+
+    <!-- SourceFile and the harvested PayloadGroupRef below both point at the
+         BA's self-contained publish output (see this project's wixproj for
+         where BootstrapperPublishDir comes from) - ba.xslt strips this same
+         exe back out of the harvested set so it isn't authored twice. -->
+    <BootstrapperApplication SourceFile="$(var.BootstrapperPublishDir)HyperVCsiAgent.Installer.Bootstrapper.exe"
+                              bal:CommandLineVariables="caseInsensitive">
+      <PayloadGroupRef Id="BA.publish" />
+    </BootstrapperApplication>
+
+    <Log Prefix="HyperVCsiAgent_Setup" Extension="log" />
+
+    <!--
+      Same names and same "local per node" reasoning as the properties in
+      HyperVCsiAgent.Installer/Product.wxs - the WPF BA sets these directly
+      from wizard input, and they flow straight into the MsiProperty entries
+      below unchanged.
+    -->
+    <Variable Name="SERVICEACCOUNT" Type="string" Value="" Persisted="yes" />
+    <Variable Name="SERVICEPASSWORD" Type="string" Value="" Persisted="no" Hidden="yes" />
+    <Variable Name="CSVVOLUMESROOT" Type="string" Value="" Persisted="yes" />
+    <Variable Name="CSVSNAPSHOTSROOT" Type="string" Value="" Persisted="yes" />
+    <Variable Name="TLSHOSTNAME" Type="string" Value="" Persisted="yes" />
+    <Variable Name="TLSPORT" Type="string" Value="443" Persisted="yes" />
+    <Variable Name="STORENAME" Type="string" Value="My" Persisted="yes" />
+    <Variable Name="STORELOCATION" Type="string" Value="LocalMachine" Persisted="yes" />
+    <Variable Name="SERVERCERTTHUMBPRINT" Type="string" Value="" Persisted="yes" />
+    <Variable Name="CLIENTTHUMBPRINTS" Type="string" Value="" Persisted="yes" />
+
+    <Chain>
+      <MsiPackage Id="Agent.Install"
+                  SourceFile="$(var.MsiPath)"
+                  Visible="no"
+                  Compressed="yes"
+                  DisplayName="Hyper-V CSI Agent"
+                  Description="Provisions and attaches VHDX-backed persistent volumes for the Hyper-V CSI driver."
+                  Vital="yes">
+        <MsiProperty Name="SERVICEACCOUNT" Value="[SERVICEACCOUNT]" />
+        <MsiProperty Name="SERVICEPASSWORD" Value="[SERVICEPASSWORD]" />
+        <MsiProperty Name="CSVVOLUMESROOT" Value="[CSVVOLUMESROOT]" />
+        <MsiProperty Name="CSVSNAPSHOTSROOT" Value="[CSVSNAPSHOTSROOT]" />
+        <MsiProperty Name="TLSHOSTNAME" Value="[TLSHOSTNAME]" />
+        <MsiProperty Name="TLSPORT" Value="[TLSPORT]" />
+        <MsiProperty Name="STORENAME" Value="[STORENAME]" />
+        <MsiProperty Name="STORELOCATION" Value="[STORELOCATION]" />
+        <MsiProperty Name="SERVERCERTTHUMBPRINT" Value="[SERVERCERTTHUMBPRINT]" />
+        <MsiProperty Name="CLIENTTHUMBPRINTS" Value="[CLIENTTHUMBPRINTS]" />
+      </MsiPackage>
+    </Chain>
+  </Bundle>
+</Wix>

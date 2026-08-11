@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Platforms>x64</Platforms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <!-- Burn v5 launches the BA as its own child process (out-of-process
+         hosting) rather than loading a DLL into the engine, so this has to be
+         a real, self-contained exe - see HyperVCsiAgent.Installer.Bundle's
+         own remarks for how it gets harvested into the bundle as a payload
+         group. -->
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Pinned, not floating: the event-arg shapes and IEngine.Plan's single-
+         argument signature used throughout this project were verified
+         against 5.0.2 specifically (WiX's own main-branch source has since
+         diverged, e.g. adding a BundleScope parameter to Plan that 5.0.2
+         does not have) - a floating restore could silently break that. -->
+    <PackageReference Include="WixToolset.BootstrapperApplicationApi" Version="5.0.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\HyperVCsiAgent.Core\HyperVCsiAgent.Core.csproj" />
+  </ItemGroup>
+
+</Project>

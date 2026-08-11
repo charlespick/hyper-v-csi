@@ -1,0 +1,50 @@
+<Project Sdk="WixToolset.Sdk/5.0.2">
+
+  <PropertyGroup>
+    <OutputType>Bundle</OutputType>
+    <TargetExt>.exe</TargetExt>
+    <Platforms>x64</Platforms>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <HarvestDirectoryAdditionalOptions>-generate payloadgroup</HarvestDirectoryAdditionalOptions>
+    <BootstrapperProjectDir>$(MSBuildThisFileDirectory)..\HyperVCsiAgent.Installer.Bootstrapper\</BootstrapperProjectDir>
+    <BootstrapperPublishDir>$(BootstrapperProjectDir)bin\$(Configuration)\net10.0-windows\win-x64\publish\</BootstrapperPublishDir>
+    <MsiProjectDir>$(MSBuildThisFileDirectory)..\HyperVCsiAgent.Installer\</MsiProjectDir>
+    <MsiPath>$(MsiProjectDir)bin\x64\$(Configuration)\HyperVCsiAgent.Installer.msi</MsiPath>
+    <DefineConstants>MsiPath=$(MsiPath);BootstrapperPublishDir=$(BootstrapperPublishDir)</DefineConstants>
+  </PropertyGroup>
+
+  <!-- The BA exe is harvested from its own publish output (all the
+       self-contained runtime DLLs alongside it) rather than its plain build
+       output - see HyperVCsiAgent.Installer/HyperVCsiAgent.Installer.wixproj's
+       own remarks for why publish, not build, is what a self-contained
+       payload has to come from. ba.xslt drops the exe itself from the
+       harvested set: Bundle.wxs references that exe directly via the
+       BootstrapperApplication element's own SourceFile attribute, so
+       harvesting it a second time would double-author the same payload. -->
+  <ItemGroup>
+    <BindInputPaths Include="$(BootstrapperPublishDir)" />
+    <HarvestDirectory Include="$(BootstrapperPublishDir)">
+      <DirectoryRefId>BA.publish</DirectoryRefId>
+      <Transforms>ba.xslt</Transforms>
+    </HarvestDirectory>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="ba.xslt" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="WixToolset.Bal.wixext" Version="5.0.2" />
+    <PackageReference Include="WixToolset.Heat" Version="5.0.2" />
+  </ItemGroup>
+
+  <!-- Same shape as HyperVCsiAgent.Installer.wixproj's own PublishAgentPayload
+       target: the MSI and the BA exe are each a separately built/published
+       artifact this bundle only embeds, so both need to exist before this
+       project's own CoreCompile runs. -->
+  <Target Name="PublishBootstrapperUiAndMsi" BeforeTargets="HarvestDirectory;CoreCompile">
+    <Exec Command="dotnet publish &quot;$(BootstrapperProjectDir)HyperVCsiAgent.Installer.Bootstrapper.csproj&quot; -c $(Configuration) -r win-x64 --self-contained -o &quot;$(BootstrapperPublishDir)&quot;" />
+    <Exec Command="dotnet build &quot;$(MsiProjectDir)HyperVCsiAgent.Installer.wixproj&quot; -c $(Configuration) -p:Platform=x64" />
+  </Target>
+
+</Project>

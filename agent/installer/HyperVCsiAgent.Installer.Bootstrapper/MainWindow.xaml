@@ -1,0 +1,39 @@
+<Window x:Class="HyperVCsiAgent.Installer.Bootstrapper.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:pages="clr-namespace:HyperVCsiAgent.Installer.Bootstrapper.Pages"
+        Title="Hyper-V CSI Agent Setup" Height="450" Width="620"
+        WindowStartupLocation="CenterScreen" ResizeMode="NoResize">
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BoolToVis" />
+    </Window.Resources>
+    <Grid Margin="0,0,0,12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <Grid Grid.Row="0" Margin="24">
+            <pages:WelcomePage Visibility="{Binding IsWelcomePage, Converter={StaticResource BoolToVis}}" />
+            <pages:ServiceAccountPage Visibility="{Binding IsServiceAccountPage, Converter={StaticResource BoolToVis}}" />
+            <pages:StoragePage Visibility="{Binding IsStoragePage, Converter={StaticResource BoolToVis}}" />
+            <pages:CertificatePage Visibility="{Binding IsCertificatePage, Converter={StaticResource BoolToVis}}" />
+            <pages:TrustedClientsPage Visibility="{Binding IsTrustedClientsPage, Converter={StaticResource BoolToVis}}" />
+            <pages:ProgressPage Visibility="{Binding IsProgressPage, Converter={StaticResource BoolToVis}}" />
+            <pages:FinishPage Visibility="{Binding IsFinishPage, Converter={StaticResource BoolToVis}}" />
+        </Grid>
+
+        <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="24,0">
+            <Button Content="Back" Width="80" Margin="0,0,8,0" Command="{Binding BackCommand}"
+                    Visibility="{Binding ShowBackButton, Converter={StaticResource BoolToVis}}" />
+            <Button Content="Next" Width="80" Margin="0,0,8,0" Command="{Binding NextCommand}" IsDefault="True"
+                    Visibility="{Binding ShowNextButton, Converter={StaticResource BoolToVis}}" />
+            <Button Content="Install" Width="80" Margin="0,0,8,0" Command="{Binding InstallCommand}"
+                    Visibility="{Binding ShowInstallButton, Converter={StaticResource BoolToVis}}" />
+            <Button Content="Close" Width="80" Command="{Binding CloseCommand}"
+                    Visibility="{Binding ShowCloseButton, Converter={StaticResource BoolToVis}}" />
+            <Button Content="Cancel" Width="80" Command="{Binding CancelCommand}"
+                    Visibility="{Binding ShowCancelButton, Converter={StaticResource BoolToVis}}" />
+        </StackPanel>
+    </Grid>
+</Window>
