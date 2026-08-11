@@ -1,0 +1,205 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package
+    Name="Hyper-V CSI Agent"
+    Manufacturer="Hyper-V CSI Driver"
+    Version="1.0.0"
+    UpgradeCode="7F4DC474-BB07-4124-822F-AFB224EE7D2E">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!--
+      Every value below is local to THIS node - see AgentOptions' own remarks
+      in HyperVCsiAgent.Core for why. That is also why running this MSI
+      unattended (msiexec /quiet PROPERTY=value ...) is the supported way to
+      provision a node from Puppet/Ansible/DSC: nothing here needs a value
+      shared with, or coordinated across, any other node in the cluster.
+    -->
+    <Property Id="SERVICEACCOUNT" Secure="yes" />
+    <Property Id="SERVICEPASSWORD" Secure="yes" Hidden="yes" />
+    <Property Id="CSVVOLUMESROOT" Secure="yes" />
+    <Property Id="CSVSNAPSHOTSROOT" Secure="yes" />
+    <Property Id="TLSHOSTNAME" Secure="yes" />
+    <Property Id="TLSPORT" Value="443" Secure="yes" />
+    <Property Id="STORENAME" Value="My" Secure="yes" />
+    <Property Id="STORELOCATION" Value="LocalMachine" Secure="yes" />
+    <Property Id="SERVERCERTTHUMBPRINT" Secure="yes" />
+    <!-- Semicolon-separated - the wizard's trusted-clients dialog joins the
+         newline-separated text an operator pastes before handing it to MSI,
+         since MSI properties collapse embedded newlines. -->
+    <Property Id="CLIENTTHUMBPRINTS" Secure="yes" />
+
+    <Binary Id="ActionsExe" SourceFile="$(var.ActionsExePath)" />
+
+    <!--
+      Immediate: reading a certificate store does not need elevation, and
+      running these before files are even staged means a typo'd thumbprint or
+      malformed client fingerprint is caught before anything changes on disk.
+      Both no-op (skip via Condition) when their input was not supplied at
+      all, so an unattended install that is only staging the service for a
+      configuration-management tool to finish later does not fail on
+      validation it was never asked to do.
+    -->
+    <CustomAction Id="ValidateServerCertificate"
+                  BinaryRef="ActionsExe"
+                  ExeCommand="validate-cert --thumbprint &quot;[SERVERCERTTHUMBPRINT]&quot; --store-name &quot;[STORENAME]&quot; --store-location &quot;[STORELOCATION]&quot;"
+                  Execute="immediate"
+                  Return="check" />
+
+    <CustomAction Id="ValidateClientThumbprints"
+                  BinaryRef="ActionsExe"
+                  ExeCommand="validate-thumbprints --values &quot;[CLIENTTHUMBPRINTS]&quot;"
+                  Execute="immediate"
+                  Return="check" />
+
+    <!--
+      Deferred and unimpersonated (running as SYSTEM, the elevated context a
+      per-machine install already runs under): granting a certificate's
+      private key file an ACL entry and writing into ProgramData both need
+      more than the interactive user's own rights. Property references in an
+      EXE custom action's command line are resolved when MSI *schedules* the
+      deferred action - during the same immediate pass these Condition
+      attributes evaluate on - not when it later executes, so this needs no
+      separate CustomActionData staging step.
+    -->
+    <CustomAction Id="GrantServiceAccountCertificateAccess"
+                  BinaryRef="ActionsExe"
+                  ExeCommand="grant-cert-access --thumbprint &quot;[SERVERCERTTHUMBPRINT]&quot; --store-name &quot;[STORENAME]&quot; --store-location &quot;[STORELOCATION]&quot; --account &quot;[SERVICEACCOUNT]&quot;"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <!--
+      Only the values an operator (or a CM tool) actually supplied end up in
+      agent.config.json - see WriteConfigCommand's own remarks for why
+      everything else is left for AgentOptions' own defaults to fill in.
+
+      Built up across three short property-setting actions rather than one
+      CustomAction: the MSI CustomAction table's Target column caps out at
+      255 authored characters (ICE03), and the full write-config command
+      line - nine flags, several of them long property references - is
+      comfortably over that. A property's own runtime VALUE has no such
+      cap, so each step below only needs to stay short as *authored*; the
+      final WriteAgentConfig CustomAction's ExeCommand is just "[WRITECONFIGCMD]",
+      which is what actually carries the long resolved string at runtime.
+    -->
+    <Property Id="WRITECONFIGCMD" Secure="yes" />
+
+    <CustomAction Id="SetWriteConfigCmd1" Property="WRITECONFIGCMD"
+                  Value="write-config --output &quot;[CommonAppDataFolder]HyperVCsiAgent\agent.config.json&quot; --csv-volumes-root &quot;[CSVVOLUMESROOT]&quot; --csv-snapshots-root &quot;[CSVSNAPSHOTSROOT]&quot;" />
+    <CustomAction Id="SetWriteConfigCmd2" Property="WRITECONFIGCMD"
+                  Value="[WRITECONFIGCMD] --tls-host-name &quot;[TLSHOSTNAME]&quot; --tls-port &quot;[TLSPORT]&quot; --tls-store-name &quot;[STORENAME]&quot;" />
+    <CustomAction Id="SetWriteConfigCmd3" Property="WRITECONFIGCMD"
+                  Value="[WRITECONFIGCMD] --tls-store-location &quot;[STORELOCATION]&quot; --server-thumbprints &quot;[SERVERCERTTHUMBPRINT]&quot; --client-thumbprints &quot;[CLIENTTHUMBPRINTS]&quot;" />
+
+    <CustomAction Id="WriteAgentConfig"
+                  BinaryRef="ActionsExe"
+                  ExeCommand="[WRITECONFIGCMD]"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <InstallExecuteSequence>
+      <Custom Action="ValidateServerCertificate" Before="InstallValidate" Condition="SERVERCERTTHUMBPRINT" />
+      <Custom Action="ValidateClientThumbprints" After="ValidateServerCertificate" Condition="CLIENTTHUMBPRINTS" />
+      <Custom Action="GrantServiceAccountCertificateAccess" After="InstallFiles" Condition="SERVERCERTTHUMBPRINT AND SERVICEACCOUNT" />
+      <Custom Action="SetWriteConfigCmd1" After="GrantServiceAccountCertificateAccess" Condition="CSVVOLUMESROOT" />
+      <Custom Action="SetWriteConfigCmd2" After="SetWriteConfigCmd1" Condition="CSVVOLUMESROOT" />
+      <Custom Action="SetWriteConfigCmd3" After="SetWriteConfigCmd2" Condition="CSVVOLUMESROOT" />
+      <Custom Action="WriteAgentConfig" After="SetWriteConfigCmd3" Condition="CSVVOLUMESROOT" />
+    </InstallExecuteSequence>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="HyperVCsiAgent" />
+    </StandardDirectory>
+
+    <Feature Id="Main">
+      <ComponentGroupRef Id="AgentComponents" />
+      <ComponentRef Id="ServiceExeComponent" />
+      <ComponentRef Id="ServiceControlStartComponent" />
+    </Feature>
+
+    <ui:WixUI Id="WixUI_InstallDir" />
+    <WixVariable Id="WixUILicenseRtf" Value="License.rtf" />
+    <UI>
+      <!-- Inserted after the standard install-directory dialog and before
+           the standard ready-to-install confirmation: service account,
+           storage, certificate and trusted-client values are all this
+           installer's own additions to the stock WixUI_InstallDir sequence. -->
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="ServiceAccountDlg" Order="4" Condition="NOT Installed" />
+      <Publish Dialog="ServiceAccountDlg" Control="Back" Event="NewDialog" Value="InstallDirDlg" />
+      <Publish Dialog="ServiceAccountDlg" Control="Next" Event="NewDialog" Value="StorageDlg" />
+
+      <Publish Dialog="StorageDlg" Control="Back" Event="NewDialog" Value="ServiceAccountDlg" />
+      <Publish Dialog="StorageDlg" Control="Next" Event="NewDialog" Value="CertificateDlg" />
+
+      <Publish Dialog="CertificateDlg" Control="Back" Event="NewDialog" Value="StorageDlg" />
+      <Publish Dialog="CertificateDlg" Control="Next" Event="DoAction" Value="ValidateServerCertificate" Condition="SERVERCERTTHUMBPRINT" Order="1" />
+      <Publish Dialog="CertificateDlg" Control="Next" Event="NewDialog" Value="TrustedClientsDlg" Order="2" />
+
+      <Publish Dialog="TrustedClientsDlg" Control="Back" Event="NewDialog" Value="CertificateDlg" />
+      <Publish Dialog="TrustedClientsDlg" Control="Next" Event="DoAction" Value="ValidateClientThumbprints" Condition="CLIENTTHUMBPRINTS" Order="1" />
+      <Publish Dialog="TrustedClientsDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="2" />
+
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="TrustedClientsDlg" />
+    </UI>
+  </Package>
+
+  <Fragment>
+    <ComponentGroup Id="AgentComponents" Directory="INSTALLFOLDER">
+      <Files Include="$(var.ServicePublishDir)**">
+        <Exclude Files="$(var.ServicePublishDir)HyperVCsiAgent.Service.exe" />
+      </Files>
+    </ComponentGroup>
+  </Fragment>
+
+  <!--
+    The service exe gets its own Component, outside the AgentComponents
+    glob-harvest, purely so ServiceInstall/ServiceControl can attach to it -
+    WiX requires both on the component that owns the service's executable.
+  -->
+  <Fragment>
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="ServiceExeComponent" Guid="9D6E9F9C-9F2E-4C7D-9E9E-2B7C7B9F6D01">
+        <File Id="ServiceExe" Source="$(var.ServicePublishDir)HyperVCsiAgent.Service.exe" KeyPath="yes" />
+
+        <ServiceInstall
+          Id="ServiceInstaller"
+          Name="hyperv-csi-agent"
+          DisplayName="Hyper-V CSI Agent"
+          Description="Provisions and attaches VHDX-backed persistent volumes for the Hyper-V CSI driver."
+          Type="ownProcess"
+          Start="auto"
+          ErrorControl="normal"
+          Account="[SERVICEACCOUNT]"
+          Password="[SERVICEPASSWORD]" />
+
+        <!-- Always stop and remove the service on uninstall regardless of
+             whether it was ever started - see ServiceControlStartComponent
+             below for why starting it, unlike this, is conditional. -->
+        <ServiceControl
+          Id="ServiceControlStop"
+          Name="hyperv-csi-agent"
+          Stop="both"
+          Remove="uninstall"
+          Wait="yes" />
+      </Component>
+
+      <!-- ServiceControl has no Condition attribute of its own, so starting
+           the service lives in its own component instead: only started once
+           a config file actually exists to start it with - see
+           WriteAgentConfig's own Condition above. An unattended install
+           that skipped configuration leaves the service registered but
+           stopped, ready for a CM tool to drop agent.config.json in place
+           and start it separately. -->
+      <Component Id="ServiceControlStartComponent" Guid="1A2B3C4D-5E6F-4A7B-8C9D-0E1F2A3B4C5D" Condition="CSVVOLUMESROOT">
+        <RegistryValue Root="HKLM" Key="Software\HyperVCsiAgent" Name="StartedAtInstall" Type="integer" Value="1" KeyPath="yes" />
+        <ServiceControl
+          Id="ServiceControlStart"
+          Name="hyperv-csi-agent"
+          Start="install"
+          Wait="yes" />
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+</Wix>

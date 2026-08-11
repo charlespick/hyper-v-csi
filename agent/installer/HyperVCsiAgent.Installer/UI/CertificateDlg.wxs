@@ -1,0 +1,30 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Fragment>
+    <UI>
+      <Dialog Id="CertificateDlg" Width="370" Height="270" Title="Server Certificate">
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="Back" />
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="Next" />
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="Cancel">
+          <Publish Event="SpawnDialog" Value="CancelDlg" Condition="1" />
+        </Control>
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="240" Height="15" Transparent="yes" NoPrefix="yes" Text="Server Certificate" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="320" Height="15" Transparent="yes" NoPrefix="yes"
+                  Text="The certificate must already be installed on this host - Setup only pins it by thumbprint, it does not import one for you." />
+
+        <Control Id="HostNameLabel" Type="Text" X="20" Y="60" Width="280" Height="15" Text="DNS name callers use to reach this agent (Agent:Tls:HostName):" />
+        <Control Id="HostNameEdit" Type="Edit" X="20" Y="75" Width="320" Height="18" Property="TLSHOSTNAME" />
+
+        <Control Id="ThumbprintLabel" Type="Text" X="20" Y="100" Width="280" Height="15" Text="Server certificate thumbprint:" />
+        <Control Id="ThumbprintEdit" Type="Edit" X="20" Y="115" Width="320" Height="18" Property="SERVERCERTTHUMBPRINT" />
+
+        <Control Id="StoreNameLabel" Type="Text" X="20" Y="140" Width="140" Height="15" Text="Certificate store name:" />
+        <Control Id="StoreNameEdit" Type="Edit" X="20" Y="155" Width="100" Height="18" Property="STORENAME" />
+
+        <Control Id="StoreLocationLabel" Type="Text" X="140" Y="140" Width="140" Height="15" Text="Certificate store location:" />
+        <Control Id="StoreLocationEdit" Type="Edit" X="140" Y="155" Width="140" Height="18" Property="STORELOCATION" />
+      </Dialog>
+    </UI>
+  </Fragment>
+</Wix>

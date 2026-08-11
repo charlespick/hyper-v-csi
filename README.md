@@ -4,12 +4,58 @@ A small, experimental Kubernetes CSI driver for provisioning and attaching
 VHDX-backed persistent volumes to Hyper-V-based nodes.
 
 > Warning: this project is still very early and is pretty much entirely vibe
-> coded. It has no finished or production-ready installer, and much of the
-> implementation is still being iterated.
+> coded. The agent installer is new and has only been exercised through its
+> unattended install path end to end, not yet a full interactive run on a
+> production cluster, and much of the implementation is still being
+> iterated.
 
 ## Agent Installation
 
-Installation instructions will be added later once a proper installer is built.
+The agent installs via `agent/installer/HyperVCsiAgent.Installer` - a WiX MSI
+that installs the service locally on one node at a time, the same way SQL
+Server's Failover Cluster Instance setup works: run it on each node, then add
+the node's service as a Generic Service resource to the failover cluster
+yourself (this installer does not touch the cluster). Config is local to the
+node it was installed on - see "Configuration" below for why - so a change
+can be piloted on one node before being applied to the other.
+
+Build the MSI (it is not part of the main solution build, since it is the
+only project in the solution that targets a specific platform):
+
+```
+dotnet build agent/installer/HyperVCsiAgent.Installer/HyperVCsiAgent.Installer.wixproj -c Release -p:Platform=x64
+```
+
+Run `HyperVCsiAgent.Installer.msi` interactively for a wizard that collects
+the service account, storage locations, server certificate, and trusted
+client certificate thumbprints, and writes them to
+`C:\ProgramData\HyperVCsiAgent\agent.config.json`. The certificate itself
+must already be installed on the host and readable by whichever store/location
+you point the wizard at - the installer only pins it by thumbprint and grants
+the service account read access to its private key, it does not import one
+for you.
+
+For unattended installs (Puppet, Ansible, DSC, or any other configuration
+management tool), run it silent with properties on the command line:
+
+```
+msiexec /i HyperVCsiAgent.Installer.msi /quiet SERVICEACCOUNT="DOMAIN\svc-hyperv-csi" SERVICEPASSWORD="..." CSVVOLUMESROOT="C:\ClusterStorage\Volume1\hyperv-csi\volumes" CSVSNAPSHOTSROOT="C:\ClusterStorage\Volume1\hyperv-csi\snapshots" TLSHOSTNAME="hyperv-csi-agent.example.com" SERVERCERTTHUMBPRINT="..." CLIENTTHUMBPRINTS="..."
+```
+
+Any property can be left out. The service and its files always install; the
+config file is only written, and the service only started, once
+`CSVVOLUMESROOT` is present - installing with just `SERVICEACCOUNT` stages a
+stopped, registered service for a configuration management tool to finish
+configuring and start on its own schedule.
+
+### Configuration
+
+Config lives at `C:\ProgramData\HyperVCsiAgent\agent.config.json` on each
+node - not on the CSV - so a config change can be edited on the node that
+currently owns the clustered role, piloted by failing the role over onto it,
+and only applied to the other node once it is proven. See the doc comment on
+`AgentOptions` in `HyperVCsiAgent.Core` for the full rationale and every
+setting the file accepts.
 
 ## Driver Installation
 

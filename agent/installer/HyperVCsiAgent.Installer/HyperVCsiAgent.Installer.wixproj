@@ -1,0 +1,30 @@
+<Project Sdk="WixToolset.Sdk/5.0.2">
+
+  <PropertyGroup>
+    <OutputType>Package</OutputType>
+    <Platforms>x64</Platforms>
+    <ServiceProjectDir>$(MSBuildThisFileDirectory)..\..\src\HyperVCsiAgent.Service\</ServiceProjectDir>
+    <ServicePublishDir>$(ServiceProjectDir)bin\$(Configuration)\net10.0\win-x64\publish\</ServicePublishDir>
+    <ActionsProjectDir>$(MSBuildThisFileDirectory)..\HyperVCsiAgent.Installer.Actions\</ActionsProjectDir>
+    <ActionsPublishDir>$(ActionsProjectDir)bin\$(Configuration)\net10.0\win-x64\publish\</ActionsPublishDir>
+    <DefineConstants>ServicePublishDir=$(ServicePublishDir);ActionsExePath=$(ActionsPublishDir)HyperVCsiAgent.Installer.Actions.exe</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="WixToolset.UI.wixext" Version="5.0.2" />
+  </ItemGroup>
+
+  <!-- The MSI packages two other projects' published output rather than
+       their build output: HyperVCsiAgent.Service has to be self-contained so
+       a node needs nothing but the MSI, and the custom-action exe has to be a
+       single file (see HyperVCsiAgent.Installer.Actions.csproj's own remarks)
+       so it can be embedded as one MSI Binary stream. Both only exist once
+       `dotnet publish` has actually run - a plain build of either leaves a
+       framework-dependent apphost that fails the moment it is extracted
+       somewhere without its dependency DLLs alongside it. -->
+  <Target Name="PublishAgentPayload" BeforeTargets="CoreCompile">
+    <Exec Command="dotnet publish &quot;$(ServiceProjectDir)HyperVCsiAgent.Service.csproj&quot; -c $(Configuration) -r win-x64 --self-contained -o &quot;$(ServicePublishDir)&quot;" />
+    <Exec Command="dotnet publish &quot;$(ActionsProjectDir)HyperVCsiAgent.Installer.Actions.csproj&quot; -c $(Configuration) -r win-x64 --self-contained -o &quot;$(ActionsPublishDir)&quot;" />
+  </Target>
+
+</Project>

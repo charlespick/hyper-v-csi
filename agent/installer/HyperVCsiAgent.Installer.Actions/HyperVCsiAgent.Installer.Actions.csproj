@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- The installer embeds this exe as an MSI Binary stream and runs it both
+         from the UI sequence (immediate, for wizard-page validation) and the
+         execute sequence (deferred, elevated, for writing config and granting
+         certificate access) - see HyperVCsiAgent.Installer/Product.wxs. A
+         framework-dependent exe would need the target host to already have a
+         matching .NET runtime installed before setup can even validate a
+         thumbprint, which defeats the point of a single self-contained
+         installer. -->
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PublishSingleFile>true</PublishSingleFile>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\HyperVCsiAgent.Core\HyperVCsiAgent.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="HyperVCsiAgent.Installer.Actions.Tests" />
+  </ItemGroup>
+
+</Project>

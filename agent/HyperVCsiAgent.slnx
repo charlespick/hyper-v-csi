@@ -7,4 +7,9 @@
     <Project Path="tests/HyperVCsiAgent.Core.Tests/HyperVCsiAgent.Core.Tests.csproj" />
     <Project Path="tests/HyperVCsiAgent.Service.Tests/HyperVCsiAgent.Service.Tests.csproj" />
   </Folder>
+  <Folder Name="/installer/">
+    <Project Path="installer/HyperVCsiAgent.Installer.Actions/HyperVCsiAgent.Installer.Actions.csproj" />
+    <Project Path="installer/HyperVCsiAgent.Installer.Actions.Tests/HyperVCsiAgent.Installer.Actions.Tests.csproj" />
+    <Project Path="installer/HyperVCsiAgent.Installer/HyperVCsiAgent.Installer.wixproj" />
+  </Folder>
 </Solution>
