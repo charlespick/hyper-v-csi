@@ -4,7 +4,7 @@
     <StackPanel>
         <TextBlock Text="Storage Locations" FontSize="18" FontWeight="Bold" Margin="0,0,0,4" />
         <TextBlock TextWrapping="Wrap" Margin="0,0,0,16"
-                   Text="Both locations must be shared storage accessible from every node that will run this agent - a Cluster Shared Volume or a Scale-Out File Server share both qualify." />
+                   Text="Configure shared storage to store Kubernetes Persistent Volumes and Snapshots." />
 
         <TextBlock Text="Volumes directory:" Margin="0,0,0,4" />
         <Grid Margin="0,0,0,12">

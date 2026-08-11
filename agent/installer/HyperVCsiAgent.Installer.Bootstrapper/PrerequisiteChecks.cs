@@ -42,7 +42,7 @@ internal static class PrerequisiteChecks
     {
         using var resources = Registry.LocalMachine.OpenSubKey(ClusterResourcesKeyPath);
         return resources is not null
-            ? new PrerequisiteCheckResult("Failover cluster membership", PrerequisiteStatus.Pass, "This host is a cluster member.")
+            ? new PrerequisiteCheckResult("Failover cluster membership", PrerequisiteStatus.Pass, "You may choose to configure the cluster role as part of installation.")
             : new PrerequisiteCheckResult(
                 "Failover cluster membership", PrerequisiteStatus.Warn,
                 "This host is not a failover cluster member. Shared storage must still be reachable from every node that will run this agent.");
