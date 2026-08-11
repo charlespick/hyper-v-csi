@@ -32,6 +32,7 @@ internal sealed class WizardViewModel : ViewModelBase
     private string _statusText = "";
     private bool _isInstalling;
     private bool _installSucceeded;
+    private bool _licenseAccepted;
     private Dispatcher? _dispatcher;
 
     private readonly IEngine _engine;
@@ -43,7 +44,8 @@ internal sealed class WizardViewModel : ViewModelBase
         _command = command;
 
         BackCommand = new RelayCommand(GoBack, () => CurrentPageIndex is > 0 and < ProgressPageIndex);
-        NextCommand = new RelayCommand(GoNext, () => CurrentPageIndex < ProgressPageIndex - 1);
+        NextCommand = new RelayCommand(GoNext, () =>
+            CurrentPageIndex < ProgressPageIndex - 1 && (CurrentPageIndex != WelcomePageIndex || LicenseAccepted));
         InstallCommand = new RelayCommand(BeginInstall, () => CurrentPageIndex == ProgressPageIndex - 1);
         CancelCommand = new RelayCommand(Cancel);
         CloseCommand = new RelayCommand(() => Application.Current?.Shutdown());
@@ -111,6 +113,7 @@ internal sealed class WizardViewModel : ViewModelBase
     public string StatusText { get => _statusText; private set => SetField(ref _statusText, value); }
     public bool IsInstalling { get => _isInstalling; private set => SetField(ref _isInstalling, value); }
     public bool InstallSucceeded { get => _installSucceeded; private set => SetField(ref _installSucceeded, value); }
+    public bool LicenseAccepted { get => _licenseAccepted; set => SetField(ref _licenseAccepted, value); }
 
     public RelayCommand BackCommand { get; }
     public RelayCommand NextCommand { get; }

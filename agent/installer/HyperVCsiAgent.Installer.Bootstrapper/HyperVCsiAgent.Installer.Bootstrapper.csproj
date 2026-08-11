@@ -30,4 +30,12 @@
     <ProjectReference Include="..\..\src\HyperVCsiAgent.Core\HyperVCsiAgent.Core.csproj" />
   </ItemGroup>
 
+  <!-- Linked, not copied: the MSI's own license dialog (until the WXS
+       dialogs are retired) and this wizard's Welcome/License page have to
+       keep showing the exact same text, so there is only one License.rtf on
+       disk for both to reference. -->
+  <ItemGroup>
+    <EmbeddedResource Include="..\HyperVCsiAgent.Installer\License.rtf" LogicalName="License.rtf" Link="Assets\License.rtf" />
+  </ItemGroup>
+
 </Project>
