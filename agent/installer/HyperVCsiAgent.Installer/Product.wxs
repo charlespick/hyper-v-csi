@@ -8,6 +8,12 @@
     <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
+    <!-- WixUI_InstallDir's InstallDirDlg binds its folder-picker control to
+         this property - without it, that control has no property to read
+         or write, and MSI refuses to even create the dialog (error 2819:
+         "Control [3] on dialog [2] needs a property linked to it"). -->
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+
     <!--
       Every value below is local to THIS node - see AgentOptions' own remarks
       in HyperVCsiAgent.Core for why. That is also why running this MSI
@@ -126,7 +132,10 @@
            the standard ready-to-install confirmation: service account,
            storage, certificate and trusted-client values are all this
            installer's own additions to the stock WixUI_InstallDir sequence. -->
-      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="ServiceAccountDlg" Order="4" Condition="NOT Installed" />
+      <!-- Order must beat WixUI_InstallDir's own InstallDirDlg-Next-
+           >VerifyReadyDlg entry, which is also Order="4" - on a tie the
+           stock NewDialog event wins and this override never fires. -->
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="ServiceAccountDlg" Order="10" Condition="NOT Installed" />
       <Publish Dialog="ServiceAccountDlg" Control="Back" Event="NewDialog" Value="InstallDirDlg" />
       <Publish Dialog="ServiceAccountDlg" Control="Next" Event="NewDialog" Value="StorageDlg" />
 
@@ -141,7 +150,9 @@
       <Publish Dialog="TrustedClientsDlg" Control="Next" Event="DoAction" Value="ValidateClientThumbprints" Condition="CLIENTTHUMBPRINTS" Order="1" />
       <Publish Dialog="TrustedClientsDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="2" />
 
-      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="TrustedClientsDlg" />
+      <!-- Same tie as InstallDirDlg's Next above, mirrored: WixUI_InstallDir's
+           own VerifyReadyDlg-Back->InstallDirDlg entry is also Order="1". -->
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="TrustedClientsDlg" Order="10" />
     </UI>
   </Package>
 
