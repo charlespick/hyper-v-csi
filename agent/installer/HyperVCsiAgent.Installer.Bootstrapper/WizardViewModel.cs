@@ -34,6 +34,7 @@ internal sealed class WizardViewModel : ViewModelBase
     private bool _isInstalling;
     private bool _installSucceeded;
     private bool _licenseAccepted;
+    private bool _snapshotsEnabled;
     private Dispatcher? _dispatcher;
 
     private readonly IEngine _engine;
@@ -135,6 +136,7 @@ internal sealed class WizardViewModel : ViewModelBase
     public bool IsInstalling { get => _isInstalling; private set => SetField(ref _isInstalling, value); }
     public bool InstallSucceeded { get => _installSucceeded; private set => SetField(ref _installSucceeded, value); }
     public bool LicenseAccepted { get => _licenseAccepted; set => SetField(ref _licenseAccepted, value); }
+    public bool SnapshotsEnabled { get => _snapshotsEnabled; set => SetField(ref _snapshotsEnabled, value); }
 
     public RelayCommand BackCommand { get; }
     public RelayCommand NextCommand { get; }
@@ -164,10 +166,21 @@ internal sealed class WizardViewModel : ViewModelBase
 
     private void GoNext()
     {
-        if (CanGoNext())
+        if (!CanGoNext())
         {
-            CurrentPageIndex++;
+            return;
         }
+
+        // Informational only, and deliberately after the required-field
+        // check above rather than folded into it - this never blocks
+        // leaving the page, it just tells the operator what to expect.
+        if (CurrentPageIndex == StoragePageIndex && SnapshotsEnabled)
+        {
+            var message = BlockCloneCheck.Describe(CsvVolumesRoot, CsvSnapshotsRoot);
+            MessageBox.Show(message, "Storage Locations", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+
+        CurrentPageIndex++;
     }
 
     private bool CanGoNext()
@@ -181,6 +194,7 @@ internal sealed class WizardViewModel : ViewModelBase
         {
             WelcomePageIndex => LicenseAccepted,
             ServiceAccountPageIndex => ServiceAccount.Length > 0 && ServicePassword.Length > 0,
+            StoragePageIndex => CsvVolumesRoot.Length > 0 && (!SnapshotsEnabled || CsvSnapshotsRoot.Length > 0),
             _ => true,
         };
     }

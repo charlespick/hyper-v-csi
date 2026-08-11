@@ -4,15 +4,28 @@
     <StackPanel>
         <TextBlock Text="Storage Locations" FontSize="18" FontWeight="Bold" Margin="0,0,0,4" />
         <TextBlock TextWrapping="Wrap" Margin="0,0,0,16"
-                   Text="Both must be Cluster Shared Volume paths - a local path is only reachable from whichever host currently owns this role." />
+                   Text="Both locations must be shared storage accessible from every node that will run this agent - a Cluster Shared Volume or a Scale-Out File Server share both qualify." />
 
-        <TextBlock Text="Volumes directory (Agent:CsvVolumesRoot):" Margin="0,0,0,4" />
-        <TextBox Text="{Binding CsvVolumesRoot, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,12" />
+        <TextBlock Text="Volumes directory:" Margin="0,0,0,4" />
+        <Grid Margin="0,0,0,12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <TextBox Grid.Column="0" Text="{Binding CsvVolumesRoot, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,8,0" />
+            <Button Grid.Column="1" Content="Browse..." Width="80" Click="BrowseVolumes_Click" />
+        </Grid>
 
-        <TextBlock Text="Snapshots directory (Agent:CsvSnapshotsRoot):" Margin="0,0,0,4" />
-        <TextBox Text="{Binding CsvSnapshotsRoot, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,12" />
+        <CheckBox Content="Enable Snapshots support" IsChecked="{Binding SnapshotsEnabled}" Margin="0,0,0,12" />
 
-        <TextBlock Text="HTTPS port (Agent:Tls:Port):" Margin="0,0,0,4" />
-        <TextBox Text="{Binding TlsPort, UpdateSourceTrigger=PropertyChanged}" Width="80" HorizontalAlignment="Left" />
+        <TextBlock Text="Snapshots directory:" Margin="0,0,0,4" IsEnabled="{Binding SnapshotsEnabled}" />
+        <Grid IsEnabled="{Binding SnapshotsEnabled}">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <TextBox Grid.Column="0" Text="{Binding CsvSnapshotsRoot, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,8,0" />
+            <Button Grid.Column="1" Content="Browse..." Width="80" Click="BrowseSnapshots_Click" />
+        </Grid>
     </StackPanel>
 </UserControl>
