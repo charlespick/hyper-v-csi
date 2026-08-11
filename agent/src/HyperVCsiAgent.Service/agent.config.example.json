@@ -14,9 +14,8 @@
     "MaxConcurrentHostOperations": 4,
     "HostOperationTimeout": "00:02:00",
 
-    "//Tls": "The server certificate is self-signed, the same as the driver's client certificate, so it is pinned by thumbprint rather than validated against a CA. HostName is a separate check: Kestrel's host filtering rejects any caller not addressing the agent by this name, independent of which certificate they trust. The store is re-read every ReloadInterval, so installing a new certificate and adding its thumbprint here is picked up without restarting the clustered role.",
+    "//Tls": "The server certificate is self-signed, the same as the driver's client certificate, so it is pinned by thumbprint rather than validated against a CA. The store is re-read every ReloadInterval, so installing a new certificate and adding its thumbprint here is picked up without restarting the clustered role.",
     "Tls": {
-      "HostName": "hyperv-csi-agent.makerland.xyz",
       "AllowedThumbprints": [
         "A1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4"
       ],

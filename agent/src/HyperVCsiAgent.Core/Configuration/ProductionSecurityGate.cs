@@ -17,7 +17,7 @@ public static class ProductionSecurityGate
             if (!options.Tls.IsConfigured)
             {
                 throw new InvalidOperationException(
-                    $"{AgentOptions.SectionName}:Tls:HostName is required outside Development; the agent must not serve plaintext HTTP");
+                    $"{AgentOptions.SectionName}:Tls:AllowedThumbprints is required outside Development; the agent must not serve plaintext HTTP");
             }
 
             if (!options.Authentication.IsConfigured)

@@ -69,8 +69,8 @@ public sealed class StoreCertificateProvider : IServerCertificateProvider
                 if (_current is not null && !_current.Thumbprint.Equals(selected.Thumbprint, StringComparison.OrdinalIgnoreCase))
                 {
                     _logger.LogInformation(
-                        "certificate for {HostName} rotated to {Thumbprint}, valid until {NotAfter}",
-                        _options.HostName, selected.Thumbprint, selected.NotAfter);
+                        "certificate rotated to {Thumbprint}, valid until {NotAfter}",
+                        selected.Thumbprint, selected.NotAfter);
                 }
 
                 // The outgoing certificate is deliberately not disposed: a

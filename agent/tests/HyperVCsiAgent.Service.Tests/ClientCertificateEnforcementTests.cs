@@ -50,7 +50,11 @@ public sealed class ClientCertificateEnforcementTests : IAsyncLifetime
         var options = new AgentOptions
         {
             CsvVolumesRoot = Path.GetTempPath(),
-            Tls = { HostName = "agent.test", Port = 0 },
+            // Only needed to make Tls.IsConfigured true - HttpsConfiguration
+            // gates ConfigureHttps on it. The actual certificate served comes
+            // from the FixedCertificateProvider registered below, which
+            // never consults AllowedThumbprints.
+            Tls = { AllowedThumbprints = ["6831285AB162AC3C472B39EC196A0F06D67B2A52"], Port = 0 },
             Authentication =
             {
                 // Both the live driver certificate and one that is pinned but

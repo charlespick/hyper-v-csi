@@ -28,7 +28,6 @@ internal static class WriteConfigCommand
             CsvSnapshotsRoot = parsed.Require("csv-snapshots-root"),
             Tls =
             {
-                HostName = parsed.Optional("tls-host-name") ?? string.Empty,
                 Port = int.TryParse(parsed.Optional("tls-port"), out var port) ? port : defaultTls.Port,
                 StoreName = parsed.Optional("tls-store-name") ?? defaultTls.StoreName,
                 StoreLocation = parsed.Optional("tls-store-location") ?? defaultTls.StoreLocation,
@@ -56,7 +55,6 @@ internal static class WriteConfigCommand
         {
             agent["Tls"] = new JsonObject
             {
-                ["HostName"] = options.Tls.HostName,
                 ["AllowedThumbprints"] = ToJsonArray(options.Tls.AllowedThumbprints),
                 ["StoreName"] = options.Tls.StoreName,
                 ["StoreLocation"] = options.Tls.StoreLocation,

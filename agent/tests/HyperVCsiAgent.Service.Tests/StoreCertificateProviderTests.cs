@@ -127,7 +127,7 @@ public sealed class StoreCertificateProviderTests
             Options.Create(new AgentOptions
             {
                 CsvVolumesRoot = Path.GetTempPath(),
-                Tls = { HostName = "agent.test", ReloadInterval = TimeSpan.FromHours(1) },
+                Tls = { ReloadInterval = TimeSpan.FromHours(1) },
             }),
             NullLogger<StoreCertificateProvider>.Instance,
             clock,

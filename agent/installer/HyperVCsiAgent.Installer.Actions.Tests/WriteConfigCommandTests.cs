@@ -43,7 +43,6 @@ public sealed class WriteConfigCommandTests : IDisposable
             "--output", output,
             "--csv-volumes-root", "C:\\ClusterStorage\\Volume1\\volumes",
             "--csv-snapshots-root", "C:\\ClusterStorage\\Volume1\\snapshots",
-            "--tls-host-name", "agent.example.com",
             "--tls-port", "8443",
             "--tls-store-name", "My",
             "--tls-store-location", "LocalMachine",
@@ -56,7 +55,6 @@ public sealed class WriteConfigCommandTests : IDisposable
         var agent = document.RootElement.GetProperty("Agent");
 
         var tls = agent.GetProperty("Tls");
-        Assert.Equal("agent.example.com", tls.GetProperty("HostName").GetString());
         Assert.Equal(8443, tls.GetProperty("Port").GetInt32());
         Assert.Equal(["A1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4"], tls.GetProperty("AllowedThumbprints").EnumerateArray().Select(e => e.GetString()));
 
@@ -67,7 +65,7 @@ public sealed class WriteConfigCommandTests : IDisposable
     }
 
     [Fact]
-    public void DefaultsPortAndStore_WhenTlsHostNameGivenWithoutThem()
+    public void DefaultsPortAndStore_WhenNotGiven()
     {
         var output = Path.Combine(_root, "agent.config.json");
 
@@ -75,7 +73,6 @@ public sealed class WriteConfigCommandTests : IDisposable
             "--output", output,
             "--csv-volumes-root", "C:\\vols",
             "--csv-snapshots-root", "C:\\snaps",
-            "--tls-host-name", "agent.example.com",
             "--server-thumbprints", "A1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4",
         ]);
 
@@ -97,18 +94,5 @@ public sealed class WriteConfigCommandTests : IDisposable
             "--csv-snapshots-root", "C:\\snaps",
         ]));
         Assert.False(File.Exists(output));
-    }
-
-    [Fact]
-    public void TlsHostNameWithoutThumbprints_FailsValidation()
-    {
-        var output = Path.Combine(_root, "agent.config.json");
-
-        Assert.Throws<InvalidOperationException>(() => WriteConfigCommand.Run([
-            "--output", output,
-            "--csv-volumes-root", "C:\\vols",
-            "--csv-snapshots-root", "C:\\snaps",
-            "--tls-host-name", "agent.example.com",
-        ]));
     }
 }

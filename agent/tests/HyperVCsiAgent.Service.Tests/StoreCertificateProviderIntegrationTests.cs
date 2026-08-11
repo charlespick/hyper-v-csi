@@ -45,7 +45,6 @@ public sealed class StoreCertificateProviderIntegrationTests : IAsyncLifetime
             CsvVolumesRoot = Path.GetTempPath(),
             Tls =
             {
-                HostName = "agent.store.test",
                 AllowedThumbprints = [_certificate.Thumbprint],
                 StoreName = "My",
                 StoreLocation = "CurrentUser",

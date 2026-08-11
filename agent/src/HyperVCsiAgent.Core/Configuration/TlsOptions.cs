@@ -14,22 +14,12 @@ namespace HyperVCsiAgent.Core.Configuration;
 public sealed class TlsOptions
 {
     /// <summary>
-    /// The DNS name callers must address this agent as. Kestrel's host
-    /// filtering rejects anything else at the HTTP layer, independent of and
-    /// in addition to certificate pinning - a caller has to know both which
-    /// name to ask for and which certificate to trust. Empty means TLS is not
-    /// configured, which is only allowed in Development.
-    /// </summary>
-    public string HostName { get; set; } = string.Empty;
-
-    /// <summary>
     /// SHA-1 thumbprints of the server certificates this agent is willing to
     /// serve from the store. Ordinarily just the one currently in use; two
     /// during a rotation - install the new certificate, add its thumbprint
     /// here, wait for <see cref="ReloadInterval"/> to pick it up, then remove
-    /// the old one. Required whenever <see cref="HostName"/> is set: unlike a
-    /// subject-name match, nothing else identifies which store certificate is
-    /// the right one to serve.
+    /// the old one. Empty means TLS is not configured, which is only allowed
+    /// in Development - see <see cref="IsConfigured"/>.
     /// </summary>
     public string[] AllowedThumbprints { get; set; } = [];
 
@@ -47,7 +37,13 @@ public sealed class TlsOptions
 
     public int Port { get; set; } = 443;
 
-    public bool IsConfigured => !string.IsNullOrWhiteSpace(HostName);
+    /// <summary>
+    /// Unlike a subject-name match, nothing but this list identifies which
+    /// store certificate is the right one to serve - so having at least one
+    /// entry is what "TLS is configured" means, with nothing else needed to
+    /// decide it.
+    /// </summary>
+    public bool IsConfigured => AllowedThumbprints.Length > 0;
 
     /// <summary>
     /// Parsed store identity. Parsing here rather than at the point of use
@@ -95,13 +91,10 @@ public sealed class TlsOptions
                 $"{AgentOptions.SectionName}:Tls:{nameof(Port)} must be a valid port number");
         }
 
-        if (AllowedThumbprints.Length == 0)
-        {
-            throw new InvalidOperationException(
-                $"{AgentOptions.SectionName}:Tls:{nameof(AllowedThumbprints)} is required when Tls:{nameof(HostName)} is set; " +
-                "the agent has no other way to choose which certificate in the store to serve");
-        }
-
+        // No "AllowedThumbprints is empty" check here: IsConfigured (which
+        // gates entry to this method) already means AllowedThumbprints is
+        // non-empty - there is no longer a distinct "configured but no
+        // thumbprints" state to reject.
         foreach (var thumbprint in AllowedThumbprints)
         {
             var normalized = ClientCertificateAuthenticator.Normalize(thumbprint);

@@ -24,7 +24,7 @@ public class ProductionSecurityGateTests
     public void Enforce_NotDevelopment_TlsConfiguredButAuthenticationNotConfigured_Throws()
     {
         var options = NewOptions();
-        options.Tls.HostName = "agent.test";
+        options.Tls.AllowedThumbprints = ["6831285AB162AC3C472B39EC196A0F06D67B2A52"];
 
         Assert.Throws<InvalidOperationException>(
             () => ProductionSecurityGate.Enforce(isDevelopment: false, options, NullLogger.Instance));
@@ -34,7 +34,7 @@ public class ProductionSecurityGateTests
     public void Enforce_NotDevelopment_TlsAndAuthenticationConfigured_DoesNotThrow()
     {
         var options = NewOptions();
-        options.Tls.HostName = "agent.test";
+        options.Tls.AllowedThumbprints = ["6831285AB162AC3C472B39EC196A0F06D67B2A52"];
         options.Authentication.AllowedClientCertificateThumbprints = ["6831285AB162AC3C472B39EC196A0F06D67B2A52"];
 
         ProductionSecurityGate.Enforce(isDevelopment: false, options, NullLogger.Instance);
@@ -52,7 +52,7 @@ public class ProductionSecurityGateTests
     public void Enforce_Development_BothConfigured_DoesNotThrow()
     {
         var options = NewOptions();
-        options.Tls.HostName = "agent.test";
+        options.Tls.AllowedThumbprints = ["6831285AB162AC3C472B39EC196A0F06D67B2A52"];
         options.Authentication.AllowedClientCertificateThumbprints = ["6831285AB162AC3C472B39EC196A0F06D67B2A52"];
 
         ProductionSecurityGate.Enforce(isDevelopment: true, options, NullLogger.Instance);

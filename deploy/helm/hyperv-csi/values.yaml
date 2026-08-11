@@ -44,14 +44,6 @@ agent:
   # allowInsecure is false.
   serverCertificateThumbprints: []
 
-  # Testing escape hatch: the agent's HostFiltering only accepts a Host header
-  # matching Tls:HostName, so agent.address has to name that DNS name -
-  # addressing the agent by bare IP gets "400 Bad Request - Invalid Hostname"
-  # from Kestrel. A real deployment resolves that name through real DNS; this
-  # is for pointing it at a host with none, via the pod's /etc/hosts. Standard
-  # Pod.spec.hostAliases shape - see the Kubernetes docs. Empty by default.
-  hostAliases: []
-
 # The self-signed client certificate the agent pins by fingerprint. Create it
 # with the commands in the repository README, and put its fingerprint in the
 # agent's own config file — the agent will reject anything else at the TLS

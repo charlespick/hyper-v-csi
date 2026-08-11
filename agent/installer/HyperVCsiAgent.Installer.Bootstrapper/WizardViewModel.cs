@@ -21,7 +21,6 @@ internal sealed class WizardViewModel : ViewModelBase
     private string _servicePassword = "";
     private string _csvVolumesRoot = "";
     private string _csvSnapshotsRoot = "";
-    private string _tlsHostName = "";
     private string _tlsPort = "443";
     private string _storeName = "My";
     private string _storeLocation = "LocalMachine";
@@ -53,6 +52,8 @@ internal sealed class WizardViewModel : ViewModelBase
         PrerequisiteResults = [hyperV, cluster];
         IsClusterMember = cluster.Status == PrerequisiteStatus.Pass;
 
+        Certificates = CertificateStoreLookup.ListCandidates();
+
         BackCommand = new RelayCommand(GoBack, () => CurrentPageIndex is > 0 and < ProgressPageIndex);
         NextCommand = new RelayCommand(GoNext, CanGoNext);
         InstallCommand = new RelayCommand(BeginInstall, () => CurrentPageIndex == ProgressPageIndex - 1);
@@ -79,13 +80,15 @@ internal sealed class WizardViewModel : ViewModelBase
     /// </summary>
     public bool IsClusterMember { get; }
 
+    /// <summary>Candidate server certificates for the Certificate page's table - see RefreshCertificates for why this isn't just populated once.</summary>
+    public IReadOnlyList<CertificateEntry> Certificates { get; private set; }
+
     public int ExitCode { get; private set; }
 
     public string ServiceAccount { get => _serviceAccount; set => SetField(ref _serviceAccount, value); }
     public string ServicePassword { get => _servicePassword; set => SetField(ref _servicePassword, value); }
     public string CsvVolumesRoot { get => _csvVolumesRoot; set => SetField(ref _csvVolumesRoot, value); }
     public string CsvSnapshotsRoot { get => _csvSnapshotsRoot; set => SetField(ref _csvSnapshotsRoot, value); }
-    public string TlsHostName { get => _tlsHostName; set => SetField(ref _tlsHostName, value); }
     public string TlsPort { get => _tlsPort; set => SetField(ref _tlsPort, value); }
     public string StoreName { get => _storeName; set => SetField(ref _storeName, value); }
     public string StoreLocation { get => _storeLocation; set => SetField(ref _storeLocation, value); }
@@ -146,6 +149,18 @@ internal sealed class WizardViewModel : ViewModelBase
 
     public void AttachDispatcher(Dispatcher dispatcher) => _dispatcher = dispatcher;
 
+    /// <summary>
+    /// Re-reads the certificate store - called after generating a new
+    /// self-signed certificate, since that adds an entry the constructor's
+    /// one-time read of <see cref="Certificates"/> would otherwise never
+    /// see.
+    /// </summary>
+    public void RefreshCertificates()
+    {
+        Certificates = CertificateStoreLookup.ListCandidates();
+        RaisePropertyChanged(nameof(Certificates));
+    }
+
     private void Cancel()
     {
         // Nothing was ever planned/applied on this path, so ApplyComplete
@@ -195,6 +210,7 @@ internal sealed class WizardViewModel : ViewModelBase
             WelcomePageIndex => LicenseAccepted,
             ServiceAccountPageIndex => ServiceAccount.Length > 0 && ServicePassword.Length > 0,
             StoragePageIndex => CsvVolumesRoot.Length > 0 && (!SnapshotsEnabled || CsvSnapshotsRoot.Length > 0),
+            CertificatePageIndex => ServerCertThumbprint.Length > 0,
             _ => true,
         };
     }
@@ -214,7 +230,6 @@ internal sealed class WizardViewModel : ViewModelBase
         _engine.SetVariableString("SERVICEPASSWORD", ServicePassword, formatted: false);
         _engine.SetVariableString("CSVVOLUMESROOT", CsvVolumesRoot, formatted: false);
         _engine.SetVariableString("CSVSNAPSHOTSROOT", CsvSnapshotsRoot, formatted: false);
-        _engine.SetVariableString("TLSHOSTNAME", TlsHostName, formatted: false);
         _engine.SetVariableString("TLSPORT", TlsPort, formatted: false);
         _engine.SetVariableString("STORENAME", StoreName, formatted: false);
         _engine.SetVariableString("STORELOCATION", StoreLocation, formatted: false);

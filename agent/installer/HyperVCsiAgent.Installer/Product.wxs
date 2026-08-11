@@ -25,7 +25,6 @@
     <Property Id="SERVICEPASSWORD" Secure="yes" Hidden="yes" />
     <Property Id="CSVVOLUMESROOT" Secure="yes" />
     <Property Id="CSVSNAPSHOTSROOT" Secure="yes" />
-    <Property Id="TLSHOSTNAME" Secure="yes" />
     <Property Id="TLSPORT" Value="443" Secure="yes" />
     <Property Id="STORENAME" Value="My" Secure="yes" />
     <Property Id="STORELOCATION" Value="LocalMachine" Secure="yes" />
@@ -94,7 +93,7 @@
     <CustomAction Id="SetWriteConfigCmd1" Property="WRITECONFIGCMD"
                   Value="write-config --output &quot;[CommonAppDataFolder]HyperVCsiAgent\agent.config.json&quot; --csv-volumes-root &quot;[CSVVOLUMESROOT]&quot; --csv-snapshots-root &quot;[CSVSNAPSHOTSROOT]&quot;" />
     <CustomAction Id="SetWriteConfigCmd2" Property="WRITECONFIGCMD"
-                  Value="[WRITECONFIGCMD] --tls-host-name &quot;[TLSHOSTNAME]&quot; --tls-port &quot;[TLSPORT]&quot; --tls-store-name &quot;[STORENAME]&quot;" />
+                  Value="[WRITECONFIGCMD] --tls-port &quot;[TLSPORT]&quot; --tls-store-name &quot;[STORENAME]&quot;" />
     <CustomAction Id="SetWriteConfigCmd3" Property="WRITECONFIGCMD"
                   Value="[WRITECONFIGCMD] --tls-store-location &quot;[STORELOCATION]&quot; --server-thumbprints &quot;[SERVERCERTTHUMBPRINT]&quot; --client-thumbprints &quot;[CLIENTTHUMBPRINTS]&quot;" />
 

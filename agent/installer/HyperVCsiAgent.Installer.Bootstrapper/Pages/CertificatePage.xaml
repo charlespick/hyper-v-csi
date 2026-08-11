@@ -1,30 +1,32 @@
 <UserControl x:Class="HyperVCsiAgent.Installer.Bootstrapper.Pages.CertificatePage"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
-    <StackPanel>
-        <TextBlock Text="Server Certificate" FontSize="18" FontWeight="Bold" Margin="0,0,0,4" />
-        <TextBlock TextWrapping="Wrap" Margin="0,0,0,16"
-                   Text="The certificate must already be installed on this host - Setup only pins it by thumbprint, it does not import one for you." />
+    <DockPanel>
+        <TextBlock DockPanel.Dock="Top" Text="Server Certificate" FontSize="18" FontWeight="Bold" Margin="0,0,0,4" />
+        <TextBlock DockPanel.Dock="Top" TextWrapping="Wrap" Margin="0,0,0,12"
+                   Text="Select the certificate this agent presents for TLS - it must already be installed on this host, or generated below." />
 
-        <TextBlock Text="DNS name callers use to reach this agent (Agent:Tls:HostName):" Margin="0,0,0,4" />
-        <TextBox Text="{Binding TlsHostName, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,12" />
-
-        <TextBlock Text="Server certificate thumbprint:" Margin="0,0,0,4" />
-        <TextBox Text="{Binding ServerCertThumbprint, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,12" />
-
-        <Grid>
+        <Grid DockPanel.Dock="Top" Margin="0,0,0,12">
             <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="*" />
             </Grid.ColumnDefinitions>
-            <StackPanel Grid.Column="0" Margin="0,0,12,0">
-                <TextBlock Text="Certificate store name:" Margin="0,0,0,4" />
-                <TextBox Text="{Binding StoreName, UpdateSourceTrigger=PropertyChanged}" />
-            </StackPanel>
-            <StackPanel Grid.Column="1">
-                <TextBlock Text="Certificate store location:" Margin="0,0,0,4" />
-                <TextBox Text="{Binding StoreLocation, UpdateSourceTrigger=PropertyChanged}" />
-            </StackPanel>
+            <TextBlock Grid.Column="0" Text="HTTPS port:" VerticalAlignment="Center" Margin="0,0,8,0" />
+            <TextBox Grid.Column="1" Text="{Binding TlsPort, UpdateSourceTrigger=PropertyChanged}" Width="80" HorizontalAlignment="Left" />
         </Grid>
-    </StackPanel>
+
+        <Button DockPanel.Dock="Bottom" Content="Generate new self-signed certificate..." HorizontalAlignment="Left"
+                Margin="0,12,0,0" Click="GenerateCertificate_Click" />
+
+        <DataGrid ItemsSource="{Binding Certificates}" SelectedValuePath="Thumbprint"
+                  SelectedValue="{Binding ServerCertThumbprint, UpdateSourceTrigger=PropertyChanged}"
+                  AutoGenerateColumns="False" IsReadOnly="True" SelectionMode="Single" SelectionUnit="FullRow"
+                  CanUserAddRows="False" CanUserDeleteRows="False" CanUserReorderColumns="False">
+            <DataGrid.Columns>
+                <DataGridTextColumn Header="Subject" Binding="{Binding SubjectName}" Width="*" />
+                <DataGridTextColumn Header="Thumbprint" Binding="{Binding Thumbprint}" Width="220" />
+                <DataGridTextColumn Header="Expires" Binding="{Binding NotAfter, StringFormat={}{0:d}}" Width="100" />
+            </DataGrid.Columns>
+        </DataGrid>
+    </DockPanel>
 </UserControl>

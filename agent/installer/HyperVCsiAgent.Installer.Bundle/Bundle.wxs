@@ -27,7 +27,6 @@
     <Variable Name="SERVICEPASSWORD" Type="string" Value="" Persisted="no" Hidden="yes" />
     <Variable Name="CSVVOLUMESROOT" Type="string" Value="" Persisted="yes" />
     <Variable Name="CSVSNAPSHOTSROOT" Type="string" Value="" Persisted="yes" />
-    <Variable Name="TLSHOSTNAME" Type="string" Value="" Persisted="yes" />
     <Variable Name="TLSPORT" Type="string" Value="443" Persisted="yes" />
     <Variable Name="STORENAME" Type="string" Value="My" Persisted="yes" />
     <Variable Name="STORELOCATION" Type="string" Value="LocalMachine" Persisted="yes" />
@@ -46,7 +45,6 @@
         <MsiProperty Name="SERVICEPASSWORD" Value="[SERVICEPASSWORD]" />
         <MsiProperty Name="CSVVOLUMESROOT" Value="[CSVVOLUMESROOT]" />
         <MsiProperty Name="CSVSNAPSHOTSROOT" Value="[CSVSNAPSHOTSROOT]" />
-        <MsiProperty Name="TLSHOSTNAME" Value="[TLSHOSTNAME]" />
         <MsiProperty Name="TLSPORT" Value="[TLSPORT]" />
         <MsiProperty Name="STORENAME" Value="[STORENAME]" />
         <MsiProperty Name="STORELOCATION" Value="[STORELOCATION]" />

@@ -24,7 +24,7 @@ public sealed class CommandLineArgsTests
     {
         var args = CommandLineArgs.Parse([]);
 
-        Assert.Null(args.Optional("tls-host-name"));
+        Assert.Null(args.Optional("tls-port"));
     }
 
     [Fact]
