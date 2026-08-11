@@ -5,8 +5,18 @@
     <TargetFramework>net10.0-windows</TargetFramework>
     <Platforms>x64</Platforms>
     <Nullable>enable</Nullable>
-    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Disabled, not enabled: UseWPF and UseWindowsForms together (the
+         latter only for DirectoryObjectPickerDialog) each contribute their
+         own implicit global usings for same-named types - UserControl,
+         Brush - and having both in scope unqualified is ambiguous. Every
+         file below imports exactly the namespaces it needs instead. -->
+    <ImplicitUsings>disable</ImplicitUsings>
     <UseWPF>true</UseWPF>
+    <!-- Tulpep.ActiveDirectoryObjectPicker's DirectoryObjectPickerDialog
+         (the Service Account page's "Select..." button) wraps the AD
+         object-picker COM dialog as a System.Windows.Forms.CommonDialog -
+         the only WinForms surface this otherwise-WPF app needs. -->
+    <UseWindowsForms>true</UseWindowsForms>
     <!-- Burn v5 launches the BA as its own child process (out-of-process
          hosting) rather than loading a DLL into the engine, so this has to be
          a real, self-contained exe - see HyperVCsiAgent.Installer.Bundle's
@@ -29,6 +39,10 @@
          Hyper-V role check goes through the same CIM path as the agent's
          own runtime checks rather than shelling out to PowerShell. -->
     <PackageReference Include="Microsoft.Management.Infrastructure" Version="3.0.0" />
+    <!-- Wraps objsel.dll's IDsObjectPicker COM dialog (the same picker
+         ADUC uses) rather than hand-rolling that COM interop directly -
+         mature, MS-PL, ~1M downloads, no other dependencies. -->
+    <PackageReference Include="Tulpep.ActiveDirectoryObjectPicker" Version="3.0.11" />
   </ItemGroup>
 
   <ItemGroup>

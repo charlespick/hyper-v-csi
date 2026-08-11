@@ -53,8 +53,7 @@ internal sealed class WizardViewModel : ViewModelBase
         IsClusterMember = cluster.Status == PrerequisiteStatus.Pass;
 
         BackCommand = new RelayCommand(GoBack, () => CurrentPageIndex is > 0 and < ProgressPageIndex);
-        NextCommand = new RelayCommand(GoNext, () =>
-            CurrentPageIndex < ProgressPageIndex - 1 && (CurrentPageIndex != WelcomePageIndex || LicenseAccepted));
+        NextCommand = new RelayCommand(GoNext, CanGoNext);
         InstallCommand = new RelayCommand(BeginInstall, () => CurrentPageIndex == ProgressPageIndex - 1);
         CancelCommand = new RelayCommand(Cancel);
         CloseCommand = new RelayCommand(() => Application.Current?.Shutdown());
@@ -165,10 +164,25 @@ internal sealed class WizardViewModel : ViewModelBase
 
     private void GoNext()
     {
-        if (CurrentPageIndex < ProgressPageIndex - 1)
+        if (CanGoNext())
         {
             CurrentPageIndex++;
         }
+    }
+
+    private bool CanGoNext()
+    {
+        if (CurrentPageIndex >= ProgressPageIndex - 1)
+        {
+            return false;
+        }
+
+        return CurrentPageIndex switch
+        {
+            WelcomePageIndex => LicenseAccepted,
+            ServiceAccountPageIndex => ServiceAccount.Length > 0 && ServicePassword.Length > 0,
+            _ => true,
+        };
     }
 
     private void BeginInstall()
