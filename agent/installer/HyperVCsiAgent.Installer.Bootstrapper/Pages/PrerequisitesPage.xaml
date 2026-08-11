@@ -1,0 +1,36 @@
+<UserControl x:Class="HyperVCsiAgent.Installer.Bootstrapper.Pages.PrerequisitesPage"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:pages="clr-namespace:HyperVCsiAgent.Installer.Bootstrapper.Pages">
+    <UserControl.Resources>
+        <pages:PrerequisiteStatusGlyphConverter x:Key="PrerequisiteStatusGlyph" />
+        <pages:PrerequisiteStatusBrushConverter x:Key="PrerequisiteStatusBrush" />
+    </UserControl.Resources>
+    <StackPanel>
+        <TextBlock Text="Prerequisites" FontSize="18" FontWeight="Bold" Margin="0,0,0,4" />
+        <TextBlock TextWrapping="Wrap" Margin="0,0,0,16"
+                   Text="These checks are informational - none of them block installation." />
+
+        <ItemsControl ItemsSource="{Binding PrerequisiteResults}">
+            <ItemsControl.ItemTemplate>
+                <DataTemplate>
+                    <Border BorderBrush="#FFDDDDDD" BorderThickness="0,0,0,1" Padding="0,10">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="20" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0" VerticalAlignment="Top" FontWeight="Bold"
+                                       Text="{Binding Status, Converter={StaticResource PrerequisiteStatusGlyph}}"
+                                       Foreground="{Binding Status, Converter={StaticResource PrerequisiteStatusBrush}}" />
+                            <StackPanel Grid.Column="1">
+                                <TextBlock Text="{Binding Name}" FontWeight="SemiBold" />
+                                <TextBlock Text="{Binding Detail}" TextWrapping="Wrap" Margin="0,2,0,0" />
+                            </StackPanel>
+                        </Grid>
+                    </Border>
+                </DataTemplate>
+            </ItemsControl.ItemTemplate>
+        </ItemsControl>
+    </StackPanel>
+</UserControl>

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Windows;
 using System.Windows.Threading;
 using WixToolset.BootstrapperApplicationApi;
@@ -43,6 +44,14 @@ internal sealed class WizardViewModel : ViewModelBase
         _engine = engine;
         _command = command;
 
+        // Run once, up front, rather than each time the Prerequisites page
+        // is shown: both checks are cheap and their answers do not change
+        // over the lifetime of one wizard session.
+        var hyperV = PrerequisiteChecks.CheckHyperVRole();
+        var cluster = PrerequisiteChecks.CheckClusterMembership();
+        PrerequisiteResults = [hyperV, cluster];
+        IsClusterMember = cluster.Status == PrerequisiteStatus.Pass;
+
         BackCommand = new RelayCommand(GoBack, () => CurrentPageIndex is > 0 and < ProgressPageIndex);
         NextCommand = new RelayCommand(GoNext, () =>
             CurrentPageIndex < ProgressPageIndex - 1 && (CurrentPageIndex != WelcomePageIndex || LicenseAccepted));
@@ -52,12 +61,23 @@ internal sealed class WizardViewModel : ViewModelBase
     }
 
     public const int WelcomePageIndex = 0;
-    public const int ServiceAccountPageIndex = 1;
-    public const int StoragePageIndex = 2;
-    public const int CertificatePageIndex = 3;
-    public const int TrustedClientsPageIndex = 4;
-    public const int ProgressPageIndex = 5;
-    public const int FinishPageIndex = 6;
+    public const int PrerequisitesPageIndex = 1;
+    public const int ServiceAccountPageIndex = 2;
+    public const int StoragePageIndex = 3;
+    public const int CertificatePageIndex = 4;
+    public const int TrustedClientsPageIndex = 5;
+    public const int ProgressPageIndex = 6;
+    public const int FinishPageIndex = 7;
+
+    /// <summary>Populated once, in the constructor - see there for why.</summary>
+    public IReadOnlyList<PrerequisiteCheckResult> PrerequisiteResults { get; }
+
+    /// <summary>
+    /// Whether Prerequisites found this host clustered - not used yet, but
+    /// this is where a later Clustering screen will read it from to decide
+    /// whether to show itself at all.
+    /// </summary>
+    public bool IsClusterMember { get; }
 
     public int ExitCode { get; private set; }
 
@@ -80,6 +100,7 @@ internal sealed class WizardViewModel : ViewModelBase
             if (SetField(ref _currentPageIndex, value))
             {
                 RaisePropertyChanged(nameof(IsWelcomePage));
+                RaisePropertyChanged(nameof(IsPrerequisitesPage));
                 RaisePropertyChanged(nameof(IsServiceAccountPage));
                 RaisePropertyChanged(nameof(IsStoragePage));
                 RaisePropertyChanged(nameof(IsCertificatePage));
@@ -96,6 +117,7 @@ internal sealed class WizardViewModel : ViewModelBase
     }
 
     public bool IsWelcomePage => CurrentPageIndex == WelcomePageIndex;
+    public bool IsPrerequisitesPage => CurrentPageIndex == PrerequisitesPageIndex;
     public bool IsServiceAccountPage => CurrentPageIndex == ServiceAccountPageIndex;
     public bool IsStoragePage => CurrentPageIndex == StoragePageIndex;
     public bool IsCertificatePage => CurrentPageIndex == CertificatePageIndex;

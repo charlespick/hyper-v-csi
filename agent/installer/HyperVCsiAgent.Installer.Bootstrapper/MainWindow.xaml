@@ -15,6 +15,7 @@
 
         <Grid Grid.Row="0" Margin="24">
             <pages:WelcomePage Visibility="{Binding IsWelcomePage, Converter={StaticResource BoolToVis}}" />
+            <pages:PrerequisitesPage Visibility="{Binding IsPrerequisitesPage, Converter={StaticResource BoolToVis}}" />
             <pages:ServiceAccountPage Visibility="{Binding IsServiceAccountPage, Converter={StaticResource BoolToVis}}" />
             <pages:StoragePage Visibility="{Binding IsStoragePage, Converter={StaticResource BoolToVis}}" />
             <pages:CertificatePage Visibility="{Binding IsCertificatePage, Converter={StaticResource BoolToVis}}" />

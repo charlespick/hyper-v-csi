@@ -16,6 +16,11 @@ public sealed class UnsupportedClusterService : IClusterService
     public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
         throw Unsupported();
 
+    // Unlike the other members here, this is a real (not thrown) answer:
+    // a non-Windows host is never a Failover Cluster member, so there is
+    // no ambiguity to fail loudly about.
+    public bool IsClusterMember() => false;
+
     public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) =>
         throw Unsupported();
 

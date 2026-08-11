@@ -33,6 +33,17 @@ public interface IClusterService
     Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken);
 
     /// <summary>
+    /// Whether this host is a member of a failover cluster at all - not
+    /// whether it owns anything, just whether Failover Clustering is
+    /// present and has a local cluster database to read. Cheap and local by
+    /// design: unlike every other member here, an implementation is
+    /// expected to answer this without a WMI round trip, since it exists
+    /// for callers - the installer's Prerequisites check among them - that
+    /// need the answer before anything else about the cluster is known.
+    /// </summary>
+    bool IsClusterMember();
+
+    /// <summary>
     /// Every VM this failover cluster manages, with the host currently
     /// running each one.
     /// </summary>

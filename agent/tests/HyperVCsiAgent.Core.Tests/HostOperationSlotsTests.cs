@@ -151,6 +151,8 @@ public sealed class HostOperationSlotsTests : IDisposable
 
     private sealed class FakeClusterService : IClusterService
     {
+        public bool IsClusterMember() => true;
+
         public string? Owner { get; init; }
 
         public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>

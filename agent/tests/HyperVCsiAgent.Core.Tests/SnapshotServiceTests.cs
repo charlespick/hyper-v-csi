@@ -2264,6 +2264,9 @@ public sealed class SnapshotServiceTests : IDisposable
     /// </summary>
     private sealed class NeverCalledClusterService : IClusterService
     {
+        public bool IsClusterMember() =>
+            throw new InvalidOperationException("no node hint was given in this test, so nothing should resolve a VM");
+
         public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("no node hint was given in this test, so nothing should resolve a VM");
 
@@ -2333,6 +2336,8 @@ public sealed class SnapshotServiceTests : IDisposable
     /// </summary>
     private sealed class FakeClusterService : IClusterService
     {
+        public bool IsClusterMember() => true;
+
         public Dictionary<string, ClusteredVm> Vms { get; init; } = [];
 
         public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>

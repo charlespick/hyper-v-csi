@@ -477,6 +477,8 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
     /// <summary>Fails ListVmsAsync outright, standing in for a cluster database this host cannot reach at all.</summary>
     private sealed class ThrowingClusterService : IClusterService
     {
+        public bool IsClusterMember() => throw new NotSupportedException();
+
         public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
@@ -743,6 +745,8 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
     /// <summary>Resolves exactly the (node ID, live) maps given, and lists exactly the VMs given.</summary>
     private sealed class FakeClusterService : IClusterService
     {
+        public bool IsClusterMember() => true;
+
         public Dictionary<string, ClusteredVm> Vms { get; init; } = [];
 
         public Dictionary<string, bool> Live { get; init; } = [];

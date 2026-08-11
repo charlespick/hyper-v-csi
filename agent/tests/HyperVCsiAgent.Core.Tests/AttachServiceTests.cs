@@ -528,6 +528,8 @@ public sealed class AttachServiceTests : IDisposable
 
     private sealed class FakeClusterService : IClusterService
     {
+        public bool IsClusterMember() => true;
+
         public string? Owner { get; init; }
 
         public bool RejectInvalidNodeIds { get; init; }

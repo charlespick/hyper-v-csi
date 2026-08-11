@@ -286,6 +286,19 @@ public sealed class MsClusterService : IClusterService
         }, cancellationToken);
 
     /// <summary>
+    /// See <see cref="IClusterService.IsClusterMember"/>. The registry key
+    /// every other method here already treats as proof of cluster
+    /// membership - <see cref="EnumerateVmResources"/> throws when it is
+    /// missing - checked directly instead, since this caller wants that as
+    /// its own yes/no answer rather than as a side effect of an exception.
+    /// </summary>
+    public bool IsClusterMember()
+    {
+        using var resources = Registry.LocalMachine.OpenSubKey(ResourcesKeyPath);
+        return resources is not null;
+    }
+
+    /// <summary>
     /// Every VM this cluster manages, with the host currently running it -
     /// see <see cref="IClusterService.ListVmsAsync"/> for why this exists and
     /// what it is expected to cost.

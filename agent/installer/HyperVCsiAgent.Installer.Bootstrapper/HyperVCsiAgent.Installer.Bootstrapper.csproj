@@ -24,6 +24,11 @@
          diverged, e.g. adding a BundleScope parameter to Plan that 5.0.2
          does not have) - a floating restore could silently break that. -->
     <PackageReference Include="WixToolset.BootstrapperApplicationApi" Version="5.0.2" />
+    <!-- Same package and version the agent service itself uses for CIM -
+         see HyperVCsiAgent.Service.csproj - so the Prerequisites page's
+         Hyper-V role check goes through the same CIM path as the agent's
+         own runtime checks rather than shelling out to PowerShell. -->
+    <PackageReference Include="Microsoft.Management.Infrastructure" Version="3.0.0" />
   </ItemGroup>
 
   <ItemGroup>

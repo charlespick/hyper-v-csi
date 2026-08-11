@@ -1412,6 +1412,8 @@ public sealed class VhdxServiceTests : IDisposable
     /// </summary>
     private sealed class FakeClusterService : IClusterService
     {
+        public bool IsClusterMember() => true;
+
         public Dictionary<string, ClusteredVm> Vms { get; init; } = [];
 
         public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
@@ -1495,6 +1497,9 @@ public sealed class VhdxServiceTests : IDisposable
     /// </summary>
     private sealed class NeverCalledClusterService : IClusterService
     {
+        public bool IsClusterMember() =>
+            throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
+
         public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
 

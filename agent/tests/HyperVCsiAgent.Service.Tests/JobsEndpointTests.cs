@@ -358,6 +358,8 @@ public sealed class JobsEndpointTests : IDisposable
     /// </summary>
     private sealed class FakeClusterService : IClusterService
     {
+        public bool IsClusterMember() => true;
+
         private readonly TaskCompletionSource<IReadOnlyList<ClusteredVm>> _discovery = new();
 
         /// <summary>An already-open gate: discovery completes before this constructor returns.</summary>
