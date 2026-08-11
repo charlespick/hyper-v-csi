@@ -20,6 +20,7 @@
             <pages:StoragePage Visibility="{Binding IsStoragePage, Converter={StaticResource BoolToVis}}" />
             <pages:CertificatePage Visibility="{Binding IsCertificatePage, Converter={StaticResource BoolToVis}}" />
             <pages:TrustedClientsPage Visibility="{Binding IsTrustedClientsPage, Converter={StaticResource BoolToVis}}" />
+            <pages:ClusteringPage Visibility="{Binding IsClusteringPage, Converter={StaticResource BoolToVis}}" />
             <pages:ProgressPage Visibility="{Binding IsProgressPage, Converter={StaticResource BoolToVis}}" />
             <pages:FinishPage Visibility="{Binding IsFinishPage, Converter={StaticResource BoolToVis}}" />
         </Grid>

@@ -56,7 +56,7 @@ internal sealed class WizardViewModel : ViewModelBase
 
         BackCommand = new RelayCommand(GoBack, () => CurrentPageIndex is > 0 and < ProgressPageIndex);
         NextCommand = new RelayCommand(GoNext, CanGoNext);
-        InstallCommand = new RelayCommand(BeginInstall, () => CurrentPageIndex == ProgressPageIndex - 1);
+        InstallCommand = new RelayCommand(BeginInstall, () => CurrentPageIndex == LastContentPageIndex);
         CancelCommand = new RelayCommand(Cancel);
         CloseCommand = new RelayCommand(() => Application.Current?.Shutdown());
     }
@@ -67,18 +67,27 @@ internal sealed class WizardViewModel : ViewModelBase
     public const int StoragePageIndex = 3;
     public const int CertificatePageIndex = 4;
     public const int TrustedClientsPageIndex = 5;
-    public const int ProgressPageIndex = 6;
-    public const int FinishPageIndex = 7;
+    public const int ClusteringPageIndex = 6;
+    public const int ProgressPageIndex = 7;
+    public const int FinishPageIndex = 8;
 
     /// <summary>Populated once, in the constructor - see there for why.</summary>
     public IReadOnlyList<PrerequisiteCheckResult> PrerequisiteResults { get; }
 
     /// <summary>
-    /// Whether Prerequisites found this host clustered - not used yet, but
-    /// this is where a later Clustering screen will read it from to decide
-    /// whether to show itself at all.
+    /// Whether Prerequisites found this host clustered - gates whether the
+    /// Clustering page shows at all (see <see cref="LastContentPageIndex"/>
+    /// and IsClusteringPage) rather than just being informational.
     /// </summary>
     public bool IsClusterMember { get; }
+
+    /// <summary>
+    /// The last page before Progress/Finish - Clustering when this host is
+    /// a cluster member, Trusted Clients otherwise, since Clustering does
+    /// not exist as a step to land on when it is not shown at all. Next and
+    /// Install both key off this instead of a fixed index.
+    /// </summary>
+    private int LastContentPageIndex => IsClusterMember ? ClusteringPageIndex : TrustedClientsPageIndex;
 
     /// <summary>Candidate server certificates for the Certificate page's table - see RefreshCertificates for why this isn't just populated once.</summary>
     public IReadOnlyList<CertificateEntry> Certificates { get; private set; }
@@ -103,6 +112,11 @@ internal sealed class WizardViewModel : ViewModelBase
     /// </summary>
     public ObservableCollection<string> ClientThumbprintList { get; } = [];
 
+    private bool _registerClusterResource;
+
+    /// <summary>The Clustering page's checkbox - see OnApplyComplete for where checking it actually takes effect.</summary>
+    public bool RegisterClusterResource { get => _registerClusterResource; set => SetField(ref _registerClusterResource, value); }
+
     public int CurrentPageIndex
     {
         get => _currentPageIndex;
@@ -116,6 +130,7 @@ internal sealed class WizardViewModel : ViewModelBase
                 RaisePropertyChanged(nameof(IsStoragePage));
                 RaisePropertyChanged(nameof(IsCertificatePage));
                 RaisePropertyChanged(nameof(IsTrustedClientsPage));
+                RaisePropertyChanged(nameof(IsClusteringPage));
                 RaisePropertyChanged(nameof(IsProgressPage));
                 RaisePropertyChanged(nameof(IsFinishPage));
                 RaisePropertyChanged(nameof(ShowBackButton));
@@ -133,12 +148,13 @@ internal sealed class WizardViewModel : ViewModelBase
     public bool IsStoragePage => CurrentPageIndex == StoragePageIndex;
     public bool IsCertificatePage => CurrentPageIndex == CertificatePageIndex;
     public bool IsTrustedClientsPage => CurrentPageIndex == TrustedClientsPageIndex;
+    public bool IsClusteringPage => CurrentPageIndex == ClusteringPageIndex;
     public bool IsProgressPage => CurrentPageIndex == ProgressPageIndex;
     public bool IsFinishPage => CurrentPageIndex == FinishPageIndex;
 
     public bool ShowBackButton => CurrentPageIndex is > WelcomePageIndex and < ProgressPageIndex;
-    public bool ShowNextButton => CurrentPageIndex < TrustedClientsPageIndex;
-    public bool ShowInstallButton => CurrentPageIndex == TrustedClientsPageIndex;
+    public bool ShowNextButton => CurrentPageIndex < LastContentPageIndex;
+    public bool ShowInstallButton => CurrentPageIndex == LastContentPageIndex;
     public bool ShowCancelButton => CurrentPageIndex < ProgressPageIndex;
     public bool ShowCloseButton => CurrentPageIndex == FinishPageIndex;
 
@@ -208,7 +224,7 @@ internal sealed class WizardViewModel : ViewModelBase
 
     private bool CanGoNext()
     {
-        if (CurrentPageIndex >= ProgressPageIndex - 1)
+        if (CurrentPageIndex >= LastContentPageIndex)
         {
             return false;
         }
@@ -300,6 +316,26 @@ internal sealed class WizardViewModel : ViewModelBase
             StatusText = InstallSucceeded
                 ? "Hyper-V CSI Agent was installed successfully."
                 : $"Setup failed (0x{e.Status:X8}). See the log for details.";
+
+            // Only after the service itself exists - a cluster resource
+            // pointing at a service the MSI never installed would have
+            // nothing to bring online. A registration failure here does not
+            // change ExitCode/InstallSucceeded: the agent is installed
+            // either way, and this is reported as its own, separate
+            // outcome rather than turned into an overall setup failure.
+            if (InstallSucceeded && RegisterClusterResource)
+            {
+                try
+                {
+                    ClusterResourceRegistrar.Register();
+                    StatusText += " The agent was also registered as a clustered role.";
+                }
+                catch (Exception ex)
+                {
+                    StatusText += $" Registering the agent as a clustered role failed: {ex.Message}";
+                }
+            }
+
             CurrentPageIndex = FinishPageIndex;
         });
     }
