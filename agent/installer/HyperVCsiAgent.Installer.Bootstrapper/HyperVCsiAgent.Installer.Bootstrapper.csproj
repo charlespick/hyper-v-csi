@@ -24,7 +24,18 @@
          group. -->
     <SelfContained>true</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- Left enabled (WPF's own default), not disabled: InvariantGlobalization
+         crashes WPF's data-binding engine the moment a window with any
+         binding actually shows - XmlLanguage.GetSpecificCulture cannot
+         resolve "en-us" with only the invariant culture available. This
+         was set true from the initial scaffold on the mistaken assumption
+         that it was a safe size/startup optimization the way it is for the
+         other self-contained exes in this repo (HyperVCsiAgent.Service,
+         HyperVCsiAgent.Installer.Actions - neither of which is a WPF app);
+         confirmed via a real crash (System.InvalidOperationException:
+         Cannot find non-neutral culture related to 'en-us') the first time
+         a window with a live binding was actually shown rather than just
+         built. -->
   </PropertyGroup>
 
   <ItemGroup>

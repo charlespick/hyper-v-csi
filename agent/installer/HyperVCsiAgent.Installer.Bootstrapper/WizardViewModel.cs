@@ -56,7 +56,7 @@ internal sealed class WizardViewModel : ViewModelBase
 
         BackCommand = new RelayCommand(GoBack, () => CurrentPageIndex is > 0 and < ProgressPageIndex);
         NextCommand = new RelayCommand(GoNext, CanGoNext);
-        InstallCommand = new RelayCommand(BeginInstall, () => CurrentPageIndex == LastContentPageIndex);
+        InstallCommand = new RelayCommand(BeginInstall, () => CurrentPageIndex == ReadyToInstallPageIndex);
         CancelCommand = new RelayCommand(Cancel);
         CloseCommand = new RelayCommand(() => Application.Current?.Shutdown());
     }
@@ -68,26 +68,20 @@ internal sealed class WizardViewModel : ViewModelBase
     public const int CertificatePageIndex = 4;
     public const int TrustedClientsPageIndex = 5;
     public const int ClusteringPageIndex = 6;
-    public const int ProgressPageIndex = 7;
-    public const int FinishPageIndex = 8;
+    public const int ReadyToInstallPageIndex = 7;
+    public const int ProgressPageIndex = 8;
+    public const int FinishPageIndex = 9;
 
     /// <summary>Populated once, in the constructor - see there for why.</summary>
     public IReadOnlyList<PrerequisiteCheckResult> PrerequisiteResults { get; }
 
     /// <summary>
     /// Whether Prerequisites found this host clustered - gates whether the
-    /// Clustering page shows at all (see <see cref="LastContentPageIndex"/>
-    /// and IsClusteringPage) rather than just being informational.
+    /// Clustering page shows at all. GoNext/GoBack skip over
+    /// ClusteringPageIndex entirely when this is false, since it is not a
+    /// step to land on when it is not shown.
     /// </summary>
     public bool IsClusterMember { get; }
-
-    /// <summary>
-    /// The last page before Progress/Finish - Clustering when this host is
-    /// a cluster member, Trusted Clients otherwise, since Clustering does
-    /// not exist as a step to land on when it is not shown at all. Next and
-    /// Install both key off this instead of a fixed index.
-    /// </summary>
-    private int LastContentPageIndex => IsClusterMember ? ClusteringPageIndex : TrustedClientsPageIndex;
 
     /// <summary>Candidate server certificates for the Certificate page's table - see RefreshCertificates for why this isn't just populated once.</summary>
     public IReadOnlyList<CertificateEntry> Certificates { get; private set; }
@@ -131,6 +125,7 @@ internal sealed class WizardViewModel : ViewModelBase
                 RaisePropertyChanged(nameof(IsCertificatePage));
                 RaisePropertyChanged(nameof(IsTrustedClientsPage));
                 RaisePropertyChanged(nameof(IsClusteringPage));
+                RaisePropertyChanged(nameof(IsReadyToInstallPage));
                 RaisePropertyChanged(nameof(IsProgressPage));
                 RaisePropertyChanged(nameof(IsFinishPage));
                 RaisePropertyChanged(nameof(ShowBackButton));
@@ -149,12 +144,13 @@ internal sealed class WizardViewModel : ViewModelBase
     public bool IsCertificatePage => CurrentPageIndex == CertificatePageIndex;
     public bool IsTrustedClientsPage => CurrentPageIndex == TrustedClientsPageIndex;
     public bool IsClusteringPage => CurrentPageIndex == ClusteringPageIndex;
+    public bool IsReadyToInstallPage => CurrentPageIndex == ReadyToInstallPageIndex;
     public bool IsProgressPage => CurrentPageIndex == ProgressPageIndex;
     public bool IsFinishPage => CurrentPageIndex == FinishPageIndex;
 
     public bool ShowBackButton => CurrentPageIndex is > WelcomePageIndex and < ProgressPageIndex;
-    public bool ShowNextButton => CurrentPageIndex < LastContentPageIndex;
-    public bool ShowInstallButton => CurrentPageIndex == LastContentPageIndex;
+    public bool ShowNextButton => CurrentPageIndex < ReadyToInstallPageIndex;
+    public bool ShowInstallButton => CurrentPageIndex == ReadyToInstallPageIndex;
     public bool ShowCancelButton => CurrentPageIndex < ProgressPageIndex;
     public bool ShowCloseButton => CurrentPageIndex == FinishPageIndex;
 
@@ -197,10 +193,20 @@ internal sealed class WizardViewModel : ViewModelBase
 
     private void GoBack()
     {
-        if (CurrentPageIndex > WelcomePageIndex)
+        if (CurrentPageIndex <= WelcomePageIndex)
         {
-            CurrentPageIndex--;
+            return;
         }
+
+        var previous = CurrentPageIndex - 1;
+        if (previous == ClusteringPageIndex && !IsClusterMember)
+        {
+            // Not a step to land on when this host is not a cluster
+            // member - skip back over it to Trusted Clients.
+            previous--;
+        }
+
+        CurrentPageIndex = previous;
     }
 
     private void GoNext()
@@ -219,12 +225,20 @@ internal sealed class WizardViewModel : ViewModelBase
             MessageBox.Show(message, "Storage Locations", MessageBoxButton.OK, MessageBoxImage.Information);
         }
 
-        CurrentPageIndex++;
+        var next = CurrentPageIndex + 1;
+        if (next == ClusteringPageIndex && !IsClusterMember)
+        {
+            // Same skip as GoBack, forwards - straight on to Ready to
+            // Install instead.
+            next++;
+        }
+
+        CurrentPageIndex = next;
     }
 
     private bool CanGoNext()
     {
-        if (CurrentPageIndex >= LastContentPageIndex)
+        if (CurrentPageIndex >= ReadyToInstallPageIndex)
         {
             return false;
         }
