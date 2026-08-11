@@ -1,13 +1,23 @@
 <UserControl x:Class="HyperVCsiAgent.Installer.Bootstrapper.Pages.TrustedClientsPage"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
-    <StackPanel>
-        <TextBlock Text="Trusted Clients" FontSize="18" FontWeight="Bold" Margin="0,0,0,4" />
-        <TextBlock TextWrapping="Wrap" Margin="0,0,0,16"
-                   Text="Fingerprints of the client certificates allowed to call this agent." />
+    <DockPanel>
+        <TextBlock DockPanel.Dock="Top" Text="Trusted Clients" FontSize="18" FontWeight="Bold" Margin="0,0,0,4" />
+        <TextBlock DockPanel.Dock="Top" TextWrapping="Wrap" Margin="0,0,0,16"
+                   Text="Fingerprints of the client certificates allowed to call this agent. At least one is required." />
 
-        <TextBlock TextWrapping="Wrap" Margin="0,0,0,4"
-                   Text="Client certificate thumbprints - separate more than one with a semicolon (;), such as during a rotation:" />
-        <TextBox Text="{Binding ClientThumbprints, UpdateSourceTrigger=PropertyChanged}" />
-    </StackPanel>
+        <Grid DockPanel.Dock="Top" Margin="0,0,0,12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <TextBox x:Name="NewThumbprintBox" Grid.Column="0" Margin="0,0,8,0" KeyDown="NewThumbprintBox_KeyDown" />
+            <Button Grid.Column="1" Content="Add" Width="80" Click="Add_Click" />
+        </Grid>
+
+        <Button DockPanel.Dock="Bottom" Content="Remove selected" HorizontalAlignment="Left" Margin="0,12,0,0"
+                Click="Remove_Click" />
+
+        <ListBox x:Name="ThumbprintList" ItemsSource="{Binding ClientThumbprintList}" />
+    </DockPanel>
 </UserControl>

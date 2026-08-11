@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.Windows;
 using System.Windows.Threading;
 using WixToolset.BootstrapperApplicationApi;
@@ -25,7 +26,6 @@ internal sealed class WizardViewModel : ViewModelBase
     private string _storeName = "My";
     private string _storeLocation = "LocalMachine";
     private string _serverCertThumbprint = "";
-    private string _clientThumbprints = "";
 
     private int _currentPageIndex;
     private int _overallProgressPercentage;
@@ -93,7 +93,15 @@ internal sealed class WizardViewModel : ViewModelBase
     public string StoreName { get => _storeName; set => SetField(ref _storeName, value); }
     public string StoreLocation { get => _storeLocation; set => SetField(ref _storeLocation, value); }
     public string ServerCertThumbprint { get => _serverCertThumbprint; set => SetField(ref _serverCertThumbprint, value); }
-    public string ClientThumbprints { get => _clientThumbprints; set => SetField(ref _clientThumbprints, value); }
+
+    /// <summary>
+    /// Add/remove list backing the Trusted Clients page, replacing the old
+    /// single semicolon-separated text field now that there is a real UI to
+    /// build one out of proper rows. Joined back into a semicolon-separated
+    /// string only where the MSI still expects one - see
+    /// PushVariablesToEngine.
+    /// </summary>
+    public ObservableCollection<string> ClientThumbprintList { get; } = [];
 
     public int CurrentPageIndex
     {
@@ -211,6 +219,7 @@ internal sealed class WizardViewModel : ViewModelBase
             ServiceAccountPageIndex => ServiceAccount.Length > 0 && ServicePassword.Length > 0,
             StoragePageIndex => CsvVolumesRoot.Length > 0 && (!SnapshotsEnabled || CsvSnapshotsRoot.Length > 0),
             CertificatePageIndex => ServerCertThumbprint.Length > 0,
+            TrustedClientsPageIndex => ClientThumbprintList.Count > 0,
             _ => true,
         };
     }
@@ -234,7 +243,7 @@ internal sealed class WizardViewModel : ViewModelBase
         _engine.SetVariableString("STORENAME", StoreName, formatted: false);
         _engine.SetVariableString("STORELOCATION", StoreLocation, formatted: false);
         _engine.SetVariableString("SERVERCERTTHUMBPRINT", ServerCertThumbprint, formatted: false);
-        _engine.SetVariableString("CLIENTTHUMBPRINTS", ClientThumbprints, formatted: false);
+        _engine.SetVariableString("CLIENTTHUMBPRINTS", string.Join(';', ClientThumbprintList), formatted: false);
     }
 
     private void RunOnUiThread(Action action)
