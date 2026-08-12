@@ -55,6 +55,31 @@ internal sealed class WizardViewModel : ViewModelBase
 
         Certificates = CertificateStoreLookup.ListCandidates();
 
+        // Not for uninstall: none of these fields' pages are ever shown on
+        // that path (see BeginUninstall's own remarks), so there is nothing
+        // to pre-fill. Password is deliberately left blank either way - SCM
+        // has no API that gives it back, so an upgrade always needs it
+        // retyped.
+        if (!IsUninstall)
+        {
+            var existing = ExistingInstallationDetector.Detect();
+            if (existing.ServiceAccount is { } account)
+            {
+                ServiceAccount = account;
+            }
+
+            if (existing.CsvVolumesRoot is { } volumesRoot)
+            {
+                CsvVolumesRoot = volumesRoot;
+            }
+
+            if (existing.CsvSnapshotsRoot is { } snapshotsRoot)
+            {
+                CsvSnapshotsRoot = snapshotsRoot;
+                SnapshotsEnabled = true;
+            }
+        }
+
         BackCommand = new RelayCommand(GoBack, () => CurrentPageIndex is > 0 and < ProgressPageIndex);
         NextCommand = new RelayCommand(GoNext, CanGoNext);
         InstallCommand = new RelayCommand(BeginInstall, () => CurrentPageIndex == ReadyToInstallPageIndex);
