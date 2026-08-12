@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Linq;
 using System.Windows;
 using System.Windows.Threading;
 using WixToolset.BootstrapperApplicationApi;
@@ -20,6 +21,7 @@ internal sealed class WizardViewModel : ViewModelBase
     // so a value set here round-trips to the chained MsiPackage untouched.
     private string _serviceAccount = "";
     private string _servicePassword = "";
+    private string _servicePasswordConfirm = "";
     private string _csvVolumesRoot = "";
     private string _csvSnapshotsRoot = "";
     private string _tlsPort = "443";
@@ -34,6 +36,7 @@ internal sealed class WizardViewModel : ViewModelBase
     private bool _installSucceeded;
     private bool _licenseAccepted;
     private bool _snapshotsEnabled;
+    private bool _passwordLocked;
     private Dispatcher? _dispatcher;
 
     private readonly IEngine _engine;
@@ -57,15 +60,24 @@ internal sealed class WizardViewModel : ViewModelBase
 
         // Not for uninstall: none of these fields' pages are ever shown on
         // that path (see BeginUninstall's own remarks), so there is nothing
-        // to pre-fill. Password is deliberately left blank either way - SCM
-        // has no API that gives it back, so an upgrade always needs it
-        // retyped.
+        // to pre-fill.
         if (!IsUninstall)
         {
             var existing = ExistingInstallationDetector.Detect();
             if (existing.ServiceAccount is { } account)
             {
                 ServiceAccount = account;
+
+                // A real account is already configured with SCM, so there is
+                // a real password already in place too - SCM has no API that
+                // gives it back, so the wizard cannot show or reuse it
+                // directly, but it also does not need to: leaving
+                // ServicePassword blank and PasswordLocked true is exactly
+                // what PushVariablesToEngine and ServiceInstall's own
+                // Password="[SERVICEPASSWORD]" (Product.wxs) need to leave
+                // the account's password untouched. See PasswordLocked's own
+                // remarks for the ServiceAccountPage side of this.
+                PasswordLocked = true;
             }
 
             if (existing.CsvVolumesRoot is { } volumesRoot)
@@ -78,12 +90,29 @@ internal sealed class WizardViewModel : ViewModelBase
                 CsvSnapshotsRoot = snapshotsRoot;
                 SnapshotsEnabled = true;
             }
+
+            // Only when the store actually has a matching candidate left -
+            // Certificates was already populated above, and selecting a
+            // thumbprint the DataGrid has no row for would just leave
+            // nothing selected, so there is no reason to distinguish "not
+            // configured" from "configured but the certificate is gone" here.
+            if (existing.ServerCertThumbprint is { } serverCertThumbprint &&
+                Certificates.Any(certificate => certificate.Thumbprint.Equals(serverCertThumbprint, StringComparison.OrdinalIgnoreCase)))
+            {
+                ServerCertThumbprint = serverCertThumbprint;
+            }
+
+            foreach (var clientThumbprint in existing.ClientThumbprints)
+            {
+                ClientThumbprintList.Add(clientThumbprint);
+            }
         }
 
         BackCommand = new RelayCommand(GoBack, () => CurrentPageIndex is > 0 and < ProgressPageIndex);
         NextCommand = new RelayCommand(GoNext, CanGoNext);
         InstallCommand = new RelayCommand(BeginInstall, () => CurrentPageIndex == ReadyToInstallPageIndex);
         UninstallCommand = new RelayCommand(BeginUninstall, () => CurrentPageIndex == UninstallConfirmPageIndex);
+        UnlockPasswordCommand = new RelayCommand(() => PasswordLocked = false);
         CancelCommand = new RelayCommand(Cancel);
         CloseCommand = new RelayCommand(() => Application.Current?.Shutdown());
 
@@ -134,7 +163,67 @@ internal sealed class WizardViewModel : ViewModelBase
     public int ExitCode { get; private set; }
 
     public string ServiceAccount { get => _serviceAccount; set => SetField(ref _serviceAccount, value); }
-    public string ServicePassword { get => _servicePassword; set => SetField(ref _servicePassword, value); }
+
+    public string ServicePassword
+    {
+        get => _servicePassword;
+        set
+        {
+            if (SetField(ref _servicePassword, value))
+            {
+                RaisePropertyChanged(nameof(PasswordsMatch));
+                RaisePropertyChanged(nameof(ShowPasswordMismatch));
+            }
+        }
+    }
+
+    public string ServicePasswordConfirm
+    {
+        get => _servicePasswordConfirm;
+        set
+        {
+            if (SetField(ref _servicePasswordConfirm, value))
+            {
+                RaisePropertyChanged(nameof(PasswordsMatch));
+                RaisePropertyChanged(nameof(ShowPasswordMismatch));
+            }
+        }
+    }
+
+    public bool PasswordsMatch => ServicePassword == ServicePasswordConfirm;
+
+    /// <summary>Only once the operator has actually started typing a confirmation - showing a mismatch warning before the second box has any text would just be noise.</summary>
+    public bool ShowPasswordMismatch => !PasswordsMatch && ServicePasswordConfirm.Length > 0;
+
+    /// <summary>
+    /// True when an existing service account was detected for this node
+    /// (see the constructor) and the operator has not clicked
+    /// UnlockPasswordCommand yet. ServiceAccountPage shows a disabled,
+    /// filled-looking password box and an "Update Password" button in this
+    /// state instead of an empty box demanding new input - SCM has no API
+    /// that gives the real password back, so there is nothing to actually
+    /// pre-fill, only a state where retyping it is optional. CanGoNext
+    /// allows leaving the page with ServicePassword still blank while this
+    /// is true, and PushVariablesToEngine then sends that blank
+    /// ServicePassword through unchanged - which is exactly what
+    /// ServiceInstall's Password="[SERVICEPASSWORD]" (Product.wxs) needs to
+    /// leave the account's password untouched rather than reset it.
+    /// </summary>
+    public bool PasswordLocked
+    {
+        get => _passwordLocked;
+        private set
+        {
+            if (SetField(ref _passwordLocked, value))
+            {
+                RaisePropertyChanged(nameof(PasswordUnlocked));
+            }
+        }
+    }
+
+    /// <summary>Just <c>!PasswordLocked</c> - ServiceAccountPage's real, editable PasswordBox needs a positive condition to bind Visibility to, the same as every other BoolToVis binding in this wizard.</summary>
+    public bool PasswordUnlocked => !PasswordLocked;
+
     public string CsvVolumesRoot { get => _csvVolumesRoot; set => SetField(ref _csvVolumesRoot, value); }
     public string CsvSnapshotsRoot { get => _csvSnapshotsRoot; set => SetField(ref _csvSnapshotsRoot, value); }
     public string TlsPort { get => _tlsPort; set => SetField(ref _tlsPort, value); }
@@ -223,6 +312,7 @@ internal sealed class WizardViewModel : ViewModelBase
     public RelayCommand NextCommand { get; }
     public RelayCommand InstallCommand { get; }
     public RelayCommand UninstallCommand { get; }
+    public RelayCommand UnlockPasswordCommand { get; }
     public RelayCommand CancelCommand { get; }
     public RelayCommand CloseCommand { get; }
 
@@ -305,7 +395,7 @@ internal sealed class WizardViewModel : ViewModelBase
         return CurrentPageIndex switch
         {
             WelcomePageIndex => LicenseAccepted,
-            ServiceAccountPageIndex => ServiceAccount.Length > 0 && ServicePassword.Length > 0,
+            ServiceAccountPageIndex => ServiceAccount.Length > 0 && (PasswordLocked || (ServicePassword.Length > 0 && PasswordsMatch)),
             StoragePageIndex => CsvVolumesRoot.Length > 0 && (!SnapshotsEnabled || CsvSnapshotsRoot.Length > 0),
             CertificatePageIndex => ServerCertThumbprint.Length > 0,
             TrustedClientsPageIndex => ClientThumbprintList.Count > 0,

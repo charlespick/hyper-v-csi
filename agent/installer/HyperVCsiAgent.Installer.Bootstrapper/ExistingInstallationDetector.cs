@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Runtime.Versioning;
 using System.Text.Json;
@@ -7,10 +8,16 @@ using Microsoft.Management.Infrastructure;
 namespace HyperVCsiAgent.Installer.Bootstrapper;
 
 /// <summary>
-/// Whatever a previous install left behind on this node - null for a field
-/// means nothing was found for it, not that it was found empty.
+/// Whatever a previous install left behind on this node - null (or an empty
+/// list for <see cref="ClientThumbprints"/>) means nothing was found for it,
+/// not that it was found empty.
 /// </summary>
-internal sealed record ExistingInstallation(string? ServiceAccount, string? CsvVolumesRoot, string? CsvSnapshotsRoot);
+internal sealed record ExistingInstallation(
+    string? ServiceAccount,
+    string? CsvVolumesRoot,
+    string? CsvSnapshotsRoot,
+    string? ServerCertThumbprint,
+    IReadOnlyList<string> ClientThumbprints);
 
 /// <summary>
 /// Reads the node-local config file and the service's own logon account so
@@ -31,15 +38,18 @@ internal static class ExistingInstallationDetector
 
     public static ExistingInstallation Detect()
     {
-        var (volumesRoot, snapshotsRoot) = ReadConfig();
-        return new ExistingInstallation(ReadServiceAccount(), volumesRoot, snapshotsRoot);
+        var config = ReadConfig();
+        return new ExistingInstallation(
+            ReadServiceAccount(), config.VolumesRoot, config.SnapshotsRoot, config.ServerCertThumbprint, config.ClientThumbprints);
     }
 
-    private static (string? VolumesRoot, string? SnapshotsRoot) ReadConfig()
+    private static (string? VolumesRoot, string? SnapshotsRoot, string? ServerCertThumbprint, IReadOnlyList<string> ClientThumbprints) ReadConfig()
     {
+        var none = (VolumesRoot: (string?)null, SnapshotsRoot: (string?)null, ServerCertThumbprint: (string?)null, ClientThumbprints: (IReadOnlyList<string>)[]);
+
         if (!File.Exists(DefaultConfigPath))
         {
-            return (null, null);
+            return none;
         }
 
         try
@@ -48,19 +58,49 @@ internal static class ExistingInstallationDetector
             using var document = JsonDocument.Parse(stream);
             if (!document.RootElement.TryGetProperty("Agent", out var agent))
             {
-                return (null, null);
+                return none;
             }
 
             var volumesRoot = agent.TryGetProperty("CsvVolumesRoot", out var v) ? v.GetString() : null;
             var snapshotsRoot = agent.TryGetProperty("CsvSnapshotsRoot", out var s) ? s.GetString() : null;
-            return (volumesRoot, snapshotsRoot);
+
+            // Only the first entry: AllowedThumbprints supports more than one
+            // during a manual rotation (see TlsOptions' own remarks), but the
+            // wizard's Certificate page only ever selects a single row.
+            string? serverCertThumbprint = null;
+            if (agent.TryGetProperty("Tls", out var tls) &&
+                tls.TryGetProperty("AllowedThumbprints", out var allowedThumbprints) &&
+                allowedThumbprints.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var entry in allowedThumbprints.EnumerateArray())
+                {
+                    serverCertThumbprint = entry.GetString();
+                    break;
+                }
+            }
+
+            var clientThumbprints = new List<string>();
+            if (agent.TryGetProperty("Authentication", out var authentication) &&
+                authentication.TryGetProperty("AllowedClientCertificateThumbprints", out var allowedClients) &&
+                allowedClients.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var entry in allowedClients.EnumerateArray())
+                {
+                    if (entry.GetString() is { } thumbprint)
+                    {
+                        clientThumbprints.Add(thumbprint);
+                    }
+                }
+            }
+
+            return (volumesRoot, snapshotsRoot, serverCertThumbprint, clientThumbprints);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
         {
             // A config file that exists but cannot be read or parsed is not
             // this wizard's problem to fix - fall back to blank fields, same
             // as a fresh install.
-            return (null, null);
+            return none;
         }
     }
 

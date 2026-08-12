@@ -24,6 +24,14 @@ public partial class ServiceAccountPage : UserControl
         }
     }
 
+    private void ConfirmPasswordBox_PasswordChanged(object sender, RoutedEventArgs e)
+    {
+        if (DataContext is WizardViewModel viewModel)
+        {
+            viewModel.ServicePasswordConfirm = ConfirmPasswordBox.Password;
+        }
+    }
+
     // The same "Select User, Computer, Service Account, or Group" dialog
     // ADUC itself uses (objsel.dll's IDsObjectPicker, wrapped by this
     // package rather than hand-rolled COM interop). WinNT provider forces
