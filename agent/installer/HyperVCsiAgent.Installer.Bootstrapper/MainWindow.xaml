@@ -22,6 +22,7 @@
             <pages:TrustedClientsPage Visibility="{Binding IsTrustedClientsPage, Converter={StaticResource BoolToVis}}" />
             <pages:ClusteringPage Visibility="{Binding IsClusteringPage, Converter={StaticResource BoolToVis}}" />
             <pages:ReadyToInstallPage Visibility="{Binding IsReadyToInstallPage, Converter={StaticResource BoolToVis}}" />
+            <pages:UninstallConfirmPage Visibility="{Binding IsUninstallConfirmPage, Converter={StaticResource BoolToVis}}" />
             <pages:ProgressPage Visibility="{Binding IsProgressPage, Converter={StaticResource BoolToVis}}" />
             <pages:FinishPage Visibility="{Binding IsFinishPage, Converter={StaticResource BoolToVis}}" />
         </Grid>
@@ -33,6 +34,8 @@
                     Visibility="{Binding ShowNextButton, Converter={StaticResource BoolToVis}}" />
             <Button Content="Install" Width="80" Margin="0,0,8,0" Command="{Binding InstallCommand}"
                     Visibility="{Binding ShowInstallButton, Converter={StaticResource BoolToVis}}" />
+            <Button Content="Uninstall" Width="80" Margin="0,0,8,0" Command="{Binding UninstallCommand}"
+                    Visibility="{Binding ShowUninstallButton, Converter={StaticResource BoolToVis}}" />
             <Button Content="Close" Width="80" Command="{Binding CloseCommand}"
                     Visibility="{Binding ShowCloseButton, Converter={StaticResource BoolToVis}}" />
             <Button Content="Cancel" Width="80" Command="{Binding CancelCommand}"

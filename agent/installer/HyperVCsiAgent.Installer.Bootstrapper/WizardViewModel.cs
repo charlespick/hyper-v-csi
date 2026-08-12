@@ -43,6 +43,7 @@ internal sealed class WizardViewModel : ViewModelBase
     {
         _engine = engine;
         _command = command;
+        IsUninstall = command.Action == LaunchAction.Uninstall;
 
         // Run once, up front, rather than each time the Prerequisites page
         // is shown: both checks are cheap and their answers do not change
@@ -57,8 +58,18 @@ internal sealed class WizardViewModel : ViewModelBase
         BackCommand = new RelayCommand(GoBack, () => CurrentPageIndex is > 0 and < ProgressPageIndex);
         NextCommand = new RelayCommand(GoNext, CanGoNext);
         InstallCommand = new RelayCommand(BeginInstall, () => CurrentPageIndex == ReadyToInstallPageIndex);
+        UninstallCommand = new RelayCommand(BeginUninstall, () => CurrentPageIndex == UninstallConfirmPageIndex);
         CancelCommand = new RelayCommand(Cancel);
         CloseCommand = new RelayCommand(() => Application.Current?.Shutdown());
+
+        // Set after the field initializer's default (WelcomePageIndex) so an
+        // uninstall launch skips straight past the whole install wizard
+        // instead of replaying License/ServiceAccount/Storage/etc. pages
+        // that have nothing to configure on the way out.
+        if (IsUninstall)
+        {
+            CurrentPageIndex = UninstallConfirmPageIndex;
+        }
     }
 
     public const int WelcomePageIndex = 0;
@@ -71,6 +82,15 @@ internal sealed class WizardViewModel : ViewModelBase
     public const int ReadyToInstallPageIndex = 7;
     public const int ProgressPageIndex = 8;
     public const int FinishPageIndex = 9;
+
+    // Outside the install wizard's own linear ordering (0-9) on purpose -
+    // this is the only page an uninstall launch ever shows before jumping
+    // straight to ProgressPageIndex, so it does not need to sit between any
+    // of the install-only pages.
+    public const int UninstallConfirmPageIndex = 10;
+
+    /// <summary>Whether this launch is Burn's Uninstall action (Control Panel "Uninstall") rather than a fresh install.</summary>
+    public bool IsUninstall { get; }
 
     /// <summary>Populated once, in the constructor - see there for why.</summary>
     public IReadOnlyList<PrerequisiteCheckResult> PrerequisiteResults { get; }
@@ -128,9 +148,11 @@ internal sealed class WizardViewModel : ViewModelBase
                 RaisePropertyChanged(nameof(IsReadyToInstallPage));
                 RaisePropertyChanged(nameof(IsProgressPage));
                 RaisePropertyChanged(nameof(IsFinishPage));
+                RaisePropertyChanged(nameof(IsUninstallConfirmPage));
                 RaisePropertyChanged(nameof(ShowBackButton));
                 RaisePropertyChanged(nameof(ShowNextButton));
                 RaisePropertyChanged(nameof(ShowInstallButton));
+                RaisePropertyChanged(nameof(ShowUninstallButton));
                 RaisePropertyChanged(nameof(ShowCancelButton));
                 RaisePropertyChanged(nameof(ShowCloseButton));
             }
@@ -147,11 +169,16 @@ internal sealed class WizardViewModel : ViewModelBase
     public bool IsReadyToInstallPage => CurrentPageIndex == ReadyToInstallPageIndex;
     public bool IsProgressPage => CurrentPageIndex == ProgressPageIndex;
     public bool IsFinishPage => CurrentPageIndex == FinishPageIndex;
+    public bool IsUninstallConfirmPage => CurrentPageIndex == UninstallConfirmPageIndex;
 
-    public bool ShowBackButton => CurrentPageIndex is > WelcomePageIndex and < ProgressPageIndex;
-    public bool ShowNextButton => CurrentPageIndex < ReadyToInstallPageIndex;
-    public bool ShowInstallButton => CurrentPageIndex == ReadyToInstallPageIndex;
-    public bool ShowCancelButton => CurrentPageIndex < ProgressPageIndex;
+    public bool ShowBackButton => !IsUninstall && CurrentPageIndex is > WelcomePageIndex and < ProgressPageIndex;
+    public bool ShowNextButton => !IsUninstall && CurrentPageIndex < ReadyToInstallPageIndex;
+    public bool ShowInstallButton => !IsUninstall && CurrentPageIndex == ReadyToInstallPageIndex;
+    public bool ShowUninstallButton => IsUninstall && CurrentPageIndex == UninstallConfirmPageIndex;
+    // Not just "< ProgressPageIndex": UninstallConfirmPageIndex sits past
+    // FinishPageIndex numerically, so Cancel needs its own not-yet-running,
+    // not-finished-yet check that holds for both flows.
+    public bool ShowCancelButton => CurrentPageIndex != ProgressPageIndex && CurrentPageIndex != FinishPageIndex;
     public bool ShowCloseButton => CurrentPageIndex == FinishPageIndex;
 
     public int OverallProgressPercentage { get => _overallProgressPercentage; private set => SetField(ref _overallProgressPercentage, value); }
@@ -161,9 +188,16 @@ internal sealed class WizardViewModel : ViewModelBase
     public bool LicenseAccepted { get => _licenseAccepted; set => SetField(ref _licenseAccepted, value); }
     public bool SnapshotsEnabled { get => _snapshotsEnabled; set => SetField(ref _snapshotsEnabled, value); }
 
+    /// <summary>ProgressPage's own heading - the one piece of UI text that has to read differently for the two flows.</summary>
+    public string ProgressTitle => IsUninstall ? "Uninstalling Hyper-V CSI Agent" : "Installing Hyper-V CSI Agent";
+
+    /// <summary>FinishPage's own heading - same reasoning as <see cref="ProgressTitle"/>.</summary>
+    public string FinishTitle => IsUninstall ? "Uninstall Complete" : "Setup Complete";
+
     public RelayCommand BackCommand { get; }
     public RelayCommand NextCommand { get; }
     public RelayCommand InstallCommand { get; }
+    public RelayCommand UninstallCommand { get; }
     public RelayCommand CancelCommand { get; }
     public RelayCommand CloseCommand { get; }
 
@@ -263,6 +297,19 @@ internal sealed class WizardViewModel : ViewModelBase
         _engine.Plan(LaunchAction.Install);
     }
 
+    private void BeginUninstall()
+    {
+        // No PushVariablesToEngine here: none of the wizard pages that
+        // populate those fields are ever shown on this path, so they are
+        // still their empty defaults - pushing them would blow away the
+        // persisted values Burn already has from the original install for
+        // no reason, and Uninstall does not need them anyway.
+        CurrentPageIndex = ProgressPageIndex;
+        IsInstalling = true;
+        StatusText = "Uninstalling...";
+        _engine.Plan(LaunchAction.Uninstall);
+    }
+
     private void PushVariablesToEngine()
     {
         _engine.SetVariableString("SERVICEACCOUNT", ServiceAccount, formatted: false);
@@ -290,9 +337,9 @@ internal sealed class WizardViewModel : ViewModelBase
 
     public void OnDetectComplete(DetectCompleteEventArgs e)
     {
-        // Bare-bones wizard only supports a fresh install today - no
-        // modify/repair/uninstall flow yet, so detection results beyond
-        // "did it succeed" are not acted on.
+        // Bare-bones wizard only supports fresh install and uninstall today
+        // - no modify/repair flow - so detection results beyond "did it
+        // succeed" are not acted on.
         if (e.Status < 0)
         {
             RunOnUiThread(() => StatusText = $"Detection failed (0x{e.Status:X8}).");
@@ -327,9 +374,13 @@ internal sealed class WizardViewModel : ViewModelBase
             IsInstalling = false;
             InstallSucceeded = e.Status >= 0;
             ExitCode = e.Status;
-            StatusText = InstallSucceeded
-                ? "Hyper-V CSI Agent was installed successfully."
-                : $"Setup failed (0x{e.Status:X8}). See the log for details.";
+            StatusText = (InstallSucceeded, IsUninstall) switch
+            {
+                (true, true) => "Hyper-V CSI Agent was removed successfully.",
+                (true, false) => "Hyper-V CSI Agent was installed successfully.",
+                (false, true) => $"Uninstall failed (0x{e.Status:X8}). See the log for details.",
+                (false, false) => $"Setup failed (0x{e.Status:X8}). See the log for details.",
+            };
 
             // Only after the service itself exists - a cluster resource
             // pointing at a service the MSI never installed would have
