@@ -33,6 +33,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: csi-driver/go.mod
+          cache-dependency-path: csi-driver/go.sum
       - working-directory: csi-driver
         run: make test
       - working-directory: csi-driver
@@ -46,6 +47,11 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
+      - uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ hashFiles('agent/**/*.csproj') }}
+          restore-keys: nuget-
       - run: dotnet test agent/HyperVCsiAgent.slnx -c Release
 
   docker:
@@ -69,6 +75,8 @@ jobs:
           tags: |
             ghcr.io/charlespick/hyperv-csi-driver:${{ needs.version.outputs.version }}
             ghcr.io/charlespick/hyperv-csi-driver:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   # Chart version is packaged from the tag rather than the value committed in
   # Chart.yaml, the same way the container image and installer take their
@@ -102,6 +110,11 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
+      - uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ hashFiles('agent/**/*.csproj') }}
+          restore-keys: nuget-
       - run: dotnet build agent/installer/HyperVCsiAgent.Installer.Bundle/HyperVCsiAgent.Installer.Bundle.wixproj -c Release -p:Platform=x64
       - uses: actions/upload-artifact@v4
         with:
