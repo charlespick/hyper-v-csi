@@ -1,7 +1,7 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
   <Bundle
     Name="Hyper-V CSI Agent"
-    Version="1.0.0"
+    Version="$(var.ProductVersion)"
     Manufacturer="Hyper-V CSI Driver"
     UpgradeCode="A6D1E4B2-3F7C-4A18-9E2D-5B8C0F1A7D33"
     DisableModify="yes">

@@ -2,10 +2,22 @@
   <Package
     Name="Hyper-V CSI Agent"
     Manufacturer="Hyper-V CSI Driver"
-    Version="1.0.0"
+    Version="$(var.ProductVersion)"
     UpgradeCode="7F4DC474-BB07-4124-822F-AFB224EE7D2E">
 
-    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <!-- AllowSameVersionUpgrades="yes": without it, MSI's default upgrade
+         search only matches STRICTLY OLDER versions, so reinstalling the
+         exact same ProductVersion (e.g. two builds off an unbumped dev
+         version, or two prerelease tags sharing the same numeric core once
+         validate-cert/thumbprints strip their suffix - see ci.yml's
+         msi-version) creates a second, unrelated product instead of
+         upgrading the first. Confirmed the hard way: this is exactly what
+         left two products registered in Programs and Features on one node,
+         each holding half a reference count on the same Component GUIDs, so
+         removing either one alone left files and the service behind. -->
+    <MajorUpgrade
+      AllowSameVersionUpgrades="yes"
+      DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <!--
@@ -114,15 +126,26 @@
                   Impersonate="no"
                   Return="check" />
 
+    <!--
+      NOT REMOVE on every one of these: the MSI properties they key off
+      (SERVERCERTTHUMBPRINT, SERVICEACCOUNT, CSVVOLUMESROOT, ...) come from
+      Burn Variables marked Persisted="yes" in Bundle.wxs, so a later
+      uninstall run still has last install's values sitting there even
+      though the bootstrapper's own BeginUninstall deliberately never pushes
+      new ones. Without NOT REMOVE, these all still evaluate truthy and fire
+      again during REMOVE=ALL - validating a certificate that isn't being
+      installed, granting access nothing needs anymore, and rewriting a
+      config file the uninstall is about to leave behind anyway.
+    -->
     <InstallExecuteSequence>
-      <Custom Action="ValidateServerCertificate" Before="InstallValidate" Condition="SERVERCERTTHUMBPRINT" />
-      <Custom Action="ValidateClientThumbprints" After="ValidateServerCertificate" Condition="CLIENTTHUMBPRINTS" />
-      <Custom Action="GrantServiceAccountCertificateAccess" After="InstallFiles" Condition="SERVERCERTTHUMBPRINT AND SERVICEACCOUNT" />
-      <Custom Action="GrantServiceAccountLogonRight" Before="InstallServices" Condition="SERVICEACCOUNT" />
-      <Custom Action="SetWriteConfigCmd1" After="GrantServiceAccountCertificateAccess" Condition="CSVVOLUMESROOT" />
-      <Custom Action="SetWriteConfigCmd2" After="SetWriteConfigCmd1" Condition="CSVVOLUMESROOT" />
-      <Custom Action="SetWriteConfigCmd3" After="SetWriteConfigCmd2" Condition="CSVVOLUMESROOT" />
-      <Custom Action="WriteAgentConfig" After="SetWriteConfigCmd3" Condition="CSVVOLUMESROOT" />
+      <Custom Action="ValidateServerCertificate" Before="InstallValidate" Condition="SERVERCERTTHUMBPRINT AND NOT REMOVE" />
+      <Custom Action="ValidateClientThumbprints" After="ValidateServerCertificate" Condition="CLIENTTHUMBPRINTS AND NOT REMOVE" />
+      <Custom Action="GrantServiceAccountCertificateAccess" After="InstallFiles" Condition="SERVERCERTTHUMBPRINT AND SERVICEACCOUNT AND NOT REMOVE" />
+      <Custom Action="GrantServiceAccountLogonRight" Before="InstallServices" Condition="SERVICEACCOUNT AND NOT REMOVE" />
+      <Custom Action="SetWriteConfigCmd1" After="GrantServiceAccountCertificateAccess" Condition="CSVVOLUMESROOT AND NOT REMOVE" />
+      <Custom Action="SetWriteConfigCmd2" After="SetWriteConfigCmd1" Condition="CSVVOLUMESROOT AND NOT REMOVE" />
+      <Custom Action="SetWriteConfigCmd3" After="SetWriteConfigCmd2" Condition="CSVVOLUMESROOT AND NOT REMOVE" />
+      <Custom Action="WriteAgentConfig" After="SetWriteConfigCmd3" Condition="CSVVOLUMESROOT AND NOT REMOVE" />
     </InstallExecuteSequence>
 
     <StandardDirectory Id="ProgramFiles64Folder">

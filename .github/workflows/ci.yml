@@ -14,16 +14,28 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
       is-release: ${{ steps.v.outputs.is-release }}
+      msi-version: ${{ steps.v.outputs.msi-version }}
     steps:
       - id: v
         run: |
           if [ "${{ github.ref_type }}" = "tag" ]; then
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            VERSION="${GITHUB_REF_NAME#v}"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
             echo "is-release=true" >> "$GITHUB_OUTPUT"
           else
-            echo "version=0.0.0-dev-${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+            VERSION="0.0.0-dev-${GITHUB_SHA::8}"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
             echo "is-release=false" >> "$GITHUB_OUTPUT"
           fi
+          # MSI/Burn ProductVersion is strictly major.minor.build (each
+          # numeric, no prerelease suffix) - this repo's own tags don't fit
+          # that as-is (e.g. v0.1.0-beta1), so strip anything from the first
+          # "-" onward for the installer specifically. Two prereleases off
+          # the same numeric core (0.1.0-beta1, 0.1.0-beta2) then map to the
+          # same MSI version, which AllowSameVersionUpgrades="yes"
+          # (Product.wxs) is exactly what's needed to still treat as an
+          # upgrade rather than a second, unrelated product.
+          echo "msi-version=${VERSION%%-*}" >> "$GITHUB_OUTPUT"
 
   go:
     name: Go test & build
@@ -115,7 +127,7 @@ jobs:
           path: ~/.nuget/packages
           key: nuget-${{ hashFiles('agent/**/*.csproj') }}
           restore-keys: nuget-
-      - run: dotnet build agent/installer/HyperVCsiAgent.Installer.Bundle/HyperVCsiAgent.Installer.Bundle.wixproj -c Release -p:Platform=x64
+      - run: dotnet build agent/installer/HyperVCsiAgent.Installer.Bundle/HyperVCsiAgent.Installer.Bundle.wixproj -c Release -p:Platform=x64 -p:InstallerVersion=${{ needs.version.outputs.msi-version }}
       - uses: actions/upload-artifact@v4
         with:
           name: installer

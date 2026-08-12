@@ -3,11 +3,21 @@
   <PropertyGroup>
     <OutputType>Package</OutputType>
     <Platforms>x64</Platforms>
+    <!-- Only a fallback for a bare `dotnet build` with no -p:InstallerVersion
+         - ci.yml's installer job always passes the real one derived from the
+         release tag. 0.HH.mmss (UTC): major pinned to 0 so a real release
+         (major >= 1) always outranks any dev build, and HH/mmss (not a
+         calendar date - see MSI's own 0-255/0-65535 field limits, which
+         leave no room for one) changes every second, which is enough that
+         two `dotnet build`s in the same local session never collide on
+         version - see AllowSameVersionUpgrades's own remarks in Product.wxs
+         for what happens when they do. -->
+    <InstallerVersion Condition="'$(InstallerVersion)' == ''">0.$([System.DateTime]::UtcNow.ToString(HH)).$([System.DateTime]::UtcNow.ToString(mmss))</InstallerVersion>
     <ServiceProjectDir>$(MSBuildThisFileDirectory)..\..\src\HyperVCsiAgent.Service\</ServiceProjectDir>
     <ServicePublishDir>$(ServiceProjectDir)bin\$(Configuration)\net10.0\win-x64\publish\</ServicePublishDir>
     <ActionsProjectDir>$(MSBuildThisFileDirectory)..\HyperVCsiAgent.Installer.Actions\</ActionsProjectDir>
     <ActionsPublishDir>$(ActionsProjectDir)bin\$(Configuration)\net10.0\win-x64\publish\</ActionsPublishDir>
-    <DefineConstants>ServicePublishDir=$(ServicePublishDir);ActionsExePath=$(ActionsPublishDir)HyperVCsiAgent.Installer.Actions.exe</DefineConstants>
+    <DefineConstants>ServicePublishDir=$(ServicePublishDir);ActionsExePath=$(ActionsPublishDir)HyperVCsiAgent.Installer.Actions.exe;ProductVersion=$(InstallerVersion)</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>

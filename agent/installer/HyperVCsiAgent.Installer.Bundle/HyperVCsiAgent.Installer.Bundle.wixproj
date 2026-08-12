@@ -6,11 +6,16 @@
     <Platforms>x64</Platforms>
     <InstallerPlatform>x64</InstallerPlatform>
     <HarvestDirectoryAdditionalOptions>-generate payloadgroup</HarvestDirectoryAdditionalOptions>
+    <!-- Same fallback, same reasoning, as HyperVCsiAgent.Installer.wixproj's
+         own InstallerVersion - kept in lockstep with the chained MSI's own
+         Package/@Version (passed through explicitly to the nested build
+         below) so Bundle and MSI never report different versions. -->
+    <InstallerVersion Condition="'$(InstallerVersion)' == ''">0.$([System.DateTime]::UtcNow.ToString(HH)).$([System.DateTime]::UtcNow.ToString(mmss))</InstallerVersion>
     <BootstrapperProjectDir>$(MSBuildThisFileDirectory)..\HyperVCsiAgent.Installer.Bootstrapper\</BootstrapperProjectDir>
     <BootstrapperPublishDir>$(BootstrapperProjectDir)bin\$(Configuration)\net10.0-windows\win-x64\publish\</BootstrapperPublishDir>
     <MsiProjectDir>$(MSBuildThisFileDirectory)..\HyperVCsiAgent.Installer\</MsiProjectDir>
     <MsiPath>$(MsiProjectDir)bin\x64\$(Configuration)\HyperVCsiAgent.Installer.msi</MsiPath>
-    <DefineConstants>MsiPath=$(MsiPath);BootstrapperPublishDir=$(BootstrapperPublishDir)</DefineConstants>
+    <DefineConstants>MsiPath=$(MsiPath);BootstrapperPublishDir=$(BootstrapperPublishDir);ProductVersion=$(InstallerVersion)</DefineConstants>
   </PropertyGroup>
 
   <!-- The BA exe is harvested from its own publish output (all the
@@ -44,7 +49,7 @@
        project's own CoreCompile runs. -->
   <Target Name="PublishBootstrapperUiAndMsi" BeforeTargets="HarvestDirectory;CoreCompile">
     <Exec Command="dotnet publish &quot;$(BootstrapperProjectDir)HyperVCsiAgent.Installer.Bootstrapper.csproj&quot; -c $(Configuration) -r win-x64 --self-contained -o &quot;$(BootstrapperPublishDir)&quot;" />
-    <Exec Command="dotnet build &quot;$(MsiProjectDir)HyperVCsiAgent.Installer.wixproj&quot; -c $(Configuration) -p:Platform=x64" />
+    <Exec Command="dotnet build &quot;$(MsiProjectDir)HyperVCsiAgent.Installer.wixproj&quot; -c $(Configuration) -p:Platform=x64 -p:InstallerVersion=$(InstallerVersion)" />
   </Target>
 
 </Project>
