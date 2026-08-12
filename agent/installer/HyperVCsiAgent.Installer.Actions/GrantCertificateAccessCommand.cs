@@ -2,7 +2,6 @@ using System.Runtime.Versioning;
 using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
-using System.Security.Principal;
 
 namespace HyperVCsiAgent.Installer.Actions;
 
@@ -60,7 +59,7 @@ internal static class GrantCertificateAccessCommand
             return 1;
         }
 
-        var sid = ResolveSid(account);
+        var sid = AccountLookup.ResolveSid(account);
         if (sid is null)
         {
             Console.Error.WriteLine($"Could not resolve '{account}' to a security identifier. Is the account name correct and the domain reachable?");
@@ -106,17 +105,5 @@ internal static class GrantCertificateAccessCommand
             ? Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData)
             : Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
         return Path.Combine(root, "Microsoft", "Crypto", "RSA", "MachineKeys", info.UniqueKeyContainerName);
-    }
-
-    private static SecurityIdentifier? ResolveSid(string account)
-    {
-        try
-        {
-            return (SecurityIdentifier)new NTAccount(account).Translate(typeof(SecurityIdentifier));
-        }
-        catch (IdentityNotMappedException)
-        {
-            return null;
-        }
     }
 }

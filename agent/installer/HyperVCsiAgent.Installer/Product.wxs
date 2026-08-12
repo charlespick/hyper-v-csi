@@ -69,6 +69,22 @@
                   Return="check" />
 
     <!--
+      Deferred and unimpersonated for the same reason as the grant above:
+      SeServiceLogonRight is a machine-wide LSA policy right, not something
+      the interactive user's own token can hand out. Scheduled before
+      InstallServices (below) - which is what actually creates the service -
+      rather than merely before StartServices, so the right already exists
+      for the whole window between service creation and the service actually
+      starting.
+    -->
+    <CustomAction Id="GrantServiceAccountLogonRight"
+                  BinaryRef="ActionsExe"
+                  ExeCommand="grant-logon-as-service --account &quot;[SERVICEACCOUNT]&quot;"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <!--
       Only the values an operator (or a CM tool) actually supplied end up in
       agent.config.json - see WriteConfigCommand's own remarks for why
       everything else is left for AgentOptions' own defaults to fill in.
@@ -102,6 +118,7 @@
       <Custom Action="ValidateServerCertificate" Before="InstallValidate" Condition="SERVERCERTTHUMBPRINT" />
       <Custom Action="ValidateClientThumbprints" After="ValidateServerCertificate" Condition="CLIENTTHUMBPRINTS" />
       <Custom Action="GrantServiceAccountCertificateAccess" After="InstallFiles" Condition="SERVERCERTTHUMBPRINT AND SERVICEACCOUNT" />
+      <Custom Action="GrantServiceAccountLogonRight" Before="InstallServices" Condition="SERVICEACCOUNT" />
       <Custom Action="SetWriteConfigCmd1" After="GrantServiceAccountCertificateAccess" Condition="CSVVOLUMESROOT" />
       <Custom Action="SetWriteConfigCmd2" After="SetWriteConfigCmd1" Condition="CSVVOLUMESROOT" />
       <Custom Action="SetWriteConfigCmd3" After="SetWriteConfigCmd2" Condition="CSVVOLUMESROOT" />

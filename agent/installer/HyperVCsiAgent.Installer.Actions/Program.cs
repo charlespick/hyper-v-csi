@@ -17,7 +17,7 @@ using HyperVCsiAgent.Installer.Actions;
 // and options types the agent itself binds and enforces at startup.
 if (args.Length == 0)
 {
-    Console.Error.WriteLine("usage: HyperVCsiAgent.Installer.Actions <validate-cert|validate-thumbprints|grant-cert-access|write-config> [options]");
+    Console.Error.WriteLine("usage: HyperVCsiAgent.Installer.Actions <validate-cert|validate-thumbprints|grant-cert-access|grant-logon-as-service|write-config> [options]");
     return 1;
 }
 
@@ -28,6 +28,7 @@ try
         "validate-cert" => ValidateCertificateCommand.Run(args[1..]),
         "validate-thumbprints" => ValidateThumbprintsCommand.Run(args[1..]),
         "grant-cert-access" => GrantCertificateAccessCommand.Run(args[1..]),
+        "grant-logon-as-service" => GrantServiceLogonRightCommand.Run(args[1..]),
         "write-config" => WriteConfigCommand.Run(args[1..]),
         var unknown => Fail($"unknown command '{unknown}'"),
     };
