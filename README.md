@@ -1,105 +1,140 @@
 # Hyper-V CSI Driver
 
-A small, experimental Kubernetes CSI driver for provisioning and attaching
-VHDX-backed persistent volumes to Hyper-V-based nodes.
+A Kubernetes CSI driver for provisioning and attaching VHDX-backed persistent
+volumes to Hyper-V-based nodes.
 
 > Warning: this project is still very early and is pretty much entirely vibe
-> coded. The agent installer is new and has only been exercised through its
-> unattended install path end to end, not yet a full interactive run on a
-> production cluster, and much of the implementation is still being
-> iterated.
+> coded. Use at your own risk.
 
-## Agent Installation
+## Overview
 
-The agent installs via `agent/installer/HyperVCsiAgent.Installer` - a WiX MSI
-that installs the service locally on one node at a time, the same way SQL
-Server's Failover Cluster Instance setup works: run it on each node, then add
-the node's service as a Generic Service resource to the failover cluster
-yourself (this installer does not touch the cluster). Config is local to the
-node it was installed on - see "Configuration" below for why - so a change
-can be piloted on one node before being applied to the other.
+The driver has two halves that talk to each other over mutual TLS:
 
-Build the MSI (it is not part of the main solution build, since it is the
-only project in the solution that targets a specific platform):
+- **The agent** runs as a clustered role on your Hyper-V failover cluster, with
+  its own IP and DNS name. It's the only component that touches Hyper-V — it
+  creates and grows VHDX files on the cluster shared volume (CSV), attaches and
+  detaches them from VMs, and takes checkpoint-backed snapshots.
+- **The driver** runs in Kubernetes as a standard CSI controller/node
+  deployment. It implements the CSI spec and turns PVC lifecycle events into
+  calls against the agent.
 
+Kubernetes nodes must themselves be VMs clustered on that same failover cluster,
+since the agent needs to resolve a node to a VM and act on it even if the VM's
+host has died. A Kubernetes cluster whose nodes span more than one Hyper-V
+cluster is supported by running one instance of the driver (with its own
+StorageClass) per Hyper-V cluster.
+
+What works today: dynamic provisioning, attach/detach, online expansion, and the
+full node staging/mount path. Snapshots (create/delete/restore) are implemented
+but off by default — see [design.md](design.md) for status and architecture in
+more depth.
+
+## Prerequisites
+
+- A Windows Server Failover Cluster
+- Kubernetes nodes running as clustered VMs on that cluster
+- A Cluster Shared Volume (CSV) for persistent volume storage — **ReFS** if you
+  intend to use snapshots (see below), NTFS is fine otherwise
+- Hyper-V hosts reachable from the agent's clustered role
+- A domain service account for the agent, with Hyper-V Administrators rights on
+  every Hyper-V host and enough Failover Cluster permissions to act on a failed
+  node's role (needed for forced detach)
+- The `hyperv-daemons` package (including `hv_kvp_daemon`) installed in every
+  guest node, with the Data Exchange integration service enabled — this is how
+  the driver discovers a guest's own VM identity
+- `kubectl` and `helm` access to the target Kubernetes cluster
+
+### Snapshots need ReFS
+
+A snapshot is taken behind a Hyper-V checkpoint that stands for the whole
+duration of the copy. On ReFS the copy is a block clone — metadata only, a few
+seconds. On NTFS it's a full byte-for-byte stream, during which the VM holding
+that volume can't have disks attached, detached, or expanded, and no other
+volume on it can be snapshotted. The CSV paths the agent is configured with for
+volumes and snapshots must be on the **same** ReFS volume for block clone to
+apply — a cross-volume clone falls back to streaming silently.
+
+If you don't plan to use snapshots, NTFS works fine for everything else.
+
+## Installation
+
+### 1. Generate a client certificate and put it in Kubernetes
+
+The driver and the agent authenticate each other with mutual TLS. Generate a
+self-signed certificate and key:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -keyout tls.key -out tls.crt -days 3650 -subj "/CN=hyperv-csi-driver"
 ```
-dotnet build agent/installer/HyperVCsiAgent.Installer/HyperVCsiAgent.Installer.wixproj -c Release -p:Platform=x64
+
+Store it as a Kubernetes Secret. The chart looks for a secret named
+`hyperv-csi-agent-client` by default (`clientCertificate.existingSecret`):
+
+```bash
+kubectl create namespace hyperv-csi
+kubectl create secret tls hyperv-csi-agent-client --cert=tls.crt --key=tls.key -n hyperv-csi
 ```
 
-Run `HyperVCsiAgent.Installer.msi` interactively for a wizard that collects
-the service account, storage locations, server certificate, and trusted
-client certificate thumbprints, and writes them to
-`C:\ProgramData\HyperVCsiAgent\agent.config.json`. The certificate itself
-must already be installed on the host and readable by whichever store/location
-you point the wizard at - the installer only pins it by thumbprint and grants
-the service account read access to its private key, it does not import one
-for you.
+Compute its thumbprint — you'll pass this to the agent installer as
+`CLIENTTHUMBPRINTS` in the next step:
 
-For unattended installs (Puppet, Ansible, DSC, or any other configuration
-management tool), run it silent with properties on the command line:
-
-```
-msiexec /i HyperVCsiAgent.Installer.msi /quiet SERVICEACCOUNT="DOMAIN\svc-hyperv-csi" SERVICEPASSWORD="..." CSVVOLUMESROOT="C:\ClusterStorage\Volume1\hyperv-csi\volumes" CSVSNAPSHOTSROOT="C:\ClusterStorage\Volume1\hyperv-csi\snapshots" TLSHOSTNAME="hyperv-csi-agent.example.com" SERVERCERTTHUMBPRINT="..." CLIENTTHUMBPRINTS="..."
+```bash
+openssl x509 -in tls.crt -noout -fingerprint -sha1 | sed 's/.*=//;s/://g'
 ```
 
-Any property can be left out. The service and its files always install; the
-config file is only written, and the service only started, once
-`CSVVOLUMESROOT` is present - installing with just `SERVICEACCOUNT` stages a
-stopped, registered service for a configuration management tool to finish
-configuring and start on its own schedule.
+### 2. Install the agent on every node
 
-### Configuration
+Download `hyperv-csi-agent-installer-<version>.exe` from the
+[Releases page](https://github.com/charlespick/hyper-v-csi/releases) and run it
+on each node of the failover cluster.
 
-Config lives at `C:\ProgramData\HyperVCsiAgent\agent.config.json` on each
-node - not on the CSV - so a config change can be edited on the node that
-currently owns the clustered role, piloted by failing the role over onto it,
-and only applied to the other node once it is proven. See the doc comment on
-`AgentOptions` in `HyperVCsiAgent.Core` for the full rationale and every
-setting the file accepts.
+You may use the installer to generate a self-signed certificate when installing
+on the first node - and transfer it to the certificate store on other nodes
+manually, or configure the certificate yourself. Select the same certificate
+when installing on every node.
 
-## Driver Installation
+Alternatively, install the agent silently using your configuration management
+system of choice
 
-Helm-based installation is planned once the chart is published. When that is
-available, this README will document the expected cluster deployment steps and
-the required values for connecting the driver to the clustered agent.
+```powershell
+.\hyperv-csi-agent-installer-<version>.exe /quiet SERVICEACCOUNT="DOMAIN\svc-hyperv-csi" SERVICEPASSWORD="..." CSVVOLUMESROOT="C:\ClusterStorage\Volume1\hyperv-csi\volumes" CSVSNAPSHOTSROOT="C:\ClusterStorage\Volume1\hyperv-csi\snapshots" TLSHOSTNAME="hyperv-csi-agent.example.com" SERVERCERTTHUMBPRINT="<server cert thumbprint>" CLIENTTHUMBPRINTS="<thumbprint from step 1>"
+```
 
-## Core requirements
+Any property can be left out — the service always installs, but the config file
+is only written and the service only started once `CSVVOLUMESROOT` is present.
+That lets you stage a stopped, registered service and have your configuration
+management tool finish configuring and starting it on its own schedule.
 
-This driver is designed around the following requirements:
+Config lives at `C:\ProgramData\HyperVCsiAgent\agent.config.json` on each node.
+See the doc comment on `AgentOptions` in `HyperVCsiAgent.Core` for every setting
+the file accepts.
 
-- Windows Server Failover Clustering
-- Clustered VMs for Kubernetes nodes
-- A Cluster Shared Volume (CSV) for persistent volume storage
-- VHDX-backed volumes stored on the CSV
-- Hyper-V hosts that can be reached by the clustered agent
-- A working Hyper-V guest environment for the node side
+### 3. Configure the cluster role
 
-Kubernetes clusters that span multiple Hyper-V clusters are supported by running
-multiple instances of the driver only
+Add the agent as a Generic Service resource to the failover cluster, the same
+way you would for any clustered Windows service:
 
-## Hyper-V daemons for KVP
+```powershell
+Add-ClusterGenericServiceRole -ServiceName HyperVCsiAgent -Name "Hyper-V CSI Agent"
+```
 
-The guest nodes need the Hyper-V Linux daemons installed, including
-hv_kvp_daemon, and Data Exchange must be enabled. This allows the guest to
-discover its own VM identity from Hyper-V so the driver can associate the node
-with the correct VM.
+Give it a static IP resource and bring it online, then point its DNS name at that IP.
 
-## Snapshot storage requirements
+### 4. Install the Helm chart
 
-**Use ReFS for the CSV if you intend to use snapshots.** A snapshot of an
-attached volume is taken behind a Hyper-V checkpoint, and that checkpoint
-stands for the whole duration of the copy. On ReFS the copy is a block clone —
-metadata only, a few seconds. On NTFS it is a full byte-for-byte stream, and
-while it runs the VM holding that volume cannot have disks attached, detached
-or expanded, and no other volume on it can be snapshotted. `CsvVolumesRoot`
-and `CsvSnapshotsRoot` must be on the **same** ReFS volume for block clone to
-apply at all — a cross-volume clone is not possible, and the copy silently
-falls back to streaming.
+The chart is published to GHCR and can be installed with standard options:
 
-Consequence on NTFS: snapshotting several volumes on one node will show
-`CreateSnapshot` failing with `ABORTED` and retrying, for as long as the
-copies ahead of them take. That is expected and self-resolving, not a fault —
-and it is why ReFS is a requirement rather than a preference.
+```bash
+helm install hyperv-csi oci://ghcr.io/charlespick/charts/hyperv-csi \
+  --version <version> \
+  --namespace hyperv-csi \
+  --set agent.address=https://hyperv-csi-agent.example.com \
+  --set agent.serverCertificateThumbprints[0]=<server cert thumbprint>
+```
+
+See [values.yaml](deploy/helm/hyperv-csi/values.yaml) for the rest of the
+chart's configuration, including the sidecar images/timeouts, StorageClass
+reclaim policy, and the opt-in VolumeSnapshotClass.
 
 ## Design notes
 
