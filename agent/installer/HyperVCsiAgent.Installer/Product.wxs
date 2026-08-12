@@ -132,7 +132,6 @@
     <Feature Id="Main">
       <ComponentGroupRef Id="AgentComponents" />
       <ComponentRef Id="ServiceExeComponent" />
-      <ComponentRef Id="ServiceControlStartComponent" />
     </Feature>
 
     <!-- The WPF Bootstrapper Application (HyperVCsiAgent.Installer.Bootstrapper,
@@ -164,41 +163,28 @@
       <Component Id="ServiceExeComponent" Guid="9D6E9F9C-9F2E-4C7D-9E9E-2B7C7B9F6D01">
         <File Id="ServiceExe" Source="$(var.ServicePublishDir)HyperVCsiAgent.Service.exe" KeyPath="yes" />
 
+        <!-- Start="demand", not "auto": this service is meant to be run
+             under cluster management (or otherwise started deliberately per
+             node), not launched unconditionally by SCM on every boot. -->
         <ServiceInstall
           Id="ServiceInstaller"
           Name="hyperv-csi-agent"
           DisplayName="Hyper-V CSI Agent"
           Description="Provisions and attaches VHDX-backed persistent volumes for the Hyper-V CSI driver."
           Type="ownProcess"
-          Start="auto"
+          Start="demand"
           ErrorControl="normal"
           Account="[SERVICEACCOUNT]"
           Password="[SERVICEPASSWORD]" />
 
         <!-- Always stop and remove the service on uninstall regardless of
-             whether it was ever started - see ServiceControlStartComponent
-             below for why starting it, unlike this, is conditional. -->
+             whether it was ever started. Install never starts it - see the
+             Start="demand" note above. -->
         <ServiceControl
           Id="ServiceControlStop"
           Name="hyperv-csi-agent"
           Stop="both"
           Remove="uninstall"
-          Wait="yes" />
-      </Component>
-
-      <!-- ServiceControl has no Condition attribute of its own, so starting
-           the service lives in its own component instead: only started once
-           a config file actually exists to start it with - see
-           WriteAgentConfig's own Condition above. An unattended install
-           that skipped configuration leaves the service registered but
-           stopped, ready for a CM tool to drop agent.config.json in place
-           and start it separately. -->
-      <Component Id="ServiceControlStartComponent" Guid="1A2B3C4D-5E6F-4A7B-8C9D-0E1F2A3B4C5D" Condition="CSVVOLUMESROOT">
-        <RegistryValue Root="HKLM" Key="Software\HyperVCsiAgent" Name="StartedAtInstall" Type="integer" Value="1" KeyPath="yes" />
-        <ServiceControl
-          Id="ServiceControlStart"
-          Name="hyperv-csi-agent"
-          Start="install"
           Wait="yes" />
       </Component>
     </DirectoryRef>
