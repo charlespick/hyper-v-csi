@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
+using System.Runtime.InteropServices;
+using System.Threading;
 using System.Windows;
 using System.Windows.Threading;
 using WixToolset.BootstrapperApplicationApi;
@@ -47,6 +49,24 @@ internal sealed class WizardViewModel : ViewModelBase
         _engine = engine;
         _command = command;
         IsUninstall = command.Action == LaunchAction.Uninstall;
+
+        // Embedded is how Burn re-launches an OLDER related bundle to
+        // uninstall it as part of applying a newer one (confirmed via the
+        // Burn log: that relaunch carries "-burn.embedded" and
+        // WixBundleUILevel=1) - without treating it as headless, that
+        // relaunch showed its own full wizard window on top of the new
+        // install's. None/Passive are the /quiet and /passive an operator
+        // scripting a cluster-wide rollout would use. Full is the only mode
+        // that gets the interactive wizard.
+        IsHeadless = command.Display is Display.Embedded or Display.None or Display.Passive;
+
+        // bal:CommandLineVariables (Bundle.wxs) only wires command-line
+        // NAME=value overrides into the built-in themed BA - confirmed by
+        // running this bundle with a property override and finding it
+        // still landed at its declared default. A custom BA has to apply
+        // them itself, which is what makes SERVICEACCOUNT=... etc. on the
+        // command line do anything at all, headless or not.
+        ApplyCommandLineVariables();
 
         // Run once, up front, rather than each time the Prerequisites page
         // is shown: both checks are cheap and their answers do not change
@@ -145,6 +165,9 @@ internal sealed class WizardViewModel : ViewModelBase
 
     /// <summary>Whether this launch is Burn's Uninstall action (Control Panel "Uninstall") rather than a fresh install.</summary>
     public bool IsUninstall { get; }
+
+    /// <summary>True for /quiet, /passive, and Burn's own embedded relaunch of a related bundle - see the constructor's own remarks. No wizard page ever shows in this mode.</summary>
+    public bool IsHeadless { get; }
 
     /// <summary>Populated once, in the constructor - see there for why.</summary>
     public IReadOnlyList<PrerequisiteCheckResult> PrerequisiteResults { get; }
@@ -318,6 +341,21 @@ internal sealed class WizardViewModel : ViewModelBase
 
     public void AttachDispatcher(Dispatcher dispatcher) => _dispatcher = dispatcher;
 
+    private readonly ManualResetEventSlim _headlessCompleted = new(initialState: false);
+
+    /// <summary>Blocks until headless Detect/Plan/Apply has finished - BootstrapperApp.Run's headless equivalent of joining the interactive path's WPF UI thread.</summary>
+    public void WaitForHeadlessCompletion() => _headlessCompleted.Wait();
+
+    private void SignalHeadlessCompletion() => _headlessCompleted.Set();
+
+    private void ApplyCommandLineVariables()
+    {
+        foreach (var variable in _command.ParseCommandLine().Variables)
+        {
+            _engine.SetVariableString(variable.Key, variable.Value, formatted: false);
+        }
+    }
+
     /// <summary>
     /// Re-reads the certificate store - called after generating a new
     /// self-signed certificate, since that adds an entry the constructor's
@@ -425,6 +463,32 @@ internal sealed class WizardViewModel : ViewModelBase
         _engine.Plan(LaunchAction.Uninstall);
     }
 
+    // Mirrors CanGoNext's per-page required-field checks - there is no
+    // wizard to enforce them interactively in headless mode, so a missing
+    // one has to be caught here instead of surfacing as a cryptic MSI
+    // failure partway through Apply. TLSPORT/STORENAME/STORELOCATION are
+    // never missing - Bundle.wxs declares real defaults for all three.
+    private static readonly string[] RequiredInstallVariableNames =
+    [
+        "SERVICEACCOUNT", "CSVVOLUMESROOT", "CSVSNAPSHOTSROOT", "SERVERCERTTHUMBPRINT", "CLIENTTHUMBPRINTS",
+    ];
+
+    private List<string> GetMissingRequiredVariables()
+    {
+        var missing = RequiredInstallVariableNames.Where(name => _engine.GetVariableString(name).Length == 0).ToList();
+
+        // SERVICEPASSWORD is the one exception: required unless SCM already
+        // has this exact account registered, same as PasswordLocked's own
+        // interactive-mode reasoning - and only worth checking at all once
+        // an account is actually present.
+        if (_engine.GetVariableString("SERVICEACCOUNT").Length > 0 && !PasswordLocked && _engine.GetVariableString("SERVICEPASSWORD").Length == 0)
+        {
+            missing.Add("SERVICEPASSWORD");
+        }
+
+        return missing;
+    }
+
     private void PushVariablesToEngine()
     {
         _engine.SetVariableString("SERVICEACCOUNT", ServiceAccount, formatted: false);
@@ -452,6 +516,20 @@ internal sealed class WizardViewModel : ViewModelBase
 
     public void OnDetectComplete(DetectCompleteEventArgs e)
     {
+        if (IsHeadless)
+        {
+            if (e.Status < 0)
+            {
+                _engine.Log(LogLevel.Error, $"Detection failed (0x{e.Status:X8}).");
+                ExitCode = e.Status;
+                SignalHeadlessCompletion();
+                return;
+            }
+
+            RunHeadlessPlan();
+            return;
+        }
+
         // Bare-bones wizard only supports fresh install and uninstall today
         // - no modify/repair flow - so detection results beyond "did it
         // succeed" are not acted on.
@@ -461,10 +539,41 @@ internal sealed class WizardViewModel : ViewModelBase
         }
     }
 
+    // No wizard page ever runs in headless mode, so this is BeginInstall/
+    // BeginUninstall's equivalent: validate (Install only) then plan
+    // straight from Detect completing, instead of waiting on a button click
+    // that will never come.
+    private void RunHeadlessPlan()
+    {
+        if (_command.Action == LaunchAction.Install)
+        {
+            var missing = GetMissingRequiredVariables();
+            if (missing.Count > 0)
+            {
+                const int ErrorInvalidParameter = 87;
+                _engine.Log(LogLevel.Error,
+                    $"Missing required propert{(missing.Count == 1 ? "y" : "ies")} for an unattended install: {string.Join(", ", missing)}.");
+                ExitCode = ErrorInvalidParameter;
+                SignalHeadlessCompletion();
+                return;
+            }
+        }
+
+        _engine.Plan(_command.Action);
+    }
+
     public void OnPlanComplete(PlanCompleteEventArgs e)
     {
         if (e.Status < 0)
         {
+            if (IsHeadless)
+            {
+                _engine.Log(LogLevel.Error, $"Planning failed (0x{e.Status:X8}).");
+                ExitCode = e.Status;
+                SignalHeadlessCompletion();
+                return;
+            }
+
             RunOnUiThread(() =>
             {
                 IsInstalling = false;
@@ -475,27 +584,58 @@ internal sealed class WizardViewModel : ViewModelBase
             return;
         }
 
-        // GetMainWindowHandle touches the Window's interop state, which
-        // (like everything else on a DispatcherObject) can only be read
-        // from the thread that owns it - this callback runs on the
-        // engine's own thread, not the UI dispatcher.
-        RunOnUiThread(() => _engine.Apply(GetMainWindowHandle()));
+        // GetApplyParentHandle touches the Window's interop state in the
+        // interactive case, which (like everything else on a
+        // DispatcherObject) can only be read from the thread that owns it -
+        // this callback runs on the engine's own thread, not the UI
+        // dispatcher.
+        RunOnUiThread(() => _engine.Apply(GetApplyParentHandle()));
     }
+
+    private string GetOutcomeMessage(bool succeeded, int status) => (succeeded, IsUninstall) switch
+    {
+        (true, true) => "Hyper-V CSI Agent was removed successfully.",
+        (true, false) => "Hyper-V CSI Agent was installed successfully.",
+        (false, true) => $"Uninstall failed (0x{status:X8}). See the log for details.",
+        (false, false) => $"Setup failed (0x{status:X8}). See the log for details.",
+    };
 
     public void OnApplyComplete(ApplyCompleteEventArgs e)
     {
+        if (IsHeadless)
+        {
+            InstallSucceeded = e.Status >= 0;
+            ExitCode = e.Status;
+            _engine.Log(InstallSucceeded ? LogLevel.Standard : LogLevel.Error, GetOutcomeMessage(InstallSucceeded, e.Status));
+
+            // Cluster registration has no command-line equivalent yet -
+            // only the interactive Clustering page sets
+            // RegisterClusterResource, so this is always false here. Left
+            // in rather than special-cased away, so adding that property
+            // later does not also require touching this method.
+            if (InstallSucceeded && RegisterClusterResource)
+            {
+                try
+                {
+                    ClusterResourceRegistrar.Register();
+                    _engine.Log(LogLevel.Standard, "The agent was also registered as a clustered role.");
+                }
+                catch (Exception ex)
+                {
+                    _engine.Log(LogLevel.Standard, $"Registering the agent as a clustered role failed: {ex.Message}");
+                }
+            }
+
+            SignalHeadlessCompletion();
+            return;
+        }
+
         RunOnUiThread(() =>
         {
             IsInstalling = false;
             InstallSucceeded = e.Status >= 0;
             ExitCode = e.Status;
-            StatusText = (InstallSucceeded, IsUninstall) switch
-            {
-                (true, true) => "Hyper-V CSI Agent was removed successfully.",
-                (true, false) => "Hyper-V CSI Agent was installed successfully.",
-                (false, true) => $"Uninstall failed (0x{e.Status:X8}). See the log for details.",
-                (false, false) => $"Setup failed (0x{e.Status:X8}). See the log for details.",
-            };
+            StatusText = GetOutcomeMessage(InstallSucceeded, e.Status);
 
             // Only after the service itself exists - a cluster resource
             // pointing at a service the MSI never installed would have
@@ -522,7 +662,15 @@ internal sealed class WizardViewModel : ViewModelBase
 
     public void OnError(ErrorEventArgs e)
     {
-        RunOnUiThread(() => StatusText = e.ErrorMessage);
+        if (IsHeadless)
+        {
+            _engine.Log(LogLevel.Error, e.ErrorMessage);
+        }
+        else
+        {
+            RunOnUiThread(() => StatusText = e.ErrorMessage);
+        }
+
         e.Result = Result.Abort;
     }
 
@@ -535,8 +683,25 @@ internal sealed class WizardViewModel : ViewModelBase
     public void OnProgress(ProgressEventArgs e) =>
         RunOnUiThread(() => OverallProgressPercentage = e.OverallPercentage);
 
-    private static IntPtr GetMainWindowHandle() =>
-        Application.Current?.MainWindow is { } window
-            ? new System.Windows.Interop.WindowInteropHelper(window).Handle
-            : IntPtr.Zero;
+    // Burn's engine rejects a null hwndParent on Detect/Apply outright
+    // ("BA passed NULL hwndParent to Apply") even when nothing is ever
+    // going to be shown against it - confirmed by a real headless run
+    // failing with exactly that error once this stopped creating a WPF
+    // window at all. The desktop window's own handle is always valid and
+    // never makes anything appear on screen, which is all a
+    // Display.None/Embedded/Passive run needs.
+    internal static IntPtr GetHeadlessWindowHandle() => NativeMethods.GetDesktopWindow();
+
+    private IntPtr GetApplyParentHandle() =>
+        IsHeadless
+            ? GetHeadlessWindowHandle()
+            : Application.Current?.MainWindow is { } window
+                ? new System.Windows.Interop.WindowInteropHelper(window).Handle
+                : IntPtr.Zero;
+
+    private static class NativeMethods
+    {
+        [DllImport("user32.dll")]
+        internal static extern IntPtr GetDesktopWindow();
+    }
 }

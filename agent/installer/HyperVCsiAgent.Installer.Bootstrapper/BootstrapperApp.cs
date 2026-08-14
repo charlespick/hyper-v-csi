@@ -27,16 +27,34 @@ internal sealed class BootstrapperApp : BootstrapperApplication
 
     protected override void Run()
     {
-        this.engine.Log(LogLevel.Standard, "Launching Hyper-V CSI Agent setup UI.");
+        // Headless covers /quiet, /passive, and - critically - Burn
+        // re-launching an old related bundle to uninstall it as part of an
+        // upgrade (Display.Embedded): without this branch, that relaunch
+        // showed its own full wizard window on top of the new install's
+        // own window. See WizardViewModel.IsHeadless for the exact display
+        // values this covers.
+        if (_viewModel!.IsHeadless)
+        {
+            this.engine.Log(LogLevel.Standard, "Running headless (no UI).");
 
-        // This method runs on the MTA thread ManagedBootstrapperApplication.Run
-        // set up (see Program.cs's own remarks on why Main isn't [STAThread]).
-        // WPF needs a real STA thread of its own, so the whole UI lives on a
-        // dedicated one and this method just blocks until it exits.
-        var uiThread = new Thread(RunWpfApplication);
-        uiThread.SetApartmentState(ApartmentState.STA);
-        uiThread.Start();
-        uiThread.Join();
+            // Detect(IntPtr.Zero) is rejected the same way Apply is - see
+            // WizardViewModel.GetHeadlessWindowHandle's own remarks.
+            this.engine.Detect(WizardViewModel.GetHeadlessWindowHandle());
+            _viewModel.WaitForHeadlessCompletion();
+        }
+        else
+        {
+            this.engine.Log(LogLevel.Standard, "Launching Hyper-V CSI Agent setup UI.");
+
+            // This method runs on the MTA thread ManagedBootstrapperApplication.Run
+            // set up (see Program.cs's own remarks on why Main isn't [STAThread]).
+            // WPF needs a real STA thread of its own, so the whole UI lives on a
+            // dedicated one and this method just blocks until it exits.
+            var uiThread = new Thread(RunWpfApplication);
+            uiThread.SetApartmentState(ApartmentState.STA);
+            uiThread.Start();
+            uiThread.Join();
+        }
 
         this.ExitCode = _viewModel!.ExitCode;
         this.engine.Quit(this.ExitCode);
