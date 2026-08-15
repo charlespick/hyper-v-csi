@@ -50,7 +50,7 @@ of it — it builds a linux/amd64 container from `test/e2e/docker/` and runs
 exec paths for the Linux test pods using its own client OS's path separator: a
 windows/amd64 `e2e.test` sends Linux pods `test -d \opt\0` instead of
 `test -d /opt/0`, which fails every time regardless of what OS is driving the
-run. See `findings.md`'s 2026-08-06 entry for how that was found.
+run. See `run-e2e.ps1`'s own header comment for how that was found.
 
 ### What is in `test/e2e/`
 

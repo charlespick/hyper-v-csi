@@ -12,7 +12,7 @@ in-container exec paths for the Linux test pods using the client's native
 path separator, so several upstream volume test helpers fail every time - a
 Linux pod sees `test -d \opt\0` instead of `test -d /opt/0`. Running the
 client itself as linux/amd64, whatever OS calls this script, is what avoids
-that class of false failure. See findings.md, 2026-08-06 entry.
+that class of false failure.
 
 The repository and the resolved kubeconfig are bind-mounted into the
 container; everything else - downloading e2e.test/ginkgo, building the skip
