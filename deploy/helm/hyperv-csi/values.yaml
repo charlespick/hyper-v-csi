@@ -227,6 +227,10 @@ storageClass:
 volumeSnapshotClass:
   name: hyperv-csi
 
+  # Free-form, e.g. for the third-party backup tools that discover a driver's
+  # VolumeSnapshotClass by annotation rather than by convention.
+  annotations: {}
+
   # Delete, unlike storageClass.reclaimPolicy above, and the consequence is the
   # same one that entry describes: deleting a VolumeSnapshot calls
   # DeleteSnapshot and destroys the snapshot on the Hyper-V side for real. It
