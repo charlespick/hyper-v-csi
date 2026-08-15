@@ -14,9 +14,28 @@
          upgrading the first. Confirmed the hard way: this is exactly what
          left two products registered in Programs and Features on one node,
          each holding half a reference count on the same Component GUIDs, so
-         removing either one alone left files and the service behind. -->
+         removing either one alone left files and the service behind.
+
+         Schedule="afterInstallExecute": the default (afterInstallValidate)
+         removes the whole old product - including, via ServiceControl's
+         Remove="uninstall" below, the service itself - before the new
+         product installs anything. ServiceExeComponent's Component Guid is
+         fixed across versions specifically so the old and new product share
+         a reference count on it, but afterInstallValidate tears the old
+         product down before the new one ever registers its own claim, so
+         the shared count still hits zero and the service gets deleted then
+         recreated on every upgrade. Confirmed the hard way: that recreation
+         is a real ServiceInstall/CreateService call, which does not honor a
+         blank Password as "leave the account's password unchanged" the way
+         a reconfigure of an already-existing service does - it sets an
+         actual empty password, breaking the service account's logon until
+         someone notices. afterInstallExecute installs the new product "on
+         top of" the old one first, so the shared component's reference
+         count never drops to zero and the service survives the upgrade
+         untouched. -->
     <MajorUpgrade
       AllowSameVersionUpgrades="yes"
+      Schedule="afterInstallExecute"
       DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
