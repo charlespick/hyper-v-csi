@@ -133,6 +133,7 @@ internal sealed class WizardViewModel : ViewModelBase
         InstallCommand = new RelayCommand(BeginInstall, () => CurrentPageIndex == ReadyToInstallPageIndex);
         UninstallCommand = new RelayCommand(BeginUninstall, () => CurrentPageIndex == UninstallConfirmPageIndex);
         UnlockPasswordCommand = new RelayCommand(() => PasswordLocked = false);
+        OpenLogCommand = new RelayCommand(OpenLog);
         CancelCommand = new RelayCommand(Cancel);
         CloseCommand = new RelayCommand(() => Application.Current?.Shutdown());
 
@@ -321,21 +322,48 @@ internal sealed class WizardViewModel : ViewModelBase
     public int OverallProgressPercentage { get => _overallProgressPercentage; private set => SetField(ref _overallProgressPercentage, value); }
     public string StatusText { get => _statusText; private set => SetField(ref _statusText, value); }
     public bool IsInstalling { get => _isInstalling; private set => SetField(ref _isInstalling, value); }
-    public bool InstallSucceeded { get => _installSucceeded; private set => SetField(ref _installSucceeded, value); }
+    public bool InstallSucceeded
+    {
+        get => _installSucceeded;
+        private set
+        {
+            if (SetField(ref _installSucceeded, value))
+            {
+                RaisePropertyChanged(nameof(FinishTitle));
+                RaisePropertyChanged(nameof(ShowOpenLogButton));
+            }
+        }
+    }
+
     public bool LicenseAccepted { get => _licenseAccepted; set => SetField(ref _licenseAccepted, value); }
     public bool SnapshotsEnabled { get => _snapshotsEnabled; set => SetField(ref _snapshotsEnabled, value); }
 
     /// <summary>ProgressPage's own heading - the one piece of UI text that has to read differently for the two flows.</summary>
     public string ProgressTitle => IsUninstall ? "Uninstalling Hyper-V CSI Agent" : "Installing Hyper-V CSI Agent";
 
-    /// <summary>FinishPage's own heading - same reasoning as <see cref="ProgressTitle"/>.</summary>
-    public string FinishTitle => IsUninstall ? "Uninstall Complete" : "Setup Complete";
+    /// <summary>
+    /// FinishPage's own heading. Depends on InstallSucceeded, not just
+    /// IsUninstall like ProgressTitle - this used to say "Setup Complete"
+    /// even when StatusText right underneath it was reporting a failure,
+    /// which reads as the installer contradicting itself.
+    /// </summary>
+    public string FinishTitle => (IsUninstall, InstallSucceeded) switch
+    {
+        (true, true) => "Uninstall Complete",
+        (true, false) => "Uninstall Encountered an Error",
+        (false, true) => "Setup Complete",
+        (false, false) => "Setup Encountered an Error",
+    };
+
+    /// <summary>Only on failure - a successful run has nothing worth sending an operator digging through a log for.</summary>
+    public bool ShowOpenLogButton => !InstallSucceeded;
 
     public RelayCommand BackCommand { get; }
     public RelayCommand NextCommand { get; }
     public RelayCommand InstallCommand { get; }
     public RelayCommand UninstallCommand { get; }
     public RelayCommand UnlockPasswordCommand { get; }
+    public RelayCommand OpenLogCommand { get; }
     public RelayCommand CancelCommand { get; }
     public RelayCommand CloseCommand { get; }
 
@@ -366,6 +394,29 @@ internal sealed class WizardViewModel : ViewModelBase
     {
         Certificates = CertificateStoreLookup.ListCandidates();
         RaisePropertyChanged(nameof(Certificates));
+    }
+
+    // WixBundleLog is set by the engine itself before Detect even begins
+    // (confirmed in a real Burn log), so it is always populated by the time
+    // FinishPage - and this button - can be showing. UseShellExecute=true
+    // opens it with whatever this machine's default handler for .log files
+    // is (Notepad, ordinarily), the same as double-clicking it in Explorer.
+    private void OpenLog()
+    {
+        var logPath = _engine.GetVariableString("WixBundleLog");
+        if (logPath.Length == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(logPath) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            StatusText += $" (Could not open the log: {ex.Message})";
+        }
     }
 
     private void Cancel()
@@ -577,6 +628,7 @@ internal sealed class WizardViewModel : ViewModelBase
             RunOnUiThread(() =>
             {
                 IsInstalling = false;
+                InstallSucceeded = false;
                 ExitCode = e.Status;
                 StatusText = $"Planning failed (0x{e.Status:X8}).";
                 CurrentPageIndex = FinishPageIndex;

@@ -10,7 +10,8 @@
          own InstallerVersion - kept in lockstep with the chained MSI's own
          Package/@Version (passed through explicitly to the nested build
          below) so Bundle and MSI never report different versions. -->
-    <InstallerVersion Condition="'$(InstallerVersion)' == ''">0.$([System.DateTime]::UtcNow.ToString(HH)).$([System.DateTime]::UtcNow.ToString(mmss))</InstallerVersion>
+    <InstallerUnixSeconds>$([System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds())</InstallerUnixSeconds>
+    <InstallerVersion Condition="'$(InstallerVersion)' == ''">0.$([MSBuild]::Modulo($([MSBuild]::Divide($(InstallerUnixSeconds), 65536)), 256)).$([MSBuild]::Modulo($(InstallerUnixSeconds), 65536))</InstallerVersion>
     <BootstrapperProjectDir>$(MSBuildThisFileDirectory)..\HyperVCsiAgent.Installer.Bootstrapper\</BootstrapperProjectDir>
     <BootstrapperPublishDir>$(BootstrapperProjectDir)bin\$(Configuration)\net10.0-windows\win-x64\publish\</BootstrapperPublishDir>
     <MsiProjectDir>$(MSBuildThisFileDirectory)..\HyperVCsiAgent.Installer\</MsiProjectDir>
