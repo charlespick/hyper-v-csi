@@ -195,11 +195,25 @@
       <Custom Action="SetWriteConfigCmd2" After="SetWriteConfigCmd1" Condition="CSVVOLUMESROOT AND NOT REMOVE" />
       <Custom Action="SetWriteConfigCmd3" After="SetWriteConfigCmd2" Condition="CSVVOLUMESROOT AND NOT REMOVE" />
       <Custom Action="WriteAgentConfig" After="SetWriteConfigCmd3" Condition="CSVVOLUMESROOT AND NOT REMOVE" />
-      <!-- Unconditional on REMOVE, unlike the install-only actions above -
-           matches ServiceControlStop's own Remove="uninstall", which always
-           stops and removes the service regardless of whether this specific
-           node ever actually opened the port (harmless no-op either way). -->
-      <Custom Action="CloseFirewallPort" Before="RemoveFiles" Condition="REMOVE" />
+      <!-- REMOVE AND NOT UPGRADINGPRODUCTCODE, not just REMOVE: this custom
+           action is a raw imperative side effect keyed by a fixed rule name,
+           not an MSI-tracked resource like ServiceControl's service, so
+           MajorUpgrade's Schedule="afterInstallExecute" (see its own remarks)
+           does not protect it the same way - the new product's InstallServices
+           reuses the existing, ref-counted service, but OpenFirewallPort and
+           CloseFirewallPort both just add/remove "Hyper-V CSI Agent" by name
+           with no ref-counting at all. Confirmed the hard way: with only
+           Condition="REMOVE", the new product's OpenFirewallPort (which now
+           runs first) got its rule deleted moments later by the old product's
+           own CloseFirewallPort (running afterward as part of the same
+           RemoveExistingProducts), leaving every upgraded node with no
+           inbound rule until someone noticed the controller's probes were
+           timing out. UPGRADINGPRODUCTCODE is set on the product being
+           removed specifically when that removal is a chained major-upgrade
+           step rather than a real, standalone uninstall - excluding that
+           case here leaves a genuine `msiexec /x` still closing the port
+           behind it, same as always. -->
+      <Custom Action="CloseFirewallPort" Before="RemoveFiles" Condition="REMOVE AND NOT UPGRADINGPRODUCTCODE" />
     </InstallExecuteSequence>
 
     <StandardDirectory Id="ProgramFiles64Folder">
