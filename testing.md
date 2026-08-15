@@ -201,9 +201,9 @@ settled by the constraint that made this suite run outside the cluster in the
 first place: something that can (a) act on the Hyper-V cluster directly — stop a
 VM, move a role, fail a host — and (b) assert on Kubernetes state while that
 happens. Neither half can run on the node under test. The scenarios worth
-writing first are already listed in `private_todo.md`: a volume attached to a
-node whose VM cannot be resolved, an unresponsive agent, an agent that cannot
-reach a host the cluster claims is online.
+writing first: a volume attached to a node whose VM cannot be resolved, an
+unresponsive agent, an agent that cannot reach a host the cluster claims is
+online.
 
 Nothing in `test/e2e/` prevents that harness from landing next to it and
 reusing the same kubeconfig and the same artifacts layout. `\[Disruptive\]`
