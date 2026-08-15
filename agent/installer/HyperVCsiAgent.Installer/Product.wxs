@@ -97,6 +97,32 @@
                   Return="check" />
 
     <!--
+      Deferred and unimpersonated: modifying the machine's Windows Firewall
+      policy needs the elevated context this install already runs under, not
+      the interactive user's own token. Without this, the agent's HTTPS
+      listener is only reachable from whatever this host's Windows Firewall
+      already happens to allow through - confirmed against a real cluster:
+      traffic from the install host's own subnet got through by coincidence,
+      traffic from the Kubernetes nodes' addresses did not, and both looked
+      identical from the agent's side (a plain connection timeout, not a
+      clear refusal).
+    -->
+    <CustomAction Id="OpenFirewallPort"
+                  BinaryRef="ActionsExe"
+                  ExeCommand="open-firewall-port --port &quot;[TLSPORT]&quot;"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <!-- Undoes OpenFirewallPort on the way out - see its own remarks. -->
+    <CustomAction Id="CloseFirewallPort"
+                  BinaryRef="ActionsExe"
+                  ExeCommand="close-firewall-port"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <!--
       Only the values an operator (or a CM tool) actually supplied end up in
       agent.config.json - see WriteConfigCommand's own remarks for why
       everything else is left for AgentOptions' own defaults to fill in.
@@ -142,10 +168,19 @@
       <Custom Action="ValidateClientThumbprints" After="ValidateServerCertificate" Condition="CLIENTTHUMBPRINTS AND NOT REMOVE" />
       <Custom Action="GrantServiceAccountCertificateAccess" After="InstallFiles" Condition="SERVERCERTTHUMBPRINT AND SERVICEACCOUNT AND NOT REMOVE" />
       <Custom Action="GrantServiceAccountLogonRight" Before="InstallServices" Condition="SERVICEACCOUNT AND NOT REMOVE" />
+      <!-- Only when the agent is actually being configured (same gate
+           WriteAgentConfig uses below) - an unattended install that is only
+           staging the service exe has no port to open yet either. -->
+      <Custom Action="OpenFirewallPort" After="GrantServiceAccountLogonRight" Condition="CSVVOLUMESROOT AND NOT REMOVE" />
       <Custom Action="SetWriteConfigCmd1" After="GrantServiceAccountCertificateAccess" Condition="CSVVOLUMESROOT AND NOT REMOVE" />
       <Custom Action="SetWriteConfigCmd2" After="SetWriteConfigCmd1" Condition="CSVVOLUMESROOT AND NOT REMOVE" />
       <Custom Action="SetWriteConfigCmd3" After="SetWriteConfigCmd2" Condition="CSVVOLUMESROOT AND NOT REMOVE" />
       <Custom Action="WriteAgentConfig" After="SetWriteConfigCmd3" Condition="CSVVOLUMESROOT AND NOT REMOVE" />
+      <!-- Unconditional on REMOVE, unlike the install-only actions above -
+           matches ServiceControlStop's own Remove="uninstall", which always
+           stops and removes the service regardless of whether this specific
+           node ever actually opened the port (harmless no-op either way). -->
+      <Custom Action="CloseFirewallPort" Before="RemoveFiles" Condition="REMOVE" />
     </InstallExecuteSequence>
 
     <StandardDirectory Id="ProgramFiles64Folder">
