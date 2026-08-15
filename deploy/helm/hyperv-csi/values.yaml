@@ -44,16 +44,6 @@ agent:
   # allowInsecure is false.
   serverCertificateThumbprints: []
 
-  # Injected into every controller and node pod's /etc/hosts (Pod.spec.hostAliases).
-  # Needed whenever agent.address's hostname isn't resolvable through the
-  # cluster's own DNS (a .test hostname for the clustered role's floating IP,
-  # for instance - .test is IANA-reserved and never resolves on real DNS).
-  # Same shape as Pod.spec.hostAliases:
-  #   hostAliases:
-  #     - ip: 10.4.3.13
-  #       hostnames: [hyperv-csi-agent.e2e.test]
-  hostAliases: []
-
 # The self-signed client certificate the agent pins by fingerprint. Create it
 # with the commands in the repository README, and put its fingerprint in the
 # agent's own config file — the agent will reject anything else at the TLS
