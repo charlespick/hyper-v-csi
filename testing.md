@@ -128,6 +128,13 @@ convention:
 
 Everything after the flags is passed to `e2e.test` verbatim.
 
+Concurrency itself has been exercised once, not just left at its cautious
+default: a `-TestProfile full -Procs 4` run — four specs in flight at once,
+including overlapping `multiVolume` cross-node cases and the `snapshottable`
+suite — passed all 64 reachable specs with nothing left behind. That is one
+data point, not a characterization, so the default stays 1; but it is
+evidence, not just caution.
+
 Each run writes to `test/e2e/_artifacts/<profile>-<timestamp>/`: `junit.xml`,
 Ginkgo's aggregated report and the one for CI to read, alongside `e2e.test`'s
 own per-process `junit_NN.xml` and whatever it dumps from the cluster on a
@@ -138,17 +145,20 @@ failure. Both that directory and the binary cache are gitignored.
 **`smoke`** is the default and is the gentle first run. It is the whole volume
 lifecycle — provision, attach, format, mount, write, expand, unmount, detach,
 delete — one pod and one volume at a time, plus subpaths, fsGroup, generic
-ephemeral volumes and ReadWriteOncePod. What it leaves out is everything that
-happens *at once*: `[Slow]`, `[Serial]`, the `multiVolume` suite and the 100 MiB
-`volumeIO` writes. The intent is that the first failures are one simple thing at
-a time rather than a cascade.
+ephemeral volumes, ReadWriteOncePod, and now `multiVolume`, including the
+cases that move a volume between nodes — a detach followed by an attach on
+another host, driven by the attach/detach controller. For a driver whose whole
+job is reconfiguring VMs on a failover cluster, that's the single most
+valuable thing in the run, and it's proven passing against a two-node cluster,
+so it no longer needs holding back here. What smoke still leaves out: the rest
+of `[Slow]` (`subPath`, `volumeMode`, and `provisioning`'s parallel-pvc-data-
+source case haven't been individually cleared), `[Serial]`, and the 100 MiB
+`volumeIO` writes. The intent is that the first failures are one simple thing
+at a time rather than a cascade.
 
 **`full`** is everything this driver is expected to pass, and is what a release
-should eventually gate on. The important thing it adds back is `multiVolume`,
-including the cases that move a volume between nodes — a detach followed by an
-attach on another host, driven by the attach/detach controller. For a driver
-whose whole job is reconfiguring VMs on a failover cluster, that is the single
-most valuable thing in the run.
+should eventually gate on. It differs from `smoke` only in the stragglers
+above.
 
 Run `smoke` until it is green, then `full`. Every line in `skips-smoke.txt` is
 expected to be deleted eventually; nothing in it describes a limitation of the
@@ -161,7 +171,7 @@ flag is a statement about the driver, a skip regex is a statement about us.
 
 | Not tested | Mechanism | Why |
 | --- | --- | --- |
-| **Snapshots** — create, delete, list, restore, group snapshots, snapshot metadata | `snapshotDataSource: false`, `groupSnapshot: false`, no `SnapshotClass`, and `\[Feature:` in `skips.txt` | `CreateSnapshot` returns `Unimplemented`. Note that `ControllerGetCapabilities` currently advertises `CREATE_DELETE_SNAPSHOT` and `LIST_SNAPSHOTS` anyway — the suite does not read that, so this is invisible here, but it is a real over-advertisement recorded in `CSI Spec.md` |
+| **Group snapshots, snapshot metadata** | `groupSnapshot: false`; `\[Feature:` in `skips.txt` still catches `volumegroupsnapshot` and `snapshotmetadata` | `CreateVolumeGroupSnapshot` and the snapshot metadata service aren't implemented. Single-volume snapshot create/delete/list/restore is no longer in this table: `snapshotDataSource: true` plus a generated `SnapshotClass` let `[Feature:VolumeSnapshotDataSource]` run instead of being silenced, and it does — the `snapshottable` suite (12 specs) passes against a real `snapshot-controller` and the chart's own external-snapshotter sidecar (`controller.snapshotter.enabled`), proven in the 2026-08-15 full-profile run |
 | **Stress and performance** — `volume-stress`, `volume-lifecycle-performance`, snapshot stress | `StressTestOptions` and `PerformanceTestOptions` left unset in `testdriver.yaml` | These provision until something breaks, on purpose. The Windows API path is the least characterised part of this driver under load; the first thing to learn from it should not be what happens at fifty volumes at once. Turning them on is adding a block to `testdriver.yaml` |
 | **Node and kubelet failover** — pod deleted while the kubelet is down, volume reused afterwards | `\[Disruptive\]` in `skips.txt` | The failure class the project has not built for. Also needs SSH to the nodes, which `--provider=skeleton` does not have, so these would error rather than fail honestly. See below |
 | **Raw block volumes** | `block: false` | `requireMountVolume` rejects them; nothing formats or maps a raw device |
@@ -223,15 +233,12 @@ list.
 
 ## Where this goes
 
-- Turn off the smoke profile's extra skips one at a time as they pass, starting
-  with `multiVolume`.
+- Turn off the smoke profile's remaining extra skips one at a time as they
+  pass. `multiVolume` is done; what's left of `[Slow]` is `subPath`,
+  `volumeMode`, and `provisioning`'s parallel-pvc-data-source case, plus
+  `[Serial]` and `volumeIO` entirely.
 - Add the Hyper-V failover harness described above, and stop calling node
   failover untested.
-- When `CreateSnapshot` lands: set `snapshotDataSource: true`, add a
-  `SnapshotClass` to `testdriver.yaml`, deploy external-snapshotter from the
-  chart, and narrow the blanket `\[Feature:` skip so
-  `[Feature:VolumeSnapshotDataSource]` runs. That single change is worth about
-  fifty tests.
 - Run the full profile on every release, from CI against a real cluster. The
   runner already emits JUnit for that; what it needs is a runner with a route to
   the cluster, which means a self-hosted one.
