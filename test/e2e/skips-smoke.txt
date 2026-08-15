@@ -5,13 +5,20 @@
 #
 # Same format as skips.txt: one Ginkgo skip regex per line.
 
-# Anything upstream tags as long-running. Not because a slow test is a bad
-# test, but because the slow ones here are also the concurrent ones — several
-# pods writing to several volumes at once — and this driver's Windows API path
-# is the part whose behaviour under load is least understood. Raising the
-# timeouts in testdriver.yaml is the answer to slow; this profile is about
-# reducing what happens at once.
-\[Slow\]
+# Anything upstream tags as long-running, except multiVolume: the 2026-08-14
+# full-profile run against a two-node cluster passed all 14 of its specs,
+# including the 4 cross-node detach/attach cases, so it no longer needs
+# holding back here. [Slow] itself can't stay the skip pattern, since
+# multiVolume carries that tag too and Go's regexp has no negative lookahead
+# to carve one suite back out of a tag match — these three are what's left of
+# it, enumerated by suite name instead. Same trade as the [Feature:
+# enumeration below: a new [Slow] suite upstream adds later runs instead of
+# being silenced, which is the right way round. Raising the timeouts in
+# testdriver.yaml is the answer to slow; this profile is about reducing what
+# happens at once.
+\] subPath .*\[Slow\]
+\] volumeMode .*\[Slow\]
+\] provisioning .*\[Slow\]
 
 # Ginkgo runs these alone, and each is the load-piling kind: the volume-limits
 # test provisions until the node refuses, and the ReadWriteOncePod preemption
