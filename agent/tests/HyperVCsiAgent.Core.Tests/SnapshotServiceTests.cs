@@ -2270,6 +2270,9 @@ public sealed class SnapshotServiceTests : IDisposable
         public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("no node hint was given in this test, so nothing should resolve a VM");
 
+        public Task<ClusteredVmState?> GetVmClusterStateAsync(string nodeId, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("no node hint was given in this test, so nothing should resolve a VM");
+
         public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("no node hint was given in this test, so nothing should resolve a VM");
 
@@ -2342,6 +2345,9 @@ public sealed class SnapshotServiceTests : IDisposable
 
         public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
             Task.FromResult(Vms.TryGetValue(nodeId, out var vm) ? vm : null);
+
+        public Task<ClusteredVmState?> GetVmClusterStateAsync(string nodeId, CancellationToken cancellationToken) =>
+            throw new NotSupportedException("SnapshotService never reads a VM's cluster resource state");
 
         public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
             Task.FromResult(true);

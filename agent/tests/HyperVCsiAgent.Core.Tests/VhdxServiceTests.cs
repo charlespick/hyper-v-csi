@@ -1419,6 +1419,9 @@ public sealed class VhdxServiceTests : IDisposable
         public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
             Task.FromResult(Vms.TryGetValue(nodeId, out var vm) ? vm : null);
 
+        public Task<ClusteredVmState?> GetVmClusterStateAsync(string nodeId, CancellationToken cancellationToken) =>
+            throw new NotSupportedException("ExpandAsync's fallback never reads a VM's cluster resource state");
+
         public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
             throw new NotSupportedException("ExpandAsync's fallback never checks host liveness");
 
@@ -1501,6 +1504,9 @@ public sealed class VhdxServiceTests : IDisposable
             throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
 
         public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
+
+        public Task<ClusteredVmState?> GetVmClusterStateAsync(string nodeId, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
 
         public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>

@@ -30,6 +30,39 @@ public interface IClusterService
     /// </remarks>
     Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// What state the cluster has a VM's own resource in - not whether its host
+    /// is up, which is <see cref="IsHostLiveAsync"/>'s different and weaker
+    /// question.
+    /// <para>
+    /// Null means one thing only: the cluster database has no VM resource for
+    /// this node ID. Everything that means "cannot answer" throws instead -
+    /// among them a node ID that is not a GUID, a cluster database this host
+    /// cannot read, the keyed query finding no row for a resource the database
+    /// just named, and a state or intent property that is missing or not of the
+    /// type the schema promises.
+    /// </para>
+    /// </summary>
+    /// <remarks>
+    /// The bar is that high because of what the answer gets used for. This is
+    /// the read behind deciding whether a Kubernetes node is safe to fence, and
+    /// an unanswerable result rendered as a negative would license
+    /// force-detaching the disks of a VM that may well be running. An empty
+    /// result is an error, never a negative answer - and measurably so: a keyed
+    /// <c>MSCluster_Resource</c> query returns zero rows with no exception for
+    /// a genuinely absent resource, for a mistyped sub-property path, and for a
+    /// cluster the caller cannot initialise against, so zero rows on its own
+    /// distinguishes nothing.
+    /// <para>
+    /// Reporting only, deliberately. This says what the cluster's state is; it
+    /// does not decide what that makes safe. Fencing policy - how long a state
+    /// must hold, how many reads agree, what the caller does about
+    /// <see cref="ClusterResourceState.Unrecognized"/> - belongs to the caller
+    /// making the fencing decision, not to the read that informs it.
+    /// </para>
+    /// </remarks>
+    Task<ClusteredVmState?> GetVmClusterStateAsync(string nodeId, CancellationToken cancellationToken);
+
     Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken);
 
     /// <summary>

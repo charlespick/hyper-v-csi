@@ -158,6 +158,9 @@ public sealed class HostOperationSlotsTests : IDisposable
         public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
             Task.FromResult(Owner is null ? null : new ClusteredVm("vm-1", Owner));
 
+        public Task<ClusteredVmState?> GetVmClusterStateAsync(string nodeId, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
         public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) => Task.FromResult(true);
 
         public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) =>

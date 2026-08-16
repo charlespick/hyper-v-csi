@@ -375,6 +375,9 @@ public sealed class JobsEndpointTests : IDisposable
         public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
             throw new NotSupportedException("no test in this file attaches through a node hint");
 
+        public Task<ClusteredVmState?> GetVmClusterStateAsync(string nodeId, CancellationToken cancellationToken) =>
+            throw new NotSupportedException("no test in this file reads a VM's cluster resource state");
+
         public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
             throw new NotSupportedException("a VM list of zero means the sweep never asks this");
 

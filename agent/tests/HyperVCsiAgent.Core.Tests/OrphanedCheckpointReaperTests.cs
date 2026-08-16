@@ -482,6 +482,9 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
         public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
+        public Task<ClusteredVmState?> GetVmClusterStateAsync(string nodeId, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
         public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
@@ -753,6 +756,9 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
 
         public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
             Task.FromResult(Vms.TryGetValue(nodeId, out var vm) ? vm : null);
+
+        public Task<ClusteredVmState?> GetVmClusterStateAsync(string nodeId, CancellationToken cancellationToken) =>
+            throw new NotSupportedException("the reaper never reads a VM's cluster resource state");
 
         public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
             Task.FromResult(!Live.TryGetValue(hostName, out var live) || live);

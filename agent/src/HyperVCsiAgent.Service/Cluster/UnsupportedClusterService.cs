@@ -13,6 +13,9 @@ public sealed class UnsupportedClusterService : IClusterService
     public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
         throw Unsupported();
 
+    public Task<ClusteredVmState?> GetVmClusterStateAsync(string nodeId, CancellationToken cancellationToken) =>
+        throw Unsupported();
+
     public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
         throw Unsupported();
 

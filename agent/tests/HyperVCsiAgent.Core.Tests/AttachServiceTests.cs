@@ -570,6 +570,9 @@ public sealed class AttachServiceTests : IDisposable
             return Task.FromResult(owner is null ? null : new ClusteredVm(VmId, owner));
         }
 
+        public Task<ClusteredVmState?> GetVmClusterStateAsync(string nodeId, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
         public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 

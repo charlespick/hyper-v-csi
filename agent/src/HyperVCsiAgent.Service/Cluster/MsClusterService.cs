@@ -67,25 +67,19 @@ public sealed class MsClusterService : IClusterService
         {
             var deadline = CimDeadline.After(_hostOperationTimeout);
 
-            // A node ID that is not a GUID means the node plugin sent something
-            // other than its VM ID, and quietly matching nothing would report
-            // that as "no such VM in the cluster".
-            //
-            // Throwing rather than returning null for the same reason: null is
-            // this interface's word for a claim about the cluster, and this is a
-            // claim about the request.
-            if (!WqlNames.IsVmId(nodeId))
-            {
-                throw new InvalidOperationException(
-                    $"node ID {nodeId} is not a virtual machine GUID, so it cannot identify a VM");
-            }
+            RequireVmId(nodeId);
 
             if (FindResourceName(nodeId, cancellationToken) is not { } resourceName)
             {
                 return null;
             }
 
-            var owner = ReadOwnerNode(resourceName, deadline, cancellationToken);
+            // The status read returns more than this method needs; the extra
+            // columns cost nothing and are ignored here. Owner is the only
+            // thing ResolveVmAsync has ever claimed, and a null row reads the
+            // same as a blank owner did before, so the throw below still covers
+            // both.
+            var owner = ReadResourceStatus(resourceName, deadline, cancellationToken)?.OwnerNode;
 
             if (string.IsNullOrWhiteSpace(owner))
             {
@@ -104,6 +98,103 @@ public sealed class MsClusterService : IClusterService
             _logger.LogDebug("VM {VmId} is resource {Resource}, owned by {OwnerNode}", nodeId, resourceName, owner);
             return new ClusteredVm(nodeId, owner);
         }, cancellationToken);
+
+    /// <summary>
+    /// See <see cref="IClusterService.GetVmClusterStateAsync"/> for the
+    /// null-versus-throw contract this keeps and why it is drawn where it is.
+    /// </summary>
+    /// <remarks>
+    /// The same two steps <see cref="ResolveVmAsync"/> takes, over the same
+    /// registry pass and the same keyed query - the state and intent columns
+    /// ride along on a query that was already being issued, so this costs one
+    /// round trip in total and none of it grows with the size of the cluster.
+    /// </remarks>
+    public Task<ClusteredVmState?> GetVmClusterStateAsync(string nodeId, CancellationToken cancellationToken) =>
+        // Registry and WMI are both synchronous, so this runs on a pool thread
+        // like everything else here.
+        Task.Run<ClusteredVmState?>(() =>
+        {
+            var deadline = CimDeadline.After(_hostOperationTimeout);
+
+            RequireVmId(nodeId);
+
+            if (FindResourceName(nodeId, cancellationToken) is not { } resourceName)
+            {
+                // The one null this method has: the cluster database really
+                // does not know this VM.
+                return null;
+            }
+
+            if (ReadResourceStatus(resourceName, deadline, cancellationToken) is not { } status)
+            {
+                // The registry mirror named this resource a moment ago and the
+                // keyed query cannot find it. Ordinarily that is a resource
+                // deleted in between, but zero rows is also what an unreadable
+                // cluster and a malformed predicate produce, and none of the
+                // three is an answer about whether a VM is running.
+                throw new InvalidOperationException(
+                    $"the cluster returned no MSCluster_Resource row for VM {nodeId} (resource {resourceName}), " +
+                    "which the cluster database named a moment earlier, so its state cannot be determined");
+            }
+
+            if (string.IsNullOrWhiteSpace(status.OwnerNode))
+            {
+                // The same fact ResolveVmAsync refuses to render as "no such
+                // VM", refused here for the stronger reason: a state reading
+                // that cannot say which node the resource belongs to is not a
+                // state reading anything should fence on.
+                throw new InvalidOperationException(
+                    $"the cluster reports no owning node for VM {nodeId} (resource {resourceName}), " +
+                    "which should not be possible");
+            }
+
+            if (status.RawState is not { } rawState)
+            {
+                throw new InvalidOperationException(
+                    $"MSCluster_Resource.State for VM {nodeId} (resource {resourceName}) is missing or is not the " +
+                    "integer the class schema declares, so the resource's state cannot be determined");
+            }
+
+            if (status.PersistentState is not { } persistentState)
+            {
+                // Not defaulted, deliberately. PersistentState is what
+                // separates a stopped VM from one being live-migrated, so
+                // guessing it would turn the one field that prevents fencing a
+                // healthy node into a coin flip.
+                throw new InvalidOperationException(
+                    $"MSCluster_Resource.PersistentState for VM {nodeId} (resource {resourceName}) is missing or is " +
+                    "not the boolean the class schema declares, so a stopped VM cannot be told apart from one being " +
+                    "live-migrated");
+            }
+
+            var state = ClusterResourceStates.FromRawState(rawState);
+
+            _logger.LogDebug(
+                "VM {VmId} is resource {Resource}, owned by {OwnerNode}, state {State} (raw {RawState}), " +
+                "persistent {PersistentState}",
+                nodeId, resourceName, status.OwnerNode, state, rawState, persistentState);
+
+            return new ClusteredVmState(nodeId, resourceName, status.OwnerNode, state, rawState, persistentState);
+        }, cancellationToken);
+
+    /// <summary>
+    /// Rejects a node ID that is not a VM GUID, which means the node plugin
+    /// sent something other than its VM ID. Quietly matching nothing would
+    /// report that as "no such VM in the cluster".
+    /// </summary>
+    /// <remarks>
+    /// Throwing rather than returning null for the same reason: null is this
+    /// interface's word for a claim about the cluster, and this is a claim
+    /// about the request.
+    /// </remarks>
+    private static void RequireVmId(string nodeId)
+    {
+        if (!WqlNames.IsVmId(nodeId))
+        {
+            throw new InvalidOperationException(
+                $"node ID {nodeId} is not a virtual machine GUID, so it cannot identify a VM");
+        }
+    }
 
     /// <summary>
     /// Finds the cluster resource for a VM by its ID, returning the resource's
@@ -220,29 +311,93 @@ public sealed class MsClusterService : IClusterService
     }
 
     /// <summary>
-    /// Reads which node currently runs a resource. OwnerNode is the node running
-    /// it - the same answer MSCluster_NodeToActiveResource gives, without the
-    /// association traversal - and is live state, which is why it comes from WMI
-    /// rather than from the registry that supplied the name.
+    /// One resource's live status: which node runs it, what state the cluster
+    /// has it in, and whether the cluster intends it to be online. Null means
+    /// the query matched no resource at all, which the two callers read
+    /// differently - see each of them.
     /// </summary>
-    private static string? ReadOwnerNode(string resourceName, CimDeadline deadline, CancellationToken cancellationToken)
+    /// <remarks>
+    /// Every column is nullable and none is validated here, because the callers
+    /// disagree about which absences matter: <see cref="ResolveVmAsync"/> has
+    /// only ever claimed the owner and must keep ignoring the rest, while
+    /// <see cref="GetVmClusterStateAsync"/> cannot render any of them as an
+    /// answer. Converting rather than validating also keeps this incapable of
+    /// throwing on a value it does not recognise, which is what lets
+    /// <see cref="ResolveVmAsync"/> stay exactly as reliable as it was before
+    /// the extra columns existed.
+    /// <para>
+    /// OwnerNode is the node running the resource - the same answer
+    /// MSCluster_NodeToActiveResource gives, without the association traversal.
+    /// All of it is live state, which is why it comes from WMI rather than from
+    /// the registry that supplied the name; the registry mirror has no
+    /// representation of a failed resource at all.
+    /// </para>
+    /// <para>
+    /// Local and still cluster-wide, the property this whole class rests on:
+    /// CLUSDB is replicated to every node, and these four columns were measured
+    /// identical from both nodes of a two-node cluster across all fifteen state
+    /// transitions of a probe VM, with no mismatch and no detectable
+    /// replication lag. Nothing here contacts the owning host, deliberately -
+    /// in the failure this read exists for, that host is the one that may be
+    /// unreachable.
+    /// </para>
+    /// </remarks>
+    private static ResourceStatus? ReadResourceStatus(
+        string resourceName, CimDeadline deadline, CancellationToken cancellationToken)
     {
         // Keyed on Name, which is MSCluster_Resource's key property, so this
-        // does not scan. The name comes from the cluster database rather than
-        // from a caller, but it is still escaped: a resource named with an
+        // does not scan - measured at a 4.18ms median against 16.50ms for the
+        // unkeyed full scan. The name comes from the cluster database rather
+        // than from a caller, but it is still escaped: a resource named with an
         // apostrophe would otherwise produce a malformed query.
+        //
+        // Every column is top-level on purpose. A dotted sub-property path
+        // (PrivateProperties.Something) is accepted by the WQL parser and
+        // returns zero rows without an error when it is wrong, which would make
+        // a typo indistinguishable from a VM that is not clustered.
         var query =
-            $"SELECT Name, OwnerNode FROM MSCluster_Resource WHERE Name = '{WqlNames.EscapeLiteral(resourceName)}'";
+            "SELECT Name, OwnerNode, State, PersistentState FROM MSCluster_Resource " +
+            $"WHERE Name = '{WqlNames.EscapeLiteral(resourceName)}'";
 
         using var session = CimSession.Create(null);
-        var options = deadline.Options("reading MSCluster_Resource.OwnerNode", cancellationToken);
+        var options = deadline.Options("reading MSCluster_Resource status", cancellationToken);
         foreach (var resource in session.QueryInstances(NamespaceName, "WQL", query, options))
         {
-            return resource.CimInstanceProperties["OwnerNode"]?.Value as string;
+            return new ResourceStatus(
+                resource.CimInstanceProperties["OwnerNode"]?.Value as string,
+                ToRawState(resource.CimInstanceProperties["State"]?.Value),
+                resource.CimInstanceProperties["PersistentState"]?.Value as bool?);
         }
 
         return null;
     }
+
+    /// <summary>
+    /// One row of <see cref="ReadResourceStatus"/>'s query, straight off the
+    /// wire.
+    /// </summary>
+    private sealed record ResourceStatus(string? OwnerNode, long? RawState, bool? PersistentState);
+
+    /// <summary>
+    /// Widens a raw <c>MSCluster_Resource.State</c> value, or answers null if
+    /// the property was absent or was not the integer the schema declares.
+    /// </summary>
+    /// <remarks>
+    /// Long, not int. The declared CIM type is <c>UInt32</c>, but the property's
+    /// own ValueMap includes <c>-1</c>, which arrives as <c>0xFFFFFFFF</c> -
+    /// and <c>Convert.ToInt32</c>, the conversion <see cref="IsHostLiveAsync"/>
+    /// uses on <c>MSCluster_Node.State</c>, throws <c>OverflowException</c> on
+    /// exactly that. Nothing in this conversion can throw on any 32-bit input,
+    /// which is the point: an unexpected value has to reach
+    /// <see cref="ClusterResourceStates.FromRawState"/> and be named
+    /// unrecognised, not abort the read.
+    /// </remarks>
+    private static long? ToRawState(object? value) => value switch
+    {
+        uint raw => raw,
+        int raw => raw,
+        _ => null,
+    };
 
     /// <summary>
     /// Whether MSCluster_Node reports this host Up. Issue #14's Phase 3 is the
