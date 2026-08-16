@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -25,8 +26,8 @@ const (
 // informerResyncPeriod re-delivers every Node through the update handler
 // periodically. The watch is the real trigger and a relist happens whenever it
 // reconnects, so this is only insurance against a dropped event leaving a
-// node unwatched; ObserveNode is idempotent, so a resync costs nothing but the
-// walk.
+// node's key out of the queue; enqueuing is idempotent (the queue collapses a
+// key already present), so a resync costs nothing but the walk.
 const informerResyncPeriod = 10 * time.Minute
 
 // LeaderElectionOptions names the lease this controller elects on.
@@ -79,39 +80,6 @@ func (c *Controller) Run(ctx context.Context, options LeaderElectionOptions) err
 		return fmt.Errorf("node fencing: building the %s/%s lease lock: %w", options.Namespace, options.LeaseName, err)
 	}
 
-	// A term signals here on its way out. leaderelection starts
-	// OnStartedLeading in a goroutine it never joins and returns from Run as
-	// soon as renewal fails, so without this the next term could begin while
-	// the previous one is still walking the tracked set — two terms deciding
-	// about the same nodes at once, which is the one thing electing a leader
-	// is here to prevent. Buffered so a term that outlives the loop's own exit
-	// never blocks on a send nothing is left to receive.
-	termEnded := make(chan struct{}, 1)
-
-	elector, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
-		Lock:          lock,
-		Name:          options.LeaseName,
-		LeaseDuration: defaultLeaseDuration,
-		RenewDeadline: defaultRenewDeadline,
-		RetryPeriod:   defaultRetryPeriod,
-		// The loop stops the moment the context it was given is cancelled, and
-		// it holds nothing that outlives it, so the lease can be handed on
-		// immediately rather than waiting out its full duration.
-		ReleaseOnCancel: true,
-		Callbacks: leaderelection.LeaderCallbacks{
-			OnStartedLeading: func(ctx context.Context) {
-				defer func() { termEnded <- struct{}{} }()
-				c.runAsLeader(ctx)
-			},
-			OnStoppedLeading: func() {
-				c.logger.Printf("node fencing: no longer the leader")
-			},
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("node fencing: building the leader elector: %w", err)
-	}
-
 	c.logger.Printf("node fencing: standing for election on lease %s/%s as %s",
 		options.Namespace, options.LeaseName, options.Identity)
 
@@ -121,7 +89,68 @@ func (c *Controller) Run(ctx context.Context, options LeaderElectionOptions) err
 	// would otherwise end election for good. Re-entering it until ctx says to
 	// actually stop is the usage the leaderelection package itself expects.
 	for ctx.Err() == nil {
-		elector.Run(ctx)
+		// A term signals here on its way out. leaderelection starts
+		// OnStartedLeading in a goroutine it never joins and returns from Run
+		// as soon as renewal fails, so without this the next term could begin
+		// while the previous one is still tearing down its informer and
+		// workers — two terms deciding about the same nodes at once, which is
+		// the one thing electing a leader is here to prevent. Buffered so a
+		// term that outlives the loop's own exit never blocks on a send
+		// nothing is left to receive.
+		termEnded := make(chan struct{}, 1)
+
+		// termCtx is this term's own context, cancelled the moment
+		// runAsLeader returns — whether because ctx (the caller's) was
+		// cancelled, or because runAsLeader stood down early on its own (an
+		// AddEventHandler error, a cache sync failure). That second case is
+		// the bug this loop exists to close: previously, runAsLeader
+		// returning early left the *outer* elector.Run(ctx) still renewing
+		// against the caller's ctx, which would not be cancelled for an
+		// unrelated reason for a long time — so the lease stayed healthy,
+		// this replica stayed "leader" by the lease's own bookkeeping, and
+		// nothing fenced anything while no peer could take over either.
+		// Building a fresh elector against termCtx for every term, and
+		// cancelling termCtx as the very first thing OnStartedLeading's
+		// deferred cleanup does, means runAsLeader returning for *any*
+		// reason ends this term's Run(termCtx) immediately: renew() exits,
+		// and ReleaseOnCancel hands the lease straight to a peer instead of
+		// holding it uselessly until it expires on its own.
+		termCtx, cancelTerm := context.WithCancel(ctx)
+
+		elector, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
+			Lock:          lock,
+			Name:          options.LeaseName,
+			LeaseDuration: defaultLeaseDuration,
+			RenewDeadline: defaultRenewDeadline,
+			RetryPeriod:   defaultRetryPeriod,
+			// The loop stops the moment the context it was given is cancelled, and
+			// it holds nothing that outlives it, so the lease can be handed on
+			// immediately rather than waiting out its full duration.
+			ReleaseOnCancel: true,
+			Callbacks: leaderelection.LeaderCallbacks{
+				OnStartedLeading: func(leadCtx context.Context) {
+					defer func() { termEnded <- struct{}{} }()
+					// See the comment on termCtx above: this is the fix. A
+					// fresh elector per term, rather than one reused across
+					// calls to Run, also sidesteps any question about
+					// whether reusing a LeaderElector across multiple Run
+					// calls is even supported — it is simplest to assume it
+					// is not and never do it.
+					defer cancelTerm()
+					c.runAsLeader(leadCtx)
+				},
+				OnStoppedLeading: func() {
+					c.logger.Printf("node fencing: no longer the leader")
+				},
+			},
+		})
+		if err != nil {
+			cancelTerm()
+			return fmt.Errorf("node fencing: building the leader elector: %w", err)
+		}
+
+		elector.Run(termCtx)
+		cancelTerm()
 
 		// Wait out the term before standing again. ReleaseOnCancel means the
 		// lease record this replica just gave up names nobody, so the next
@@ -147,16 +176,21 @@ func (c *Controller) Run(ctx context.Context, options LeaderElectionOptions) err
 }
 
 // runAsLeader is the loop, and it runs only while this replica is the leader.
-// The informer starts here rather than at process start so a non-leader holds
-// no tracked state at all, and so a replica that wins the lease begins from a
-// full relist rather than from whatever it happened to have seen earlier.
+// The informer and the queue both start here rather than at process start so
+// a non-leader holds no state at all, and so a replica that wins the lease
+// begins from a full relist rather than from whatever it happened to have
+// seen earlier.
 func (c *Controller) runAsLeader(ctx context.Context) {
 	// A leadership change is a clean slate: grace periods are measured from
-	// when *this* controller first saw a node unreachable, and a streak
-	// inherited from a previous term would be one nothing observed.
+	// when *this* controller first reconciled a node as unreachable, and a
+	// streak inherited from a previous term would be one nothing observed.
+	// The queue is rebuilt for the same reason on its own axis: a previous
+	// term's queued keys and exponential-backoff history belong to that term,
+	// not this one.
 	c.mu.Lock()
-	c.tracked = map[string]*trackedNode{}
+	c.state = map[string]*nodeState{}
 	c.mu.Unlock()
+	c.queue = c.newQueue()
 
 	c.logger.Printf("node fencing: leading. Watching for the %s:%s taint; grace period %s, "+
 		"polling every %s, fencing after %d consecutive confirmations",
@@ -166,25 +200,34 @@ func (c *Controller) runAsLeader(ctx context.Context) {
 	factory := informers.NewSharedInformerFactory(c.kube, informerResyncPeriod)
 	nodes := factory.Core().V1().Nodes().Informer()
 
+	// The handlers below carry no information of their own — they enqueue a
+	// node name and nothing else. Every decision about what that node's
+	// event means (unreachable? recovered? gone?) is made once, inside
+	// Reconcile, from a fresh read of the object. The previous design had
+	// ObserveNode deciding from the event payload it was handed while a
+	// ticker separately decided from a snapshot it owned, and reconciling
+	// those two views — which could each be mid-decision about the same node
+	// at once — is what forced record-identity guards through every
+	// mutation. A handler that only enqueues has nothing to reconcile against
+	// a poll loop, because there is no longer a separate poll loop with its
+	// own view of the world.
 	if _, err := nodes.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj any) {
 			if node, ok := obj.(*corev1.Node); ok {
-				c.ObserveNode(node)
+				c.queue.Add(node.Name)
 			}
 		},
 		UpdateFunc: func(_, obj any) {
 			if node, ok := obj.(*corev1.Node); ok {
-				c.ObserveNode(node)
+				c.queue.Add(node.Name)
 			}
 		},
 		DeleteFunc: func(obj any) {
-			// A deleted Node is the other thing that unblocks the
-			// attach-detach controller, so there is nothing left to fence.
 			if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
 				obj = tombstone.Obj
 			}
 			if node, ok := obj.(*corev1.Node); ok {
-				c.Untrack(node.Name)
+				c.queue.Add(node.Name)
 			}
 		},
 	}); err != nil {
@@ -193,6 +236,21 @@ func (c *Controller) runAsLeader(ctx context.Context) {
 	}
 
 	factory.Start(ctx.Done())
+
+	// Joined before this term returns, not merely signalled to stop. Start
+	// only hands the informers a channel to notice; it does not wait for the
+	// goroutines behind them, so without this a handler from this term can
+	// still be running when the next term begins — and the first thing the
+	// next term does is replace c.queue. A handler reading that field while
+	// runAsLeader writes it is a data race in the plain sense, and the
+	// symptom it would produce is worse than the race report: an enqueue from
+	// a term that has already ended, landing in the queue of a term that has
+	// not yet finished relisting, for a node the new term has formed no
+	// opinion about. Shutdown blocks until every informer goroutine is gone,
+	// which is what makes "one term at a time" true of the informers and not
+	// just of the workers.
+	defer factory.Shutdown()
+
 	for informerType, synced := range factory.WaitForCacheSync(ctx.Done()) {
 		if !synced {
 			c.logger.Printf("node fencing: %v cache did not sync, standing down", informerType)
@@ -200,15 +258,23 @@ func (c *Controller) runAsLeader(ctx context.Context) {
 		}
 	}
 
-	ticker := c.clock.NewTicker(c.pollInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C():
-			c.ProcessOnce(ctx)
-		}
+	var workers sync.WaitGroup
+	for i := 0; i < maxConcurrentReconciles; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			c.runWorker(ctx)
+		}()
 	}
+
+	<-ctx.Done()
+
+	// ShutDown wakes every worker blocked in queue.Get with shutdown=true,
+	// and does not return until they have all called Done on whatever they
+	// were mid-reconcile on — so waiting on workers below is belt and braces,
+	// not strictly necessary, but it costs nothing and it is the honest
+	// statement of what "leading is over" means: no goroutine of this term's
+	// still touching the API server or the agent after runAsLeader returns.
+	c.queue.ShutDown()
+	workers.Wait()
 }

@@ -45,10 +45,28 @@ func hasTaint(node *corev1.Node, key string, effect corev1.TaintEffect) bool {
 	return false
 }
 
+// taintResult names the three distinct outcomes applyOutOfServiceTaint can
+// reach on success, so the caller can log each one for what it actually is
+// instead of collapsing them into a single boolean the way "added" once did.
+type taintResult int
+
+const (
+	// taintAdded means this call was the one that appended the taint.
+	taintAdded taintResult = iota
+	// taintAlreadyPresent means the node carried the key before this call
+	// touched it — an idempotent restart, or an operator who got there first.
+	taintAlreadyPresent
+	// taintSkippedNodeRecovered means the node no longer carried the
+	// unreachable taint by the time this call went to write — it recovered
+	// between the caller's last confirmation and the write — so nothing was
+	// written.
+	taintSkippedNodeRecovered
+)
+
 // applyOutOfServiceTaint adds node.kubernetes.io/out-of-service to the node if
-// it is not already there, reporting whether it actually added it. Adding it
-// twice is not possible and not an error: a node that already carries the key
-// is left exactly as it is.
+// it is warranted, reporting which of the three outcomes above happened.
+// Adding it twice is not possible and not an error: a node that already
+// carries the key is left exactly as it is.
 //
 // This is a read-modify-write under optimistic concurrency rather than a
 // patch, and that is deliberate — "patch is safer than update" is the usual
@@ -69,13 +87,14 @@ func hasTaint(node *corev1.Node, key string, effect corev1.TaintEffect) bool {
 // Update fails with a conflict, we re-read, and the append lands on top of
 // *their* version — their taint survives and so does ours. The re-read on
 // conflict is the entire point; RetryOnConflict without it would be pointless.
-func applyOutOfServiceTaint(ctx context.Context, client kubernetes.Interface, nodeName string) (bool, error) {
-	added := false
+func applyOutOfServiceTaint(ctx context.Context, client kubernetes.Interface, nodeName string) (taintResult, error) {
+	var result taintResult
 
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		// Reset per attempt: a conflict means this closure runs again from a
-		// freshly read node, and the previous attempt's verdict is stale.
-		added = false
+		// Reset per attempt, same as `added` was reset before: a conflict
+		// means this closure runs again from a freshly read node, and the
+		// previous attempt's verdict — whatever it was — is stale.
+		result = taintAdded
 
 		node, err := client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 		if err != nil {
@@ -83,6 +102,23 @@ func applyOutOfServiceTaint(ctx context.Context, client kubernetes.Interface, no
 		}
 
 		if hasTaintKey(node, corev1.TaintNodeOutOfService) {
+			result = taintAlreadyPresent
+			return nil
+		}
+
+		// The caller decided to fence some time ago — a poll interval times
+		// a confirmation count earlier, at least — and everything about that
+		// decision was read from state that is now stale by definition. This
+		// Get is the freshest look at the node this call will ever get, on
+		// every attempt including retries, so checking the recovery
+		// condition against the very object about to be Updated — rather
+		// than against whatever the caller last saw — is what closes the
+		// window between "decided to fence" and "wrote the taint" all the
+		// way, instead of merely narrowing it. A node that came back in that
+		// window must not be fenced on the strength of a decision that no
+		// longer describes it.
+		if !hasTaint(node, corev1.TaintNodeUnreachable, corev1.TaintEffectNoExecute) {
+			result = taintSkippedNodeRecovered
 			return nil
 		}
 
@@ -91,12 +127,12 @@ func applyOutOfServiceTaint(ctx context.Context, client kubernetes.Interface, no
 			return err
 		}
 
-		added = true
+		result = taintAdded
 		return nil
 	})
 	if err != nil {
-		return false, fmt.Errorf("applying the out-of-service taint to node %s: %w", nodeName, err)
+		return result, fmt.Errorf("applying the out-of-service taint to node %s: %w", nodeName, err)
 	}
 
-	return added, nil
+	return result, nil
 }

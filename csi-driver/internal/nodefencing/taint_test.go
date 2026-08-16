@@ -32,12 +32,12 @@ func TestApplyOutOfServiceTaintPreservesExistingTaints(t *testing.T) {
 	}
 	kube := fake.NewSimpleClientset(node)
 
-	added, err := applyOutOfServiceTaint(context.Background(), kube, testNodeName)
+	result, err := applyOutOfServiceTaint(context.Background(), kube, testNodeName)
 	if err != nil {
 		t.Fatalf("applyOutOfServiceTaint: %v", err)
 	}
-	if !added {
-		t.Fatal("added = false on a node that did not carry the taint")
+	if result != taintAdded {
+		t.Fatalf("result = %v, want taintAdded", result)
 	}
 
 	updated, err := kube.CoreV1().Nodes().Get(context.Background(), testNodeName, metav1.GetOptions{})
@@ -75,12 +75,12 @@ func TestApplyOutOfServiceTaintIsIdempotent(t *testing.T) {
 	})
 
 	for i := 0; i < 3; i++ {
-		added, err := applyOutOfServiceTaint(context.Background(), kube, testNodeName)
+		result, err := applyOutOfServiceTaint(context.Background(), kube, testNodeName)
 		if err != nil {
 			t.Fatalf("applyOutOfServiceTaint: %v", err)
 		}
-		if added {
-			t.Fatal("added = true on a node that already carried the taint")
+		if result != taintAlreadyPresent {
+			t.Fatalf("result = %v, want taintAlreadyPresent on a node that already carried the taint", result)
 		}
 	}
 
@@ -143,12 +143,12 @@ func TestApplyOutOfServiceTaintRetriesOnConflict(t *testing.T) {
 			action.GetResource().GroupResource(), testNodeName, errPretendConflict{})
 	})
 
-	added, err := applyOutOfServiceTaint(context.Background(), kube, testNodeName)
+	result, err := applyOutOfServiceTaint(context.Background(), kube, testNodeName)
 	if err != nil {
 		t.Fatalf("applyOutOfServiceTaint: %v", err)
 	}
-	if !added {
-		t.Fatal("added = false; the retry should have applied the taint")
+	if result != taintAdded {
+		t.Fatalf("result = %v, want taintAdded; the retry should have applied the taint", result)
 	}
 
 	updated, err := kube.CoreV1().Nodes().Get(context.Background(), testNodeName, metav1.GetOptions{})
@@ -172,12 +172,11 @@ func TestApplyOutOfServiceTaintRetriesOnConflict(t *testing.T) {
 func TestApplyOutOfServiceTaintReportsAMissingNode(t *testing.T) {
 	kube := fake.NewSimpleClientset()
 
-	added, err := applyOutOfServiceTaint(context.Background(), kube, testNodeName)
-	if err == nil {
+	// The returned result is not meaningful when err != nil — only err is;
+	// this only asserts the write failing surfaces as an error the caller
+	// must see, not a silent no-op it would read as a successful fence.
+	if _, err := applyOutOfServiceTaint(context.Background(), kube, testNodeName); err == nil {
 		t.Fatal("applyOutOfServiceTaint returned no error for a node that does not exist")
-	}
-	if added {
-		t.Fatal("added = true despite the error")
 	}
 }
 

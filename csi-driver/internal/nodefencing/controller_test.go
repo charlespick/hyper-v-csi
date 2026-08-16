@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	clocktesting "k8s.io/utils/clock/testing"
 	"k8s.io/utils/ptr"
 
@@ -120,6 +121,7 @@ func csiNode(nodeName, driverName, nodeID string) *storagev1.CSINode {
 }
 
 type harness struct {
+	t          *testing.T
 	controller *Controller
 	kube       *fake.Clientset
 	states     *fakeStateSource
@@ -147,18 +149,47 @@ func newHarness(t *testing.T, states *fakeStateSource, objects ...runtime.Object
 		t.Fatalf("New: %v", err)
 	}
 
-	return &harness{controller: controller, kube: kube, states: states, clock: fakeClock}
+	return &harness{t: t, controller: controller, kube: kube, states: states, clock: fakeClock}
 }
 
 // pastGrace advances the fake clock beyond the grace period.
 func (h *harness) pastGrace() { h.clock.Step(testGracePeriod + time.Second) }
 
-// poll runs n passes of the state machine, which is what the ticker in
-// runAsLeader does — driven directly here so no ticker, informer or real time
-// is involved.
-func (h *harness) poll(n int) {
+// track calls Reconcile once for nodeName. It is what the queue driving a
+// node's very first reconcile — the moment the informer first enqueues an
+// unreachable node — looks like: it creates the node's tracking entry with
+// firstSeen at the current clock time. Every test that needs a node tracked
+// before advancing the clock past the grace period calls this first, exactly
+// as a real worker would reconcile the key as soon as it is enqueued rather
+// than only once the grace period has already elapsed.
+func (h *harness) track(nodeName string) {
+	h.t.Helper()
+	if _, err := h.controller.Reconcile(context.Background(), nodeName); err != nil {
+		h.t.Fatalf("Reconcile (seeding tracking state for %s): %v", nodeName, err)
+	}
+}
+
+// poll calls Reconcile n times for nodeName, discarding the requeueAfter —
+// this is what n trips through the queue for the same key look like from the
+// outside, without needing a real queue, an informer or real time to drive
+// them. Every test using poll expects Reconcile to succeed on each call;
+// scenarios that expect an error call Reconcile directly instead.
+func (h *harness) poll(nodeName string, n int) {
+	h.t.Helper()
 	for i := 0; i < n; i++ {
-		h.controller.ProcessOnce(context.Background())
+		if _, err := h.controller.Reconcile(context.Background(), nodeName); err != nil {
+			h.t.Fatalf("Reconcile(%s): unexpected error: %v", nodeName, err)
+		}
+	}
+}
+
+// updateNode replaces nodeName's object in the fake clientset, the same way
+// an informer watch would observe a Node update made by the kubelet or an
+// operator.
+func (h *harness) updateNode(node *corev1.Node) {
+	h.t.Helper()
+	if _, err := h.kube.CoreV1().Nodes().Update(context.Background(), node, metav1.UpdateOptions{}); err != nil {
+		h.t.Fatalf("updating node %s: %v", node.Name, err)
 	}
 }
 
@@ -187,10 +218,12 @@ func TestNoFenceBeforeGracePeriod(t *testing.T) {
 	states := &fakeStateSource{responses: []stateResponse{notRunning()}}
 	h := newHarness(t, states, unreachableNode(testNodeName), csiNode(testNodeName, testDriverName, testVMID))
 
-	h.controller.ObserveNode(unreachableNode(testNodeName))
+	// Seeds tracking state at the current clock time, exactly as a worker
+	// reconciling the key the moment it is enqueued would.
+	h.track(testNodeName)
 
 	// Far more polls than the confirmation count, but no time has passed.
-	h.poll(testConfirmations * 3)
+	h.poll(testNodeName, testConfirmations*3)
 
 	if states.callCount() != 0 {
 		t.Fatalf("the agent was asked %d times inside the grace period; it must not be asked at all",
@@ -202,7 +235,7 @@ func TestNoFenceBeforeGracePeriod(t *testing.T) {
 
 	// Stepping just short of the grace period must still not release it.
 	h.clock.Step(testGracePeriod - time.Second)
-	h.poll(testConfirmations)
+	h.poll(testNodeName, testConfirmations)
 	if states.callCount() != 0 {
 		t.Fatalf("the agent was asked %d times one second before the grace period elapsed", states.callCount())
 	}
@@ -215,16 +248,16 @@ func TestFencesOnlyAfterNConsecutiveConfirmations(t *testing.T) {
 	states := &fakeStateSource{responses: []stateResponse{notRunning()}}
 	h := newHarness(t, states, unreachableNode(testNodeName), csiNode(testNodeName, testDriverName, testVMID))
 
-	h.controller.ObserveNode(unreachableNode(testNodeName))
+	h.track(testNodeName)
 	h.pastGrace()
 
-	h.poll(testConfirmations - 1)
+	h.poll(testNodeName, testConfirmations-1)
 	if h.fenced(t, testNodeName) {
 		t.Fatalf("node was fenced after %d confirmations; %d are required",
 			testConfirmations-1, testConfirmations)
 	}
 
-	h.poll(1)
+	h.poll(testNodeName, 1)
 	if !h.fenced(t, testNodeName) {
 		t.Fatalf("node was not fenced after %d consecutive confirmations", testConfirmations)
 	}
@@ -251,10 +284,10 @@ func TestNonTerminalObservationResetsTheStreak(t *testing.T) {
 	states := &fakeStateSource{responses: script}
 	h := newHarness(t, states, unreachableNode(testNodeName), csiNode(testNodeName, testDriverName, testVMID))
 
-	h.controller.ObserveNode(unreachableNode(testNodeName))
+	h.track(testNodeName)
 	h.pastGrace()
 
-	h.poll(len(script))
+	h.poll(testNodeName, len(script))
 	if h.fenced(t, testNodeName) {
 		t.Fatalf("node was fenced after %d confirmations, an Online reading, and %d more; "+
 			"the reading in the middle must reset the streak to zero",
@@ -262,7 +295,7 @@ func TestNonTerminalObservationResetsTheStreak(t *testing.T) {
 	}
 
 	// One more confirmation completes the second run and does fence.
-	h.poll(1)
+	h.poll(testNodeName, 1)
 	if !h.fenced(t, testNodeName) {
 		t.Fatal("node was not fenced once a full run of confirmations was rebuilt after the reset")
 	}
@@ -290,9 +323,9 @@ func TestErrorsResetTheStreakAndNeverFence(t *testing.T) {
 			states := &fakeStateSource{responses: []stateResponse{failing(test.err)}}
 			h := newHarness(t, states, unreachableNode(testNodeName), csiNode(testNodeName, testDriverName, testVMID))
 
-			h.controller.ObserveNode(unreachableNode(testNodeName))
+			h.track(testNodeName)
 			h.pastGrace()
-			h.poll(testConfirmations * 3)
+			h.poll(testNodeName, testConfirmations*3)
 
 			if h.fenced(t, testNodeName) {
 				t.Fatalf("node was fenced on repeated %q; an error is not an observation that the VM is stopped",
@@ -316,9 +349,9 @@ func TestErrorsResetTheStreakAndNeverFence(t *testing.T) {
 			states := &fakeStateSource{responses: script}
 			h := newHarness(t, states, unreachableNode(testNodeName), csiNode(testNodeName, testDriverName, testVMID))
 
-			h.controller.ObserveNode(unreachableNode(testNodeName))
+			h.track(testNodeName)
 			h.pastGrace()
-			h.poll(len(script))
+			h.poll(testNodeName, len(script))
 
 			if h.fenced(t, testNodeName) {
 				t.Fatalf("%q mid-streak did not reset the confirmation count", test.name)
@@ -334,9 +367,26 @@ func TestSkipsNodeWithNoCSINodeEntryForThisDriver(t *testing.T) {
 		csiNode(testNodeName, "csi.some-other-driver.example.com", "whatever"),
 	)
 
-	h.controller.ObserveNode(unreachableNode(testNodeName))
+	h.track(testNodeName)
 	h.pastGrace()
-	h.poll(testConfirmations * 2)
+
+	// Reconciled once past the grace period, not polled repeatedly. Dropping
+	// the node is expressed as requeueAfter zero with no error, which is
+	// exactly what makes the queue Forget the key instead of asking again —
+	// so a second trip is not something that happens to this node, and a test
+	// that drove one would be asserting against a sequence the queue cannot
+	// produce. Re-entry only happens if an informer event enqueues the name
+	// again, and starting over from a fresh grace period is right when it
+	// does: it is how a node that later has this driver installed on it gets
+	// picked up rather than being remembered as "not ours" forever.
+	requeueAfter, err := h.controller.Reconcile(context.Background(), testNodeName)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if requeueAfter != 0 {
+		t.Fatalf("requeueAfter = %s, want 0 so the queue forgets a node this driver does not serve",
+			requeueAfter)
+	}
 
 	if states.callCount() != 0 {
 		t.Fatalf("the agent was asked about a node this driver does not serve (%d calls)",
@@ -350,113 +400,93 @@ func TestSkipsNodeWithNoCSINodeEntryForThisDriver(t *testing.T) {
 	}
 }
 
-// A missing CSINode object, unlike one that simply lists other drivers, is
-// not distinguishable from transient API-server churn — the same kind of
-// disruption that can accompany a node going unreachable in the first place.
-// The node must stay tracked and be retried, not be dropped as "not ours" on
-// the first 404.
-func TestKeepsTrackingNodeWhenCSINodeObjectIsTransientlyMissing(t *testing.T) {
+// TestMissingCSINodeObjectReturnsErrorAndStaysTracked replaces two tests from
+// the ticker-driven design that encoded its bounded-retry behaviour
+// (maxNodeIDResolutionFailures, deleted along with the ticker). A missing
+// CSINode object is not distinguishable from transient API-server churn — the
+// same kind of disruption that can accompany a node going unreachable in the
+// first place — so Reconcile now reports it as an ordinary error and leaves
+// the caller to back off through the queue's exponential-failure rate
+// limiter, rather than counting attempts itself and dropping the node after a
+// fixed number of them.
+func TestMissingCSINodeObjectReturnsErrorAndStaysTracked(t *testing.T) {
 	states := &fakeStateSource{responses: []stateResponse{notRunning()}}
-	h := newHarness(t, states, unreachableNode(testNodeName))
+	h := newHarness(t, states, unreachableNode(testNodeName)) // no CSINode object
 
-	h.controller.ObserveNode(unreachableNode(testNodeName))
+	h.track(testNodeName)
 	h.pastGrace()
-	h.poll(testConfirmations * 2)
+
+	if _, err := h.controller.Reconcile(context.Background(), testNodeName); err == nil {
+		t.Fatal("Reconcile returned no error for a node with no CSINode object; the caller cannot back off without one")
+	}
 
 	if states.callCount() != 0 {
-		t.Fatalf("the agent was asked about a node whose CSI node ID is still unresolved (%d calls)",
+		t.Fatalf("the agent was asked about a node whose CSI node ID could not be resolved (%d calls)",
 			states.callCount())
 	}
 	if h.fenced(t, testNodeName) {
 		t.Fatal("a node with no resolvable CSI node ID was fenced")
 	}
 	if tracked := h.controller.TrackedNodes(); len(tracked) != 1 {
-		t.Fatalf("a transiently-missing CSINode should leave the node tracked for retry, got %v", tracked)
+		t.Fatalf("a node with a missing CSINode object should stay tracked for the caller to retry, got %v", tracked)
 	}
 }
 
-// Retrying a missing CSINode is patience, not a promise. A node whose CSINode
-// never appears — the driver was removed from it, or it was decommissioned
-// with its Node object left behind — has to stop being polled eventually
-// rather than be retried for the life of the process.
-func TestDropsNodeWhoseCSINodeNeverAppears(t *testing.T) {
-	states := &fakeStateSource{responses: []stateResponse{notRunning()}}
-	h := newHarness(t, states, unreachableNode(testNodeName))
-
-	h.controller.ObserveNode(unreachableNode(testNodeName))
-	h.pastGrace()
-
-	h.poll(maxNodeIDResolutionFailures - 1)
-	if tracked := h.controller.TrackedNodes(); len(tracked) != 1 {
-		t.Fatalf("node was dropped after %d unresolved polls; %d are allowed, got %v",
-			maxNodeIDResolutionFailures-1, maxNodeIDResolutionFailures, tracked)
-	}
-
-	h.poll(1)
-	if tracked := h.controller.TrackedNodes(); len(tracked) != 0 {
-		t.Fatalf("node still tracked after %d consecutive unresolved polls: %v",
-			maxNodeIDResolutionFailures, tracked)
-	}
-	if h.fenced(t, testNodeName) {
-		t.Fatal("a node that never resolved to a VM id was fenced")
-	}
-	if states.callCount() != 0 {
-		t.Fatalf("the agent was asked about a node with no resolvable VM id (%d calls)", states.callCount())
-	}
-}
-
-func TestUntracksWhenUnreachableTaintClears(t *testing.T) {
+func TestReconcileDropsStateWhenUnreachableTaintClears(t *testing.T) {
 	states := &fakeStateSource{responses: []stateResponse{notRunning()}}
 	h := newHarness(t, states, unreachableNode(testNodeName), csiNode(testNodeName, testDriverName, testVMID))
 
-	h.controller.ObserveNode(unreachableNode(testNodeName))
+	h.track(testNodeName)
 	h.pastGrace()
-	h.poll(testConfirmations - 1)
+	h.poll(testNodeName, testConfirmations-1)
 
 	if tracked := h.controller.TrackedNodes(); len(tracked) != 1 {
 		t.Fatalf("expected the node to be tracked, got %v", tracked)
 	}
 
 	// The node comes back: kubelet reports Ready and the taint is removed.
-	recovered := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: testNodeName}}
-	h.controller.ObserveNode(recovered)
+	h.updateNode(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: testNodeName}})
+	h.poll(testNodeName, 1)
 
 	if tracked := h.controller.TrackedNodes(); len(tracked) != 0 {
 		t.Fatalf("node still tracked after the unreachable taint cleared: %v", tracked)
 	}
 
 	// And the streak it had built is gone with it, not merely paused.
-	h.poll(testConfirmations * 2)
+	h.poll(testNodeName, testConfirmations*2)
 	if h.fenced(t, testNodeName) {
 		t.Fatal("a recovered node was fenced")
 	}
 
 	// Going unreachable again starts a fresh grace period rather than
 	// resuming.
-	h.controller.ObserveNode(unreachableNode(testNodeName))
+	h.updateNode(unreachableNode(testNodeName))
+	h.track(testNodeName)
 	before := states.callCount()
-	h.poll(testConfirmations)
+	h.poll(testNodeName, testConfirmations)
 	if states.callCount() != before {
 		t.Fatal("a node that went unreachable again was polled without serving a fresh grace period")
 	}
 }
 
-func TestAlreadyFencedNodeIsNotTracked(t *testing.T) {
-	// An idempotent restart: this controller comes up and relists a node it
-	// (or an operator) already fenced.
+func TestAlreadyFencedNodeIsNeverTracked(t *testing.T) {
+	// An idempotent restart: this controller comes up and the informer
+	// delivers a node it (or an operator) already fenced.
 	alreadyFenced := unreachableNode(testNodeName, outOfServiceTaint())
 
 	states := &fakeStateSource{responses: []stateResponse{notRunning()}}
 	h := newHarness(t, states, alreadyFenced, csiNode(testNodeName, testDriverName, testVMID))
 
-	h.controller.ObserveNode(alreadyFenced)
+	if _, err := h.controller.Reconcile(context.Background(), testNodeName); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
 
 	if tracked := h.controller.TrackedNodes(); len(tracked) != 0 {
-		t.Fatalf("an already-fenced node was tracked again: %v", tracked)
+		t.Fatalf("an already-fenced node was tracked: %v", tracked)
 	}
 
 	h.pastGrace()
-	h.poll(testConfirmations * 2)
+	h.poll(testNodeName, testConfirmations*2)
 
 	if states.callCount() != 0 {
 		t.Fatalf("the agent was asked about an already-fenced node (%d calls)", states.callCount())
@@ -474,7 +504,7 @@ func TestAlreadyFencedNodeIsNotTracked(t *testing.T) {
 	}
 }
 
-func TestOnlyTheUnreachableNoExecuteTaintTriggersTracking(t *testing.T) {
+func TestOnlyTheUnreachableNoExecuteTaintCreatesState(t *testing.T) {
 	tests := []struct {
 		name string
 		node *corev1.Node
@@ -530,8 +560,11 @@ func TestOnlyTheUnreachableNoExecuteTaintTriggersTracking(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			h := newHarness(t, &fakeStateSource{responses: []stateResponse{notRunning()}})
-			h.controller.ObserveNode(test.node)
+			h := newHarness(t, &fakeStateSource{responses: []stateResponse{notRunning()}}, test.node)
+
+			if _, err := h.controller.Reconcile(context.Background(), testNodeName); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
 
 			got := len(h.controller.TrackedNodes()) == 1
 			if got != test.want {
@@ -541,52 +574,167 @@ func TestOnlyTheUnreachableNoExecuteTaintTriggersTracking(t *testing.T) {
 	}
 }
 
-// TestTrackingIsIdempotent guards the grace period against a resync: a second
-// observation of an already-tracked node must not restart its clock or wipe
-// its streak, or a node re-delivered every resync would never age past the
-// grace period at all.
-func TestTrackingIsIdempotent(t *testing.T) {
+// TestRepeatedReconcileBeforeGracePeriodDoesNotRestartTheClock guards the
+// grace period against a resync: the informer redelivering an already-tracked
+// node — which now just means its key is enqueued and reconciled again — must
+// not restart its clock or wipe its streak, or a node re-delivered on every
+// resync would never age past the grace period at all.
+func TestRepeatedReconcileBeforeGracePeriodDoesNotRestartTheClock(t *testing.T) {
 	states := &fakeStateSource{responses: []stateResponse{notRunning()}}
 	h := newHarness(t, states, unreachableNode(testNodeName), csiNode(testNodeName, testDriverName, testVMID))
 
-	h.controller.ObserveNode(unreachableNode(testNodeName))
-	h.pastGrace()
-	h.poll(testConfirmations - 1)
+	h.track(testNodeName) // firstSeen = t0
 
-	// A resync re-delivers the same node.
-	h.controller.ObserveNode(unreachableNode(testNodeName))
+	// A resync redelivers the node just short of its original grace period.
+	h.clock.Step(testGracePeriod - time.Second)
+	h.poll(testNodeName, 1)
+	if states.callCount() != 0 {
+		t.Fatal("agent asked before the grace period elapsed")
+	}
 
-	h.poll(1)
+	// One more second closes out the ORIGINAL grace period, measured from t0
+	// — not from the resync above. If the resync had restarted the clock,
+	// this step would still leave the node inside a fresh grace period.
+	h.clock.Step(time.Second)
+	h.poll(testNodeName, testConfirmations)
 	if !h.fenced(t, testNodeName) {
-		t.Fatal("a resync of an already-tracked node reset its grace period or its streak")
+		t.Fatal("a resync of an already-tracked node reset its grace period")
 	}
 }
 
 // TestFencingRetriesWhenTheTaintWriteFails keeps the decision when only the
-// write failed: the node stays tracked with its streak, and the next tick
-// tries again.
+// write failed: the node stays tracked with its streak, and the next
+// reconcile tries again.
 func TestFencingRetriesWhenTheTaintWriteFails(t *testing.T) {
 	states := &fakeStateSource{responses: []stateResponse{notRunning()}}
+	h := newHarness(t, states, unreachableNode(testNodeName), csiNode(testNodeName, testDriverName, testVMID))
 
-	// No Node object, so the Get inside applyOutOfServiceTaint fails.
-	h := newHarness(t, states, csiNode(testNodeName, testDriverName, testVMID))
+	// The write, not the read, fails: every Update against this node errors
+	// until the reactor is turned off below.
+	writesShouldFail := true
+	h.kube.PrependReactor("update", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if writesShouldFail {
+			return true, nil, errors.New("simulated write failure")
+		}
+		return false, nil, nil
+	})
 
-	h.controller.ObserveNode(unreachableNode(testNodeName))
+	h.track(testNodeName)
 	h.pastGrace()
-	h.poll(testConfirmations)
+	h.poll(testNodeName, testConfirmations)
 
 	if tracked := h.controller.TrackedNodes(); len(tracked) != 1 {
 		t.Fatalf("node dropped after a failed taint write; it must stay tracked to retry, tracked = %v", tracked)
 	}
-
-	// The node appears; the next pass fences it without rebuilding the streak.
-	if _, err := h.kube.CoreV1().Nodes().Create(context.Background(), unreachableNode(testNodeName), metav1.CreateOptions{}); err != nil {
-		t.Fatalf("creating node: %v", err)
+	if h.fenced(t, testNodeName) {
+		t.Fatal("node was fenced despite the write failing")
 	}
 
-	h.poll(1)
+	// The write starts succeeding; the next reconcile fences without
+	// rebuilding the streak.
+	writesShouldFail = false
+	h.poll(testNodeName, 1)
 	if !h.fenced(t, testNodeName) {
 		t.Fatal("node was not fenced on the retry after the write succeeded")
+	}
+}
+
+// TestGracePeriodReturnsExactRemainingTime is the improvement the rewrite
+// exists to capture: the old ticker-driven design could not do better than
+// "come back next tick" for a node still inside its grace period, because
+// nothing was keyed to that node's own clock. Reconcile can, and must, return
+// exactly how much of the grace period is left.
+func TestGracePeriodReturnsExactRemainingTime(t *testing.T) {
+	states := &fakeStateSource{responses: []stateResponse{notRunning()}}
+	h := newHarness(t, states, unreachableNode(testNodeName), csiNode(testNodeName, testDriverName, testVMID))
+
+	// The first reconcile creates the tracking entry; nothing has elapsed
+	// yet, so the full grace period remains.
+	got, err := h.controller.Reconcile(context.Background(), testNodeName)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got != testGracePeriod {
+		t.Fatalf("requeueAfter = %s on the first reconcile, want the full grace period %s", got, testGracePeriod)
+	}
+
+	elapsed := 37 * time.Second
+	h.clock.Step(elapsed)
+
+	got, err = h.controller.Reconcile(context.Background(), testNodeName)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	want := testGracePeriod - elapsed
+	if got != want {
+		t.Fatalf("requeueAfter = %s, want the exact remainder %s — not a full poll interval", got, want)
+	}
+}
+
+// TestFenceSkipsWriteWhenNodeRecoveredDuringTheFencingCall exercises
+// applyOutOfServiceTaint's recovered-node guard end to end. Reconcile reads
+// the node once, at the very top of the call, to decide the node is still
+// unreachable and worth confirming; applyOutOfServiceTaint takes its own
+// fresh read, much later in the same call, immediately before the write. The
+// gap between those two reads — not between separate Reconcile calls, which
+// the top-of-call check already closes — is the window this guard exists to
+// close: if the node recovers in that gap, the write must not happen.
+func TestFenceSkipsWriteWhenNodeRecoveredDuringTheFencingCall(t *testing.T) {
+	states := &fakeStateSource{responses: []stateResponse{notRunning()}}
+	kube := fake.NewSimpleClientset(unreachableNode(testNodeName), csiNode(testNodeName, testDriverName, testVMID))
+	fakeClock := clocktesting.NewFakeClock(time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC))
+
+	controller, err := New(Config{
+		KubeClient:    kube,
+		ClusterStates: states,
+		DriverName:    testDriverName,
+		GracePeriod:   ptr.To(testGracePeriod),
+		PollInterval:  ptr.To(testPollInterval),
+		// Confirmations = 1 so the fencing call happens on the second
+		// Reconcile call overall, keeping the count of Get calls against the
+		// Node predictable enough to intercept the right one below.
+		Confirmations: ptr.To(1),
+		Clock:         fakeClock,
+		Logger:        log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Gets 1 and 2 are Reconcile's own reads (seeding the tracking entry,
+	// then reading again once past the grace period); get 3 is
+	// applyOutOfServiceTaint's independent fresh read right before the
+	// write. Only that third read sees the node recovered.
+	var gets int
+	kube.PrependReactor("get", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		gets++
+		if gets == 3 {
+			return true, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: testNodeName}}, nil
+		}
+		return false, nil, nil
+	})
+
+	ctx := context.Background()
+	if _, err := controller.Reconcile(ctx, testNodeName); err != nil {
+		t.Fatalf("Reconcile (seeding): %v", err)
+	}
+	fakeClock.Step(testGracePeriod + time.Second)
+
+	if _, err := controller.Reconcile(ctx, testNodeName); err != nil {
+		t.Fatalf("Reconcile (fencing): %v", err)
+	}
+
+	// The reactor above only substitutes what the third Get call *returns*;
+	// it does not mutate the fake clientset's actual stored object. Reading
+	// it back now confirms no Update ever landed against it.
+	node, err := kube.CoreV1().Nodes().Get(ctx, testNodeName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("reading node back: %v", err)
+	}
+	for _, taint := range node.Spec.Taints {
+		if taint.Key == corev1.TaintNodeOutOfService {
+			t.Fatal("a node that recovered during the fencing call was fenced anyway")
+		}
 	}
 }
 
@@ -604,7 +752,8 @@ func TestNewRejectsMissingDependencies(t *testing.T) {
 		{"negative grace period", Config{KubeClient: kube, ClusterStates: states, DriverName: testDriverName, GracePeriod: ptr.To(-time.Second)}},
 		{"negative poll interval", Config{KubeClient: kube, ClusterStates: states, DriverName: testDriverName, PollInterval: ptr.To(-time.Second)}},
 		// Unlike the other two, a zero here has no meaning to honour: it goes
-		// straight to a ticker that panics on it.
+		// straight to the queue's exponential-failure rate limiter as a zero
+		// base delay, which makes every retry after the first immediate.
 		{"zero poll interval", Config{KubeClient: kube, ClusterStates: states, DriverName: testDriverName, PollInterval: ptr.To(time.Duration(0))}},
 		{"negative confirmations", Config{KubeClient: kube, ClusterStates: states, DriverName: testDriverName, Confirmations: ptr.To(-1)}},
 	}
