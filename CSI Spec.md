@@ -259,15 +259,84 @@ reverse-direction question below: no single query answers it, so it would mean a
 scan per cluster node. It is refused with INVALID_ARGUMENT rather than answered
 wrongly. Kubernetes always sets it, so this costs nothing in practice.
 
-**Force-detach from a failed node is not built.**
-`IClusterService.IsHostLiveAsync` is still unimplemented, so an unpublish whose
-owning host is down fails and is retried rather than fenced. That is the safe
-direction — it never detaches a disk from a VM that might still be running — but
-it does mean a node that stays down blocks its volumes from moving until an
-operator intervenes.
+**Force-detach from a failed node is built, and none of it is in this RPC.**
+The mechanism is a Kubernetes-side controller — `csi-driver/internal/nodefencing`
+— not a CSI feature: CSI has no `force` field anywhere on
+ControllerUnpublishVolumeRequest. It watches Node objects for the
+`unreachable:NoExecute` taint, resolves a tainted node to this driver's VM ID
+through its `CSINode` object, asks the agent what that VM's own cluster resource
+says, and — after a grace period and a run of consecutive confirming readings —
+applies `node.kubernetes.io/out-of-service=nodeshutdown:NoExecute` to the Node.
+It is leader-elected, and it never removes the taint: clearing it is an operator
+step during node recovery.
 
-What an authoritative check would take, if one is ever wanted anyway. The
-attachment itself lives in `Msvm_StorageAllocationSettingData` in
+**Which is why this call needed no changes at all.** Once the taint lands,
+upstream machinery does the rest — pod GC force-deletes the stranded pods, and
+the attach-detach controller proceeds to unpublish without waiting for node-side
+confirmation. What arrives here is an ordinary, unmarked `{volume_id, node_id}`
+request, indistinguishable from any other, and the existing detach path handles
+it the way it handles all of them: resolve the VM through the cluster database,
+reconfigure, confirm by read-back, fail closed if it cannot confirm. The
+decision to force the issue is made before this call, not inside it.
+
+**`IsHostLiveAsync` is implemented, and deliberately not what that decision
+rests on.** It exists (`MsClusterService.cs`) and `OrphanedCheckpointReaper`
+already uses it to skip a booting or draining host, so this section's older
+claim — that it was unimplemented and that force-detach was blocked on it — was
+stale twice over. It also answers the wrong question. `MSCluster_Node.State`
+says whether a *physical host* is up: a host being `Up` does not mean this VM is
+not `Failed` on it, and a host being `Down` proves the cluster lost contact with
+that node, not that the VM stopped. The signal used instead is the VM's own
+`MSCluster_Resource` state — what that signal is, and what it is not, is
+immediately below.
+
+**It is off by default, and it has never been exercised against a real host
+failure.** `controller.nodeFencing.enabled` defaults to false and must be turned
+on deliberately. The decision logic and the taint write have unit tests; there is
+no end-to-end failover test, and `testing.md` says so. What can be claimed is
+that the mechanism exists, not that a lost host has been watched to self-heal.
+
+**The trust boundary the whole thing rests on.** `MSCluster_Resource.State`
+reflects cluster **consensus**, not a hardware guarantee. WSFC's quorum voting
+reliably determines who is *allowed* to bring a resource online, but whether a
+partitioned node can be trusted to have actually stopped executing depends on
+whether the deployment has real fencing underneath the soft quorum —
+BMC/iDRAC/iLO-driven power fencing, or Storage Spaces Direct's poison-pill
+self-fencing if S2D is in play. Without that, "the cluster says nobody owns it"
+is a strong signal, not a proof.
+
+This is a deliberately accepted risk, not a gap this feature is trying to close.
+If the cluster itself malfunctions in a way that leaves it unable to truthfully
+answer whether a VM is dead, the system stays wedged — exactly as it does with
+fencing off. That is an accepted cost of running on Hyper-V/WSFC for now, not
+something worked around here. It is written down explicitly because it is the
+single most load-bearing assumption in the design, and should be a deliberate,
+known trust boundary rather than something implicit in a WMI query.
+
+**What counts as confirmation, and why it is not simply "not Online".** The
+confirmed-not-running set is `Failed`, or `Offline` with `PersistentState`
+false. Bare `Offline` is not sufficient: a perfectly healthy VM reads `Offline`
+for roughly a quarter of a second in the middle of every live migration, with
+`PersistentState` — the cluster's persisted *intent* that the resource should be
+online — staying true straight through. A rule of "not Online means not running"
+would therefore fence a running node during an ordinary migration, which is
+precisely the double-mount this design exists to avoid. `PersistentState` flips
+false only when a stop has actually been requested.
+
+A run of consecutive confirmations is required on top of that, and the streak is
+state-gated rather than merely time-gated: only a qualifying reading advances it,
+and any other observation — a pending state, an unrecognised one, or an error
+asking at all — resets it to zero. A single `Failed` reading means "not online at
+this instant", not "the cluster gave up": under the cluster's own retry policy
+(`RestartAction = 2`) a genuinely broken VM cycles Failed → OnlinePending →
+OfflinePending → Failed for a long time. The state integers behind all of this
+were measured against a live cluster rather than taken from documentation, and
+values that were never observed are left unnamed in code rather than guessed.
+
+A different question, and the notes on it are worth keeping separately: what an
+authoritative check that a given VHDX is attached *anywhere* would take. Nothing
+above needs one — fencing asks about a VM, not a disk — but a DeleteVolume-time
+guard would. The attachment itself lives in `Msvm_StorageAllocationSettingData` in
 `root\virtualization\v2`: match `HostResource[0]` against the VHDX path with
 `ResourceSubType` `Microsoft:Hyper-V:Virtual Hard Disk`. That is *configuration*
 data — it exists whether or not the VM is running, which is exactly the property

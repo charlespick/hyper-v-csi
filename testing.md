@@ -173,7 +173,7 @@ flag is a statement about the driver, a skip regex is a statement about us.
 | --- | --- | --- |
 | **Group snapshots, snapshot metadata** | `groupSnapshot: false`; `\[Feature:` in `skips.txt` still catches `volumegroupsnapshot` and `snapshotmetadata` | `CreateVolumeGroupSnapshot` and the snapshot metadata service aren't implemented. Single-volume snapshot create/delete/list/restore is no longer in this table: `snapshotDataSource: true` plus a generated `SnapshotClass` let `[Feature:VolumeSnapshotDataSource]` run instead of being silenced, and it does — the `snapshottable` suite (12 specs) passes against a real `snapshot-controller` and the chart's own external-snapshotter sidecar (`controller.snapshotter.enabled`), proven in the 2026-08-15 full-profile run |
 | **Stress and performance** — `volume-stress`, `volume-lifecycle-performance`, snapshot stress | `StressTestOptions` and `PerformanceTestOptions` left unset in `testdriver.yaml` | These provision until something breaks, on purpose. The Windows API path is the least characterised part of this driver under load; the first thing to learn from it should not be what happens at fifty volumes at once. Turning them on is adding a block to `testdriver.yaml` |
-| **Node and kubelet failover** — pod deleted while the kubelet is down, volume reused afterwards | `\[Disruptive\]` in `skips.txt` | The failure class the project has not built for. Also needs SSH to the nodes, which `--provider=skeleton` does not have, so these would error rather than fail honestly. See below |
+| **Node and kubelet failover** — pod deleted while the kubelet is down, volume reused afterwards | `\[Disruptive\]` in `skips.txt` | Two different things behind one skip. The *kubelet* half is upstream's territory and stays out of scope: it needs SSH to the nodes, which `--provider=skeleton` does not have, so those specs would error rather than fail honestly. The *Hyper-V* half — a node lost with its host — is no longer a failure class the project has not built for: node fencing exists, behind `controller.nodeFencing.enabled`. It has no end-to-end test either, for the different reason below |
 | **Raw block volumes** | `block: false` | `requireMountVolume` rejects them; nothing formats or maps a raw device |
 | **ReadWriteMany, ReadOnlyMany** | `RWX: false`, `capReadOnlyMany: false` | A VHDX attaches to one VM at a time |
 | **Volume cloning** (`pvcDataSource`) | `pvcDataSource: false` | `CreateVolume` rejects a volume content source |
@@ -196,6 +196,17 @@ is a Hyper-V host losing a VM, or a cluster role moving between hosts while a
 volume is attached — which the upstream suite has no vocabulary for and no way
 to cause.
 
+The driver is no longer without an answer for that failure class, which is the
+one thing that has changed here. Node fencing
+(`csi-driver/internal/nodefencing`, behind `controller.nodeFencing.enabled`, off
+by default) watches for the `unreachable:NoExecute` taint, confirms with the
+Hyper-V cluster that the node's VM is not running anywhere, and applies
+`node.kubernetes.io/out-of-service` so the stranded pods can be force-deleted
+and their volumes detached. What is missing is not the mechanism, it is this
+harness: the decision logic and the taint write have unit tests, and nothing has
+ever watched a real host die and seen a volume come back. Untested end to end,
+not unbuilt.
+
 That work is a separate harness, and the shape it has to take is already
 settled by the constraint that made this suite run outside the cluster in the
 first place: something that can (a) act on the Hyper-V cluster directly — stop a
@@ -203,7 +214,12 @@ VM, move a role, fail a host — and (b) assert on Kubernetes state while that
 happens. Neither half can run on the node under test. The scenarios worth
 writing first: a volume attached to a node whose VM cannot be resolved, an
 unresponsive agent, an agent that cannot reach a host the cluster claims is
-online.
+online. Fencing adds its own obvious candidates, and two of them are about the
+taint *not* firing: a live migration, during which the VM's cluster resource
+reads Offline for a fraction of a second and nothing may be fenced; and an agent
+that cannot be reached at all, where being unable to ask must not resolve to an
+answer. The third is the case it exists for — a host genuinely lost, where the
+taint has to land and the volume has to come back somewhere else.
 
 Nothing in `test/e2e/` prevents that harness from landing next to it and
 reusing the same kubeconfig and the same artifacts layout. `\[Disruptive\]`

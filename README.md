@@ -27,7 +27,9 @@ StorageClass) per Hyper-V cluster.
 What works today: dynamic provisioning, attach/detach, online expansion, and the
 full node staging/mount path. Snapshots (create/delete/restore) are implemented
 but off by default — see [design.md](design.md) for status and architecture in
-more depth.
+more depth. Recovery from a node lost with its Hyper-V host is also built and
+also off by default — see [Node fencing](#node-fencing) below, including the
+manual recovery step it needs from you.
 
 ## Prerequisites
 
@@ -135,6 +137,49 @@ helm install hyperv-csi oci://ghcr.io/charlespick/charts/hyperv-csi \
 See [values.yaml](deploy/helm/hyperv-csi/values.yaml) for the rest of the
 chart's configuration, including the sidecar images/timeouts, StorageClass
 reclaim policy, and the opt-in VolumeSnapshotClass.
+
+## Node fencing
+
+**Off by default.** When a Kubernetes node stops being reachable and the Hyper-V
+cluster confirms that node's VM is not running anywhere, the driver applies
+`node.kubernetes.io/out-of-service` to the Node. That taint is what lets
+Kubernetes force-delete the pods stranded on a dead node and detach their
+volumes; without it a pod sits `Terminating` indefinitely, because the kubelet
+that would confirm teardown died with the node, and a StatefulSet never gets a
+replacement for that ordinal.
+
+Turn it on by adding `--set controller.nodeFencing.enabled=true` to the
+`helm install` above. Doing so also grants the driver `get`/`list`/`watch`/`update` on `nodes` — a
+wider privilege than anything else in this chart asks for. The grace period,
+poll interval, and how many consecutive confirmations are required before the
+taint is applied are all tunable; see `controller.nodeFencing` in
+[values.yaml](deploy/helm/hyperv-csi/values.yaml).
+
+### The taint is applied and never removed
+
+Clearing it is a manual step during node recovery:
+
+```bash
+kubectl taint nodes <node> node.kubernetes.io/out-of-service-
+```
+
+Until you run that, a node that has recovered and is otherwise healthy stays
+out-of-service and will not run pods. This is deliberate — removing the taint
+while volumes are still detaching would undo the thing it was applied for — but
+it does mean recovery is not fully automatic.
+
+### What to weigh before enabling it
+
+The confirmation comes from Windows Failover Clustering's own quorum-backed
+answer that the VM's cluster resource is not online anywhere. That is cluster
+*consensus*, not a hardware guarantee: it is a strong signal only if real fencing
+sits underneath it — BMC/iDRAC/iLO power fencing, or Storage Spaces Direct's
+poison-pill self-fencing. The trust boundary section in
+[CSI Spec.md](CSI%20Spec.md) sets out what that signal is and is not.
+
+And the mechanism, while built and unit tested, has never been exercised against
+a real host failure. Enabling it is a decision to try it, not to switch on
+something proven.
 
 ## Design notes
 

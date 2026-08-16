@@ -24,7 +24,7 @@
 |---|---|
 | Dynamic VHDX provisioning | `CreateVolume` |
 | Attach/detach to node VM | `ControllerPublishVolume` / `ControllerUnpublishVolume` |
-| Force-detach from a failed node | `ControllerUnpublishVolume`, using cluster membership/quorum as the source of truth on node liveness |
+| Force-detach from a failed node | Not a CSI call — a controller loop applies `node.kubernetes.io/out-of-service` once the VM's own cluster *resource* state confirms it is not running; an ordinary `ControllerUnpublishVolume` falls out of the taint. Off by default, untested end to end |
 | Format + mount in guest | `NodeStageVolume` / `NodePublishVolume` |
 | Online/offline expansion | `ControllerExpandVolume` / `NodeExpandVolume` |
 | Snapshots | `CreateSnapshot` / `DeleteSnapshot` / restore via `CreateVolume(source)` |
