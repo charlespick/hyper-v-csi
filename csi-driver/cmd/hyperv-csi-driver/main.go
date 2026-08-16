@@ -23,6 +23,7 @@ import (
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/agentclient"
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/driver"
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/hypervkvp"
+	"github.com/charlespick/hyper-v-csi/csi-driver/internal/nodefencing"
 )
 
 func main() {
@@ -41,6 +42,24 @@ func main() {
 			"PEM private key for --agent-client-cert")
 		allowInsecureAgent = flag.Bool("allow-insecure-agent", false,
 			"talk to the agent without TLS or a client certificate. Development only: the credentials are what stop anyone who can reach the agent from creating and deleting volumes")
+
+		// Off by default, and deliberately so. This mechanism force-deletes
+		// pods and detaches disks on the strength of a WMI read, which is
+		// cluster consensus rather than a hardware guarantee; opting in is an
+		// operator saying their deployment's fencing story is good enough for
+		// that. Controller mode only.
+		nodeFencing = flag.Bool("node-fencing", false,
+			"watch for unreachable nodes and, once Windows Failover Clustering confirms their VM is not running, apply node.kubernetes.io/out-of-service=nodeshutdown:NoExecute so their pods can be force-deleted and their disks detached. Controller mode only")
+		nodeFencingGracePeriod = flag.Duration("node-fencing-grace-period", nodefencing.DefaultGracePeriod,
+			"how long a node must carry the unreachable taint before the cluster is asked about it at all. Kubernetes applies that taint within roughly 40s of NotReady, which an ordinary guest reboot also produces")
+		nodeFencingPollInterval = flag.Duration("node-fencing-poll-interval", nodefencing.DefaultPollInterval,
+			"how often to ask the cluster about nodes that are past their grace period")
+		nodeFencingConfirmations = flag.Int("node-fencing-confirmations", nodefencing.DefaultConfirmations,
+			"how many consecutive confirmed-not-running readings are required before fencing. Any other reading, including an error, resets the count to zero")
+		nodeFencingLeaseNamespace = flag.String("node-fencing-lease-namespace", os.Getenv("POD_NAMESPACE"),
+			"namespace holding the node-fencing leader election Lease. Defaults to $POD_NAMESPACE")
+		nodeFencingLeaseName = flag.String("node-fencing-lease-name", nodefencing.DefaultLeaseName,
+			"name of the node-fencing leader election Lease")
 	)
 	var agentServerCertThumbprints stringSliceFlag
 	flag.Var(&agentServerCertThumbprints, "agent-server-cert-thumbprint",
@@ -57,6 +76,9 @@ func main() {
 			log.Fatal("--agent-address is required in controller mode")
 		}
 	case "node":
+		if *nodeFencing {
+			log.Fatal("--node-fencing is a controller-mode flag; the node server has no Kubernetes client and does not watch Node objects")
+		}
 		// The node's identity is its Hyper-V VM ID, which only the guest can
 		// learn and only through the host's key-value pools. Reported verbatim
 		// by NodeGetInfo, recorded by kubelet in the CSINode object, and handed
@@ -114,6 +136,50 @@ func main() {
 
 	d := driver.New(*nodeID, agent, kubeClient)
 
+	// Kubelet stops the container with SIGTERM. Established here rather than
+	// just before Serve because the node-fencing controller below shares it:
+	// one signal has to stop both the gRPC server and every background loop.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if *nodeFencing {
+		fencer, err := nodefencing.New(nodefencing.Config{
+			KubeClient:    kubeClient,
+			ClusterStates: agent,
+			DriverName:    driver.DriverName,
+			GracePeriod:   *nodeFencingGracePeriod,
+			PollInterval:  *nodeFencingPollInterval,
+			Confirmations: *nodeFencingConfirmations,
+		})
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		identity, err := leaderElectionIdentity()
+		if err != nil {
+			log.Fatalf("node fencing: %v", err)
+		}
+		if *nodeFencingLeaseNamespace == "" {
+			log.Fatal("node fencing: --node-fencing-lease-namespace is required (or set POD_NAMESPACE from the downward API)")
+		}
+
+		go func() {
+			// Losing the lease or failing to elect is not fatal to the CSI
+			// RPCs, which keep serving; it only means nothing is fencing.
+			// Logged loudly rather than taking the whole controller down,
+			// since a driver that cannot fence is still a driver that can
+			// provision, attach and snapshot.
+			err := fencer.Run(ctx, nodefencing.LeaderElectionOptions{
+				Namespace: *nodeFencingLeaseNamespace,
+				LeaseName: *nodeFencingLeaseName,
+				Identity:  identity,
+			})
+			if err != nil && ctx.Err() == nil {
+				log.Printf("WARNING: node fencing stopped; unreachable nodes will not be fenced until this pod restarts: %v", err)
+			}
+		}()
+	}
+
 	listener, err := listen(*endpoint)
 	if err != nil {
 		log.Fatalf("failed to listen on %s: %v", *endpoint, err)
@@ -129,10 +195,8 @@ func main() {
 		csi.RegisterNodeServer(server, d.NodeServer())
 	}
 
-	// Kubelet stops the container with SIGTERM; drain in-flight RPCs instead
-	// of dying mid-call. Serve returns nil after GracefulStop.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	// Drain in-flight RPCs instead of dying mid-call. Serve returns nil after
+	// GracefulStop.
 	go func() {
 		<-ctx.Done()
 		log.Print("shutdown signal received, draining gRPC server")
@@ -177,6 +241,24 @@ func buildAgentClient(address, certificateFile, keyFile string, serverCertThumbp
 	}
 
 	return agentclient.NewMutualTLS(address, certificateFile, keyFile, serverCertThumbprints)
+}
+
+// leaderElectionIdentity names this replica in the fencing lease. $POD_NAME
+// from the downward API is the right answer in the deployment; the hostname is
+// the same string in practice and covers running the binary outside a pod.
+// Two replicas sharing an identity would both believe they hold the lease, so
+// this refuses to guess rather than defaulting to something non-unique.
+func leaderElectionIdentity() (string, error) {
+	if name := os.Getenv("POD_NAME"); name != "" {
+		return name, nil
+	}
+
+	hostname, err := os.Hostname()
+	if err != nil {
+		return "", fmt.Errorf("no $POD_NAME and the hostname is unreadable, so this replica has no unique identity for leader election: %w", err)
+	}
+
+	return hostname, nil
 }
 
 // stringSliceFlag implements flag.Value so --agent-server-cert-thumbprint can
