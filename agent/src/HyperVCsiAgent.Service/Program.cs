@@ -5,6 +5,7 @@ using HyperVCsiAgent.Core.HostControl;
 using HyperVCsiAgent.Core.Jobs;
 using HyperVCsiAgent.Core.Security;
 using HyperVCsiAgent.Core.Storage;
+using HyperVCsiAgent.Service.Cim;
 using HyperVCsiAgent.Service.Cluster;
 using HyperVCsiAgent.Service.HostControl;
 using HyperVCsiAgent.Service.Security;
@@ -239,6 +240,75 @@ app.MapGet("/v1/jobs/{id}", (string id, IJobStore jobStore) =>
 {
     var job = jobStore.Get(id);
     return job is null ? Results.NotFound() : Results.Ok(job);
+});
+
+// A plain synchronous read, deliberately not a job. POST /v1/jobs exists to
+// serialize mutations against a vm:<id> target and to keep the listener off a
+// multi-minute Hyper-V operation; this mutates nothing, so it has nothing to
+// serialize against, and it is one keyed WMI query - an enqueue-and-poll round
+// trip would be pure overhead around an answer that is already cheap.
+//
+// It is also deliberately NOT behind JobIntakeGate, and that is not an
+// inconsistency for someone to tidy up later. The gate exists so an RPC-driven
+// job cannot claim vm:<id> ahead of a recovery job OrphanedCheckpointReaper's
+// startup sweep has not enqueued yet. This handler claims no target and
+// enqueues nothing, so there is no such race for it to lose. Gating it would
+// withhold this answer during exactly the window after an agent failover when
+// a host has just died - which is precisely when the caller asking "is this VM
+// running anywhere the cluster knows about" needs it.
+app.MapGet("/v1/vms/{vmId}/cluster-state", async (
+    string vmId,
+    IClusterService cluster,
+    ILogger<Program> logger,
+    CancellationToken cancellationToken) =>
+{
+    // Checked here as well as in MsClusterService.RequireVmId, which stays as
+    // defense in depth for callers that never come through HTTP. Rejecting at
+    // the edge is what makes "the caller sent something that is not a VM GUID"
+    // a clean client error instead of a 5xx indistinguishable from a cluster
+    // that cannot be read. WqlNames.IsVmId rather than a second GUID rule, so
+    // the endpoint cannot come to disagree with the service about what a VM ID
+    // is.
+    if (!WqlNames.IsVmId(vmId))
+    {
+        return Results.BadRequest(new { error = $"vmId {vmId} is not a virtual machine GUID" });
+    }
+
+    try
+    {
+        var state = await cluster.GetVmClusterStateAsync(vmId, cancellationToken);
+
+        // 404 means one thing and only one: the cluster database has no VM
+        // resource with this ID. It has to stay a different code from the 503
+        // below even though a caller refuses to fence on either, because the
+        // two need opposite remediation - a 404 says the VM has left the
+        // cluster, a 503 says the cluster cannot answer about a VM that may
+        // well still be in it.
+        return state is null
+            ? Results.NotFound(new { error = $"the cluster database has no VM resource for {vmId}" })
+            : Results.Ok(state);
+    }
+    catch (Exception ex)
+    {
+        // 503 rather than 500. Every throw out of GetVmClusterStateAsync means
+        // the cluster could not be read - an unreadable cluster database, a WMI
+        // round trip past its deadline, a resource the registry mirror named
+        // that the keyed query then could not find - not that the agent has a
+        // defect. All of those are states of a cluster mid-upheaval, which is
+        // the normal condition while this endpoint is being called at all,
+        // since nothing asks it until a host has already stopped responding.
+        // 503 is the code that says "ask again", which is exactly what the
+        // caller should do; 500 would claim a bug in the agent and would train
+        // an operator to ignore a code that fires routinely during a failover.
+        //
+        // What is load-bearing is only that it is non-2xx and distinct from
+        // 404: this answer decides whether a Kubernetes node gets fenced, and
+        // no failure here may be renderable as "the VM is not running".
+        logger.LogWarning(ex, "Could not read cluster state for VM {VmId}", vmId);
+        return Results.Json(
+            new { error = $"the cluster could not be asked about VM {vmId}; retry shortly" },
+            statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
 });
 
 app.Run();
