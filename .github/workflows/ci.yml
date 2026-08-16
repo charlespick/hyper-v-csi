@@ -48,6 +48,11 @@ jobs:
           cache-dependency-path: csi-driver/go.sum
       - working-directory: csi-driver
         run: make test
+      # Runs here and not on a developer's machine: the race detector needs
+      # cgo, which the Windows host this driver is developed on cannot supply,
+      # so this job is the only place the check can happen at all.
+      - working-directory: csi-driver
+        run: make test-race
       - working-directory: csi-driver
         run: make build
 

@@ -3,6 +3,7 @@ package nodefencing
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"sync"
@@ -811,6 +812,112 @@ func TestNewHonorsAnExplicitZero(t *testing.T) {
 	if controller.confirmations != 0 {
 		t.Errorf("confirmations = %d, want 0 (an explicit zero must not be replaced by the default)", controller.confirmations)
 	}
+}
+
+// TestConcurrentReconcilesAreRaceFree exists to give `make test-race`
+// something to catch. Every other test in this file drives Reconcile from one
+// goroutine, which is the right way to assert a decision but cannot observe
+// the thing that has actually gone wrong in this package repeatedly: state
+// touched by more than one goroutine at once.
+//
+// It reconciles distinct node names in parallel and never the same name twice
+// at once, because that is exactly the guarantee the workqueue makes and the
+// guarantee the design is built on — an entry's fields are owned by whoever
+// holds that key, and only the map's own structure is shared. A test that
+// drove two concurrent reconciles of one name would be asserting against a
+// promise nothing makes, and its failures would say nothing about production.
+//
+// Without -race this still checks that the whole path is deadlock-free and
+// reaches the right end state. With it, this is the check that the ownership
+// rule on Controller.mu is real rather than aspirational.
+func TestConcurrentReconcilesAreRaceFree(t *testing.T) {
+	const (
+		nodeCount        = 12
+		reconcilesEach   = 20
+		trackedNodesLoop = 200
+	)
+
+	objects := make([]runtime.Object, 0, nodeCount*2)
+	names := make([]string, 0, nodeCount)
+	for i := 0; i < nodeCount; i++ {
+		name := fmt.Sprintf("csidevnode%02d", i)
+		names = append(names, name)
+		objects = append(objects, unreachableNode(name), csiNode(name, testDriverName, testVMID))
+	}
+
+	// A zero grace period and a single confirmation, so every reconcile runs
+	// the whole state machine instead of returning at the grace check — the
+	// contended paths are the ones past it. Both are explicit zeros/ones the
+	// config honours rather than defaults.
+	states := &fakeStateSource{responses: []stateResponse{notRunning()}}
+	controller, err := New(Config{
+		KubeClient:    fake.NewSimpleClientset(objects...),
+		ClusterStates: states,
+		DriverName:    testDriverName,
+		GracePeriod:   ptr.To(time.Duration(0)),
+		PollInterval:  ptr.To(time.Millisecond),
+		Confirmations: ptr.To(1),
+		Logger:        log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx := context.Background()
+	var wg sync.WaitGroup
+
+	for _, name := range names {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < reconcilesEach; i++ {
+				// t.Errorf rather than t.Fatalf: Fatalf from a non-test
+				// goroutine does not stop the test, it just stops this one.
+				if _, err := controller.Reconcile(ctx, name); err != nil {
+					t.Errorf("Reconcile(%s): %v", name, err)
+					return
+				}
+			}
+		}()
+	}
+
+	// Reading the map's structure while the reconciles above are inserting
+	// into and deleting from it, which is the access pattern the mutex exists
+	// for and the one an introspection caller actually produces.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < trackedNodesLoop; i++ {
+			controller.TrackedNodes()
+		}
+	}()
+
+	wg.Wait()
+
+	// Every node was confirmed not running once, which at Confirmations 1 is
+	// enough to fence it; each node's later reconciles then find the
+	// out-of-service taint and drop it. So the end state is fully decided:
+	// all fenced, nothing still tracked.
+	for _, name := range names {
+		if !controller.hasOutOfServiceTaint(t, name) {
+			t.Errorf("node %s was never fenced", name)
+		}
+	}
+	if tracked := controller.TrackedNodes(); len(tracked) != 0 {
+		t.Errorf("nodes still tracked after every reconcile settled: %v", tracked)
+	}
+}
+
+// hasOutOfServiceTaint reads a node straight from this controller's client, so
+// the concurrency test above needs no harness.
+func (c *Controller) hasOutOfServiceTaint(t *testing.T, nodeName string) bool {
+	t.Helper()
+
+	node, err := c.kube.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("reading node %s: %v", nodeName, err)
+	}
+	return hasTaintKey(node, corev1.TaintNodeOutOfService)
 }
 
 // Compile-time proof that the real client satisfies the narrow interface this
