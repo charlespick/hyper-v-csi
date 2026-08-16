@@ -341,7 +341,17 @@ public sealed class MsClusterService : IClusterService
             }
 
             _resourceNameByVmId = fresh;
-            _resourceNameCacheExpiresAt = now + ResourceNameCacheTtl;
+
+            // Measured from when the scan finished, not from when it started.
+            // The scan is the cost being amortized, so timing the window from
+            // before it is what makes a slow scan produce a cache that is
+            // already expired: callers queued behind this lock would then each
+            // rescan in turn, serializing what used to run in parallel and
+            // amortizing nothing. The freshness check above deliberately still
+            // uses the earlier reading - a caller asking whether the cache it
+            // is about to read is stale wants the time it asked, not the time
+            // some other caller's scan ended.
+            _resourceNameCacheExpiresAt = _timeProvider.GetUtcNow() + ResourceNameCacheTtl;
             return fresh;
         }
     }
