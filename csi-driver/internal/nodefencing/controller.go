@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/clock"
+	"k8s.io/utils/ptr"
 
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/agentclient"
 )
@@ -122,7 +123,27 @@ type trackedNode struct {
 
 	// streak is the number of consecutive confirmed-not-running readings.
 	streak int
+
+	// unresolvedPolls is the number of consecutive polls that could not read
+	// this node's CSI node ID. Bounded by maxNodeIDResolutionFailures.
+	unresolvedPolls int
 }
+
+// maxNodeIDResolutionFailures bounds how many consecutive polls may fail to
+// resolve a node's CSI node ID before the node is dropped.
+//
+// A missing CSINode object is treated as transient, for the reason
+// resolveNodeID gives, but "transient" has to end somewhere. A node whose
+// CSINode never comes back — the driver was removed from it, or it was
+// decommissioned with its Node object left behind — would otherwise sit in
+// the tracked set being polled and logged about for the life of the process.
+//
+// Dropping is the safe direction whatever the cause: a node this controller
+// has forgotten is one it cannot fence, and if the node is still unreachable
+// when the informer next relists it, ObserveNode tracks it again from a fresh
+// grace period. That costs a delay before fencing and never a wrong fence,
+// which is the trade this whole package is built around.
+const maxNodeIDResolutionFailures = 20
 
 // New validates the config and builds a Controller.
 func New(config Config) (*Controller, error) {
@@ -138,8 +159,13 @@ func New(config Config) (*Controller, error) {
 	if config.GracePeriod != nil && *config.GracePeriod < 0 {
 		return nil, fmt.Errorf("node fencing: grace period %s must not be negative", *config.GracePeriod)
 	}
-	if config.PollInterval != nil && *config.PollInterval < 0 {
-		return nil, fmt.Errorf("node fencing: poll interval %s must not be negative", *config.PollInterval)
+	// Positive, not merely non-negative: this one is handed straight to
+	// clock.NewTicker, and the real clock's ticker panics on a non-positive
+	// interval. A zero here is the one explicit zero of the three that has no
+	// meaning to give it, so it is rejected at construction rather than left
+	// to take the process down the first time a replica wins the lease.
+	if config.PollInterval != nil && *config.PollInterval <= 0 {
+		return nil, fmt.Errorf("node fencing: poll interval %s must be positive", *config.PollInterval)
 	}
 	if config.Confirmations != nil && *config.Confirmations < 0 {
 		return nil, fmt.Errorf("node fencing: confirmation count %d must not be negative", *config.Confirmations)
@@ -149,23 +175,14 @@ func New(config Config) (*Controller, error) {
 		kube:          config.KubeClient,
 		states:        config.ClusterStates,
 		driverName:    config.DriverName,
-		gracePeriod:   DefaultGracePeriod,
-		pollInterval:  DefaultPollInterval,
-		confirmations: DefaultConfirmations,
+		gracePeriod:   ptr.Deref(config.GracePeriod, DefaultGracePeriod),
+		pollInterval:  ptr.Deref(config.PollInterval, DefaultPollInterval),
+		confirmations: ptr.Deref(config.Confirmations, DefaultConfirmations),
 		clock:         config.Clock,
 		logger:        config.Logger,
 		tracked:       map[string]*trackedNode{},
 	}
 
-	if config.GracePeriod != nil {
-		controller.gracePeriod = *config.GracePeriod
-	}
-	if config.PollInterval != nil {
-		controller.pollInterval = *config.PollInterval
-	}
-	if config.Confirmations != nil {
-		controller.confirmations = *config.Confirmations
-	}
 	if controller.clock == nil {
 		controller.clock = clock.RealClock{}
 	}
@@ -304,21 +321,35 @@ func (c *Controller) processNode(ctx context.Context, nodeName string) {
 	// grace-period check just passed used a stale record's expired window,
 	// not the current record's. Confirm the record is still the one just
 	// checked before asking the agent on the strength of it.
-	c.mu.Lock()
-	current, stillTracked := c.tracked[nodeName]
-	sameRecord := stillTracked && current == tracked
-	c.mu.Unlock()
-	if !sameRecord {
+	//
+	// This is an early-out, not the whole guard: the calls below take real
+	// time, so the record can be swapped while one of them is in flight. That
+	// is why every mutation past this point is made through a helper that
+	// takes the record it was decided on and applies nothing if the tracked
+	// entry is no longer that same record.
+	if !c.stillTracking(nodeName, tracked) {
 		return
 	}
 
 	if nodeID == "" {
 		resolved, err := c.resolveNodeID(ctx, nodeName)
 		if err != nil {
-			// Transient: leave the node tracked and try again next tick. The
-			// streak is necessarily still zero, since nothing has been asked
-			// about this VM yet.
-			c.logger.Printf("node fencing: cannot resolve node %s to a VM id yet: %v", nodeName, err)
+			// Transient: leave the node tracked and try again next tick, up to
+			// maxNodeIDResolutionFailures times. The streak is necessarily
+			// still zero, since nothing has been asked about this VM yet.
+			polls, dropped := c.noteUnresolvedNodeID(nodeName, tracked)
+			switch {
+			case polls == 0:
+				// Untracked while the CSINode was being read — the node came
+				// back, or leadership changed. Not ours to count.
+			case dropped:
+				c.logger.Printf("node fencing: node %s could not be resolved to a VM id in %d consecutive polls; "+
+					"dropping it rather than polling for it forever. The last failure was: %v",
+					nodeName, polls, err)
+			default:
+				c.logger.Printf("node fencing: cannot resolve node %s to a VM id yet (attempt %d of %d): %v",
+					nodeName, polls, maxNodeIDResolutionFailures, err)
+			}
 			return
 		}
 		if resolved == "" {
@@ -330,7 +361,7 @@ func (c *Controller) processNode(ctx context.Context, nodeName string) {
 
 		nodeID = resolved
 		c.mu.Lock()
-		if tracked, ok := c.tracked[nodeName]; ok {
+		if current, ok := c.tracked[nodeName]; ok && current == tracked {
 			tracked.nodeID = nodeID
 		}
 		c.mu.Unlock()
@@ -345,7 +376,7 @@ func (c *Controller) processNode(ctx context.Context, nodeName string) {
 		// is the normal condition during exactly the upheaval that brings
 		// anything here. Neither is evidence of a VM being down, and the
 		// remediation for both is an operator, not a fence.
-		c.resetStreak(nodeName, describeStateError(err))
+		c.resetStreak(nodeName, tracked, describeStateError(err))
 		return
 	}
 
@@ -354,21 +385,21 @@ func (c *Controller) processNode(ctx context.Context, nodeName string) {
 		// an error — but a nil answer read as anything but "no" is the one
 		// mistake this package must not make, and the log lines below would
 		// dereference it.
-		c.resetStreak(nodeName, "the state source returned no state and no error")
+		c.resetStreak(nodeName, tracked, "the state source returned no state and no error")
 		return
 	}
 
 	if !ConfirmedNotRunning(state) {
-		c.resetStreak(nodeName, fmt.Sprintf("cluster reports state %s (raw %d, persistentState %t)",
+		c.resetStreak(nodeName, tracked, fmt.Sprintf("cluster reports state %s (raw %d, persistentState %t)",
 			state.State, state.RawState, state.PersistentState))
 		return
 	}
 
-	streak, ok := c.advanceStreak(nodeName)
+	streak, ok := c.advanceStreak(nodeName, tracked)
 	if !ok {
-		// Untracked while the agent was being asked — the node came back, or
-		// leadership changed. Whatever the answer was, it is not ours to act
-		// on any more.
+		// Untracked, or re-tracked as a new record, while the agent was being
+		// asked — the node came back, or leadership changed. Whatever the
+		// answer was, it is not ours to act on any more.
 		return
 	}
 
@@ -414,16 +445,56 @@ func (c *Controller) fence(ctx context.Context, nodeName, nodeID string, state *
 	c.Untrack(nodeName)
 }
 
+// stillTracking reports whether nodeName is still tracked by exactly the
+// record the caller decided on.
+//
+// Identity, not mere presence. A node whose unreachable taint clears and
+// reappears is replaced by a new record with its own firstSeen, and an
+// observation authorized under the old record's elapsed grace period says
+// nothing about the new one — which has not waited out a grace period of its
+// own. Comparing pointers is what keeps the two apart; comparing names cannot.
+func (c *Controller) stillTracking(nodeName string, record *trackedNode) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	current, ok := c.tracked[nodeName]
+	return ok && current == record
+}
+
+// noteUnresolvedNodeID counts one failed CSI node ID resolution against a
+// node's record, dropping the node once maxNodeIDResolutionFailures of them
+// have run consecutively. It answers the running count and whether this call
+// dropped the node; a zero count means the record is no longer the tracked
+// one, so nothing was counted.
+func (c *Controller) noteUnresolvedNodeID(nodeName string, record *trackedNode) (int, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if current, ok := c.tracked[nodeName]; !ok || current != record {
+		return 0, false
+	}
+
+	record.unresolvedPolls++
+	if record.unresolvedPolls < maxNodeIDResolutionFailures {
+		return record.unresolvedPolls, false
+	}
+
+	delete(c.tracked, nodeName)
+	return record.unresolvedPolls, true
+}
+
 // resetStreak zeroes a node's confirmation count, logging why if it had one to
 // lose. A node that has never confirmed anything is the common case and is not
 // worth a line every poll.
-func (c *Controller) resetStreak(nodeName, reason string) {
+//
+// Keyed on the record the reading was taken against, not just the name — see
+// stillTracking for why a streak must never cross from one record to the next.
+func (c *Controller) resetStreak(nodeName string, record *trackedNode, reason string) {
 	c.mu.Lock()
-	tracked, ok := c.tracked[nodeName]
 	had := 0
-	if ok {
-		had = tracked.streak
-		tracked.streak = 0
+	if current, ok := c.tracked[nodeName]; ok && current == record {
+		had = record.streak
+		record.streak = 0
 	}
 	c.mu.Unlock()
 
@@ -434,18 +505,18 @@ func (c *Controller) resetStreak(nodeName, reason string) {
 }
 
 // advanceStreak increments and returns a node's confirmation count, reporting
-// false if the node is no longer tracked.
-func (c *Controller) advanceStreak(nodeName string) (int, bool) {
+// false if the node is no longer tracked under the record the reading was
+// taken against.
+func (c *Controller) advanceStreak(nodeName string, record *trackedNode) (int, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	tracked, ok := c.tracked[nodeName]
-	if !ok {
+	if current, ok := c.tracked[nodeName]; !ok || current != record {
 		return 0, false
 	}
 
-	tracked.streak++
-	return tracked.streak, true
+	record.streak++
+	return record.streak, true
 }
 
 // resolveNodeID maps a Kubernetes node name to this driver's CSI node ID —
@@ -460,7 +531,9 @@ func (c *Controller) advanceStreak(nodeName string) (int, bool) {
 // that case — it is returned as an error like any other Get failure, since it
 // can be as transient as the API-server churn that made the node unreachable
 // in the first place, and the caller retries transient errors rather than
-// dropping the node.
+// dropping the node. It does not retry indefinitely: see
+// maxNodeIDResolutionFailures for where that patience runs out and why
+// running out is safe.
 //
 // A direct Get rather than a second shared informer, deliberately. This runs
 // only for nodes that have been unreachable for longer than the grace period,

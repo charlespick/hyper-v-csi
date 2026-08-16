@@ -42,9 +42,11 @@ type LeaderElectionOptions struct {
 }
 
 // Run elects a leader and, while this replica holds the lease, watches Node
-// objects and fences the ones the cluster confirms are not running. It blocks
-// until ctx is cancelled or leadership is lost, and returns nil only for the
-// former.
+// objects and fences the ones the cluster confirms are not running. Losing the
+// lease is not the end of it: this replica stands for election again and keeps
+// doing so, so the only thing that ends Run is ctx, and it returns nil when
+// that is what happened. A non-nil error means election could not be set up at
+// all and this replica will never fence anything.
 //
 // Leader election is not about correctness of the taint write, which is
 // idempotent and safe under concurrency. It is about the decision: with
@@ -77,6 +79,15 @@ func (c *Controller) Run(ctx context.Context, options LeaderElectionOptions) err
 		return fmt.Errorf("node fencing: building the %s/%s lease lock: %w", options.Namespace, options.LeaseName, err)
 	}
 
+	// A term signals here on its way out. leaderelection starts
+	// OnStartedLeading in a goroutine it never joins and returns from Run as
+	// soon as renewal fails, so without this the next term could begin while
+	// the previous one is still walking the tracked set — two terms deciding
+	// about the same nodes at once, which is the one thing electing a leader
+	// is here to prevent. Buffered so a term that outlives the loop's own exit
+	// never blocks on a send nothing is left to receive.
+	termEnded := make(chan struct{}, 1)
+
 	elector, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
 		Lock:          lock,
 		Name:          options.LeaseName,
@@ -88,7 +99,10 @@ func (c *Controller) Run(ctx context.Context, options LeaderElectionOptions) err
 		// immediately rather than waiting out its full duration.
 		ReleaseOnCancel: true,
 		Callbacks: leaderelection.LeaderCallbacks{
-			OnStartedLeading: c.runAsLeader,
+			OnStartedLeading: func(ctx context.Context) {
+				defer func() { termEnded <- struct{}{} }()
+				c.runAsLeader(ctx)
+			},
 			OnStoppedLeading: func() {
 				c.logger.Printf("node fencing: no longer the leader")
 			},
@@ -108,8 +122,28 @@ func (c *Controller) Run(ctx context.Context, options LeaderElectionOptions) err
 	// actually stop is the usage the leaderelection package itself expects.
 	for ctx.Err() == nil {
 		elector.Run(ctx)
+
+		// Wait out the term before standing again. ReleaseOnCancel means the
+		// lease record this replica just gave up names nobody, so the next
+		// acquire can succeed immediately — early enough to overlap a term
+		// that has not finished unwinding yet.
+		select {
+		case <-termEnded:
+		case <-ctx.Done():
+		}
+
+		if ctx.Err() == nil {
+			// Loud, because between here and winning the lease back nothing is
+			// fencing anything, and a replica that churns through terms this
+			// way looks identical to a healthy one in the logs otherwise.
+			c.logger.Printf("WARNING: node fencing: lost the %s/%s lease; no node will be fenced "+
+				"until this replica or a peer is leading again", options.Namespace, options.LeaseName)
+		}
 	}
-	return ctx.Err()
+
+	// Only ctx ends the loop, and ctx ending is an ordinary shutdown rather
+	// than a failure to report.
+	return nil
 }
 
 // runAsLeader is the loop, and it runs only while this replica is the leader.

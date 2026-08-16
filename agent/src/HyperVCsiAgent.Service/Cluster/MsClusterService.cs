@@ -68,8 +68,23 @@ public sealed class MsClusterService : IClusterService
     private readonly TimeProvider _timeProvider;
 
     private readonly object _resourceNameCacheLock = new();
-    private IReadOnlyDictionary<string, (string ResourceId, string ResourceName)>? _resourceNameByVmId;
+    private IReadOnlyDictionary<string, ResourceNameMatch>? _resourceNameByVmId;
     private DateTimeOffset _resourceNameCacheExpiresAt = DateTimeOffset.MinValue;
+
+    /// <summary>
+    /// One VM ID's entry in the resource-name cache. <see cref="Ambiguity"/> is
+    /// null for the ordinary case and otherwise carries the message describing
+    /// the two resources that claim this VM ID.
+    /// </summary>
+    /// <remarks>
+    /// Recorded per VM rather than thrown while the scan runs, because the scan
+    /// is now shared: throwing out of it would fail whichever caller happened
+    /// to trigger the rebuild, about a VM it never asked for, and would leave
+    /// the cache unpopulated so that every later caller rebuilt and threw
+    /// again. The ambiguity is a fact about one VM ID, so it is stored against
+    /// that VM ID and raised only for the caller asking about it.
+    /// </remarks>
+    private sealed record ResourceNameMatch(string ResourceId, string ResourceName, string? Ambiguity);
 
     public MsClusterService(IOptions<AgentOptions> options, TimeProvider timeProvider, ILogger<MsClusterService> logger)
     {
@@ -97,7 +112,23 @@ public sealed class MsClusterService : IClusterService
             // thing ResolveVmAsync has ever claimed, and a null row reads the
             // same as a blank owner did before, so the throw below still covers
             // both.
-            var owner = ReadResourceStatus(resourceName, deadline, cancellationToken)?.OwnerNode;
+            var status = ReadResourceStatus(resourceName, deadline, cancellationToken);
+            if (status is null)
+            {
+                // The cached name may be up to ResourceNameCacheTtl stale, so
+                // rescan before concluding the impossible - the same reasoning
+                // GetVmClusterStateAsync spells out. A VM gone from the cluster
+                // since the cached scan is this method's null, not its throw.
+                if (FindResourceName(nodeId, cancellationToken, forceRefresh: true) is not { } freshResourceName)
+                {
+                    return null;
+                }
+
+                resourceName = freshResourceName;
+                status = ReadResourceStatus(resourceName, deadline, cancellationToken);
+            }
+
+            var owner = status?.OwnerNode;
 
             if (string.IsNullOrWhiteSpace(owner))
             {
@@ -143,10 +174,28 @@ public sealed class MsClusterService : IClusterService
                 return null;
             }
 
-            if (ReadResourceStatus(resourceName, deadline, cancellationToken) is not { } status)
+            var status = ReadResourceStatus(resourceName, deadline, cancellationToken);
+            if (status is null)
             {
-                // The registry mirror named this resource a moment ago and the
-                // keyed query cannot find it. Ordinarily that is a resource
+                // The name may have come from a scan up to ResourceNameCacheTtl
+                // old, so "the database named it a moment ago" is no longer
+                // self-evident and the throw below would be claiming more than
+                // is known. Rescan and ask again: a VM that has left the
+                // cluster since the cached scan is the ordinary "no such VM"
+                // this method has a null for, not an impossible state.
+                if (FindResourceName(nodeId, cancellationToken, forceRefresh: true) is not { } freshResourceName)
+                {
+                    return null;
+                }
+
+                resourceName = freshResourceName;
+                status = ReadResourceStatus(resourceName, deadline, cancellationToken);
+            }
+
+            if (status is null)
+            {
+                // A resource the registry mirror named just now, that the keyed
+                // query still cannot find. Ordinarily that is a resource
                 // deleted in between, but zero rows is also what an unreadable
                 // cluster and a malformed predicate produce, and none of the
                 // three is an answer about whether a VM is running.
@@ -221,34 +270,52 @@ public sealed class MsClusterService : IClusterService
     /// number of VMs in the cluster, and reuses the result across calls within
     /// <see cref="ResourceNameCacheTtl"/> - see that constant for why.
     /// </summary>
-    private string? FindResourceName(string vmId, CancellationToken cancellationToken) =>
-        GetResourceNameCache(cancellationToken).TryGetValue(vmId, out var match) ? match.ResourceName : null;
+    private string? FindResourceName(string vmId, CancellationToken cancellationToken, bool forceRefresh = false)
+    {
+        if (!GetResourceNameCache(cancellationToken, forceRefresh).TryGetValue(vmId, out var match))
+        {
+            return null;
+        }
+
+        // Raised here rather than during the scan, so that two resources
+        // claiming one VM ID fail only the VM they actually involve - see
+        // ResourceNameMatch.
+        if (match.Ambiguity is { } ambiguity)
+        {
+            throw new InvalidOperationException(ambiguity);
+        }
+
+        return match.ResourceName;
+    }
 
     /// <summary>
     /// The registry scan behind <see cref="FindResourceName"/>, memoized for
     /// <see cref="ResourceNameCacheTtl"/>. Rebuilt wholesale rather than
     /// updated incrementally - the scan itself is the entire cost being
     /// amortized, so a partial refresh would not save anything a full one
-    /// does not already.
+    /// does not already. <paramref name="forceRefresh"/> rescans regardless of
+    /// how fresh the cache is, for a caller that has just been told by the
+    /// cluster itself that the cached answer no longer holds.
     /// </summary>
-    private IReadOnlyDictionary<string, (string ResourceId, string ResourceName)> GetResourceNameCache(
-        CancellationToken cancellationToken)
+    private IReadOnlyDictionary<string, ResourceNameMatch> GetResourceNameCache(
+        CancellationToken cancellationToken, bool forceRefresh)
     {
         lock (_resourceNameCacheLock)
         {
             var now = _timeProvider.GetUtcNow();
-            if (_resourceNameByVmId is { } cached && now < _resourceNameCacheExpiresAt)
+            if (!forceRefresh && _resourceNameByVmId is { } cached && now < _resourceNameCacheExpiresAt)
             {
                 return cached;
             }
 
-            // Tracks the first match rather than throwing on it, so that a
-            // second match - subkey enumeration order under this key is not
-            // meaningful, GUID-named subkeys - is not silently picked over.
+            // Keeps the first match rather than overwriting with the second, so
+            // that a second match - subkey enumeration order under this key is
+            // not meaningful, GUID-named subkeys - is not silently picked over.
             // Every other "should not be possible" state in this class throws
             // rather than guessing; an ambiguous match should not be the
-            // exception.
-            var fresh = new Dictionary<string, (string ResourceId, string ResourceName)>(StringComparer.OrdinalIgnoreCase);
+            // exception, and the recorded Ambiguity is what makes it throw for
+            // the caller that asks about that VM.
+            var fresh = new Dictionary<string, ResourceNameMatch>(StringComparer.OrdinalIgnoreCase);
             foreach (var (resourceId, resourceName, candidateVmId) in EnumerateVmResources(cancellationToken))
             {
                 // Braces are stripped because clustering and the guest's
@@ -260,12 +327,17 @@ public sealed class MsClusterService : IClusterService
                 // silently match nothing.
                 if (fresh.TryGetValue(candidateVmId, out var firstMatch))
                 {
-                    throw new InvalidOperationException(
-                        $"cluster VM resources {firstMatch.ResourceName} ({firstMatch.ResourceId}) and " +
-                        $"{resourceName} ({resourceId}) both have VmID {candidateVmId}, which should not be possible");
+                    fresh[candidateVmId] = firstMatch with
+                    {
+                        Ambiguity =
+                            $"cluster VM resources {firstMatch.ResourceName} ({firstMatch.ResourceId}) and " +
+                            $"{resourceName} ({resourceId}) both have VmID {candidateVmId}, " +
+                            "which should not be possible",
+                    };
+                    continue;
                 }
 
-                fresh[candidateVmId] = (resourceId, resourceName);
+                fresh[candidateVmId] = new ResourceNameMatch(resourceId, resourceName, null);
             }
 
             _resourceNameByVmId = fresh;

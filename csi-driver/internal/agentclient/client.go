@@ -320,6 +320,20 @@ func readAgentError(resp *http.Response, path string) error {
 	return fmt.Errorf("agent returned %s from %s: %s", resp.Status, path, strings.TrimSpace(string(detail)))
 }
 
+// drainBody reads the rest of a response body so its connection goes back to
+// the idle pool rather than being torn down and redialed on the next call.
+//
+// To EOF, and so deliberately uncapped: http.Transport only pools a connection
+// whose body was read to completion, so a capped drain would quietly fail to
+// pool exactly the oversized responses it looked like it was handling. Nothing
+// bounds this but the client's own timeout, which is the right bound — the
+// peer here is one the agent's mutual TLS has already authenticated, and its
+// error bodies are small JSON documents rather than anything a stranger can
+// make arbitrarily long.
+func drainBody(resp *http.Response) {
+	_, _ = io.Copy(io.Discard, resp.Body)
+}
+
 // Healthz calls GET /healthz, the agent's liveness endpoint. It answers with a
 // status code and nothing else, so this reports reachability rather than
 // decoding anything — which is why it doesn't go through do, and why a caller
@@ -349,7 +363,7 @@ func (c *Client) Healthz(ctx context.Context) error {
 
 	// Drained so the connection goes back to the pool rather than being torn
 	// down and redialed on every probe.
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBody))
+	drainBody(resp)
 	return nil
 }
 
@@ -392,13 +406,13 @@ func (c *Client) GetVMClusterState(ctx context.Context, vmID string) (*VMCluster
 	case resp.StatusCode == http.StatusNotFound:
 		// Drained so the connection goes back to the pool rather than being
 		// torn down and redialed on every poll.
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBody))
+		drainBody(resp)
 		return nil, ErrVMClusterResourceNotFound
 	case resp.StatusCode == http.StatusServiceUnavailable:
 		// This is the routine, repeating response while a fencing event is in
 		// progress — draining matters here more than anywhere else in this
 		// file, since it recurs every poll for the duration of the outage.
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBody))
+		drainBody(resp)
 		return nil, ErrClusterUnavailable
 	case resp.StatusCode >= 300:
 		return nil, readAgentError(resp, req.URL.Path)

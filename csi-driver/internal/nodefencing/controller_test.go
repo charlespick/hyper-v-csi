@@ -375,6 +375,36 @@ func TestKeepsTrackingNodeWhenCSINodeObjectIsTransientlyMissing(t *testing.T) {
 	}
 }
 
+// Retrying a missing CSINode is patience, not a promise. A node whose CSINode
+// never appears — the driver was removed from it, or it was decommissioned
+// with its Node object left behind — has to stop being polled eventually
+// rather than be retried for the life of the process.
+func TestDropsNodeWhoseCSINodeNeverAppears(t *testing.T) {
+	states := &fakeStateSource{responses: []stateResponse{notRunning()}}
+	h := newHarness(t, states, unreachableNode(testNodeName))
+
+	h.controller.ObserveNode(unreachableNode(testNodeName))
+	h.pastGrace()
+
+	h.poll(maxNodeIDResolutionFailures - 1)
+	if tracked := h.controller.TrackedNodes(); len(tracked) != 1 {
+		t.Fatalf("node was dropped after %d unresolved polls; %d are allowed, got %v",
+			maxNodeIDResolutionFailures-1, maxNodeIDResolutionFailures, tracked)
+	}
+
+	h.poll(1)
+	if tracked := h.controller.TrackedNodes(); len(tracked) != 0 {
+		t.Fatalf("node still tracked after %d consecutive unresolved polls: %v",
+			maxNodeIDResolutionFailures, tracked)
+	}
+	if h.fenced(t, testNodeName) {
+		t.Fatal("a node that never resolved to a VM id was fenced")
+	}
+	if states.callCount() != 0 {
+		t.Fatalf("the agent was asked about a node with no resolvable VM id (%d calls)", states.callCount())
+	}
+}
+
 func TestUntracksWhenUnreachableTaintClears(t *testing.T) {
 	states := &fakeStateSource{responses: []stateResponse{notRunning()}}
 	h := newHarness(t, states, unreachableNode(testNodeName), csiNode(testNodeName, testDriverName, testVMID))
@@ -573,6 +603,9 @@ func TestNewRejectsMissingDependencies(t *testing.T) {
 		{"no driver name", Config{KubeClient: kube, ClusterStates: states}},
 		{"negative grace period", Config{KubeClient: kube, ClusterStates: states, DriverName: testDriverName, GracePeriod: ptr.To(-time.Second)}},
 		{"negative poll interval", Config{KubeClient: kube, ClusterStates: states, DriverName: testDriverName, PollInterval: ptr.To(-time.Second)}},
+		// Unlike the other two, a zero here has no meaning to honour: it goes
+		// straight to a ticker that panics on it.
+		{"zero poll interval", Config{KubeClient: kube, ClusterStates: states, DriverName: testDriverName, PollInterval: ptr.To(time.Duration(0))}},
 		{"negative confirmations", Config{KubeClient: kube, ClusterStates: states, DriverName: testDriverName, Confirmations: ptr.To(-1)}},
 	}
 
@@ -609,13 +642,14 @@ func TestNewDefaultsTheTunables(t *testing.T) {
 	}
 }
 
+// PollInterval is not in here: it is the one tunable a zero cannot be honoured
+// for, and TestNewRejectsMissingDependencies covers it being refused instead.
 func TestNewHonorsAnExplicitZero(t *testing.T) {
 	controller, err := New(Config{
 		KubeClient:    fake.NewSimpleClientset(),
 		ClusterStates: &fakeStateSource{},
 		DriverName:    testDriverName,
 		GracePeriod:   ptr.To(time.Duration(0)),
-		PollInterval:  ptr.To(time.Duration(0)),
 		Confirmations: ptr.To(0),
 	})
 	if err != nil {
@@ -624,9 +658,6 @@ func TestNewHonorsAnExplicitZero(t *testing.T) {
 
 	if controller.gracePeriod != 0 {
 		t.Errorf("gracePeriod = %s, want 0 (an explicit zero must not be replaced by the default)", controller.gracePeriod)
-	}
-	if controller.pollInterval != 0 {
-		t.Errorf("pollInterval = %s, want 0 (an explicit zero must not be replaced by the default)", controller.pollInterval)
 	}
 	if controller.confirmations != 0 {
 		t.Errorf("confirmations = %d, want 0 (an explicit zero must not be replaced by the default)", controller.confirmations)
