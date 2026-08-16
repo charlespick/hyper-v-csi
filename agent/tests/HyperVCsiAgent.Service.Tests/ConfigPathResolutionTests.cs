@@ -1,5 +1,8 @@
 using System.Net;
+using HyperVCsiAgent.Core.Configuration;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 
 namespace HyperVCsiAgent.Service.Tests;
 
@@ -50,6 +53,41 @@ public sealed class ConfigPathResolutionTests : IDisposable
         var response = await client.GetAsync("/healthz");
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [Fact]
+    public void ConfigFile_DoesNotOutrankSettingsTheHostWasStartedWith()
+    {
+        // The rest of this project's tests point the agent at a temp directory
+        // with UseSetting. When the config file outranked those, every one of
+        // them silently ran against whatever CSV the installed node's
+        // C:\ProgramData\HyperVCsiAgent\agent.config.json names - passing in CI
+        // only because CI has no installed config to find.
+        var fileRoot = Path.Combine(_root, "from-file");
+        var settingRoot = Path.Combine(_root, "from-setting");
+        var configPath = Path.Combine(_root, "agent.config.json");
+        File.WriteAllText(configPath, $$"""
+            {
+              "Agent": {
+                "CsvVolumesRoot": {{System.Text.Json.JsonSerializer.Serialize(fileRoot)}},
+                "CsvSnapshotsRoot": {{System.Text.Json.JsonSerializer.Serialize(Path.Combine(fileRoot, "snapshots"))}}
+              }
+            }
+            """);
+
+        using var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
+        {
+            builder.UseSetting("config", configPath);
+            builder.UseSetting("Agent:CsvVolumesRoot", settingRoot);
+        });
+
+        var options = factory.Services.GetRequiredService<IOptions<AgentOptions>>().Value;
+
+        Assert.Equal(settingRoot, options.CsvVolumesRoot);
+
+        // ...while the file still supplies everything the host was not started
+        // with, which is the whole point of it outranking appsettings.json.
+        Assert.Equal(Path.Combine(fileRoot, "snapshots"), options.CsvSnapshotsRoot);
     }
 
     [Fact]

@@ -9,6 +9,8 @@ using HyperVCsiAgent.Service.Cluster;
 using HyperVCsiAgent.Service.HostControl;
 using HyperVCsiAgent.Service.Security;
 using HyperVCsiAgent.Service.Storage;
+using Microsoft.Extensions.Configuration.CommandLine;
+using Microsoft.Extensions.Configuration.Json;
 using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -28,17 +30,39 @@ builder.Services.AddWindowsService(options => options.ServiceName = "hyperv-csi-
 // the file on the node that currently owns the role, fail over onto it, and
 // only touch the other node once the change is proven. --config overrides the
 // default path for dev/test, where each profile already names its own file.
-// Added last so it wins over the built-in sources. The default path is
-// optional - the installer writes it before the service ever starts, but
-// a host with nothing installed yet (or a test host driving Agent:* settings
-// through other configuration sources entirely) should not fail here just
-// because nothing has been installed. An explicit --config is a deliberate
-// choice of file, so a typo there still fails loudly instead of silently
-// falling through to defaults.
+// It goes above the app's own appsettings.json and environment defaults, but
+// below the per-invocation overrides - command-line arguments, and the chained
+// host configuration a test host injects its settings through. Appending it
+// last would put the installed node's file above those instead, which is how
+// the endpoint tests ended up running against this node's real CSV on any host
+// where the agent happens to be installed, rather than the temp directory they
+// asked for. The default path is optional - the installer writes it before the
+// service ever starts, but a host with nothing installed yet (or a test host
+// driving Agent:* settings through other configuration sources entirely)
+// should not fail here just because nothing has been installed. An explicit
+// --config is a deliberate choice of file, so a typo there still fails loudly
+// instead of silently falling through to defaults.
 var explicitConfigPath = builder.Configuration["config"];
 var configPath = explicitConfigPath
     ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "HyperVCsiAgent", "agent.config.json");
-builder.Configuration.AddJsonFile(Path.GetFullPath(configPath), optional: explicitConfigPath is null, reloadOnChange: false);
+var configSource = new JsonConfigurationSource
+{
+    Path = Path.GetFullPath(configPath),
+    Optional = explicitConfigPath is null,
+    ReloadOnChange = false,
+};
+configSource.ResolveFileProvider();
+configSource.EnsureDefaults(builder.Configuration);
+
+var configSources = builder.Configuration.Sources;
+var configFileIndex = configSources.Count;
+while (configFileIndex > 0
+    && configSources[configFileIndex - 1] is CommandLineConfigurationSource or ChainedConfigurationSource)
+{
+    configFileIndex--;
+}
+
+configSources.Insert(configFileIndex, configSource);
 
 // Bound once and shared: Kestrel has to be configured before the container
 // exists, so binding a second copy for it would let the startup guards below
