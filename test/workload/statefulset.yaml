@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: workload-postgres
+  namespace: csi-workload-test
+  labels:
+    app: workload-postgres
+spec:
+  serviceName: workload-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: workload-postgres
+  template:
+    metadata:
+      labels:
+        app: workload-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          env:
+            - name: POSTGRES_PASSWORD
+              value: workload
+            - name: POSTGRES_DB
+              value: workload
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+              name: postgres
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+        - name: workload
+          image: postgres:16
+          command: ["/bin/sh", "/scripts/workload.sh"]
+          env:
+            - name: POSTGRES_PASSWORD
+              value: workload
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: workload-scripts
+            defaultMode: 0755
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: hyperv-csi
+        resources:
+          requests:
+            storage: 5Gi

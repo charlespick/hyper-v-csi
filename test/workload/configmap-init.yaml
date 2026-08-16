@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: workload-scripts
+  namespace: csi-workload-test
+data:
+  init.sql: |
+    CREATE TABLE IF NOT EXISTS heartbeat (
+      id BIGSERIAL PRIMARY KEY,
+      ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+      source TEXT NOT NULL
+    );
+
+  workload.sh: |
+    #!/bin/sh
+    set -eu
+    export PGPASSWORD="$POSTGRES_PASSWORD"
+
+    until pg_isready -h localhost -U postgres >/dev/null 2>&1; do sleep 1; done
+    psql -h localhost -U postgres -d workload -v ON_ERROR_STOP=1 -f /scripts/init.sql
+
+    # -i drops and rebuilds the pgbench_* tables, so only run it once — on a
+    # pod restart against an already-initialized PV this would wipe pgbench's
+    # own tables (not heartbeat, which is untouched either way).
+    if ! psql -h localhost -U postgres -d workload -tAc \
+        "SELECT to_regclass('public.pgbench_accounts')" | grep -q pgbench_accounts; then
+      pgbench -h localhost -U postgres -d workload -i -s 5
+    fi
+
+    # Heartbeat: one row every 2s. This is the forensic timeline — see
+    # verify.sh. The row before a gap is roughly the snapshot point; the row
+    # after is when this (possibly restored) instance resumed writing.
+    (
+      while true; do
+        psql -h localhost -U postgres -d workload -c \
+          "INSERT INTO heartbeat (source) VALUES ('$(hostname)');" >/dev/null
+        sleep 2
+      done
+    ) &
+
+    # Realistic randomized read/write IO against the pgbench dataset, rate
+    # limited to look like modest production traffic rather than a stress
+    # test. Runs in 60s bursts so a slow network blip doesn't wedge the loop.
+    while true; do
+      pgbench -h localhost -U postgres -d workload -c 4 -j 2 -T 60 -R 20 || true
+    done
