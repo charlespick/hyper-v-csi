@@ -57,6 +57,21 @@ type LeaderElectionOptions struct {
 // event — the thing that has to be reconstructible afterwards — ambiguous
 // about which replica actually decided what. Every sidecar in this deployment
 // already elects; this is the same reasoning.
+//
+// Known and accepted: two replicas can still overlap briefly across a
+// shutdown. ReleaseOnCancel clears the lease holder as soon as renewal stops,
+// which is one API write, while the outgoing term still has to drain workers
+// that may be waiting on an agent round trip — so a peer can win the lease and
+// begin its own term inside that gap. The overlap is bounded by the agent
+// client's own timeout, and it cannot produce a wrong taint: both replicas
+// re-check the unreachable taint against a freshly read node inside
+// applyOutOfServiceTaint's retry closure, and the write is idempotent, so the
+// second one finds the taint already there. What it costs is duplicate agent
+// load and a moment of ambiguity in the logs. Closing it would mean giving up
+// ReleaseOnCancel, and with it the fast failover that lets a surviving replica
+// pick up fencing promptly, or adding a drain barrier before release — both
+// real trades rather than corrections, and neither worth making for a window
+// that cannot fence the wrong node.
 func (c *Controller) Run(ctx context.Context, options LeaderElectionOptions) error {
 	if options.Namespace == "" {
 		return errors.New("node fencing: a lease namespace is required for leader election")
