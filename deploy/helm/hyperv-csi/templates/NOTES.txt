@@ -52,6 +52,24 @@ and the VHDX behind, to be removed by hand. DeleteVolume is implemented — set
 storageClass.reclaimPolicy=Delete once you have seen it succeed against your
 own hosts.
 {{- end }}
+{{- if .Values.controller.nodeFencing.enabled }}
+
+Node fencing is enabled. When a node goes unreachable and the Hyper-V cluster
+confirms its VM is not running anywhere, the driver applies
+node.kubernetes.io/out-of-service to that Node, which is what lets Kubernetes
+force-delete the stranded pods and detach their volumes.
+
+The one thing to know operationally: the driver applies that taint and never
+removes it. Clearing it is a manual step during node recovery —
+
+  kubectl taint nodes <node> node.kubernetes.io/out-of-service-
+
+Until you run it, a node that has recovered and is otherwise healthy stays
+out-of-service and will not run pods. This is deliberate: removing the taint
+while volumes are still detaching would undo the thing it was applied for.
+
+  kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints
+{{- end }}
 {{- if .Values.agent.allowInsecure }}
 
 WARNING: agent.allowInsecure is set. The connection to the agent has no TLS and

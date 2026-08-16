@@ -22,6 +22,14 @@ metadata:
 # own node ID - both already permitted by the attacher role below, but
 # declared again here because this need is the driver's own and does not
 # depend on external-attacher being deployed.
+#
+# Node fencing, when enabled, adds something of a different kind to this role.
+# The two rules above are reads of storage objects; the nodes rule below is a
+# write onto a core object outside storage, and its effect is to make
+# Kubernetes force-delete pods and detach their disks. It is rendered only when
+# controller.nodeFencing.enabled is set, for the same reason the snapshotter
+# role below is conditional — an install that has not opted in should not be
+# carrying a standing grant to write to every Node in the cluster.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -32,9 +40,32 @@ rules:
   - apiGroups: ["storage.k8s.io"]
     resources: ["volumeattachments"]
     verbs: ["get", "list", "watch"]
+  # Also how node fencing turns a tainted node into this driver's VM ID, so it
+  # needs nothing added when fencing is on.
   - apiGroups: ["storage.k8s.io"]
     resources: ["csinodes"]
     verbs: ["get", "list", "watch"]
+  {{- if .Values.controller.nodeFencing.enabled }}
+  # get/list/watch feed the Node informer that spots the unreachable:NoExecute
+  # taint. update is what writes node.kubernetes.io/out-of-service back.
+  #
+  # It has to be update, not patch, and this is not the usual "we were lazy"
+  # case — do not tighten it. NodeSpec.Taints is +listType=atomic with no
+  # patchStrategy and no patchMergeKey, so a strategic-merge patch against it
+  # does not merge, it replaces the whole list. A patch built from a node read
+  # a moment earlier would silently delete any taint another controller added
+  # in between: an autoscaler's NoSchedule, a kubelet pressure taint, an
+  # operator's drain marker. The driver therefore applies the taint with a
+  # read-append-update under retry.RetryOnConflict, whose failure mode is the
+  # benign one — a conflict re-reads and lands the append on top of the other
+  # writer's version, so both taints survive. See applyOutOfServiceTaint in
+  # csi-driver/internal/nodefencing/taint.go.
+  #
+  # No nodes/status: taints live in spec, not status.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "update"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -262,6 +293,12 @@ roleRef:
 # VolumeSnapshotContent. Every sidecar runs with the same ServiceAccount, so
 # the snapshotter is covered by this binding as soon as it is deployed; there
 # is nothing to switch on here.
+#
+# The driver container elects here too when node fencing is enabled, on its own
+# lease (controller.nodeFencing, and --node-fencing-lease-name to rename it).
+# get/create/update are what client-go's Lease resourcelock actually calls, and
+# they are already granted above, so that switch needs nothing added here
+# either.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

@@ -132,6 +132,62 @@ controller:
     timeout: 30s
     extraArgs: []
 
+  # Node fencing. Off by default, and this is the one switch in this chart that
+  # grants the driver a write over an object outside storage: when a node stops
+  # being reachable and the Hyper-V cluster confirms its VM is not running
+  # anywhere, the driver applies node.kubernetes.io/out-of-service to the Node.
+  # That taint is what lets Kubernetes force-delete pods stranded on a dead node
+  # and detach their volumes — without it a pod sits Terminating forever,
+  # because the kubelet that would confirm teardown is on the node that died,
+  # and a StatefulSet never gets its replacement for that ordinal.
+  #
+  # What the decision rests on is worth understanding before turning this on.
+  # The confirmation comes from Windows Failover Clustering's own quorum-backed
+  # answer that the VM's cluster resource is not online on any node. That is
+  # cluster *consensus*, not a hardware guarantee: quorum reliably decides who
+  # is *allowed* to run the VM, but whether a partitioned host actually stopped
+  # executing depends on real fencing underneath — BMC/iDRAC/iLO power fencing,
+  # or Storage Spaces Direct's poison-pill self-fencing. With that underneath,
+  # "the cluster says nobody owns it" is a strong signal; without it, it is an
+  # assumption, and the cost of it being wrong is the double-mount this whole
+  # design exists to avoid.
+  #
+  # Enabling this also grants the driver's ClusterRole get/list/watch/update on
+  # nodes, which is a new privilege category for this chart — see rbac.yaml.
+  #
+  # The taint is applied and never removed. Clearing it is a manual step during
+  # node recovery (kubectl taint nodes <node> node.kubernetes.io/out-of-service-)
+  # and a recovered, healthy node stays out-of-service until someone does.
+  nodeFencing:
+    enabled: false
+
+    # How long a node must hold the unreachable:NoExecute taint before the
+    # driver starts asking the cluster about it at all. This is the window for
+    # ordinary disruption to resolve itself — a brief network partition, a
+    # kubelet restart, a node rebooting — without anything being fenced.
+    gracePeriod: 2m
+
+    # How often the cluster is asked about a node past its grace period. Each
+    # poll is one keyed WQL query against the local cluster database mirror,
+    # measured in single-digit milliseconds and answered without contacting the
+    # owning host, so this is cheap; it is kept modest because nothing here is
+    # urgent enough to be worth a tighter loop.
+    pollInterval: 30s
+
+    # How many consecutive confirmations are required before the taint is
+    # applied. This is not belt-and-braces — it is load-bearing. A genuinely
+    # broken VM does not settle: with the cluster's own restart policy retrying
+    # it, the resource cycles Failed -> OnlinePending -> OfflinePending ->
+    # Failed for minutes on end, and a healthy VM reads Offline for a fraction
+    # of a second in the middle of an ordinary live migration. The streak is
+    # state-gated, not merely time-gated: only a terminal reading advances it,
+    # and any other reading — a pending state, an unrecognised one, or an error
+    # asking at all — resets it to zero. So this many confirmations means this
+    # many *uninterrupted* ones, and raising it buys certainty at the cost of
+    # confirmations * pollInterval extra delay before a genuinely dead node is
+    # released.
+    confirmations: 5
+
   resources:
     requests:
       cpu: 10m
