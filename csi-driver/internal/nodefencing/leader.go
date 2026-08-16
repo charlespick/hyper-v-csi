@@ -77,8 +77,6 @@ func (c *Controller) Run(ctx context.Context, options LeaderElectionOptions) err
 		return fmt.Errorf("node fencing: building the %s/%s lease lock: %w", options.Namespace, options.LeaseName, err)
 	}
 
-	lostLeadership := false
-
 	elector, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
 		Lock:          lock,
 		Name:          options.LeaseName,
@@ -92,7 +90,6 @@ func (c *Controller) Run(ctx context.Context, options LeaderElectionOptions) err
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: c.runAsLeader,
 			OnStoppedLeading: func() {
-				lostLeadership = ctx.Err() == nil
 				c.logger.Printf("node fencing: no longer the leader")
 			},
 		},
@@ -103,10 +100,14 @@ func (c *Controller) Run(ctx context.Context, options LeaderElectionOptions) err
 
 	c.logger.Printf("node fencing: standing for election on lease %s/%s as %s",
 		options.Namespace, options.LeaseName, options.Identity)
-	elector.Run(ctx)
 
-	if lostLeadership {
-		return errors.New("node fencing: lost the leader lease")
+	// elector.Run returns as soon as this replica stops leading or fails to
+	// acquire the lease, not only when ctx is cancelled — a lease renewal
+	// that misses its deadline for a transient reason (an API server hiccup)
+	// would otherwise end election for good. Re-entering it until ctx says to
+	// actually stop is the usage the leaderelection package itself expects.
+	for ctx.Err() == nil {
+		elector.Run(ctx)
 	}
 	return ctx.Err()
 }

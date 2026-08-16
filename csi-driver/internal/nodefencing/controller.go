@@ -10,7 +10,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/clock"
@@ -55,11 +54,17 @@ type Config struct {
 	// within roughly 40s of a node going NotReady, which an ordinary guest
 	// reboot or a slow live migration also produces, so the first read is
 	// deliberately not taken the moment the taint appears.
-	GracePeriod time.Duration
+	//
+	// Nil means "use DefaultGracePeriod". A pointer, not a bare zero value, so
+	// an explicit zero can be told apart from "not set" — a bare
+	// time.Duration cannot distinguish the two, and would otherwise silently
+	// discard a caller's deliberate zero in favor of the default.
+	GracePeriod *time.Duration
 
 	// PollInterval is how often the tracked set is walked once nodes in it are
-	// past their grace period.
-	PollInterval time.Duration
+	// past their grace period. Nil means "use DefaultPollInterval"; see
+	// GracePeriod for why this is a pointer.
+	PollInterval *time.Duration
 
 	// Confirmations is how many *consecutive* readings must satisfy
 	// ConfirmedNotRunning before the node is fenced. Any other observation —
@@ -69,7 +74,10 @@ type Config struct {
 	// policy, so a single Failed reading means "not online at this instant",
 	// not "the cluster gave up"; requiring a run of them is what separates the
 	// two. A timer alone would not.
-	Confirmations int
+	//
+	// Nil means "use DefaultConfirmations"; see GracePeriod for why this is a
+	// pointer.
+	Confirmations *int
 
 	// Clock is injectable so tests need no real time. Defaults to the real one.
 	Clock clock.WithTicker
@@ -127,36 +135,36 @@ func New(config Config) (*Controller, error) {
 	if config.DriverName == "" {
 		return nil, errors.New("node fencing: a driver name is required")
 	}
-	if config.GracePeriod < 0 {
-		return nil, fmt.Errorf("node fencing: grace period %s must not be negative", config.GracePeriod)
+	if config.GracePeriod != nil && *config.GracePeriod < 0 {
+		return nil, fmt.Errorf("node fencing: grace period %s must not be negative", *config.GracePeriod)
 	}
-	if config.PollInterval < 0 {
-		return nil, fmt.Errorf("node fencing: poll interval %s must not be negative", config.PollInterval)
+	if config.PollInterval != nil && *config.PollInterval < 0 {
+		return nil, fmt.Errorf("node fencing: poll interval %s must not be negative", *config.PollInterval)
 	}
-	if config.Confirmations < 0 {
-		return nil, fmt.Errorf("node fencing: confirmation count %d must not be negative", config.Confirmations)
+	if config.Confirmations != nil && *config.Confirmations < 0 {
+		return nil, fmt.Errorf("node fencing: confirmation count %d must not be negative", *config.Confirmations)
 	}
 
 	controller := &Controller{
 		kube:          config.KubeClient,
 		states:        config.ClusterStates,
 		driverName:    config.DriverName,
-		gracePeriod:   config.GracePeriod,
-		pollInterval:  config.PollInterval,
-		confirmations: config.Confirmations,
+		gracePeriod:   DefaultGracePeriod,
+		pollInterval:  DefaultPollInterval,
+		confirmations: DefaultConfirmations,
 		clock:         config.Clock,
 		logger:        config.Logger,
 		tracked:       map[string]*trackedNode{},
 	}
 
-	if controller.gracePeriod == 0 {
-		controller.gracePeriod = DefaultGracePeriod
+	if config.GracePeriod != nil {
+		controller.gracePeriod = *config.GracePeriod
 	}
-	if controller.pollInterval == 0 {
-		controller.pollInterval = DefaultPollInterval
+	if config.PollInterval != nil {
+		controller.pollInterval = *config.PollInterval
 	}
-	if controller.confirmations == 0 {
-		controller.confirmations = DefaultConfirmations
+	if config.Confirmations != nil {
+		controller.confirmations = *config.Confirmations
 	}
 	if controller.clock == nil {
 		controller.clock = clock.RealClock{}
@@ -232,20 +240,47 @@ func (c *Controller) TrackedNodes() []string {
 	return names
 }
 
-// ProcessOnce walks the whole tracked set once. This is one pass of a single
-// ticker rather than a goroutine per node: the set is small, every entry wants
-// the same cadence, and a goroutine per node would make the confirmation
-// streaks impossible to reason about across a leadership change.
+// maxConcurrentPolls bounds how many nodes ProcessOnce asks the agent about at
+// once. A host failure is exactly the case that puts many nodes into the
+// tracked set at the same time, and polling them one at a time would stretch
+// a single pass past PollInterval; each node's own bookkeeping is already
+// serialized through c.mu, so nothing about running several at once is unsafe
+// — it only needs a cap so one pass cannot open an unbounded number of
+// connections to the agent.
+const maxConcurrentPolls = 8
+
+// ProcessOnce walks the whole tracked set once, polling up to
+// maxConcurrentPolls nodes concurrently. This is one pass of a single ticker
+// rather than a goroutine per node that outlives it: every launched goroutine
+// is joined before ProcessOnce returns, so from the ticker loop's point of
+// view a pass is still a single, bounded unit of work.
 func (c *Controller) ProcessOnce(ctx context.Context) {
 	// Snapshot the names first so nothing holds the lock across an API call or
 	// an agent round trip, and so a node untracked mid-pass by the informer is
 	// simply not found when its turn comes.
-	for _, nodeName := range c.TrackedNodes() {
-		if ctx.Err() != nil {
-			return
+	nodeNames := c.TrackedNodes()
+
+	sem := make(chan struct{}, maxConcurrentPolls)
+	var wg sync.WaitGroup
+
+nodes:
+	for _, nodeName := range nodeNames {
+		nodeName := nodeName
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			break nodes
 		}
-		c.processNode(ctx, nodeName)
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			c.processNode(ctx, nodeName)
+		}()
 	}
+
+	wg.Wait()
 }
 
 func (c *Controller) processNode(ctx context.Context, nodeName string) {
@@ -259,6 +294,21 @@ func (c *Controller) processNode(ctx context.Context, nodeName string) {
 	c.mu.Unlock()
 
 	if c.clock.Since(firstSeen) < c.gracePeriod {
+		return
+	}
+
+	// The informer's Untrack/track run concurrently with this call rather
+	// than being serialized against it. If this node's unreachable taint
+	// cleared and reappeared since the snapshot above — replacing this
+	// node's tracked record with a new one of its own, later firstSeen — the
+	// grace-period check just passed used a stale record's expired window,
+	// not the current record's. Confirm the record is still the one just
+	// checked before asking the agent on the strength of it.
+	c.mu.Lock()
+	current, stillTracked := c.tracked[nodeName]
+	sameRecord := stillTracked && current == tracked
+	c.mu.Unlock()
+	if !sameRecord {
 		return
 	}
 
@@ -404,9 +454,13 @@ func (c *Controller) advanceStreak(nodeName string) (int, bool) {
 // or not the node or its guest OS can still be reached, which is the entire
 // reason this path does not go anywhere near the node itself.
 //
-// Empty string with a nil error means "no entry for this driver": either the
-// CSINode object is gone or it registers other drivers only. Either way the
-// node is not ours and the caller drops it.
+// Empty string with a nil error means "no entry for this driver": the
+// CSINode object exists but registers other drivers only, so the node is not
+// ours and the caller drops it. A missing CSINode object is not folded into
+// that case — it is returned as an error like any other Get failure, since it
+// can be as transient as the API-server churn that made the node unreachable
+// in the first place, and the caller retries transient errors rather than
+// dropping the node.
 //
 // A direct Get rather than a second shared informer, deliberately. This runs
 // only for nodes that have been unreachable for longer than the grace period,
@@ -426,9 +480,6 @@ func (c *Controller) advanceStreak(nodeName string) (int, bool) {
 func (c *Controller) resolveNodeID(ctx context.Context, nodeName string) (string, error) {
 	csiNode, err := c.kube.StorageV1().CSINodes().Get(ctx, nodeName, metav1.GetOptions{})
 	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return "", nil
-		}
 		return "", fmt.Errorf("reading CSINode %s: %w", nodeName, err)
 	}
 

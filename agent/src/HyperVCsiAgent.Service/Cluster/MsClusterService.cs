@@ -51,12 +51,30 @@ public sealed class MsClusterService : IClusterService
     /// </summary>
     private const string VirtualMachineResourceType = "Virtual Machine";
 
+    /// <summary>
+    /// How long <see cref="FindResourceName"/>'s registry scan is reused before
+    /// being repeated. Node fencing turned this from a bursty, per-attach call
+    /// into a steady poll - one call per tracked node every PollInterval - and a
+    /// single host failure is exactly the scenario that tracks many nodes at
+    /// once, so calls for different VMs landing within this window now share
+    /// one scan instead of each re-walking every resource in the cluster.
+    /// Short enough that a VM added to or removed from the cluster is never
+    /// stale for more than one poll's worth of callers.
+    /// </summary>
+    private static readonly TimeSpan ResourceNameCacheTtl = TimeSpan.FromSeconds(5);
+
     private readonly ILogger<MsClusterService> _logger;
     private readonly TimeSpan _hostOperationTimeout;
+    private readonly TimeProvider _timeProvider;
 
-    public MsClusterService(IOptions<AgentOptions> options, ILogger<MsClusterService> logger)
+    private readonly object _resourceNameCacheLock = new();
+    private IReadOnlyDictionary<string, (string ResourceId, string ResourceName)>? _resourceNameByVmId;
+    private DateTimeOffset _resourceNameCacheExpiresAt = DateTimeOffset.MinValue;
+
+    public MsClusterService(IOptions<AgentOptions> options, TimeProvider timeProvider, ILogger<MsClusterService> logger)
     {
         _logger = logger;
+        _timeProvider = timeProvider;
         _hostOperationTimeout = options.Value.HostOperationTimeout;
     }
 
@@ -200,43 +218,60 @@ public sealed class MsClusterService : IClusterService
     /// Finds the cluster resource for a VM by its ID, returning the resource's
     /// name. Reads the local mirror of the cluster database rather than querying
     /// WMI, because this is the step whose cost would otherwise grow with the
-    /// number of VMs in the cluster.
+    /// number of VMs in the cluster, and reuses the result across calls within
+    /// <see cref="ResourceNameCacheTtl"/> - see that constant for why.
     /// </summary>
-    private string? FindResourceName(string vmId, CancellationToken cancellationToken)
+    private string? FindResourceName(string vmId, CancellationToken cancellationToken) =>
+        GetResourceNameCache(cancellationToken).TryGetValue(vmId, out var match) ? match.ResourceName : null;
+
+    /// <summary>
+    /// The registry scan behind <see cref="FindResourceName"/>, memoized for
+    /// <see cref="ResourceNameCacheTtl"/>. Rebuilt wholesale rather than
+    /// updated incrementally - the scan itself is the entire cost being
+    /// amortized, so a partial refresh would not save anything a full one
+    /// does not already.
+    /// </summary>
+    private IReadOnlyDictionary<string, (string ResourceId, string ResourceName)> GetResourceNameCache(
+        CancellationToken cancellationToken)
     {
-        // Tracks the first match rather than returning on it, so that a second
-        // match - subkey enumeration order under this key is not meaningful,
-        // GUID-named subkeys - is not silently picked over. Every other
-        // "should not be possible" state below throws rather than guessing;
-        // an ambiguous match should not be the exception.
-        string? firstMatchResourceName = null;
-        string? firstMatchResourceId = null;
-
-        foreach (var (resourceId, resourceName, candidateVmId) in EnumerateVmResources(cancellationToken))
+        lock (_resourceNameCacheLock)
         {
-            // Braces are stripped because clustering and the guest's key-value
-            // pools do not agree on whether to include them, and the comparison
-            // is case-insensitive because neither agrees on case either. Doing
-            // this in memory is also why the match is not a WQL predicate: WQL
-            // compares case-insensitively but does not tolerate braces, so a
-            // braced value in the database would silently match nothing.
-            if (!string.Equals(candidateVmId, vmId, StringComparison.OrdinalIgnoreCase))
+            var now = _timeProvider.GetUtcNow();
+            if (_resourceNameByVmId is { } cached && now < _resourceNameCacheExpiresAt)
             {
-                continue;
+                return cached;
             }
 
-            if (firstMatchResourceName is not null)
+            // Tracks the first match rather than throwing on it, so that a
+            // second match - subkey enumeration order under this key is not
+            // meaningful, GUID-named subkeys - is not silently picked over.
+            // Every other "should not be possible" state in this class throws
+            // rather than guessing; an ambiguous match should not be the
+            // exception.
+            var fresh = new Dictionary<string, (string ResourceId, string ResourceName)>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (resourceId, resourceName, candidateVmId) in EnumerateVmResources(cancellationToken))
             {
-                throw new InvalidOperationException(
-                    $"cluster VM resources {firstMatchResourceName} ({firstMatchResourceId}) and {resourceName} " +
-                    $"({resourceId}) both have VmID {vmId}, which should not be possible");
+                // Braces are stripped because clustering and the guest's
+                // key-value pools do not agree on whether to include them, and
+                // the comparison is case-insensitive because neither agrees on
+                // case either. Doing this in memory is also why the match is
+                // not a WQL predicate: WQL compares case-insensitively but does
+                // not tolerate braces, so a braced value in the database would
+                // silently match nothing.
+                if (fresh.TryGetValue(candidateVmId, out var firstMatch))
+                {
+                    throw new InvalidOperationException(
+                        $"cluster VM resources {firstMatch.ResourceName} ({firstMatch.ResourceId}) and " +
+                        $"{resourceName} ({resourceId}) both have VmID {candidateVmId}, which should not be possible");
+                }
+
+                fresh[candidateVmId] = (resourceId, resourceName);
             }
 
-            firstMatchResourceName = resourceName;
-            firstMatchResourceId = resourceId;
+            _resourceNameByVmId = fresh;
+            _resourceNameCacheExpiresAt = now + ResourceNameCacheTtl;
+            return fresh;
         }
-
-        return firstMatchResourceName;
     }
 
     /// <summary>

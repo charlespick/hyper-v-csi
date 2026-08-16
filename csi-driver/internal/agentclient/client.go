@@ -313,6 +313,13 @@ func (c *Client) GetJob(ctx context.Context, jobID string) (*Job, error) {
 	return c.do(req)
 }
 
+// readAgentError drains a capped portion of resp.Body and formats it as the
+// error every non-2xx response in this file is reported with.
+func readAgentError(resp *http.Response, path string) error {
+	detail, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
+	return fmt.Errorf("agent returned %s from %s: %s", resp.Status, path, strings.TrimSpace(string(detail)))
+}
+
 // Healthz calls GET /healthz, the agent's liveness endpoint. It answers with a
 // status code and nothing else, so this reports reachability rather than
 // decoding anything — which is why it doesn't go through do, and why a caller
@@ -337,8 +344,7 @@ func (c *Client) Healthz(ctx context.Context) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 300 {
-		detail, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
-		return fmt.Errorf("agent returned %s from /healthz: %s", resp.Status, strings.TrimSpace(string(detail)))
+		return readAgentError(resp, req.URL.Path)
 	}
 
 	// Drained so the connection goes back to the pool rather than being torn
@@ -384,13 +390,18 @@ func (c *Client) GetVMClusterState(ctx context.Context, vmID string) (*VMCluster
 
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
+		// Drained so the connection goes back to the pool rather than being
+		// torn down and redialed on every poll.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBody))
 		return nil, ErrVMClusterResourceNotFound
 	case resp.StatusCode == http.StatusServiceUnavailable:
+		// This is the routine, repeating response while a fencing event is in
+		// progress — draining matters here more than anywhere else in this
+		// file, since it recurs every poll for the duration of the outage.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBody))
 		return nil, ErrClusterUnavailable
 	case resp.StatusCode >= 300:
-		detail, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
-		return nil, fmt.Errorf("agent returned %s from %s: %s",
-			resp.Status, req.URL.Path, strings.TrimSpace(string(detail)))
+		return nil, readAgentError(resp, req.URL.Path)
 	}
 
 	var state VMClusterState
@@ -412,9 +423,7 @@ func (c *Client) do(req *http.Request) (*Job, error) {
 	case resp.StatusCode == http.StatusNotFound:
 		return nil, ErrJobNotFound
 	case resp.StatusCode >= 300:
-		detail, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
-		return nil, fmt.Errorf("agent returned %s from %s: %s",
-			resp.Status, req.URL.Path, strings.TrimSpace(string(detail)))
+		return nil, readAgentError(resp, req.URL.Path)
 	}
 
 	var job Job

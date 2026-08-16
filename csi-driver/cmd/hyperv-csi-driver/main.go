@@ -147,9 +147,9 @@ func main() {
 			KubeClient:    kubeClient,
 			ClusterStates: agent,
 			DriverName:    driver.DriverName,
-			GracePeriod:   *nodeFencingGracePeriod,
-			PollInterval:  *nodeFencingPollInterval,
-			Confirmations: *nodeFencingConfirmations,
+			GracePeriod:   nodeFencingGracePeriod,
+			PollInterval:  nodeFencingPollInterval,
+			Confirmations: nodeFencingConfirmations,
 		})
 		if err != nil {
 			log.Fatal(err)

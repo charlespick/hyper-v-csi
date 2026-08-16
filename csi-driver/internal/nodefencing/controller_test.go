@@ -16,6 +16,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	clocktesting "k8s.io/utils/clock/testing"
+	"k8s.io/utils/ptr"
 
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/agentclient"
 )
@@ -135,9 +136,9 @@ func newHarness(t *testing.T, states *fakeStateSource, objects ...runtime.Object
 		KubeClient:    kube,
 		ClusterStates: states,
 		DriverName:    testDriverName,
-		GracePeriod:   testGracePeriod,
-		PollInterval:  testPollInterval,
-		Confirmations: testConfirmations,
+		GracePeriod:   ptr.To(testGracePeriod),
+		PollInterval:  ptr.To(testPollInterval),
+		Confirmations: ptr.To(testConfirmations),
 		Clock:         fakeClock,
 		// Quiet: these tests exercise decisions, not output.
 		Logger: log.New(io.Discard, "", 0),
@@ -327,43 +328,50 @@ func TestErrorsResetTheStreakAndNeverFence(t *testing.T) {
 }
 
 func TestSkipsNodeWithNoCSINodeEntryForThisDriver(t *testing.T) {
-	tests := []struct {
-		name    string
-		objects []runtime.Object
-	}{
-		{
-			name:    "no CSINode object at all",
-			objects: []runtime.Object{unreachableNode(testNodeName)},
-		},
-		{
-			name: "CSINode registers only another driver",
-			objects: []runtime.Object{
-				unreachableNode(testNodeName),
-				csiNode(testNodeName, "csi.some-other-driver.example.com", "whatever"),
-			},
-		},
+	states := &fakeStateSource{responses: []stateResponse{notRunning()}}
+	h := newHarness(t, states,
+		unreachableNode(testNodeName),
+		csiNode(testNodeName, "csi.some-other-driver.example.com", "whatever"),
+	)
+
+	h.controller.ObserveNode(unreachableNode(testNodeName))
+	h.pastGrace()
+	h.poll(testConfirmations * 2)
+
+	if states.callCount() != 0 {
+		t.Fatalf("the agent was asked about a node this driver does not serve (%d calls)",
+			states.callCount())
 	}
+	if h.fenced(t, testNodeName) {
+		t.Fatal("a node this driver does not serve was fenced")
+	}
+	if tracked := h.controller.TrackedNodes(); len(tracked) != 0 {
+		t.Fatalf("a node this driver does not serve is still tracked: %v", tracked)
+	}
+}
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			states := &fakeStateSource{responses: []stateResponse{notRunning()}}
-			h := newHarness(t, states, test.objects...)
+// A missing CSINode object, unlike one that simply lists other drivers, is
+// not distinguishable from transient API-server churn — the same kind of
+// disruption that can accompany a node going unreachable in the first place.
+// The node must stay tracked and be retried, not be dropped as "not ours" on
+// the first 404.
+func TestKeepsTrackingNodeWhenCSINodeObjectIsTransientlyMissing(t *testing.T) {
+	states := &fakeStateSource{responses: []stateResponse{notRunning()}}
+	h := newHarness(t, states, unreachableNode(testNodeName))
 
-			h.controller.ObserveNode(unreachableNode(testNodeName))
-			h.pastGrace()
-			h.poll(testConfirmations * 2)
+	h.controller.ObserveNode(unreachableNode(testNodeName))
+	h.pastGrace()
+	h.poll(testConfirmations * 2)
 
-			if states.callCount() != 0 {
-				t.Fatalf("the agent was asked about a node this driver does not serve (%d calls)",
-					states.callCount())
-			}
-			if h.fenced(t, testNodeName) {
-				t.Fatal("a node this driver does not serve was fenced")
-			}
-			if tracked := h.controller.TrackedNodes(); len(tracked) != 0 {
-				t.Fatalf("a node this driver does not serve is still tracked: %v", tracked)
-			}
-		})
+	if states.callCount() != 0 {
+		t.Fatalf("the agent was asked about a node whose CSI node ID is still unresolved (%d calls)",
+			states.callCount())
+	}
+	if h.fenced(t, testNodeName) {
+		t.Fatal("a node with no resolvable CSI node ID was fenced")
+	}
+	if tracked := h.controller.TrackedNodes(); len(tracked) != 1 {
+		t.Fatalf("a transiently-missing CSINode should leave the node tracked for retry, got %v", tracked)
 	}
 }
 
@@ -563,9 +571,9 @@ func TestNewRejectsMissingDependencies(t *testing.T) {
 		{"no kube client", Config{ClusterStates: states, DriverName: testDriverName}},
 		{"no state source", Config{KubeClient: kube, DriverName: testDriverName}},
 		{"no driver name", Config{KubeClient: kube, ClusterStates: states}},
-		{"negative grace period", Config{KubeClient: kube, ClusterStates: states, DriverName: testDriverName, GracePeriod: -time.Second}},
-		{"negative poll interval", Config{KubeClient: kube, ClusterStates: states, DriverName: testDriverName, PollInterval: -time.Second}},
-		{"negative confirmations", Config{KubeClient: kube, ClusterStates: states, DriverName: testDriverName, Confirmations: -1}},
+		{"negative grace period", Config{KubeClient: kube, ClusterStates: states, DriverName: testDriverName, GracePeriod: ptr.To(-time.Second)}},
+		{"negative poll interval", Config{KubeClient: kube, ClusterStates: states, DriverName: testDriverName, PollInterval: ptr.To(-time.Second)}},
+		{"negative confirmations", Config{KubeClient: kube, ClusterStates: states, DriverName: testDriverName, Confirmations: ptr.To(-1)}},
 	}
 
 	for _, test := range tests {
@@ -598,6 +606,30 @@ func TestNewDefaultsTheTunables(t *testing.T) {
 	}
 	if controller.clock == nil || controller.logger == nil {
 		t.Error("clock and logger must both default to something usable")
+	}
+}
+
+func TestNewHonorsAnExplicitZero(t *testing.T) {
+	controller, err := New(Config{
+		KubeClient:    fake.NewSimpleClientset(),
+		ClusterStates: &fakeStateSource{},
+		DriverName:    testDriverName,
+		GracePeriod:   ptr.To(time.Duration(0)),
+		PollInterval:  ptr.To(time.Duration(0)),
+		Confirmations: ptr.To(0),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if controller.gracePeriod != 0 {
+		t.Errorf("gracePeriod = %s, want 0 (an explicit zero must not be replaced by the default)", controller.gracePeriod)
+	}
+	if controller.pollInterval != 0 {
+		t.Errorf("pollInterval = %s, want 0 (an explicit zero must not be replaced by the default)", controller.pollInterval)
+	}
+	if controller.confirmations != 0 {
+		t.Errorf("confirmations = %d, want 0 (an explicit zero must not be replaced by the default)", controller.confirmations)
 	}
 }
 
