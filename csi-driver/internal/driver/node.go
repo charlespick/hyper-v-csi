@@ -251,17 +251,13 @@ func safeWork(work func() error) (err error) {
 // vmbusdisk.Resolve with its own budget (stageOperationBudget) rather than a
 // context that may already be cancelled by the time this returns.
 func (s *nodeServer) stageVolume(controllerID string, lun int32, target, fsType string, options []string, readOnly bool) error {
-	// Checked before vmbusdisk.Resolve, not after: an idempotent replay
-	// against an already-correctly-staged volume has no reason to pay
-	// Resolve's up-to-30s poll at all.
-	alreadyMounted, err := s.alreadyMountedCompatibly(target, "staging target", readOnly)
-	if err != nil {
-		return err
-	}
-	if alreadyMounted {
-		return nil
-	}
-
+	// Resolved before the already-mounted check, not after, because that
+	// check now needs devicePath to confirm an existing mount at target is
+	// this volume's own device rather than trusting the path match (see
+	// alreadyMountedCompatibly). This does not reintroduce the poll cost an
+	// idempotent replay used to avoid: for an already-correctly-staged
+	// volume the device is already present in sysfs, so Resolve's chain
+	// succeeds on its first attempt without waiting.
 	devicePath, err := vmbusdisk.Resolve(context.Background(), s.sysRoot, s.devRoot, controllerID, lun, stageOperationBudget)
 	if err != nil {
 		if errors.Is(err, vmbusdisk.ErrTimeout) {
@@ -269,6 +265,14 @@ func (s *nodeServer) stageVolume(controllerID string, lun int32, target, fsType 
 			return status.Errorf(codes.Aborted, "waiting for the disk to appear in the guest: %v", err)
 		}
 		return status.Errorf(codes.Internal, "resolving device for controller %s lun %d: %v", controllerID, lun, err)
+	}
+
+	alreadyMounted, err := s.alreadyMountedCompatibly(target, "staging target", readOnly, devicePath)
+	if err != nil {
+		return err
+	}
+	if alreadyMounted {
+		return nil
 	}
 
 	if err := s.mounter.FormatAndMount(devicePath, target, fsType, options); err != nil {
@@ -334,17 +338,20 @@ func (s *nodeServer) targetIsReadOnly(target string) (bool, error) {
 }
 
 // alreadyMountedCompatibly reports whether target is already mounted with the
-// requested ro/rw mode, creating target first if it does not exist yet — the
-// idempotency check NodeStageVolume and NodePublishVolume both need for a
-// repeat call against the same (volume, target). ok is false, with no error,
-// when target needs mounting; the caller does that and returns. label names
-// target in the ALREADY_EXISTS message ("staging target" or "target"), since
-// that is the one thing the two callers' wording differs on.
-//
-// The comparison is ro/rw only — per CLAUDE.md's narrow-scope convention,
-// nothing here confirms the mounted device is even this volume's; that gap is
-// worth naming once rather than building a fuller check into this change.
-func (s *nodeServer) alreadyMountedCompatibly(target, label string, readOnly bool) (ok bool, err error) {
+// requested ro/rw mode against the requested device, creating target first if
+// it does not exist yet — the idempotency check NodeStageVolume and
+// NodePublishVolume both need for a repeat call against the same (volume,
+// target). ok is false, with no error, when target needs mounting; the caller
+// does that and returns. label names target in the ALREADY_EXISTS message
+// ("staging target" or "target"), since that is the one thing the two
+// callers' wording differs on. expectedDevice is the underlying block device
+// the caller expects to find backing target: devicePath for
+// NodeStageVolume's direct mount, and the staging target's own resolved
+// device for NodePublishVolume's bind mount — either way, what
+// mount.GetDeviceNameFromMount(target) should report if what is already there
+// really is this volume, and not some other volume's mount left at a reused
+// path.
+func (s *nodeServer) alreadyMountedCompatibly(target, label string, readOnly bool, expectedDevice string) (ok bool, err error) {
 	notMountPoint, err := mount.IsNotMountPoint(s.mounter, target)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -368,7 +375,40 @@ func (s *nodeServer) alreadyMountedCompatibly(target, label string, readOnly boo
 			"%s %s is already mounted %s, which is incompatible with the requested %s",
 			label, target, readWriteLabel(alreadyReadOnly), readWriteLabel(readOnly))
 	}
+
+	actualDevice, err := s.mountedDevice(target)
+	if err != nil {
+		return false, status.Errorf(codes.Internal, "reading the device mounted at %s: %v", target, err)
+	}
+	if actualDevice != expectedDevice {
+		return false, status.Errorf(codes.AlreadyExists,
+			"%s %s is already mounted from %s, not the requested volume's device %s",
+			label, target, actualDevice, expectedDevice)
+	}
 	return true, nil
+}
+
+// mountedDevice resolves the block device backing whatever is mounted at
+// target, per s.mounter's own view of the mount table — the same
+// /proc/mounts-based technique expandVolume uses via
+// mount.GetDeviceNameFromMount to find the device to resize. For a bind
+// mount, the kernel records the original device here, not the bind source
+// path, so this returns the same value for a staging mount and every target
+// bound from it.
+func (s *nodeServer) mountedDevice(target string) (string, error) {
+	device, _, err := mount.GetDeviceNameFromMount(s.mounter, target)
+	if err != nil {
+		return "", err
+	}
+	if device == "" {
+		// IsNotMountPoint (or the caller's own prior check) just reported
+		// target as mounted; finding no matching entry here means the mount
+		// table changed underneath us (a race), the same race
+		// targetIsReadOnly fails closed on rather than guessing.
+		return "", fmt.Errorf(
+			"%s is reported mounted but has no matching entry in the mount table", target)
+	}
+	return device, nil
 }
 
 // readWriteLabel renders readOnly for the ALREADY_EXISTS messages above.
@@ -543,12 +583,17 @@ func (s *nodeServer) publishVolume(stagingTarget, target string, options []strin
 			stagingTarget)
 	}
 
+	stagingDevice, err := s.mountedDevice(stagingTarget)
+	if err != nil {
+		return status.Errorf(codes.Internal, "reading the device mounted at staging target %s: %v", stagingTarget, err)
+	}
+
 	// Already published: a repeat call for the same (volume, target) has to
 	// succeed, but only if what is already mounted matches what was asked
-	// for — the same check stageVolume makes against its own target, and with
-	// the same gap named there: nothing confirms the mount at target is a
-	// bind of this volume's staging mount rather than something else's.
-	alreadyMounted, err := s.alreadyMountedCompatibly(target, "target", readOnly)
+	// for — the same check stageVolume makes against its own target,
+	// including confirming the mount at target is a bind of this volume's
+	// staging mount rather than something else's, via stagingDevice.
+	alreadyMounted, err := s.alreadyMountedCompatibly(target, "target", readOnly, stagingDevice)
 	if err != nil {
 		return err
 	}

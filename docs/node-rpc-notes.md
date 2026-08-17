@@ -38,14 +38,18 @@ rather than quietly:
   to say so.
 
 A repeat call for the same (volume, target) succeeds if what is already
-mounted matches the ro/rw the request asked for, and is `ALREADY_EXISTS`
-if it does not — the same comparison `NodeStageVolume` makes for its own
-staging mount. Both share a known gap: neither confirms the mount already
-at the target is a bind of *this* volume's staging mount (NodePublishVolume)
-or backed by *this* volume's VHDX (NodeStageVolume), rather than some other
-volume's — tracked in
+mounted matches the ro/rw the request asked for *and* is backed by the
+right device, and is `ALREADY_EXISTS` if either does not match — the same
+two-part comparison `NodeStageVolume` makes for its own staging mount. The
+device check resolves both sides through `mount.GetDeviceNameFromMount`,
+the same `/proc/mounts`-based technique `NodeExpandVolume` uses, rather
+than trusting the path: for `NodePublishVolume` that means confirming the
+mount at target is a bind of *this* volume's staging mount, and for
+`NodeStageVolume` confirming the staging mount is backed by *this*
+volume's VHDX device, not some other volume's left behind by a target
+path reused elsewhere — closing the gap tracked in
 [#24](https://github.com/charlespick/hyper-v-csi/issues/24).
-Nor does anything refuse a read-write
+Nothing here refuses a read-write
 publish of a staging mount that was staged read-only — the bind inherits
 the read-only-ness, since Linux will not upgrade one, and writes fail with
 `EROFS` at runtime. Kubernetes hands stage and publish the same PV
