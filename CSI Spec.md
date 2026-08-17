@@ -290,11 +290,18 @@ that node, not that the VM stopped. The signal used instead is the VM's own
 `MSCluster_Resource` state — what that signal is, and what it is not, is
 immediately below.
 
-**It is off by default, and it has never been exercised against a real host
-failure.** `controller.nodeFencing.enabled` defaults to false and must be turned
-on deliberately. The decision logic and the taint write have unit tests; there is
-no end-to-end failover test, and `testing.md` says so. What can be claimed is
-that the mechanism exists, not that a lost host has been watched to self-heal.
+**It is off by default, and it has been watched to work once, manually, not
+proven by an automated harness.** `controller.nodeFencing.enabled` defaults to
+false and must be turned on deliberately. The decision logic and the taint
+write have unit tests, and one manual run killed a node's VM directly and
+confirmed the taint landed, the stranded pod was force-deleted and
+rescheduled, the volume reattached and mounted on the new node, and the
+recovered node needed the documented manual taint removal, exactly as
+designed. Durations were not captured, and the cases that matter because they
+must *not* fire — a live migration's momentary Offline read, an unreachable
+agent — were not exercised. `testing.md` tracks the automated harness that
+still needs to exist; what can be claimed now is that the mechanism works, not
+that it has been proven under repetition or at the edges.
 
 **The trust boundary the whole thing rests on.** `MSCluster_Resource.State`
 reflects cluster **consensus**, not a hardware guarantee. WSFC's quorum voting

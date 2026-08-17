@@ -202,23 +202,32 @@ one thing that has changed here. Node fencing
 by default) watches for the `unreachable:NoExecute` taint, confirms with the
 Hyper-V cluster that the node's VM is not running anywhere, and applies
 `node.kubernetes.io/out-of-service` so the stranded pods can be force-deleted
-and their volumes detached. What is missing is not the mechanism, it is this
-harness: the decision logic and the taint write have unit tests, and nothing has
-ever watched a real host die and seen a volume come back. Untested end to end,
-not unbuilt.
+and their volumes detached.
 
-That work is a separate harness, and the shape it has to take is already
-settled by the constraint that made this suite run outside the cluster in the
-first place: something that can (a) act on the Hyper-V cluster directly — stop a
-VM, move a role, fail a host — and (b) assert on Kubernetes state while that
-happens. Neither half can run on the node under test. The scenarios worth
-writing first: a volume attached to a node whose VM cannot be resolved, an
-unresponsive agent, an agent that cannot reach a host the cluster claims is
-online. Fencing adds its own obvious candidates, and two of them are about the
-taint *not* firing: a live migration, during which the VM's cluster resource
-reads Offline for a fraction of a second and nothing may be fenced; and an agent
-that cannot be reached at all, where being unable to ask must not resolve to an
-answer. The third is the case it exists for — a host genuinely lost, where the
+It has now been watched to work once, manually: a node's VM was killed
+directly (not a host power-off — the same trigger either way, since the
+controller reads the VM's own cluster resource state, not host liveness), the
+taint landed, the stranded pod was force-deleted and rescheduled to a healthy
+node, and the volume reattached and mounted there. Recovering the failed node
+afterward needed the documented manual `kubectl taint ... out-of-service-`
+step, as expected — nothing removes it automatically. Durations were not
+captured. That single manual run does not replace an automated harness: it
+covers the happy path once, not the taint-must-not-fire cases below, and
+nothing yet asserts on timing or repeats the scenario in CI.
+
+That harness is still a separate piece of work, and the shape it has to take is
+already settled by the constraint that made this suite run outside the cluster
+in the first place: something that can (a) act on the Hyper-V cluster
+directly — stop a VM, move a role, fail a host — and (b) assert on Kubernetes
+state while that happens. Neither half can run on the node under test. The
+scenarios worth writing first: a volume attached to a node whose VM cannot be
+resolved, an unresponsive agent, an agent that cannot reach a host the cluster
+claims is online. Fencing adds its own obvious candidates, and two of them are
+about the taint *not* firing: a live migration, during which the VM's cluster
+resource reads Offline for a fraction of a second and nothing may be fenced;
+and an agent that cannot be reached at all, where being unable to ask must not
+resolve to an answer. The third is the case it exists for — a host genuinely
+lost, where the
 taint has to land and the volume has to come back somewhere else.
 
 Nothing in `test/e2e/` prevents that harness from landing next to it and
