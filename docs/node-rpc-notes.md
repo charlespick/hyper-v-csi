@@ -39,10 +39,12 @@ rather than quietly:
 
 A repeat call for the same (volume, target) succeeds if what is already
 mounted matches the ro/rw the request asked for, and is `ALREADY_EXISTS`
-if it does not — the same comparison `NodeStageVolume` makes. A known gap
-in that comparison: nothing confirms the mount already at the target is a
-bind of *this* volume's staging mount rather than something else's —
-tracked in [#24](https://github.com/charlespick/hyper-v-csi/issues/24).
+if it does not — the same comparison `NodeStageVolume` makes for its own
+staging mount. Both share a known gap: neither confirms the mount already
+at the target is a bind of *this* volume's staging mount (NodePublishVolume)
+or backed by *this* volume's VHDX (NodeStageVolume), rather than some other
+volume's — tracked in
+[#24](https://github.com/charlespick/hyper-v-csi/issues/24).
 Nor does anything refuse a read-write
 publish of a staging mount that was staged read-only — the bind inherits
 the read-only-ness, since Linux will not upgrade one, and writes fail with
@@ -94,9 +96,12 @@ This is the one node RPC that changes nothing, and it still takes the
 `mountPathKey` lock. kubelet polls it on a timer for every mounted volume
 on the node, so a `statfs` wedged on a sick filesystem would otherwise pile
 up a fresh goroutine per poll — `runBounded`'s work cannot be cancelled,
-only stopped waiting on — for as long as it stayed sick. Holding the key
-turns the second poll into an `ABORTED`, and it serializes a stats read
-against an unpublish of the same path.
+only stopped waiting on, the same as every other node RPC's operation
+budget (see [Wedged operations are conceded, not
+prevented](host-cim-and-timeouts.md#wedged-operations-are-conceded-not-prevented))
+— for as long as it stayed sick. Holding the key turns the second poll into
+an `ABORTED`, and it serializes a stats read against an unpublish of the
+same path.
 
 The syscall lives in `internal/fsstats` behind a `//go:build linux` tag,
 with a non-Linux stand-in that returns an error rather than zeroes. That is

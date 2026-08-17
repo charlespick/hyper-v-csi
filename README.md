@@ -178,9 +178,11 @@ poison-pill self-fencing.
 [docs/controller-rpc-notes.md](docs/controller-rpc-notes.md#the-node-fencing-trust-boundary)
 sets out what that signal is and is not.
 
-And the mechanism, while built and unit tested, has never been exercised against
-a real host failure. Enabling it is a decision to try it, not to switch on
-something proven.
+And the mechanism has been watched to work once, manually — a node's VM was
+killed directly and the taint landed, the stranded pod was force-deleted and
+rescheduled, and the volume reattached on the new node — not proven by an
+automated harness (see `testing.md`). Enabling it is a decision to try it, not
+to switch on something proven under repetition.
 
 ## Design notes
 

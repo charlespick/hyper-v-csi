@@ -8,10 +8,11 @@
 # succeed. Its knobs are here as promised, under controller.snapshotter and
 # volumeSnapshotClass, and they are defaulted off.
 #
-# Implemented is not the same as exercised. Only provisioning, reclaim,
-# attach/detach and staging have run against a real Hyper-V cluster; see
-# testing.md, and the individual defaults below that stay conservative
-# because of it — snapshotting being the newest and least exercised of them.
+# Implemented is not the same as exercised. Provisioning, reclaim,
+# attach/detach, staging, and single-volume snapshot create/delete/list/
+# restore have all run against a real Hyper-V cluster; see testing.md. Group
+# snapshots and snapshot metadata are not implemented, which is what the
+# defaults below stay conservative for.
 
 image:
   repository: ghcr.io/charlespick/hyperv-csi-driver

@@ -25,8 +25,10 @@ capabilities are added:
 
 The chart deploys `external-snapshotter` behind
 `controller.snapshotter.enabled`, defaulted off. That's a deployment
-caution — the snapshot RPCs are the newest and least exercised of the
-lot — not a statement that the capability is dishonest.
+caution, not a statement that the capability is dishonest: single-volume
+snapshot create/delete/list/restore has passed a real-cluster run (see
+`testing.md`), but group snapshots and snapshot metadata are not
+implemented.
 
 ## Probe
 
@@ -238,16 +240,13 @@ is an ordinary `NOT_FOUND` from the source inspection.
 `CreateVolume` (one failing the safe filename rule) reports success rather
 than `INVALID_ARGUMENT`: no such volume can exist, CSI requires OK for a
 volume that isn't there, and failing would strand the PV in `Terminating`
-on a retry nothing could satisfy.
+on a retry nothing could satisfy. The `FAILED_PRECONDITION` mapping needs
+mandatory file locking to exercise, so its test is skipped off Windows.
 
-**A wedged delete is conceded, not prevented.** `File.Delete` takes no
-cancellation token, so a delete stuck on a CSV in redirected mode cannot be
-called off. The timeout is therefore *observed* rather than enforced: the
-job fails, the volume's job chain drains and its concurrency slot is
-released, but the thread stays in the syscall. Abandoning it is safe here
-in a way it would not be for `CreateVolume` — if the call does eventually
-return, it returns having deleted the file, which is what was asked for. A
-create abandoned the same way could leave a disk nobody expects.
+A wedged delete is conceded, not prevented, for the same reason and in the
+same shape as every other filesystem-touching RPC in this driver — see
+[Wedged operations are conceded, not
+prevented](host-cim-and-timeouts.md#wedged-operations-are-conceded-not-prevented).
 
 ## ControllerPublishVolume / ControllerUnpublishVolume
 
@@ -296,6 +295,12 @@ the reverse-direction question priced in
 answers it, so it would mean a scan per cluster node. It is refused with
 `INVALID_ARGUMENT` rather than answered wrongly. Kubernetes always sets
 it, so this costs nothing in practice.
+
+## Node fencing
+
+This is not part of `ControllerPublishVolume`/`ControllerUnpublishVolume`
+itself — see the next section for why — but it's what decides when a
+force-detach happens, so it belongs next to the RPCs it acts on.
 
 ### Force-detach and node fencing
 
@@ -416,7 +421,9 @@ is what licenses the ONLINE claim in `GetPluginCapabilities`.
 the one of the three CIM methods most likely to defer to a job, since
 growing an attached disk means vmms coordinating with the running worker
 process. Waiting for job completion is therefore load-bearing here, not
-bookkeeping.
+bookkeeping — see [Host CIM calls are bounded per
+call](host-cim-and-timeouts.md#host-cim-calls-are-bounded-per-call) for how
+that wait is timed out.
 
 **The agent's idempotency check opens the VHDX directly, which fails on an
 attached, running disk — the fallback is why this RPC talks to

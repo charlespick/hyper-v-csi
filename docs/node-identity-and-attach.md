@@ -132,10 +132,11 @@ controller's VMBus instance GUID and the LUN, because that pair is the
 only thing telling `NodeStageVolume` which of the guest's block devices
 this volume is — the CSV path means nothing inside the VM. A Linux guest
 sees the same GUID under `/sys/bus/vmbus/devices`, which is the
-assumption the node plugin is built on. If it ever turns out not to hold
-on some other kernel or Hyper-V version, the fallback is the disk's SCSI
-page-83 identifier, which would mean returning that in the publish context
-too.
+assumption the node plugin is built on; a real attach-then-stage against
+`csidevnode01` resolved it correctly to `/dev/sdb`, confirming the
+assumption on that guest. If it ever turns out not to hold on some other
+kernel or Hyper-V version, the fallback is the disk's SCSI page-83
+identifier, which would mean returning that in the publish context too.
 
 `vmbusdisk.Resolve` is what turns that pair into a device path, and it
 walks a fixed chain: the VMBus channel directory at
