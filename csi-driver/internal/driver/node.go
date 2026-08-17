@@ -18,10 +18,10 @@ import (
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/vmbusdisk"
 )
 
-// nodeServer implements the RPCs marked "Node" in CSI Spec.md. These act
-// entirely inside the guest VM (format/mount, bind-mount); they never call
-// out to hyperv-csi-agent, since the disk is already attached by the time
-// these run.
+// nodeServer implements the RPCs marked "Node" in docs/rpc-surface-overview.md.
+// These act entirely inside the guest VM (format/mount, bind-mount); they
+// never call out to hyperv-csi-agent, since the disk is already attached by
+// the time these run.
 type nodeServer struct {
 	csi.UnimplementedNodeServer
 	driver  *Driver
@@ -104,7 +104,8 @@ const (
 
 // validateStagingRequest checks the two fields NodeStageVolume and
 // NodeUnstageVolume both require: volume ID and staging target path, the
-// pair CSI Spec.md documents as the idempotency key for either RPC.
+// pair docs/rpc-surface-overview.md documents as the idempotency key for
+// either RPC.
 func validateStagingRequest(volumeID, target string) error {
 	if volumeID == "" {
 		return status.Error(codes.InvalidArgument, "volume id is required")
@@ -120,9 +121,9 @@ func validateStagingRequest(volumeID, target string) error {
 // needs: a call for the same key already in flight is rejected with ABORTED
 // rather than run alongside it or blocked on it. target is the staging target
 // path for NodeStageVolume/NodeUnstageVolume and the pod's target path for
-// NodePublishVolume, which is what CSI Spec.md lists as each one's idempotency
-// key; the two never collide, because kubelet gives a pod a different path
-// from the node-wide staging directory.
+// NodePublishVolume, which is what docs/rpc-surface-overview.md lists as each
+// one's idempotency key; the two never collide, because kubelet gives a pod a
+// different path from the node-wide staging directory.
 func (s *nodeServer) acquireMountLock(rpcName, volumeID, target string) (func(), error) {
 	unlock, acquired := s.locks.TryLock(mountPathKey(volumeID, target))
 	if !acquired {
@@ -198,9 +199,9 @@ func (s *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolu
 // happens first decides what this returns, but work always runs to
 // completion in the background regardless: neither a mount syscall nor
 // vmbusdisk.Resolve's wait for the guest kernel can be cancelled once begun,
-// the same limit CSI Spec.md notes for DeleteVolume's uncancellable
-// File.Delete. unlock is called exactly once, by the goroutine running work,
-// once work actually returns — not when this function returns — so the
+// the same limit docs/controller-rpc-notes.md notes for DeleteVolume's
+// uncancellable File.Delete. unlock is called exactly once, by the goroutine
+// running work, once work actually returns — not when this function returns — so the
 // mountPathKey stays held for as long as the real operation is still running,
 // and a retry that arrives first gets ABORTED from keyLock.TryLock rather
 // than running alongside it.

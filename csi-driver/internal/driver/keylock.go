@@ -86,9 +86,9 @@ func (l *keyLock) release(key string, entry *lockEntry) {
 }
 
 // mountPathKey is the idempotency and concurrency key for the node RPCs that
-// mount and unmount, per CSI Spec.md: volume ID + the path the RPC is about —
-// the staging target path for NodeStageVolume/NodeUnstageVolume, the pod's
-// target path for NodePublishVolume. Reuses escapeKeyComponent from
+// mount and unmount: volume ID + the path the RPC is about — the staging
+// target path for NodeStageVolume/NodeUnstageVolume, the pod's target path
+// for NodePublishVolume. Reuses escapeKeyComponent from
 // controller.go so the same guarantee publishKey relies on holds here too —
 // two distinct (volumeID, path) pairs can never collide onto the same key.
 func mountPathKey(volumeID, path string) string {

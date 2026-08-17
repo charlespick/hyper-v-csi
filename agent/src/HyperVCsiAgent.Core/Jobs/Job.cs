@@ -10,7 +10,7 @@ public sealed class Job
     public required string Id { get; init; }
 
     /// <summary>
-    /// The raw identifier from CSI Spec.md's "Idempotency Key" column. The
+    /// The raw identifier from docs/rpc-surface-overview.md's "Idempotency Key" column. The
     /// operation type is NOT part of this key - dedupe is on the
     /// (OperationType, IdempotencyKey) pair - so a controller retry of the same
     /// operation attaches to the in-flight job instead of starting a duplicate.

@@ -251,10 +251,10 @@ the node plugin's logs on the node the pod landed on
 (`kubectl -n hyperv-csi logs ds/hyperv-csi-node -c hyperv-csi-driver`), and the
 agent's own log on whichever host owns the clustered role.
 
-A failure is worth checking against the Status column in `CSI Spec.md` before
-anything else: a test failing on an RPC whose status is still "Not started" is
-the suite telling the truth about a gap, and the fix is the driver, not the skip
-list.
+A failure is worth checking against
+[docs/rpc-surface-overview.md](docs/rpc-surface-overview.md) before anything
+else: a test failing on an RPC this driver doesn't implement is the suite
+telling the truth about a gap, and the fix is the driver, not the skip list.
 
 ## Where this goes
 

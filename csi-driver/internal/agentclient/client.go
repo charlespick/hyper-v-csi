@@ -278,11 +278,11 @@ func NewMutualTLS(baseURL, certificateFile, keyFile string, serverCertificateThu
 }
 
 // EnqueueJob calls POST /v1/jobs. idempotencyKey is the raw identifier from
-// CSI Spec.md's "Idempotency Key" column — the operation is never baked into
-// it; the agent dedupes on the (operationType, idempotencyKey) pair, so a
-// controller retry attaches to the in-flight job instead of starting a
-// duplicate. What the job serializes against is the agent's to decide from the
-// payload; see enqueueRequest.
+// the "Idempotency Key" column in docs/rpc-surface-overview.md — the operation
+// is never baked into it; the agent dedupes on the (operationType,
+// idempotencyKey) pair, so a controller retry attaches to the in-flight job
+// instead of starting a duplicate. What the job serializes against is the
+// agent's to decide from the payload; see enqueueRequest.
 func (c *Client) EnqueueJob(ctx context.Context, idempotencyKey, operationType string, payload any) (*Job, error) {
 	body, err := json.Marshal(enqueueRequest{
 		OperationType:  operationType,

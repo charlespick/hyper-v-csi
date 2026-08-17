@@ -174,8 +174,9 @@ The confirmation comes from Windows Failover Clustering's own quorum-backed
 answer that the VM's cluster resource is not online anywhere. That is cluster
 *consensus*, not a hardware guarantee: it is a strong signal only if real fencing
 sits underneath it — BMC/iDRAC/iLO power fencing, or Storage Spaces Direct's
-poison-pill self-fencing. The trust boundary section in
-[CSI Spec.md](CSI%20Spec.md) sets out what that signal is and is not.
+poison-pill self-fencing.
+[docs/controller-rpc-notes.md](docs/controller-rpc-notes.md#the-node-fencing-trust-boundary)
+sets out what that signal is and is not.
 
 And the mechanism, while built and unit tested, has never been exercised against
 a real host failure. Enabling it is a decision to try it, not to switch on
@@ -183,4 +184,6 @@ something proven.
 
 ## Design notes
 
-See [design.md](design.md) for the current architecture and requirements.
+See [design.md](design.md) for the current architecture and requirements,
+and [docs/](docs/) for per-RPC design rationale — why each CSI call behaves
+the way it does, known gaps, and the Hyper-V/cluster mechanics behind it.

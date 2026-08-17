@@ -9,10 +9,9 @@
 # volumeSnapshotClass, and they are defaulted off.
 #
 # Implemented is not the same as exercised. Only provisioning, reclaim,
-# attach/detach and staging have run against a real Hyper-V cluster; see the
-# Status column in CSI Spec.md, and the individual defaults below that stay
-# conservative because of it — snapshotting being the newest and least
-# exercised of them.
+# attach/detach and staging have run against a real Hyper-V cluster; see
+# testing.md, and the individual defaults below that stay conservative
+# because of it — snapshotting being the newest and least exercised of them.
 
 image:
   repository: ghcr.io/charlespick/hyperv-csi-driver

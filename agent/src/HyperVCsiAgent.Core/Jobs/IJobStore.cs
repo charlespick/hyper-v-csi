@@ -14,8 +14,9 @@ public interface IJobStore
     /// idempotent (e.g. re-checking the CSV for an existing volume) rather than on
     /// this store remembering outcomes.
     ///
-    /// idempotencyKey is the raw identifier from CSI Spec.md's "Idempotency Key"
-    /// column (volume name/ID, snapshot name/ID, "+ node ID" where listed). The
+    /// idempotencyKey is the raw identifier from docs/rpc-surface-overview.md's
+    /// "Idempotency Key" column (volume name/ID, snapshot name/ID, "+ node ID"
+    /// where listed). The
     /// operation is never baked into the key; dedupe is on the
     /// (operationType, idempotencyKey) pair.
     ///

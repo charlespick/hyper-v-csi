@@ -1,9 +1,9 @@
 // Package vmbusdisk resolves a Hyper-V-attached disk's guest device path from
 // the two identifiers ControllerPublishVolume hands back in the publish
 // context: the SCSI controller's VMBus instance GUID and the disk's LUN on
-// that controller. See "The publish context is load-bearing" in
-// CSI Spec.md for why those two values, rather than anything CSV- or
-// VHDX-relative, are what identifies a disk inside the guest.
+// that controller. See "Publish context and vmbusdisk.Resolve" in
+// docs/node-identity-and-attach.md for why those two values, rather than
+// anything CSV- or VHDX-relative, are what identifies a disk inside the guest.
 //
 // A Linux guest exposes a VMBus channel as a directory named by its instance
 // GUID under /sys/bus/vmbus/devices. For the synthetic SCSI controller that
@@ -14,7 +14,8 @@
 // /sys/bus/scsi/devices/<N>:0:0:<lun>/block holds exactly one entry named for
 // the block device (for example sda), and the device node is /dev/<name>.
 //
-// This is the piece CSI Spec.md flags as unconfirmed against real hardware;
+// This is the piece docs/node-identity-and-attach.md flags as unconfirmed
+// against real hardware beyond the one guest configuration tested so far;
 // the fallback named there, if the VMBus GUID assumption doesn't hold, is
 // matching on the disk's SCSI page-83 identifier instead. That fallback is
 // not implemented here — it would need a different publish context field —

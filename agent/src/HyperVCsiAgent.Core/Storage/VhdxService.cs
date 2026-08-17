@@ -56,8 +56,8 @@ public sealed class VhdxService : IVhdxService, IDisposable
     /// gone. In the other direction, the storage stack can leave a kernel-mode
     /// lock behind after a worker process exits, so a violation can outlive any
     /// attachment. Treat this purely as "the file was busy", never as a
-    /// detachment check. Nothing here performs one, by design; see "DeleteVolume
-    /// deliberately does not check that the volume is detached" in CSI Spec.md.
+    /// detachment check. Nothing here performs one, by design; see "DeleteVolume"
+    /// in docs/controller-rpc-notes.md.
     /// </summary>
     private const int SharingViolationHResult = unchecked((int)0x80070020);
 

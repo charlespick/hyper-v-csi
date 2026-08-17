@@ -12,7 +12,7 @@ public sealed class EnqueueJobRequest
 {
     public string? OperationType { get; init; }
 
-    /// <summary>Raw identifier from CSI Spec.md's "Idempotency Key" column.</summary>
+    /// <summary>Raw identifier from docs/rpc-surface-overview.md's "Idempotency Key" column.</summary>
     public string? IdempotencyKey { get; init; }
 
     /// <summary>

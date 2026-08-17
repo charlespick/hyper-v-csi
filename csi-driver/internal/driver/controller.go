@@ -63,9 +63,10 @@ const defaultVolumeSizeBytes = 1 << 30 // 1 GiB
 // impossible.
 const vhdxSectorAlignment = 4096
 
-// controllerServer implements the RPCs marked "Controller" in CSI Spec.md.
-// Each dispatches to hyperv-csi-agent's async job API rather than talking to
-// Hyper-V hosts directly; idempotency keys follow the column in that table.
+// controllerServer implements the RPCs marked "Controller" in
+// docs/rpc-surface-overview.md. Each dispatches to hyperv-csi-agent's async
+// job API rather than talking to Hyper-V hosts directly; idempotency keys
+// follow the column in that table.
 type controllerServer struct {
 	csi.UnimplementedControllerServer
 	driver *Driver
@@ -138,8 +139,8 @@ func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		return nil, err
 	}
 
-	// The CSI volume name is the idempotency key per CSI Spec.md, so a
-	// provisioner retry for the same PVC re-attaches to this job instead of
+	// The CSI volume name is the idempotency key (docs/rpc-surface-overview.md),
+	// so a provisioner retry for the same PVC re-attaches to this job instead of
 	// racing a second create for the same file.
 	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetName(), operationCreateVolume, createVolumePayload{
 		Name:             req.GetName(),
@@ -365,14 +366,16 @@ type deleteVolumePayload struct {
 // has already run by the time CSI asks for a delete. If some attachment this
 // driver didn't make is holding the disk, the delete fails and that error is
 // passed through rather than cleared out of the way. See "DeleteVolume" in
-// CSI Spec.md — that decision has a real prerequisite attached to it.
+// docs/controller-rpc-notes.md — that decision has a real prerequisite
+// attached to it.
 func (s *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume id is required")
 	}
 
-	// The volume ID is the idempotency key per CSI Spec.md, and it doubles as
-	// the target so a delete can't interleave with other work on the same disk.
+	// The volume ID is the idempotency key (docs/rpc-surface-overview.md), and
+	// it doubles as the target so a delete can't interleave with other work on
+	// the same disk.
 	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetVolumeId(), operationDeleteVolume, deleteVolumePayload{
 		VolumeID: req.GetVolumeId(),
 	})
@@ -448,9 +451,10 @@ func (s *controllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			"read-only publishing is not supported; the node plugin mounts read-only when asked")
 	}
 
-	// Volume ID + node ID per CSI Spec.md. The agent serializes this against the
-	// VM, not the volume: what must not race is slot allocation on one VM, and
-	// it runs one job at a time per target.
+	// Volume ID + node ID is the idempotency key (docs/rpc-surface-overview.md).
+	// The agent serializes this against the VM, not the volume: what must not
+	// race is slot allocation on one VM, and it runs one job at a time per
+	// target.
 	job, err := s.driver.Agent.EnqueueJob(ctx, publishKey(req.GetVolumeId(), req.GetNodeId()), operationAttachVolume,
 		attachVolumePayload{
 			VolumeID: req.GetVolumeId(),
@@ -534,7 +538,8 @@ func (s *controllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 	// CSI makes node_id optional, meaning "unpublish from every node this
 	// volume is published to". Answering that needs the cluster-wide scan the
 	// design declines — one query per node — so it is refused rather than
-	// answered wrongly. Kubernetes always sets it; see CSI Spec.md.
+	// answered wrongly. Kubernetes always sets it; see
+	// docs/node-identity-and-attach.md's "Forward vs. reverse cluster queries".
 	if req.GetNodeId() == "" {
 		return nil, status.Error(codes.InvalidArgument,
 			"node id is required; unpublishing from every node at once is not supported")
@@ -627,9 +632,10 @@ func (s *controllerServer) ValidateVolumeCapabilities(ctx context.Context, req *
 			VolumeContext:      req.GetVolumeContext(),
 			// Parameters are deliberately not echoed. Confirming them would
 			// claim the volume was provisioned to honor them, and CreateVolume
-			// ignores StorageClass parameters outright — see "CreateVolume gaps"
-			// in CSI Spec.md. Echoing them back would turn a documented gap into
-			// a guarantee this driver does not keep.
+			// ignores StorageClass parameters outright — see "CreateVolume" in
+			// docs/controller-rpc-notes.md (tracked in issue #23). Echoing them
+			// back would turn a documented gap into a guarantee this driver does
+			// not keep.
 		},
 	}, nil
 }
@@ -881,7 +887,8 @@ func (s *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 	}
 
 	// req.GetParameters() is ignored, the same way CreateVolume ignores
-	// StorageClass parameters — see "CreateVolume gaps" in CSI Spec.md. Passing
+	// StorageClass parameters — see "CreateVolume" in
+	// docs/controller-rpc-notes.md (tracked in issue #23). Passing
 	// VolumeSnapshotClass parameters through to the agent without anything acting
 	// on them would look like support for them; dropping them here keeps the gap
 	// where it already is, and honest.
@@ -898,9 +905,10 @@ func (s *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 		return nil, findAttachedNodeFailed(ctx, err, "finding which node has %s attached", req.GetSourceVolumeId())
 	}
 
-	// The snapshot name is the idempotency key per CSI Spec.md, so a retry from
-	// external-snapshotter for the same VolumeSnapshot re-attaches to the job in
-	// flight instead of starting a second copy of the same disk.
+	// The snapshot name is the idempotency key (docs/rpc-surface-overview.md),
+	// so a retry from external-snapshotter for the same VolumeSnapshot
+	// re-attaches to the job in flight instead of starting a second copy of the
+	// same disk.
 	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetName(), operationCreateSnapshot,
 		createSnapshotPayload{
 			SourceVolumeID: req.GetSourceVolumeId(),
@@ -955,10 +963,10 @@ func (s *controllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteSn
 		return nil, status.Error(codes.InvalidArgument, "snapshot id is required")
 	}
 
-	// The snapshot ID is the idempotency key per CSI Spec.md, and the agent
-	// derives its target from it — the same target a CreateSnapshot for this
-	// snapshot derives from its source and name — so a delete can't interleave
-	// with a create of the snapshot it is removing.
+	// The snapshot ID is the idempotency key (docs/rpc-surface-overview.md),
+	// and the agent derives its target from it — the same target a
+	// CreateSnapshot for this snapshot derives from its source and name — so a
+	// delete can't interleave with a create of the snapshot it is removing.
 	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetSnapshotId(), operationDeleteSnapshot,
 		deleteSnapshotPayload{
 			SnapshotID: req.GetSnapshotId(),
