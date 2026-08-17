@@ -88,16 +88,16 @@ public class AgentOptionsValidationTests
     [Theory]
     [InlineData("")]
     [InlineData("   ")]
-    public void Validate_MissingSnapshotsRoot_IsRejected(string root)
+    public void Validate_MissingSnapshotsRoot_IsAccepted(string root)
     {
-        // Required exactly as CsvVolumesRoot is. There is no defensible default:
-        // a relative path would resolve against whatever directory the SCM
-        // started the process in, which for a clustered role is C:\Windows\System32.
+        // Unlike CsvVolumesRoot, snapshots support is optional end to end -
+        // the installer's Storage page lets an operator leave it unconfigured,
+        // and Validate() has to accept that rather than treat it as a bad
+        // config (issue #27).
         var options = NewOptions();
         options.CsvSnapshotsRoot = root;
 
-        var failure = Assert.Throws<InvalidOperationException>(options.Validate);
-        Assert.Contains(nameof(AgentOptions.CsvSnapshotsRoot), failure.Message, StringComparison.Ordinal);
+        options.Validate();
     }
 
     [Theory]

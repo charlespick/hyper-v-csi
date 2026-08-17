@@ -84,6 +84,28 @@ public sealed class WriteConfigCommandTests : IDisposable
     }
 
     [Fact]
+    public void BlankCsvSnapshotsRoot_SucceedsAndOmitsTheProperty()
+    {
+        // The installer always passes --csv-snapshots-root, even when the
+        // Storage page's "Enable Snapshots support" checkbox is unchecked -
+        // in that case as "" (issue #27). That must produce a valid config
+        // with snapshots left unconfigured, not a validation failure.
+        var output = Path.Combine(_root, "agent.config.json");
+
+        var result = WriteConfigCommand.Run([
+            "--output", output,
+            "--csv-volumes-root", "C:\\ClusterStorage\\Volume1\\volumes",
+            "--csv-snapshots-root", "",
+        ]);
+
+        Assert.Equal(0, result);
+        using var document = JsonDocument.Parse(File.ReadAllText(output));
+        var agent = document.RootElement.GetProperty("Agent");
+        Assert.Equal("C:\\ClusterStorage\\Volume1\\volumes", agent.GetProperty("CsvVolumesRoot").GetString());
+        Assert.False(agent.TryGetProperty("CsvSnapshotsRoot", out _));
+    }
+
+    [Fact]
     public void BlankCsvVolumesRoot_FailsTheSameValidationTheAgentRunsAtStartup()
     {
         var output = Path.Combine(_root, "agent.config.json");

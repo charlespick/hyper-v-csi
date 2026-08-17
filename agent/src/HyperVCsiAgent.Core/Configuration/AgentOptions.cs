@@ -211,12 +211,11 @@ public sealed class AgentOptions
                 "(C:\\ProgramData\\HyperVCsiAgent\\agent.config.json by default, or the path passed via --config)");
         }
 
-        if (string.IsNullOrWhiteSpace(CsvSnapshotsRoot))
-        {
-            throw new InvalidOperationException(
-                $"{SectionName}:{nameof(CsvSnapshotsRoot)} is required; set it in agent.config.json " +
-                "(C:\\ProgramData\\HyperVCsiAgent\\agent.config.json by default, or the path passed via --config)");
-        }
+        // Unlike CsvVolumesRoot, genuinely optional: an operator who has not
+        // set up (or has deliberately declined) snapshot storage for this
+        // node leaves it blank, and that is a valid, snapshots-not-configured
+        // state rather than a misconfiguration - see the installer's Storage
+        // page, which lets "Enable Snapshots support" go unchecked.
 
         if (MaxConcurrentDiskOperations < 1)
         {

@@ -48,8 +48,17 @@ internal static class WriteConfigCommand
         var agent = new JsonObject
         {
             ["CsvVolumesRoot"] = options.CsvVolumesRoot,
-            ["CsvSnapshotsRoot"] = options.CsvSnapshotsRoot,
         };
+
+        // Omitted rather than written as "", the same "not configured" shape
+        // Tls/Authentication below already use: AgentOptions.Validate() now
+        // only requires this when it holds a real value, and this is what
+        // the wizard's Storage page leaves it as when snapshots support is
+        // unchecked.
+        if (!string.IsNullOrWhiteSpace(options.CsvSnapshotsRoot))
+        {
+            agent["CsvSnapshotsRoot"] = options.CsvSnapshotsRoot;
+        }
 
         if (options.Tls.IsConfigured)
         {

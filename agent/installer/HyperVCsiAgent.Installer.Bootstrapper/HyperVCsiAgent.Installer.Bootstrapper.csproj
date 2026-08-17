@@ -24,6 +24,15 @@
          group. -->
     <SelfContained>true</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <!-- requireAdministrator, not the SDK's default asInvoker: a per-machine
+         bundle only elevates for Burn's own Apply() step, so without this
+         the whole wizard - including the Certificate page's "Generate new
+         self-signed certificate..." button, which writes to LocalMachine\My
+         well before Apply runs - executes unelevated and privileged actions
+         taken before the final step fail. See app.manifest for the rest of
+         what this replaces from the SDK-generated default. -->
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <!-- Left enabled (WPF's own default), not disabled: InvariantGlobalization
          crashes WPF's data-binding engine the moment a window with any
          binding actually shows - XmlLanguage.GetSpecificCulture cannot
