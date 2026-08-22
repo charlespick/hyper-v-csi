@@ -1,3 +1,4 @@
+using System;
 using System.Threading;
 using System.Windows;
 using WixToolset.BootstrapperApplicationApi;
@@ -7,6 +8,7 @@ namespace HyperVCsiAgent.Installer.Bootstrapper;
 internal sealed class BootstrapperApp : BootstrapperApplication
 {
     private WizardViewModel? _viewModel;
+    private bool _elevated;
 
     public int ExitCode { get; private set; }
 
@@ -15,6 +17,36 @@ internal sealed class BootstrapperApp : BootstrapperApplication
         base.OnCreate(args);
 
         _viewModel = new WizardViewModel(this.engine, args.Command);
+
+        // Not for headless (/quiet, /passive, or Burn's own Display.Embedded
+        // relaunch to uninstall an older related bundle - see
+        // WizardViewModel.IsHeadless): those runs never reach the Certificate
+        // page's "Generate new self-signed certificate..." button that needs
+        // this, and Elevate() blocks on a UAC prompt that nobody is at the
+        // keyboard to answer in an unattended run.
+        if (!_viewModel.IsHeadless)
+        {
+            try
+            {
+                // Burn's own supported way to get the whole session running
+                // elevated up front: it shows the UAC prompt itself and
+                // reconnects to an elevated companion process, without which
+                // the Certificate page's LocalMachine\My import (and anything
+                // else privileged reached before Apply()) fails. See the
+                // Bootstrapper csproj's remarks for why a requireAdministrator
+                // manifest on this exe cannot do the same job.
+                this.engine.Elevate(IntPtr.Zero);
+                _elevated = true;
+            }
+            catch (Exception ex)
+            {
+                // The user declined the UAC prompt (or it otherwise failed) -
+                // same exit code Cancel() uses for backing out of setup, since
+                // nothing was ever planned/applied on this path either.
+                this.engine.Log(LogLevel.Error, $"Elevation was declined or failed: {ex.Message}");
+                _viewModel.CancelCommand.Execute(null);
+            }
+        }
 
         this.DetectComplete += (_, e) => _viewModel.OnDetectComplete(e);
         this.PlanComplete += (_, e) => _viewModel.OnPlanComplete(e);
@@ -42,7 +74,7 @@ internal sealed class BootstrapperApp : BootstrapperApplication
             this.engine.Detect(WizardViewModel.GetHeadlessWindowHandle());
             _viewModel.WaitForHeadlessCompletion();
         }
-        else
+        else if (_elevated)
         {
             this.engine.Log(LogLevel.Standard, "Launching Hyper-V CSI Agent setup UI.");
 
@@ -55,6 +87,10 @@ internal sealed class BootstrapperApp : BootstrapperApplication
             uiThread.Start();
             uiThread.Join();
         }
+
+        // else: elevation was declined in OnCreate, which already set
+        // _viewModel.ExitCode via CancelCommand - fall straight through to
+        // Quit below without ever showing the wizard.
 
         this.ExitCode = _viewModel!.ExitCode;
         this.engine.Quit(this.ExitCode);

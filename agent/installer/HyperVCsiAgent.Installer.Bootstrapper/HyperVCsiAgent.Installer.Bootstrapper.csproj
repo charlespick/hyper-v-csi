@@ -24,14 +24,17 @@
          group. -->
     <SelfContained>true</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <!-- requireAdministrator, not the SDK's default asInvoker: a per-machine
-         bundle only elevates for Burn's own Apply() step, so without this
-         the whole wizard - including the Certificate page's "Generate new
-         self-signed certificate..." button, which writes to LocalMachine\My
-         well before Apply runs - executes unelevated and privileged actions
-         taken before the final step fail. See app.manifest for the rest of
-         what this replaces from the SDK-generated default. -->
-    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- Left at the SDK default (asInvoker), not requireAdministrator: this
+         exe is hosted out-of-process (see the SelfContained remark above) and
+         launched by the native Burn stub via CreateProcess, which does not
+         honor manifest-based UAC elevation the way ShellExecute does - a
+         requireAdministrator manifest here just fails that CreateProcess call
+         outright (ERROR_ELEVATION_REQUIRED) with no prompt and no window,
+         unless the stub itself already happens to be elevated. BootstrapperApp
+         calls the engine's own Elevate() instead, which is Burn's supported
+         mechanism for prompting UAC and getting the same "everything after
+         this point is elevated" effect that the Certificate page's
+         LocalMachine\My import needs. -->
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <!-- Left enabled (WPF's own default), not disabled: InvariantGlobalization
          crashes WPF's data-binding engine the moment a window with any
