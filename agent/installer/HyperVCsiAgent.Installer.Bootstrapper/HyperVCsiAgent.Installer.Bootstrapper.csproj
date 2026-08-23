@@ -30,11 +30,16 @@
          honor manifest-based UAC elevation the way ShellExecute does - a
          requireAdministrator manifest here just fails that CreateProcess call
          outright (ERROR_ELEVATION_REQUIRED) with no prompt and no window,
-         unless the stub itself already happens to be elevated. BootstrapperApp
-         calls the engine's own Elevate() instead, which is Burn's supported
-         mechanism for prompting UAC and getting the same "everything after
-         this point is elevated" effect that the Certificate page's
-         LocalMachine\My import needs. -->
+         unless the stub itself already happens to be elevated. This process
+         stays asInvoker for its whole lifetime instead, and needs no
+         elevation at all: the Certificate page's "will be generated" choice
+         only collects a subject name here (GenerateCertificateWindow) - the
+         actual LocalMachine\My import happens later, in
+         HyperVCsiAgent.Installer.Actions' GenerateServerCertificateCommand,
+         during the MSI's own already-elevated execute sequence, same as
+         every other privileged write this installer makes. Apply() still
+         gets Burn's own automatic elevation for that, same as any
+         per-machine bundle. -->
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <!-- Left enabled (WPF's own default), not disabled: InvariantGlobalization
          crashes WPF's data-binding engine the moment a window with any

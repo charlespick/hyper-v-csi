@@ -18,10 +18,9 @@ public partial class CertificatePage : UserControl
         }
 
         var dialog = new GenerateCertificateWindow { Owner = Window.GetWindow(this) };
-        if (dialog.ShowDialog() == true && dialog.GeneratedThumbprint is { } thumbprint)
+        if (dialog.ShowDialog() == true && dialog.SubjectName is { } subjectName)
         {
-            viewModel.RefreshCertificates();
-            viewModel.ServerCertThumbprint = thumbprint;
+            viewModel.AddPendingCertificate(subjectName);
         }
     }
 }

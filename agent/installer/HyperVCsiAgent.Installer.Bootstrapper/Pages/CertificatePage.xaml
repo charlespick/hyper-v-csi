@@ -18,13 +18,13 @@
         <Button DockPanel.Dock="Bottom" Content="Generate new self-signed certificate..." HorizontalAlignment="Left"
                 Margin="0,12,0,0" Click="GenerateCertificate_Click" />
 
-        <DataGrid ItemsSource="{Binding Certificates}" SelectedValuePath="Thumbprint"
-                  SelectedValue="{Binding ServerCertThumbprint, UpdateSourceTrigger=PropertyChanged}"
+        <DataGrid ItemsSource="{Binding Certificates}" SelectedValuePath="Key"
+                  SelectedValue="{Binding SelectedCertificateKey, UpdateSourceTrigger=PropertyChanged}"
                   AutoGenerateColumns="False" IsReadOnly="True" SelectionMode="Single" SelectionUnit="FullRow"
                   CanUserAddRows="False" CanUserDeleteRows="False" CanUserReorderColumns="False">
             <DataGrid.Columns>
-                <DataGridTextColumn Header="Subject" Binding="{Binding SubjectName}" Width="*" />
-                <DataGridTextColumn Header="Thumbprint" Binding="{Binding Thumbprint}" Width="220" />
+                <DataGridTextColumn Header="Subject" Binding="{Binding DisplaySubject}" Width="*" />
+                <DataGridTextColumn Header="Thumbprint" Binding="{Binding DisplayThumbprint}" Width="220" />
                 <DataGridTextColumn Header="Expires" Binding="{Binding NotAfter, StringFormat={}{0:d}}" Width="100" />
             </DataGrid.Columns>
         </DataGrid>

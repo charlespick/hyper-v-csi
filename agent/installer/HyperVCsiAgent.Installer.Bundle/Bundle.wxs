@@ -31,6 +31,7 @@
     <Variable Name="STORENAME" Type="string" Value="My" Persisted="yes" />
     <Variable Name="STORELOCATION" Type="string" Value="LocalMachine" Persisted="yes" />
     <Variable Name="SERVERCERTTHUMBPRINT" Type="string" Value="" Persisted="yes" />
+    <Variable Name="GENERATECERTSUBJECT" Type="string" Value="" Persisted="yes" />
     <Variable Name="CLIENTTHUMBPRINTS" Type="string" Value="" Persisted="yes" />
 
     <Chain>
@@ -49,6 +50,7 @@
         <MsiProperty Name="STORENAME" Value="[STORENAME]" />
         <MsiProperty Name="STORELOCATION" Value="[STORELOCATION]" />
         <MsiProperty Name="SERVERCERTTHUMBPRINT" Value="[SERVERCERTTHUMBPRINT]" />
+        <MsiProperty Name="GENERATECERTSUBJECT" Value="[GENERATECERTSUBJECT]" />
         <MsiProperty Name="CLIENTTHUMBPRINTS" Value="[CLIENTTHUMBPRINTS]" />
       </MsiPackage>
     </Chain>

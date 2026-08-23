@@ -5,7 +5,15 @@ namespace HyperVCsiAgent.Installer.Bootstrapper;
 
 public partial class GenerateCertificateWindow : Window
 {
-    public string? GeneratedThumbprint { get; private set; }
+    /// <summary>
+    /// The subject name to generate a certificate for - collected here, but
+    /// not acted on here. This process runs asInvoker for its whole
+    /// lifetime (see the Bootstrapper csproj's own remarks), so importing
+    /// into LocalMachine\My needs to happen later, during the MSI's own
+    /// elevated execute sequence - see WizardViewModel.AddPendingCertificate
+    /// and HyperVCsiAgent.Installer.Actions' GenerateServerCertificateCommand.
+    /// </summary>
+    public string? SubjectName { get; private set; }
 
     public GenerateCertificateWindow()
     {
@@ -23,16 +31,7 @@ public partial class GenerateCertificateWindow : Window
             return;
         }
 
-        try
-        {
-            var certificate = SelfSignedCertificateGenerator.CreateAndImport(subjectName);
-            GeneratedThumbprint = certificate.Thumbprint;
-            DialogResult = true;
-        }
-        catch (Exception ex)
-        {
-            MessageBox.Show(this, $"Could not generate the certificate: {ex.Message}", "Generate Self-Signed Certificate",
-                MessageBoxButton.OK, MessageBoxImage.Error);
-        }
+        SubjectName = subjectName;
+        DialogResult = true;
     }
 }

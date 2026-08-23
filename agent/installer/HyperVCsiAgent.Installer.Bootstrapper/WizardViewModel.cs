@@ -29,7 +29,7 @@ internal sealed class WizardViewModel : ViewModelBase
     private string _tlsPort = "443";
     private string _storeName = "My";
     private string _storeLocation = "LocalMachine";
-    private string _serverCertThumbprint = "";
+    private string _selectedCertificateKey = "";
 
     private int _currentPageIndex;
     private int _overallProgressPercentage;
@@ -117,9 +117,10 @@ internal sealed class WizardViewModel : ViewModelBase
             // nothing selected, so there is no reason to distinguish "not
             // configured" from "configured but the certificate is gone" here.
             if (existing.ServerCertThumbprint is { } serverCertThumbprint &&
-                Certificates.Any(certificate => certificate.Thumbprint.Equals(serverCertThumbprint, StringComparison.OrdinalIgnoreCase)))
+                Certificates.FirstOrDefault(certificate =>
+                    certificate.Thumbprint?.Equals(serverCertThumbprint, StringComparison.OrdinalIgnoreCase) == true) is { } existingCertificate)
             {
-                ServerCertThumbprint = serverCertThumbprint;
+                SelectedCertificateKey = existingCertificate.Key;
             }
 
             foreach (var clientThumbprint in existing.ClientThumbprints)
@@ -181,7 +182,7 @@ internal sealed class WizardViewModel : ViewModelBase
     /// </summary>
     public bool IsClusterMember { get; }
 
-    /// <summary>Candidate server certificates for the Certificate page's table - see RefreshCertificates for why this isn't just populated once.</summary>
+    /// <summary>Candidate server certificates for the Certificate page's table - see AddPendingCertificate for why this isn't just populated once.</summary>
     public IReadOnlyList<CertificateEntry> Certificates { get; private set; }
 
     public int ExitCode { get; private set; }
@@ -253,7 +254,43 @@ internal sealed class WizardViewModel : ViewModelBase
     public string TlsPort { get => _tlsPort; set => SetField(ref _tlsPort, value); }
     public string StoreName { get => _storeName; set => SetField(ref _storeName, value); }
     public string StoreLocation { get => _storeLocation; set => SetField(ref _storeLocation, value); }
-    public string ServerCertThumbprint { get => _serverCertThumbprint; set => SetField(ref _serverCertThumbprint, value); }
+
+    /// <summary>
+    /// Backs the Certificate page's DataGrid selection - a row's
+    /// <see cref="CertificateEntry.Key"/>, never its (possibly not-yet-real)
+    /// Thumbprint. See <see cref="SelectedCertificate"/> for the row this
+    /// resolves to and <see cref="CertificateEntry"/>'s own remarks for why
+    /// Key exists as a separate thing at all.
+    /// </summary>
+    public string SelectedCertificateKey
+    {
+        get => _selectedCertificateKey;
+        set
+        {
+            if (SetField(ref _selectedCertificateKey, value))
+            {
+                RaisePropertyChanged(nameof(SelectedCertificate));
+                RaisePropertyChanged(nameof(CertificateSummary));
+            }
+        }
+    }
+
+    /// <summary>The currently selected row, or null before anything has been picked - resolved by key, not cached, since Certificates itself can grow (AddPendingCertificate) without the selection changing.</summary>
+    public CertificateEntry? SelectedCertificate =>
+        Certificates.FirstOrDefault(certificate => certificate.Key == SelectedCertificateKey);
+
+    /// <summary>
+    /// Ready to Install's own certificate line - the one place this whole
+    /// page's choice has to read back unambiguously as "using this already-
+    /// installed certificate" or "generating a new one for this subject",
+    /// never just a bare thumbprint or subject name that could be either.
+    /// </summary>
+    public string CertificateSummary => SelectedCertificate switch
+    {
+        null => "(none selected)",
+        { IsPending: true } pending => $"New self-signed certificate will be generated for '{pending.PendingSubjectName}'",
+        { } existing => $"Existing certificate: {existing.DisplaySubject} ({existing.Thumbprint})",
+    };
 
     /// <summary>
     /// Add/remove list backing the Trusted Clients page, replacing the old
@@ -385,15 +422,22 @@ internal sealed class WizardViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// Re-reads the certificate store - called after generating a new
-    /// self-signed certificate, since that adds an entry the constructor's
-    /// one-time read of <see cref="Certificates"/> would otherwise never
-    /// see.
+    /// Adds a "will be generated" placeholder row and selects it. Appends
+    /// rather than replaces anything already in <see cref="Certificates"/>:
+    /// an earlier pending row (or a real certificate) left unselected is
+    /// simply inert - nothing has actually been generated yet for any
+    /// pending row, so there is nothing to clean up, and the operator can
+    /// still switch back to it later. That is also why this never touches
+    /// the store itself - the certificate this describes does not exist
+    /// until the MSI's own elevated execute sequence creates it (see
+    /// HyperVCsiAgent.Installer.Actions' GenerateServerCertificateCommand).
     /// </summary>
-    public void RefreshCertificates()
+    public void AddPendingCertificate(string subjectName)
     {
-        Certificates = CertificateStoreLookup.ListCandidates();
+        var entry = CertificateEntry.Pending(subjectName);
+        Certificates = [.. Certificates, entry];
         RaisePropertyChanged(nameof(Certificates));
+        SelectedCertificateKey = entry.Key;
     }
 
     // WixBundleLog is set by the engine itself before Detect even begins
@@ -486,7 +530,7 @@ internal sealed class WizardViewModel : ViewModelBase
             WelcomePageIndex => LicenseAccepted,
             ServiceAccountPageIndex => ServiceAccount.Length > 0 && (PasswordLocked || (ServicePassword.Length > 0 && PasswordsMatch)),
             StoragePageIndex => CsvVolumesRoot.Length > 0 && (!SnapshotsEnabled || CsvSnapshotsRoot.Length > 0),
-            CertificatePageIndex => ServerCertThumbprint.Length > 0,
+            CertificatePageIndex => SelectedCertificate is not null,
             TrustedClientsPageIndex => ClientThumbprintList.Count > 0,
             _ => true,
         };
@@ -521,7 +565,7 @@ internal sealed class WizardViewModel : ViewModelBase
     // never missing - Bundle.wxs declares real defaults for all three.
     private static readonly string[] RequiredInstallVariableNames =
     [
-        "SERVICEACCOUNT", "CSVVOLUMESROOT", "CSVSNAPSHOTSROOT", "SERVERCERTTHUMBPRINT", "CLIENTTHUMBPRINTS",
+        "SERVICEACCOUNT", "CSVVOLUMESROOT", "CSVSNAPSHOTSROOT", "CLIENTTHUMBPRINTS",
     ];
 
     private List<string> GetMissingRequiredVariables()
@@ -537,6 +581,15 @@ internal sealed class WizardViewModel : ViewModelBase
             missing.Add("SERVICEPASSWORD");
         }
 
+        // A cert either already exists (SERVERCERTTHUMBPRINT) or gets
+        // generated fresh (GENERATECERTSUBJECT) - see PushVariablesToEngine
+        // - so unlike every other name above, exactly one of a pair has to
+        // be present rather than one fixed name.
+        if (_engine.GetVariableString("SERVERCERTTHUMBPRINT").Length == 0 && _engine.GetVariableString("GENERATECERTSUBJECT").Length == 0)
+        {
+            missing.Add("SERVERCERTTHUMBPRINT or GENERATECERTSUBJECT");
+        }
+
         return missing;
     }
 
@@ -549,7 +602,18 @@ internal sealed class WizardViewModel : ViewModelBase
         _engine.SetVariableString("TLSPORT", TlsPort, formatted: false);
         _engine.SetVariableString("STORENAME", StoreName, formatted: false);
         _engine.SetVariableString("STORELOCATION", StoreLocation, formatted: false);
-        _engine.SetVariableString("SERVERCERTTHUMBPRINT", ServerCertThumbprint, formatted: false);
+
+        // Exactly one of these two is ever non-empty: a pending row has no
+        // real thumbprint to send (nothing has been generated yet - see
+        // AddPendingCertificate), so the MSI generates one itself from
+        // GENERATECERTSUBJECT during its own elevated execute sequence
+        // instead (Product.wxs' GenerateServerCertificate custom action).
+        // An already-installed certificate needs no generation at all, so
+        // GENERATECERTSUBJECT stays blank and every downstream custom
+        // action keeps using SERVERCERTTHUMBPRINT exactly as before.
+        _engine.SetVariableString("SERVERCERTTHUMBPRINT", SelectedCertificate?.Thumbprint ?? "", formatted: false);
+        _engine.SetVariableString("GENERATECERTSUBJECT", SelectedCertificate?.PendingSubjectName ?? "", formatted: false);
+
         _engine.SetVariableString("CLIENTTHUMBPRINTS", string.Join(';', ClientThumbprintList), formatted: false);
     }
 

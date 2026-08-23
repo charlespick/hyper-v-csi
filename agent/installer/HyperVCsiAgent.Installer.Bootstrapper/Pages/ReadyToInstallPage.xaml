@@ -48,7 +48,7 @@
             </TextBlock>
 
             <TextBlock Grid.Row="3" Grid.Column="0" Text="Server certificate:" FontWeight="SemiBold" Margin="0,0,0,6" />
-            <TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding ServerCertThumbprint}" Margin="0,0,0,6" />
+            <TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding CertificateSummary}" Margin="0,0,0,6" TextWrapping="Wrap" />
 
             <TextBlock Grid.Row="4" Grid.Column="0" Text="HTTPS port:" FontWeight="SemiBold" Margin="0,0,0,6" />
             <TextBlock Grid.Row="4" Grid.Column="1" Text="{Binding TlsPort}" Margin="0,0,0,6" />

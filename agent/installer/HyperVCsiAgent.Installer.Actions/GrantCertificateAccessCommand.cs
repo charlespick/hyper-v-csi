@@ -32,7 +32,7 @@ internal static class GrantCertificateAccessCommand
     public static int Run(string[] args)
     {
         var parsed = CommandLineArgs.Parse(args);
-        var thumbprint = parsed.Require("thumbprint");
+        var thumbprint = EffectiveThumbprint.Resolve(parsed.Optional("thumbprint"), parsed.Optional("thumbprint-file"));
         var storeName = parsed.Require("store-name");
         var storeLocation = parsed.Require("store-location");
         var account = parsed.Require("account");

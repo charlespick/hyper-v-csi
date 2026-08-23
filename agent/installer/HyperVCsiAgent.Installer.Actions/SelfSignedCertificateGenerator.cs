@@ -1,9 +1,8 @@
-using System;
 using System.Runtime.Versioning;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 
-namespace HyperVCsiAgent.Installer.Bootstrapper;
+namespace HyperVCsiAgent.Installer.Actions;
 
 /// <summary>
 /// Creates a new self-signed server certificate and imports it into

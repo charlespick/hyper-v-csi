@@ -31,7 +31,7 @@ internal static class WriteConfigCommand
                 Port = int.TryParse(parsed.Optional("tls-port"), out var port) ? port : defaultTls.Port,
                 StoreName = parsed.Optional("tls-store-name") ?? defaultTls.StoreName,
                 StoreLocation = parsed.Optional("tls-store-location") ?? defaultTls.StoreLocation,
-                AllowedThumbprints = parsed.OptionalList("server-thumbprints"),
+                AllowedThumbprints = ResolveServerThumbprints(parsed),
             },
             Authentication =
             {
@@ -95,4 +95,17 @@ internal static class WriteConfigCommand
 
     private static JsonArray ToJsonArray(IEnumerable<string> values) =>
         new(values.Select(value => (JsonNode)JsonValue.Create(value)).ToArray());
+
+    /// <summary>
+    /// --server-thumbprints only ever carries the one certificate the
+    /// Certificate page selected, but a freshly generated one is not known
+    /// as an MSI property by the time this command's own CustomActionData
+    /// is captured - see EffectiveThumbprint for why --server-thumbprint-file
+    /// exists to cover that case instead.
+    /// </summary>
+    private static string[] ResolveServerThumbprints(CommandLineArgs parsed)
+    {
+        var thumbprint = EffectiveThumbprint.Resolve(null, parsed.Optional("server-thumbprint-file"));
+        return thumbprint.Length > 0 ? [thumbprint] : parsed.OptionalList("server-thumbprints");
+    }
 }

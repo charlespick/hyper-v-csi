@@ -28,7 +28,7 @@ internal static class CertificateStoreLookup
             .OfType<X509Certificate2>()
             .Where(certificate => certificate.HasPrivateKey)
             .Where(certificate => now >= certificate.NotBefore && now <= certificate.NotAfter)
-            .Select(certificate => new CertificateEntry(
+            .Select(certificate => CertificateEntry.FromStore(
                 certificate.GetNameInfo(X509NameType.SimpleName, forIssuer: false),
                 certificate.Thumbprint,
                 certificate.NotAfter))

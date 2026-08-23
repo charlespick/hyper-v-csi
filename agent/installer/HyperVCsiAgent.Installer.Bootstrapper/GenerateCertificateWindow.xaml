@@ -1,11 +1,11 @@
 <Window x:Class="HyperVCsiAgent.Installer.Bootstrapper.GenerateCertificateWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Generate Self-Signed Certificate" Height="180" Width="420"
-        WindowStartupLocation="CenterOwner" ResizeMode="NoResize" ShowInTaskbar="False">
+        Title="Generate Self-Signed Certificate" Height="220" Width="420"
+        WindowStartupLocation="CenterOwner" ResizeMode="NoResize" ShowInTaskbar="False" SizeToContent="Height">
     <StackPanel Margin="16">
         <TextBlock TextWrapping="Wrap" Margin="0,0,0,12"
-                   Text="Creates a new self-signed certificate and imports it into this host's certificate store." />
+                   Text="Adds a placeholder to the certificate list below. The actual self-signed certificate is generated and imported into this host's certificate store when setup runs." />
 
         <TextBlock Text="Certificate subject name (typically this host's DNS name):" Margin="0,0,0,4" />
         <TextBox x:Name="SubjectNameBox" Margin="0,0,0,16" />

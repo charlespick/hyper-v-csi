@@ -8,7 +8,6 @@ namespace HyperVCsiAgent.Installer.Bootstrapper;
 internal sealed class BootstrapperApp : BootstrapperApplication
 {
     private WizardViewModel? _viewModel;
-    private bool _elevated;
 
     public int ExitCode { get; private set; }
 
@@ -18,36 +17,20 @@ internal sealed class BootstrapperApp : BootstrapperApplication
 
         _viewModel = new WizardViewModel(this.engine, args.Command);
 
-        // Not for headless (/quiet, /passive, or Burn's own Display.Embedded
-        // relaunch to uninstall an older related bundle - see
-        // WizardViewModel.IsHeadless): those runs never reach the Certificate
-        // page's "Generate new self-signed certificate..." button that needs
-        // this, and Elevate() blocks on a UAC prompt that nobody is at the
-        // keyboard to answer in an unattended run.
-        if (!_viewModel.IsHeadless)
-        {
-            try
-            {
-                // Burn's own supported way to get the whole session running
-                // elevated up front: it shows the UAC prompt itself and
-                // reconnects to an elevated companion process, without which
-                // the Certificate page's LocalMachine\My import (and anything
-                // else privileged reached before Apply()) fails. See the
-                // Bootstrapper csproj's remarks for why a requireAdministrator
-                // manifest on this exe cannot do the same job.
-                this.engine.Elevate(IntPtr.Zero);
-                _elevated = true;
-            }
-            catch (Exception ex)
-            {
-                // The user declined the UAC prompt (or it otherwise failed) -
-                // same exit code Cancel() uses for backing out of setup, since
-                // nothing was ever planned/applied on this path either.
-                this.engine.Log(LogLevel.Error, $"Elevation was declined or failed: {ex.Message}");
-                _viewModel.CancelCommand.Execute(null);
-            }
-        }
-
+        // No engine.Elevate() here: it elevates Burn's own internal companion
+        // process for engine-driven operations (Plan/Apply/package execution)
+        // - see BurnEngine's CoreElevate - not this managed process's own
+        // token, so it never actually helped the Certificate page's
+        // LocalMachine\My import the way an earlier version of this method
+        // assumed. That page no longer needs it at all: it only collects a
+        // subject name now (GenerateCertificateWindow), and the actual
+        // import happens later, elevated, during the MSI's own execute
+        // sequence (HyperVCsiAgent.Installer.Actions' GenerateServerCertificateCommand)
+        // - the same "mutate only during the already-elevated install
+        // window" rule every other privileged write here already follows.
+        // Apply() still elevates on its own when it actually needs to,
+        // exactly as any per-machine Burn bundle does without any BA code
+        // asking for it.
         this.DetectComplete += (_, e) => _viewModel.OnDetectComplete(e);
         this.PlanComplete += (_, e) => _viewModel.OnPlanComplete(e);
         this.ApplyComplete += (_, e) => _viewModel.OnApplyComplete(e);
@@ -74,7 +57,7 @@ internal sealed class BootstrapperApp : BootstrapperApplication
             this.engine.Detect(WizardViewModel.GetHeadlessWindowHandle());
             _viewModel.WaitForHeadlessCompletion();
         }
-        else if (_elevated)
+        else
         {
             this.engine.Log(LogLevel.Standard, "Launching Hyper-V CSI Agent setup UI.");
 
@@ -87,10 +70,6 @@ internal sealed class BootstrapperApp : BootstrapperApplication
             uiThread.Start();
             uiThread.Join();
         }
-
-        // else: elevation was declined in OnCreate, which already set
-        // _viewModel.ExitCode via CancelCommand - fall straight through to
-        // Quit below without ever showing the wizard.
 
         this.ExitCode = _viewModel!.ExitCode;
         this.engine.Quit(this.ExitCode);

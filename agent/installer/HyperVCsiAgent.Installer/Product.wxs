@@ -1,4 +1,12 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <!-- The one channel GenerateServerCertificate has to hand its result to
+       ValidateServerCertificate/GrantServiceAccountCertificateAccess/
+       WriteAgentConfig - see EffectiveThumbprint (HyperVCsiAgent.Installer.Actions)
+       for why a deferred custom action cannot do that through an MSI
+       property. [TempFolder] is left as literal text for the MSI engine
+       itself to resolve, at each consuming CustomAction's own scheduling
+       moment - only the fixed filename after it is a build-time constant. -->
+  <?define GeneratedCertThumbprintPath = "[TempFolder]HyperVCsiAgent.GeneratedServerCert.thumbprint" ?>
   <Package
     Name="Hyper-V CSI Agent"
     Manufacturer="Hyper-V CSI Driver"
@@ -54,6 +62,12 @@
     <Property Id="STORENAME" Value="My" Secure="yes" />
     <Property Id="STORELOCATION" Value="LocalMachine" Secure="yes" />
     <Property Id="SERVERCERTTHUMBPRINT" Secure="yes" />
+    <!-- The subject name for GenerateServerCertificate to generate a fresh
+         self-signed certificate for, when the Certificate page's selection
+         was "will be generated" rather than an already-installed
+         certificate - see WizardViewModel.PushVariablesToEngine, which
+         never sends both this and SERVERCERTTHUMBPRINT at once. -->
+    <Property Id="GENERATECERTSUBJECT" Secure="yes" />
     <!-- Semicolon-separated - the wizard's trusted-clients dialog joins the
          newline-separated text an operator pastes before handing it to MSI,
          since MSI properties collapse embedded newlines. -->
@@ -70,6 +84,25 @@
       configuration-management tool to finish later does not fail on
       validation it was never asked to do.
     -->
+    <!--
+      Deferred and unimpersonated, unlike the validation actions below it:
+      importing a fresh self-signed certificate into LocalMachine\My needs
+      more than the interactive user's own rights, the same reason
+      GrantServiceAccountCertificateAccess is deferred/elevated rather than
+      immediate. Always scheduled (Condition is just NOT REMOVE, not
+      GENERATECERTSUBJECT) so it also clears out any thumbprint file a
+      previous run's generated certificate left behind when this run is
+      using an already-installed certificate instead - see
+      GenerateServerCertificateCommand's own remarks for why leaving a stale
+      file in place would be a real correctness bug, not just clutter.
+    -->
+    <CustomAction Id="GenerateServerCertificate"
+                  BinaryRef="ActionsExe"
+                  ExeCommand="generate-server-cert --subject &quot;[GENERATECERTSUBJECT]&quot; --thumbprint-file &quot;$(GeneratedCertThumbprintPath)&quot;"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
     <CustomAction Id="ValidateServerCertificate"
                   BinaryRef="ActionsExe"
                   ExeCommand="validate-cert --thumbprint &quot;[SERVERCERTTHUMBPRINT]&quot; --store-name &quot;[STORENAME]&quot; --store-location &quot;[STORELOCATION]&quot;"
@@ -92,9 +125,15 @@
       attributes evaluate on - not when it later executes, so this needs no
       separate CustomActionData staging step.
     -->
+    <!--
+      The thumbprint-file flag wins over the thumbprint flag when
+      GenerateServerCertificate actually generated a certificate this run
+      (SERVERCERTTHUMBPRINT itself stays blank in that case - see
+      WizardViewModel.PushVariablesToEngine) - see EffectiveThumbprint.
+    -->
     <CustomAction Id="GrantServiceAccountCertificateAccess"
                   BinaryRef="ActionsExe"
-                  ExeCommand="grant-cert-access --thumbprint &quot;[SERVERCERTTHUMBPRINT]&quot; --store-name &quot;[STORENAME]&quot; --store-location &quot;[STORELOCATION]&quot; --account &quot;[SERVICEACCOUNT]&quot;"
+                  ExeCommand="grant-cert-access --thumbprint &quot;[SERVERCERTTHUMBPRINT]&quot; --store-name &quot;[STORENAME]&quot; --store-location &quot;[STORELOCATION]&quot; --account &quot;[SERVICEACCOUNT]&quot; --thumbprint-file &quot;$(GeneratedCertThumbprintPath)&quot;"
                   Execute="deferred"
                   Impersonate="no"
                   Return="check" />
@@ -161,8 +200,11 @@
                   Value="write-config --output &quot;[CommonAppDataFolder]HyperVCsiAgent\agent.config.json&quot; --csv-volumes-root &quot;[CSVVOLUMESROOT]&quot; --csv-snapshots-root &quot;[CSVSNAPSHOTSROOT]&quot;" />
     <CustomAction Id="SetWriteConfigCmd2" Property="WRITECONFIGCMD"
                   Value="[WRITECONFIGCMD] --tls-port &quot;[TLSPORT]&quot; --tls-store-name &quot;[STORENAME]&quot;" />
+    <!-- The server-thumbprint-file flag wins over server-thumbprints the same
+         way GrantServiceAccountCertificateAccess's thumbprint-file flag does
+         - see EffectiveThumbprint. -->
     <CustomAction Id="SetWriteConfigCmd3" Property="WRITECONFIGCMD"
-                  Value="[WRITECONFIGCMD] --tls-store-location &quot;[STORELOCATION]&quot; --server-thumbprints &quot;[SERVERCERTTHUMBPRINT]&quot; --client-thumbprints &quot;[CLIENTTHUMBPRINTS]&quot;" />
+                  Value="[WRITECONFIGCMD] --tls-store-location &quot;[STORELOCATION]&quot; --server-thumbprints &quot;[SERVERCERTTHUMBPRINT]&quot; --client-thumbprints &quot;[CLIENTTHUMBPRINTS]&quot; --server-thumbprint-file &quot;$(GeneratedCertThumbprintPath)&quot;" />
 
     <CustomAction Id="WriteAgentConfig"
                   BinaryRef="ActionsExe"
@@ -183,9 +225,15 @@
       config file the uninstall is about to leave behind anyway.
     -->
     <InstallExecuteSequence>
+      <Custom Action="GenerateServerCertificate" After="InstallInitialize" Condition="NOT REMOVE" />
       <Custom Action="ValidateServerCertificate" Before="InstallValidate" Condition="SERVERCERTTHUMBPRINT AND NOT REMOVE" />
       <Custom Action="ValidateClientThumbprints" After="ValidateServerCertificate" Condition="CLIENTTHUMBPRINTS AND NOT REMOVE" />
-      <Custom Action="GrantServiceAccountCertificateAccess" After="InstallFiles" Condition="SERVERCERTTHUMBPRINT AND SERVICEACCOUNT AND NOT REMOVE" />
+      <!-- SERVERCERTTHUMBPRINT OR GENERATECERTSUBJECT, not SERVERCERTTHUMBPRINT
+           alone: the generate case leaves SERVERCERTTHUMBPRINT itself blank
+           (see WizardViewModel.PushVariablesToEngine) - GrantServiceAccountCertificateAccess
+           still needs to run, it just resolves the actual thumbprint from
+           GenerateServerCertificate's file instead (EffectiveThumbprint). -->
+      <Custom Action="GrantServiceAccountCertificateAccess" After="InstallFiles" Condition="(SERVERCERTTHUMBPRINT OR GENERATECERTSUBJECT) AND SERVICEACCOUNT AND NOT REMOVE" />
       <Custom Action="GrantServiceAccountLogonRight" Before="InstallServices" Condition="SERVICEACCOUNT AND NOT REMOVE" />
       <!-- Only when the agent is actually being configured (same gate
            WriteAgentConfig uses below) - an unattended install that is only
