@@ -465,12 +465,58 @@ internal sealed class WizardViewModel : ViewModelBase
 
     private void Cancel()
     {
+        if (ConfirmCancel())
+        {
+            Application.Current?.Shutdown();
+        }
+    }
+
+    /// <summary>
+    /// Shared by the wizard's own Cancel button and the window chrome's
+    /// native close button (see ConfirmCloseFromWindowChrome) - both back
+    /// out of setup the same way once confirmed, just triggered
+    /// differently.
+    /// </summary>
+    private bool ConfirmCancel()
+    {
+        var message = IsUninstall
+            ? "Are you sure you want to cancel? The Hyper-V CSI Agent will not be removed."
+            : "Are you sure you want to cancel setup? The Hyper-V CSI Agent will not be installed.";
+        var result = MessageBox.Show(message, "Cancel Setup", MessageBoxButton.YesNo, MessageBoxImage.Question);
+        if (result != MessageBoxResult.Yes)
+        {
+            return false;
+        }
+
         // Nothing was ever planned/applied on this path, so ApplyComplete
         // never runs to set ExitCode - without this it would default to 0
         // (success) even though setup did not run.
         const int ErrorInstallUserExit = 1602;
         ExitCode = ErrorInstallUserExit;
-        Application.Current?.Shutdown();
+        return true;
+    }
+
+    /// <summary>
+    /// Called from MainWindow's Closing handler for the native title-bar
+    /// close button and Alt+F4, neither of which goes through CancelCommand
+    /// - unlike the wizard's own Cancel button, window chrome has no
+    /// Visibility binding to hide it during Progress. Blocks outright while
+    /// Apply() is actually running: closing the UI does not stop Burn's own
+    /// engine, which keeps installing regardless, so there is nothing safe
+    /// to confirm there. Closes without asking once setup has already
+    /// finished, same as clicking the visible Close button.
+    /// </summary>
+    public bool ConfirmCloseFromWindowChrome()
+    {
+        if (IsProgressPage)
+        {
+            MessageBox.Show(
+                "Setup is currently running and cannot be closed from here.",
+                "Setup In Progress", MessageBoxButton.OK, MessageBoxImage.Information);
+            return false;
+        }
+
+        return IsFinishPage || ConfirmCancel();
     }
 
     private void GoBack()
