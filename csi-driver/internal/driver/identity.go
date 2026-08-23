@@ -8,6 +8,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/wrapperspb"
+	"k8s.io/klog/v2"
 )
 
 type identityServer struct {
@@ -63,6 +64,8 @@ const probeBudget = 5 * time.Second
 // is a misconfiguration worth surfacing at startup rather than at the first
 // CreateVolume, since the sidecars call Probe before they call anything else.
 func (s *identityServer) Probe(ctx context.Context, req *csi.ProbeRequest) (*csi.ProbeResponse, error) {
+	klog.V(4).InfoS("Probe")
+
 	// Node mode, where no agent address is configured and no node RPC calls the
 	// agent: staging, publishing and stats are all local to the guest. Reporting
 	// unready for an unreachable dependency this plugin does not have would
@@ -92,8 +95,10 @@ func (s *identityServer) Probe(ctx context.Context, req *csi.ProbeRequest) (*csi
 		//
 		// Retried, not fatal: the agent is a clustered role, and a failover
 		// window is an expected transient state rather than a broken driver.
-		return nil, status.Errorf(codes.FailedPrecondition,
+		err = status.Errorf(codes.FailedPrecondition,
 			"hyperv-csi-agent at %s is not reachable: %v", s.driver.Agent.BaseURL, err)
+		klog.ErrorS(err, "Probe: agent unreachable", "agentBaseUrl", s.driver.Agent.BaseURL)
+		return nil, err
 	}
 
 	return &csi.ProbeResponse{Ready: wrapperspb.Bool(true)}, nil

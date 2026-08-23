@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"k8s.io/klog/v2"
 )
 
 // operationCreateVolume is the operationType the agent dispatches on; it must
@@ -121,21 +122,27 @@ type createVolumeResult struct {
 // cluster API — the agent creates the file on the CSV it already owns, so
 // there's no ownership to resolve and no VM to reconfigure.
 func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
+	klog.V(2).InfoS("CreateVolume", "name", req.GetName())
+
 	if req.GetName() == "" {
+		klog.V(2).InfoS("CreateVolume: rejected, no name")
 		return nil, status.Error(codes.InvalidArgument, "name is required")
 	}
 
 	if err := validateVolumeCapabilities(req.GetVolumeCapabilities()); err != nil {
+		klog.V(2).InfoS("CreateVolume: rejected, unsupported volume capabilities", "name", req.GetName(), "err", err)
 		return nil, err
 	}
 
 	sourceSnapshotID, err := volumeContentSourceSnapshotID(req.GetVolumeContentSource())
 	if err != nil {
+		klog.V(2).InfoS("CreateVolume: rejected, invalid content source", "name", req.GetName(), "err", err)
 		return nil, err
 	}
 
 	sizeBytes, err := pickVolumeSize(req.GetCapacityRange())
 	if err != nil {
+		klog.V(2).InfoS("CreateVolume: rejected, invalid capacity range", "name", req.GetName(), "err", err)
 		return nil, err
 	}
 
@@ -166,10 +173,14 @@ func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 
 	var result createVolumeResult
 	if err := json.Unmarshal(done.Result, &result); err != nil {
-		return nil, status.Errorf(codes.Internal, "decoding CreateVolume result for %s: %v", req.GetName(), err)
+		err = status.Errorf(codes.Internal, "decoding CreateVolume result for %s: %v", req.GetName(), err)
+		klog.ErrorS(err, "CreateVolume: decoding agent result failed", "name", req.GetName())
+		return nil, err
 	}
 	if result.VolumeID == "" {
-		return nil, status.Errorf(codes.Internal, "agent returned no volume id for %s", req.GetName())
+		err := status.Errorf(codes.Internal, "agent returned no volume id for %s", req.GetName())
+		klog.ErrorS(err, "CreateVolume: agent returned no volume id", "name", req.GetName())
+		return nil, err
 	}
 
 	if limit := req.GetCapacityRange().GetLimitBytes(); limit > 0 && result.ActualSizeBytes > limit {
@@ -180,43 +191,61 @@ func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 			// caught in advance. The request is unsatisfiable, not a name
 			// collision or a driver bug, in both the fresh-restore and the
 			// replay case alike.
-			return nil, status.Errorf(codes.OutOfRange,
+			err := status.Errorf(codes.OutOfRange,
 				"snapshot %s is %d bytes, above the requested limit of %d",
 				sourceSnapshotID, result.ActualSizeBytes, limit)
+			klog.ErrorS(err, "CreateVolume: restore exceeds requested limit",
+				"name", req.GetName(), "volumeId", result.VolumeID, "sourceSnapshotId", sourceSnapshotID)
+			return nil, err
 		}
 
 		// A pre-existing disk too big for this request is a name collision
 		// with incompatible parameters, which CSI spells ALREADY_EXISTS.
 		if result.AlreadyPresent {
-			return nil, status.Errorf(codes.AlreadyExists,
+			err := status.Errorf(codes.AlreadyExists,
 				"volume %s already exists at %d bytes, above the requested limit of %d",
 				req.GetName(), result.ActualSizeBytes, limit)
+			klog.ErrorS(err, "CreateVolume: existing volume exceeds requested limit",
+				"name", req.GetName(), "volumeId", result.VolumeID)
+			return nil, err
 		}
 
 		// One we just created should be impossible — the request is aligned
 		// down so Hyper-V's round-up stays inside the limit. Say so rather
 		// than hand back a volume that violates the range that was asked for.
-		return nil, status.Errorf(codes.Internal,
+		err := status.Errorf(codes.Internal,
 			"created volume %s at %d bytes, above the requested limit of %d",
 			req.GetName(), result.ActualSizeBytes, limit)
+		klog.ErrorS(err, "CreateVolume: newly created volume exceeds requested limit",
+			"name", req.GetName(), "volumeId", result.VolumeID)
+		return nil, err
 	}
 
 	if required := req.GetCapacityRange().GetRequiredBytes(); required > 0 && result.ActualSizeBytes < required {
 		// A pre-existing disk too small for this request is a name collision
 		// with incompatible parameters, which CSI spells ALREADY_EXISTS.
 		if result.AlreadyPresent {
-			return nil, status.Errorf(codes.AlreadyExists,
+			err := status.Errorf(codes.AlreadyExists,
 				"volume %s already exists at %d bytes, below the requested minimum of %d",
 				req.GetName(), result.ActualSizeBytes, required)
+			klog.ErrorS(err, "CreateVolume: existing volume below requested minimum",
+				"name", req.GetName(), "volumeId", result.VolumeID)
+			return nil, err
 		}
 
 		// One we just created should be impossible — the request is at least
 		// the minimum, and Hyper-V only rounds up. Say so rather than hand
 		// back a volume that violates the range that was asked for.
-		return nil, status.Errorf(codes.Internal,
+		err := status.Errorf(codes.Internal,
 			"created volume %s at %d bytes, below the requested minimum of %d",
 			req.GetName(), result.ActualSizeBytes, required)
+		klog.ErrorS(err, "CreateVolume: newly created volume below requested minimum",
+			"name", req.GetName(), "volumeId", result.VolumeID)
+		return nil, err
 	}
+
+	klog.V(2).InfoS("CreateVolume: volume created",
+		"name", req.GetName(), "volumeId", result.VolumeID, "actualSizeBytes", result.ActualSizeBytes)
 
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
@@ -369,7 +398,10 @@ type deleteVolumePayload struct {
 // docs/controller-rpc-notes.md — that decision has a real prerequisite
 // attached to it.
 func (s *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
+	klog.V(2).InfoS("DeleteVolume", "volumeId", req.GetVolumeId())
+
 	if req.GetVolumeId() == "" {
+		klog.V(2).InfoS("DeleteVolume: rejected, no volume id")
 		return nil, status.Error(codes.InvalidArgument, "volume id is required")
 	}
 
@@ -387,6 +419,7 @@ func (s *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 		return nil, err
 	}
 
+	klog.V(2).InfoS("DeleteVolume: volume deleted", "volumeId", req.GetVolumeId())
 	return &csi.DeleteVolumeResponse{}, nil
 }
 
@@ -430,16 +463,24 @@ const (
 // deployed, so Kubernetes creates a VolumeAttachment and calls this before a
 // volume's first use.
 func (s *controllerServer) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
+	klog.V(2).InfoS("ControllerPublishVolume", "volumeId", req.GetVolumeId(), "nodeId", req.GetNodeId())
+
 	if req.GetVolumeId() == "" {
+		klog.V(2).InfoS("ControllerPublishVolume: rejected, no volume id")
 		return nil, status.Error(codes.InvalidArgument, "volume id is required")
 	}
 	if req.GetNodeId() == "" {
+		klog.V(2).InfoS("ControllerPublishVolume: rejected, no node id", "volumeId", req.GetVolumeId())
 		return nil, status.Error(codes.InvalidArgument, "node id is required")
 	}
 
 	if capability := req.GetVolumeCapability(); capability == nil {
+		klog.V(2).InfoS("ControllerPublishVolume: rejected, no volume capability",
+			"volumeId", req.GetVolumeId(), "nodeId", req.GetNodeId())
 		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
 	} else if err := validateVolumeCapabilities([]*csi.VolumeCapability{capability}); err != nil {
+		klog.V(2).InfoS("ControllerPublishVolume: rejected, unsupported volume capability",
+			"volumeId", req.GetVolumeId(), "nodeId", req.GetNodeId(), "err", err)
 		return nil, err
 	}
 
@@ -447,6 +488,8 @@ func (s *controllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		// A VHDX attaches read-write; read-only is enforced where it actually
 		// works, at the guest mount. Silently attaching read-write while
 		// reporting success here would promise something no layer delivers.
+		klog.V(2).InfoS("ControllerPublishVolume: rejected, read-only publish not supported",
+			"volumeId", req.GetVolumeId(), "nodeId", req.GetNodeId())
 		return nil, status.Error(codes.InvalidArgument,
 			"read-only publishing is not supported; the node plugin mounts read-only when asked")
 	}
@@ -472,15 +515,25 @@ func (s *controllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 
 	var result attachVolumeResult
 	if err := json.Unmarshal(done.Result, &result); err != nil {
-		return nil, status.Errorf(codes.Internal,
+		err = status.Errorf(codes.Internal,
 			"decoding ControllerPublishVolume result for %s on %s: %v", req.GetVolumeId(), req.GetNodeId(), err)
+		klog.ErrorS(err, "ControllerPublishVolume: decoding agent result failed",
+			"volumeId", req.GetVolumeId(), "nodeId", req.GetNodeId())
+		return nil, err
 	}
 	if result.ControllerInstanceID == "" {
 		// Without the controller the LUN alone is ambiguous across a VM's
 		// several SCSI controllers, so the node could stage the wrong disk.
-		return nil, status.Errorf(codes.Internal,
+		err := status.Errorf(codes.Internal,
 			"agent attached %s to %s but reported no controller", req.GetVolumeId(), req.GetNodeId())
+		klog.ErrorS(err, "ControllerPublishVolume: agent reported no controller",
+			"volumeId", req.GetVolumeId(), "nodeId", req.GetNodeId())
+		return nil, err
 	}
+
+	klog.V(2).InfoS("ControllerPublishVolume: volume published",
+		"volumeId", req.GetVolumeId(), "nodeId", req.GetNodeId(),
+		"controllerId", result.ControllerInstanceID, "lun", result.Lun, "alreadyAttached", result.AlreadyAttached)
 
 	return &csi.ControllerPublishVolumeResponse{
 		PublishContext: map[string]string{
@@ -531,7 +584,10 @@ type detachVolumePayload struct {
 // reconciles it, even though the stuck VolumeAttachment blocks the PV's deletion
 // and the node's drain while it does.
 func (s *controllerServer) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
+	klog.V(2).InfoS("ControllerUnpublishVolume", "volumeId", req.GetVolumeId(), "nodeId", req.GetNodeId())
+
 	if req.GetVolumeId() == "" {
+		klog.V(2).InfoS("ControllerUnpublishVolume: rejected, no volume id")
 		return nil, status.Error(codes.InvalidArgument, "volume id is required")
 	}
 
@@ -541,6 +597,7 @@ func (s *controllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 	// answered wrongly. Kubernetes always sets it; see
 	// docs/node-identity-and-attach.md's "Forward vs. reverse cluster queries".
 	if req.GetNodeId() == "" {
+		klog.V(2).InfoS("ControllerUnpublishVolume: rejected, no node id", "volumeId", req.GetVolumeId())
 		return nil, status.Error(codes.InvalidArgument,
 			"node id is required; unpublishing from every node at once is not supported")
 	}
@@ -566,6 +623,7 @@ func (s *controllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		return nil, err
 	}
 
+	klog.V(2).InfoS("ControllerUnpublishVolume: volume unpublished", "volumeId", req.GetVolumeId(), "nodeId", req.GetNodeId())
 	return &csi.ControllerUnpublishVolumeResponse{}, nil
 }
 
@@ -595,10 +653,14 @@ type volumeExistsPayload struct {
 // a validation issued during a create answers about the finished volume, and
 // one issued during a delete answers about its absence.
 func (s *controllerServer) ValidateVolumeCapabilities(ctx context.Context, req *csi.ValidateVolumeCapabilitiesRequest) (*csi.ValidateVolumeCapabilitiesResponse, error) {
+	klog.V(2).InfoS("ValidateVolumeCapabilities", "volumeId", req.GetVolumeId())
+
 	if req.GetVolumeId() == "" {
+		klog.V(2).InfoS("ValidateVolumeCapabilities: rejected, no volume id")
 		return nil, status.Error(codes.InvalidArgument, "volume id is required")
 	}
 	if len(req.GetVolumeCapabilities()) == 0 {
+		klog.V(2).InfoS("ValidateVolumeCapabilities: rejected, no volume capabilities", "volumeId", req.GetVolumeId())
 		return nil, status.Error(codes.InvalidArgument, "volume capabilities are required")
 	}
 
@@ -622,10 +684,12 @@ func (s *controllerServer) ValidateVolumeCapabilities(ctx context.Context, req *
 			// Not an error. CSI reserves this RPC's error codes for a request
 			// that could not be evaluated; "evaluated, and no" is an ordinary
 			// response with confirmed left unset and the reason in the message.
+			klog.V(2).InfoS("ValidateVolumeCapabilities: not confirmed", "volumeId", req.GetVolumeId(), "reason", reason)
 			return &csi.ValidateVolumeCapabilitiesResponse{Message: reason}, nil
 		}
 	}
 
+	klog.V(2).InfoS("ValidateVolumeCapabilities: confirmed", "volumeId", req.GetVolumeId())
 	return &csi.ValidateVolumeCapabilitiesResponse{
 		Confirmed: &csi.ValidateVolumeCapabilitiesResponse_Confirmed{
 			VolumeCapabilities: req.GetVolumeCapabilities(),
@@ -694,7 +758,10 @@ type expandVolumeResult struct {
 // inside it does not, which is why the response sets node_expansion_required
 // and kubelet follows up with NodeExpandVolume.
 func (s *controllerServer) ControllerExpandVolume(ctx context.Context, req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
+	klog.V(2).InfoS("ControllerExpandVolume", "volumeId", req.GetVolumeId())
+
 	if req.GetVolumeId() == "" {
+		klog.V(2).InfoS("ControllerExpandVolume: rejected, no volume id")
 		return nil, status.Error(codes.InvalidArgument, "volume id is required")
 	}
 
@@ -702,15 +769,19 @@ func (s *controllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 		// CSI makes it optional here. A block one is still refused, since
 		// nothing in this driver handles raw block devices.
 		if err := validateVolumeCapabilities([]*csi.VolumeCapability{capability}); err != nil {
+			klog.V(2).InfoS("ControllerExpandVolume: rejected, unsupported volume capability",
+				"volumeId", req.GetVolumeId(), "err", err)
 			return nil, err
 		}
 		if _, err := requireMountVolume(capability); err != nil {
+			klog.V(2).InfoS("ControllerExpandVolume: rejected, not a mount volume", "volumeId", req.GetVolumeId(), "err", err)
 			return nil, err
 		}
 	}
 
 	sizeBytes, err := pickExpandSize(req.GetCapacityRange())
 	if err != nil {
+		klog.V(2).InfoS("ControllerExpandVolume: rejected, invalid capacity range", "volumeId", req.GetVolumeId(), "err", err)
 		return nil, err
 	}
 
@@ -743,24 +814,34 @@ func (s *controllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 
 	var result expandVolumeResult
 	if err := json.Unmarshal(done.Result, &result); err != nil {
-		return nil, status.Errorf(codes.Internal,
+		err = status.Errorf(codes.Internal,
 			"decoding ControllerExpandVolume result for %s: %v", req.GetVolumeId(), err)
+		klog.ErrorS(err, "ControllerExpandVolume: decoding agent result failed", "volumeId", req.GetVolumeId())
+		return nil, err
 	}
 	if result.ActualSizeBytes <= 0 {
 		// capacity_bytes is mandatory in this response, so there is nothing
 		// honest to send without it.
-		return nil, status.Errorf(codes.Internal,
+		err := status.Errorf(codes.Internal,
 			"agent expanded %s but reported no capacity", req.GetVolumeId())
+		klog.ErrorS(err, "ControllerExpandVolume: agent reported no capacity", "volumeId", req.GetVolumeId())
+		return nil, err
 	}
 	if result.ActualSizeBytes < sizeBytes {
 		// The agent only ever grows, and reads the size back from the disk
 		// afterwards, so a shortfall means the resize silently did less than it
 		// said. Reporting it as success would have Kubernetes record a PVC
 		// capacity the volume does not have.
-		return nil, status.Errorf(codes.Internal,
+		err := status.Errorf(codes.Internal,
 			"agent expanded %s to %d bytes, below the requested %d",
 			req.GetVolumeId(), result.ActualSizeBytes, sizeBytes)
+		klog.ErrorS(err, "ControllerExpandVolume: agent expanded below requested size",
+			"volumeId", req.GetVolumeId(), "actualSizeBytes", result.ActualSizeBytes, "requestedSizeBytes", sizeBytes)
+		return nil, err
 	}
+
+	klog.V(2).InfoS("ControllerExpandVolume: volume expanded",
+		"volumeId", req.GetVolumeId(), "actualSizeBytes", result.ActualSizeBytes, "alreadyLargeEnough", result.AlreadyLargeEnough)
 
 	return &csi.ControllerExpandVolumeResponse{
 		CapacityBytes: result.ActualSizeBytes,
@@ -879,10 +960,14 @@ func (r snapshotResult) csiSnapshot() *csi.Snapshot {
 // re-derived from the files, which survive, not from the job record, which does
 // not.
 func (s *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
+	klog.V(2).InfoS("CreateSnapshot", "name", req.GetName(), "sourceVolumeId", req.GetSourceVolumeId())
+
 	if req.GetSourceVolumeId() == "" {
+		klog.V(2).InfoS("CreateSnapshot: rejected, no source volume id", "name", req.GetName())
 		return nil, status.Error(codes.InvalidArgument, "source volume id is required")
 	}
 	if req.GetName() == "" {
+		klog.V(2).InfoS("CreateSnapshot: rejected, no name", "sourceVolumeId", req.GetSourceVolumeId())
 		return nil, status.Error(codes.InvalidArgument, "name is required")
 	}
 
@@ -927,17 +1012,27 @@ func (s *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 
 	var result snapshotResult
 	if err := json.Unmarshal(done.Result, &result); err != nil {
-		return nil, status.Errorf(codes.Internal,
+		err = status.Errorf(codes.Internal,
 			"decoding CreateSnapshot result for %s of %s: %v", req.GetName(), req.GetSourceVolumeId(), err)
+		klog.ErrorS(err, "CreateSnapshot: decoding agent result failed",
+			"name", req.GetName(), "sourceVolumeId", req.GetSourceVolumeId())
+		return nil, err
 	}
 	if result.SnapshotID == "" {
 		// Mirrors CreateVolume's empty-volume-id check. snapshot_id is what every
 		// later DeleteSnapshot and restore is addressed by, so a snapshot handed
 		// back without one is an object Kubernetes can record but never act on
 		// again. An agent bug, and INTERNAL says so.
-		return nil, status.Errorf(codes.Internal,
+		err := status.Errorf(codes.Internal,
 			"agent returned no snapshot id for %s of %s", req.GetName(), req.GetSourceVolumeId())
+		klog.ErrorS(err, "CreateSnapshot: agent returned no snapshot id",
+			"name", req.GetName(), "sourceVolumeId", req.GetSourceVolumeId())
+		return nil, err
 	}
+
+	klog.V(2).InfoS("CreateSnapshot: snapshot created",
+		"name", req.GetName(), "sourceVolumeId", req.GetSourceVolumeId(),
+		"snapshotId", result.SnapshotID, "readyToUse", result.ReadyToUse)
 
 	return &csi.CreateSnapshotResponse{Snapshot: result.csiSnapshot()}, nil
 }
@@ -959,7 +1054,10 @@ type deleteSnapshotPayload struct {
 // produced, on DeleteVolume's reasoning: no retry can make such a snapshot exist,
 // so failing would only strand the VolumeSnapshotContent forever.
 func (s *controllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
+	klog.V(2).InfoS("DeleteSnapshot", "snapshotId", req.GetSnapshotId())
+
 	if req.GetSnapshotId() == "" {
+		klog.V(2).InfoS("DeleteSnapshot: rejected, no snapshot id")
 		return nil, status.Error(codes.InvalidArgument, "snapshot id is required")
 	}
 
@@ -981,6 +1079,7 @@ func (s *controllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteSn
 		return nil, err
 	}
 
+	klog.V(2).InfoS("DeleteSnapshot: snapshot deleted", "snapshotId", req.GetSnapshotId())
 	return &csi.DeleteSnapshotResponse{}, nil
 }
 
@@ -1014,6 +1113,9 @@ type listSnapshotsResult struct {
 // RPC to confirm a snapshot has actually gone after a delete, so an error there
 // would turn a completed deletion into a stuck one.
 func (s *controllerServer) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
+	klog.V(2).InfoS("ListSnapshots",
+		"snapshotId", req.GetSnapshotId(), "sourceVolumeId", req.GetSourceVolumeId(), "startingToken", req.GetStartingToken())
+
 	job, err := s.driver.Agent.EnqueueJob(ctx, listSnapshotsKey(req), operationListSnapshots,
 		listSnapshotsPayload{
 			SnapshotID:     req.GetSnapshotId(),
@@ -1036,13 +1138,17 @@ func (s *controllerServer) ListSnapshots(ctx context.Context, req *csi.ListSnaps
 		// array, so a body that won't decode is a broken agent rather than a
 		// listing with nothing in it. Treating the two alike would report "no
 		// snapshots" to a caller that is about to conclude they were all deleted.
-		return nil, status.Errorf(codes.Internal, "decoding ListSnapshots result: %v", err)
+		err = status.Errorf(codes.Internal, "decoding ListSnapshots result: %v", err)
+		klog.ErrorS(err, "ListSnapshots: decoding agent result failed")
+		return nil, err
 	}
 
 	entries := make([]*csi.ListSnapshotsResponse_Entry, 0, len(result.Entries))
 	for _, entry := range result.Entries {
 		entries = append(entries, &csi.ListSnapshotsResponse_Entry{Snapshot: entry.csiSnapshot()})
 	}
+
+	klog.V(2).InfoS("ListSnapshots: listed", "entries", len(entries), "nextToken", result.NextToken)
 
 	return &csi.ListSnapshotsResponse{
 		Entries:   entries,

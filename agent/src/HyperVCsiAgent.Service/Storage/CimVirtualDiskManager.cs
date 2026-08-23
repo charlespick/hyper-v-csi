@@ -56,6 +56,7 @@ public sealed class CimVirtualDiskManager : IVirtualDiskManager
         // it still keeps queued work from starting after a cancellation.
         Task.Run(() =>
         {
+            _logger.LogDebug("creating VHDX {Path} at {SizeBytes} bytes", path, maxInternalSizeBytes);
             var deadline = CimDeadline.After(remainingBudget);
 
             // Built through System.Management because the parameter is a MOF
@@ -87,6 +88,7 @@ public sealed class CimVirtualDiskManager : IVirtualDiskManager
     public Task<long> ResizeVhdxAsync(string path, long maxInternalSizeBytes, TimeSpan remainingBudget, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
+            _logger.LogDebug("resizing VHDX {Path} to {SizeBytes} bytes", path, maxInternalSizeBytes);
             var deadline = CimDeadline.After(remainingBudget);
 
             using var session = CimSession.Create(null);
@@ -141,6 +143,7 @@ public sealed class CimVirtualDiskManager : IVirtualDiskManager
     public Task<long> GetVirtualSizeAsync(string path, TimeSpan remainingBudget, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
+            _logger.LogDebug("reading the virtual size of VHDX {Path}", path);
             var deadline = CimDeadline.After(remainingBudget);
 
             using var session = CimSession.Create(null);
@@ -152,6 +155,7 @@ public sealed class CimVirtualDiskManager : IVirtualDiskManager
     public Task<Guid> ResetDiskIdentifierAsync(string path, TimeSpan remainingBudget, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
+            _logger.LogDebug("resetting DiskIdentifier for VHDX {Path}", path);
             var deadline = CimDeadline.After(remainingBudget);
             var newId = Guid.NewGuid();
 

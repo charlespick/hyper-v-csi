@@ -177,6 +177,7 @@ spec:
           args:
             - --mode=controller
             - --endpoint=unix:///csi/csi.sock
+            - --v={{ .Values.logging.verbosity }}
             - --agent-address={{ .Values.agent.address }}
             {{- if .Values.agent.allowInsecure }}
             - --allow-insecure-agent

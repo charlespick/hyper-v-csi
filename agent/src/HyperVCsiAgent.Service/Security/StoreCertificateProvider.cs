@@ -124,6 +124,11 @@ public sealed class StoreCertificateProvider : IServerCertificateProvider
         var candidates = store.Certificates.OfType<X509Certificate2>().ToList();
         var selected = CertificateSelector.Select(candidates, _options.AllowedThumbprints, now);
 
+        _logger.LogDebug(
+            "read {CandidateCount} certificates from {StoreLocation}/{StoreName}; {SelectedState}",
+            candidates.Count, _options.StoreLocation, _options.StoreName,
+            selected is null ? "none matched an allowed thumbprint" : $"selected {selected.Thumbprint}");
+
         // The selected certificate outlives the store handle, so hand back a
         // copy and release everything else. Cloning via the copy constructor
         // rather than a PKCS#12 export/reimport keeps the private key tied to

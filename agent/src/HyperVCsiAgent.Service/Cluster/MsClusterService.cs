@@ -102,8 +102,11 @@ public sealed class MsClusterService : IClusterService
 
             RequireVmId(nodeId);
 
+            _logger.LogDebug("resolving cluster ownership for VM {VmId}", nodeId);
+
             if (FindResourceName(nodeId, cancellationToken) is not { } resourceName)
             {
+                _logger.LogDebug("VM {VmId} has no cluster resource in the local database", nodeId);
                 return null;
             }
 
@@ -119,6 +122,9 @@ public sealed class MsClusterService : IClusterService
                 // rescan before concluding the impossible - the same reasoning
                 // GetVmClusterStateAsync spells out. A VM gone from the cluster
                 // since the cached scan is this method's null, not its throw.
+                _logger.LogDebug(
+                    "MSCluster_Resource query for {Resource} (VM {VmId}) returned no row; rescanning before concluding it is gone",
+                    resourceName, nodeId);
                 if (FindResourceName(nodeId, cancellationToken, forceRefresh: true) is not { } freshResourceName)
                 {
                     return null;
@@ -167,10 +173,13 @@ public sealed class MsClusterService : IClusterService
 
             RequireVmId(nodeId);
 
+            _logger.LogDebug("reading cluster state for VM {VmId}", nodeId);
+
             if (FindResourceName(nodeId, cancellationToken) is not { } resourceName)
             {
                 // The one null this method has: the cluster database really
                 // does not know this VM.
+                _logger.LogDebug("VM {VmId} has no cluster resource in the local database", nodeId);
                 return null;
             }
 
@@ -183,6 +192,9 @@ public sealed class MsClusterService : IClusterService
                 // is known. Rescan and ask again: a VM that has left the
                 // cluster since the cached scan is the ordinary "no such VM"
                 // this method has a null for, not an impossible state.
+                _logger.LogDebug(
+                    "MSCluster_Resource query for {Resource} (VM {VmId}) returned no row; rescanning before concluding it is gone",
+                    resourceName, nodeId);
                 if (FindResourceName(nodeId, cancellationToken, forceRefresh: true) is not { } freshResourceName)
                 {
                     return null;
@@ -529,6 +541,8 @@ public sealed class MsClusterService : IClusterService
         {
             var deadline = CimDeadline.After(_hostOperationTimeout);
 
+            _logger.LogDebug("reading MSCluster_Node.State for {HostName}", hostName);
+
             // Keyed on Name, MSCluster_Node's key property, so this does not
             // scan - the same reasoning ReadOwnerNode gives for
             // MSCluster_Resource. hostName is not caller-supplied in
@@ -546,14 +560,23 @@ public sealed class MsClusterService : IClusterService
                 // new work here yet", which for a sweep is indistinguishable
                 // from Down: either way this pass skips the host and the next
                 // interval pass tries again once it settles.
-                return node.CimInstanceProperties["State"]?.Value is { } state
+                var live = node.CimInstanceProperties["State"]?.Value is { } state
                     && Convert.ToInt32(state) == 0;
+                if (!live)
+                {
+                    _logger.LogDebug(
+                        "{HostName} is not Up (MSCluster_Node.State {RawState}); skipping it this pass",
+                        hostName, node.CimInstanceProperties["State"]?.Value);
+                }
+
+                return live;
             }
 
             // No such node in the cluster database - stale or renamed since
             // ListVmsAsync last reported it as an OwningHost. Not live is the
             // safe answer: skip it this pass rather than asking a host that
             // may not exist to enumerate anything.
+            _logger.LogDebug("no MSCluster_Node named {HostName}; treating it as not live", hostName);
             return false;
         }, cancellationToken);
 
@@ -605,6 +628,8 @@ public sealed class MsClusterService : IClusterService
         Task.Run<IReadOnlyList<ClusteredVm>>(() =>
         {
             var deadline = CimDeadline.After(_hostOperationTimeout);
+
+            _logger.LogDebug("listing every clustered VM in the cluster database");
 
             var vmResources = new List<(string ResourceName, string VmId)>();
             var seenVmIds = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -695,6 +720,7 @@ public sealed class MsClusterService : IClusterService
                 vms.Add(new ClusteredVm(vmId, owner));
             }
 
+            _logger.LogInformation("listed {Count} clustered VMs across the cluster", vms.Count);
             return vms;
         }, cancellationToken);
 }

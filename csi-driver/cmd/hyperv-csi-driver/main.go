@@ -8,7 +8,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"os/signal"
@@ -19,6 +18,7 @@ import (
 	"google.golang.org/grpc"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/klog/v2"
 
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/agentclient"
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/driver"
@@ -27,6 +27,9 @@ import (
 )
 
 func main() {
+	klog.InitFlags(nil)
+	defer klog.Flush()
+
 	var (
 		endpoint = flag.String("endpoint", "unix:///csi/csi.sock", "CSI endpoint")
 		mode     = flag.String("mode", "node", "driver mode: controller or node")
@@ -73,11 +76,11 @@ func main() {
 	switch *mode {
 	case "controller":
 		if *agentAddress == "" {
-			log.Fatal("--agent-address is required in controller mode")
+			klog.Fatal("--agent-address is required in controller mode")
 		}
 	case "node":
 		if *nodeFencing {
-			log.Fatal("--node-fencing is a controller-mode flag; the node server has no Kubernetes client and does not watch Node objects")
+			klog.Fatal("--node-fencing is a controller-mode flag; the node server has no Kubernetes client and does not watch Node objects")
 		}
 		// The node's identity is its Hyper-V VM ID, which only the guest can
 		// learn and only through the host's key-value pools. Reported verbatim
@@ -92,16 +95,16 @@ func main() {
 		if *nodeID == "" {
 			id, err := hypervkvp.VirtualMachineID(*kvpPoolDir)
 			if err != nil {
-				log.Fatalf("resolving this node's Hyper-V VM ID: %v", err)
+				klog.Fatalf("resolving this node's Hyper-V VM ID: %v", err)
 			}
 
-			log.Printf("node identity resolved from the Hyper-V key-value pools: VM %s", id)
+			klog.InfoS("node identity resolved from the Hyper-V key-value pools", "vmId", id)
 			*nodeID = id
 		} else {
-			log.Printf("WARNING: --node-id %q was set explicitly, bypassing resolution of this node's identity from the Hyper-V key-value pools", *nodeID)
+			klog.Warningf("--node-id %q was set explicitly, bypassing resolution of this node's identity from the Hyper-V key-value pools", *nodeID)
 		}
 	default:
-		log.Fatalf("invalid --mode %q: must be \"controller\" or \"node\"", *mode)
+		klog.Fatalf("invalid --mode %q: must be \"controller\" or \"node\"", *mode)
 	}
 
 	// Built in either mode when an address is given. Node mode has no RPC that
@@ -113,7 +116,7 @@ func main() {
 		var err error
 		agent, err = buildAgentClient(*agentAddress, *agentClientCert, *agentClientKey, agentServerCertThumbprints, *allowInsecureAgent)
 		if err != nil {
-			log.Fatal(err)
+			klog.Fatal(err)
 		}
 	}
 
@@ -126,11 +129,11 @@ func main() {
 	if *mode == "controller" {
 		config, err := rest.InClusterConfig()
 		if err != nil {
-			log.Fatalf("building in-cluster Kubernetes config: %v", err)
+			klog.Fatalf("building in-cluster Kubernetes config: %v", err)
 		}
 		kubeClient, err = kubernetes.NewForConfig(config)
 		if err != nil {
-			log.Fatalf("building Kubernetes client: %v", err)
+			klog.Fatalf("building Kubernetes client: %v", err)
 		}
 	}
 
@@ -152,15 +155,15 @@ func main() {
 			Confirmations: nodeFencingConfirmations,
 		})
 		if err != nil {
-			log.Fatal(err)
+			klog.Fatal(err)
 		}
 
 		identity, err := leaderElectionIdentity()
 		if err != nil {
-			log.Fatalf("node fencing: %v", err)
+			klog.Fatalf("node fencing: %v", err)
 		}
 		if *nodeFencingLeaseNamespace == "" {
-			log.Fatal("node fencing: --node-fencing-lease-namespace is required (or set POD_NAMESPACE from the downward API)")
+			klog.Fatal("node fencing: --node-fencing-lease-namespace is required (or set POD_NAMESPACE from the downward API)")
 		}
 
 		go func() {
@@ -175,17 +178,17 @@ func main() {
 				Identity:  identity,
 			})
 			if err != nil && ctx.Err() == nil {
-				log.Printf("WARNING: node fencing stopped; unreachable nodes will not be fenced until this pod restarts: %v", err)
+				klog.Warningf("node fencing stopped; unreachable nodes will not be fenced until this pod restarts: %v", err)
 			}
 		}()
 	}
 
 	listener, err := listen(*endpoint)
 	if err != nil {
-		log.Fatalf("failed to listen on %s: %v", *endpoint, err)
+		klog.Fatalf("failed to listen on %s: %v", *endpoint, err)
 	}
 
-	server := grpc.NewServer()
+	server := grpc.NewServer(grpc.UnaryInterceptor(driver.LoggingInterceptor))
 	csi.RegisterIdentityServer(server, d.IdentityServer())
 
 	switch *mode {
@@ -199,13 +202,13 @@ func main() {
 	// GracefulStop.
 	go func() {
 		<-ctx.Done()
-		log.Print("shutdown signal received, draining gRPC server")
+		klog.Info("shutdown signal received, draining gRPC server")
 		server.GracefulStop()
 	}()
 
-	log.Printf("hyperv-csi-driver starting in %s mode on %s", *mode, *endpoint)
+	klog.InfoS("hyperv-csi-driver starting", "mode", *mode, "endpoint", *endpoint, "version", driver.Version)
 	if err := server.Serve(listener); err != nil {
-		log.Fatalf("gRPC server exited: %v", err)
+		klog.Fatalf("gRPC server exited: %v", err)
 	}
 }
 
@@ -226,7 +229,7 @@ func buildAgentClient(address, certificateFile, keyFile string, serverCertThumbp
 				"--agent-client-cert and --agent-client-key are required in controller mode; pass --allow-insecure-agent only for local development")
 		}
 
-		log.Printf("WARNING: talking to %s without TLS or a client certificate", address)
+		klog.Warningf("talking to %s without TLS or a client certificate", address)
 		return agentclient.New(address), nil
 	}
 

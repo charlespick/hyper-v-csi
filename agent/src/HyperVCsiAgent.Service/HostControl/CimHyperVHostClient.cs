@@ -125,6 +125,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
         Task.Run<AttachedDisk?>(() =>
         {
+            _logger.LogDebug("looking for {VhdxPath} attached to {VmId} on {HostName}", vhdxPath, vmId, hostName);
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
             using var settings = GetActiveSettings(session, hostName, vmId, deadline, cancellationToken);
@@ -135,6 +136,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
+            _logger.LogDebug("checking whether {VhdxPath} is attached to {VmId} on {HostName}", vhdxPath, vmId, hostName);
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
             using var settings = GetActiveSettings(session, hostName, vmId, deadline, cancellationToken);
@@ -144,6 +146,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
         Task.Run<DiskSlot?>(() =>
         {
+            _logger.LogDebug("looking for a free disk slot on {VmId} on {HostName}", vmId, hostName);
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
             using var settings = GetActiveSettings(session, hostName, vmId, deadline, cancellationToken);
@@ -202,6 +205,8 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         string hostName, string vmId, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
+            _logger.LogDebug(
+                "attaching {VhdxPath} to {VmId} on {HostName} at LUN {Lun}", vhdxPath, vmId, hostName, slot.Lun);
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
             using var settings = GetActiveSettings(session, hostName, vmId, deadline, cancellationToken);
@@ -318,6 +323,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
+            _logger.LogDebug("detaching {VhdxPath} from {VmId} on {HostName}", vhdxPath, vmId, hostName);
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
             using var settings = GetActiveSettings(session, hostName, vmId, deadline, cancellationToken);
@@ -356,6 +362,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     public Task<long> GetDiskSizeAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
+            _logger.LogDebug("reading the virtual size of {VhdxPath} for {VmId} on {HostName}", vhdxPath, vmId, hostName);
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
             using var service = GetImageManagementService(session, deadline, cancellationToken);
@@ -365,6 +372,8 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     public Task<long> ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
+            _logger.LogDebug(
+                "resizing VHDX {Path} for {VmId} on {HostName} to {SizeBytes} bytes", vhdxPath, vmId, hostName, newSizeBytes);
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
             using var service = GetImageManagementService(session, deadline, cancellationToken);
@@ -414,6 +423,9 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         string hostName, string vmId, string vhdxPath, string thisSnapshotElementName, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
+            _logger.LogDebug(
+                "classifying how {VhdxPath} is attached to {VmId} on {HostName} relative to snapshot {ElementName}",
+                vhdxPath, vmId, hostName, thisSnapshotElementName);
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
 
@@ -444,8 +456,15 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                     return ClassifyAttachment(
                         session, settings, hostName, vmId, vhdxPath, thisSnapshotElementName, deadline, cancellationToken);
                 }
-                catch (AmbiguousChainException) when (attempt < MaxAttachmentClassificationAttempts - 1)
+                catch (AmbiguousChainException ex) when (attempt < MaxAttachmentClassificationAttempts - 1)
                 {
+                    // Expected and self-clearing, not swallowed silently: see
+                    // this loop's own remarks for why attempt < the last one
+                    // retries rather than lets this become the caller-visible
+                    // failure.
+                    _logger.LogDebug(ex,
+                        "attempt {Attempt} to classify {VhdxPath}'s attachment to {VmId} on {HostName} was ambiguous; retrying",
+                        attempt + 1, vhdxPath, vmId, hostName);
                     cancellationToken.ThrowIfCancellationRequested();
                     Thread.Sleep(CheckpointDiscoveryPollInterval);
                 }
@@ -456,6 +475,8 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         string hostName, string vmId, string elementName, string notesJson, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
+            _logger.LogDebug(
+                "creating checkpoint {ElementName} of {VmId} on {HostName}", elementName, vmId, hostName);
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
 
@@ -506,6 +527,8 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         string hostName, string vmId, string elementName, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
+            _logger.LogDebug(
+                "looking for checkpoint {ElementName} of {VmId} on {HostName}", elementName, vmId, hostName);
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
             using var vm = GetComputerSystem(session, hostName, vmId, deadline, cancellationToken);
@@ -515,6 +538,8 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     public Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
+            _logger.LogDebug(
+                "destroying checkpoint {ElementName} on {HostName}", checkpoint.ElementName, hostName);
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
             using var snapshotService = GetSnapshotService(session, deadline, cancellationToken);
@@ -550,6 +575,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         string hostName, string vmId, CancellationToken cancellationToken) =>
         Task.Run<IReadOnlyList<Checkpoint>>(() =>
         {
+            _logger.LogDebug("listing checkpoints this driver owns on {VmId} on {HostName}", vmId, hostName);
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
             using var vm = GetComputerSystem(session, hostName, vmId, deadline, cancellationToken);
@@ -562,6 +588,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
+            _logger.LogDebug("checking whether {VmId} on {HostName} is configured for production-only checkpoints", vmId, hostName);
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
             using var activeSettings = GetActiveSettings(session, hostName, vmId, deadline, cancellationToken);
@@ -572,10 +599,12 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
+            _logger.LogDebug(
+                "checking whether {VhdxPath}'s differencing chain on {VmId} on {HostName} has collapsed", vhdxPath, vmId, hostName);
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
             using var settings = GetActiveSettings(session, hostName, vmId, deadline, cancellationToken);
-            return IsChainCollapsed(session, settings, vhdxPath, deadline, cancellationToken);
+            return IsChainCollapsed(session, settings, vhdxPath, deadline, cancellationToken, _logger);
         }, cancellationToken);
 
     /// <summary>
@@ -592,7 +621,8 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         CimInstance settings,
         string vhdxPath,
         CimDeadline deadline,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ILogger logger)
     {
         var otherDisks = new List<string>();
 
@@ -643,7 +673,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                 {
                     parent = ParentPathOf(session, imageService, descendant, deadline, cancellationToken);
                 }
-                catch (InvalidOperationException)
+                catch (InvalidOperationException ex)
                 {
                     // ParentPathOf could not read this disk's setting data,
                     // so whether it is still built on vhdxPath is unknown.
@@ -652,7 +682,14 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                     // one instead answers "not collapsed yet" - its one
                     // caller is polling a merge already under way, and a
                     // momentarily unreadable disk is exactly what polling
-                    // during an active reconfiguration looks like.
+                    // during an active reconfiguration looks like. Logged
+                    // rather than swallowed outright, though: a disk that
+                    // stays unreadable across many polls of the same merge is
+                    // worth an operator's attention even though no single
+                    // poll should fail over it.
+                    logger.LogDebug(ex,
+                        "could not read {Descendant}'s setting data while checking whether its chain has collapsed onto {VhdxPath}; treating it as not collapsed yet",
+                        descendant, vhdxPath);
                     return false;
                 }
 

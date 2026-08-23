@@ -280,7 +280,7 @@ public sealed class OrphanedCheckpointReaper : BackgroundService
     /// </summary>
     private void HandleOwnedCheckpoint(string vmId, Checkpoint checkpoint, string host)
     {
-        if (RecoverIdentity(checkpoint) is not { } identity)
+        if (RecoverIdentity(checkpoint, _logger) is not { } identity)
         {
             // Loud on purpose: this driver never destroys, merges or copies
             // through a checkpoint it cannot name, so a checkpoint stuck here
@@ -358,7 +358,7 @@ public sealed class OrphanedCheckpointReaper : BackgroundService
     /// other way to be recovered at all.
     /// </para>
     /// </remarks>
-    private static (string SourceVolumeId, string SnapshotName)? RecoverIdentity(Checkpoint checkpoint)
+    private static (string SourceVolumeId, string SnapshotName)? RecoverIdentity(Checkpoint checkpoint, ILogger logger)
     {
         if (checkpoint.Notes is { Length: > 0 } notes)
         {
@@ -385,12 +385,18 @@ public sealed class OrphanedCheckpointReaper : BackgroundService
                     return (parsed.VolumeId, parsed.SnapshotName);
                 }
             }
-            catch (JsonException)
+            catch (JsonException ex)
             {
                 // Malformed, or written by some future schema this build
                 // does not know how to read. Falls through to ElementName
                 // below rather than giving up - the two halves this driver
-                // itself composed are still sitting right there.
+                // itself composed are still sitting right there. Logged at
+                // Debug rather than swallowed outright: not actionable on its
+                // own since the fallback below still recovers the identity,
+                // but worth having on hand if that fallback ever fails too.
+                logger.LogDebug(ex,
+                    "checkpoint {ElementName}'s Notes did not parse as this driver's own JSON; falling back to splitting ElementName",
+                    checkpoint.ElementName);
             }
         }
 

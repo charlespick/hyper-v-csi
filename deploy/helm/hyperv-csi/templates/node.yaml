@@ -55,6 +55,7 @@ spec:
             # ControllerPublishVolume, so the agent resolves a node to a VM by
             # identity rather than by matching names.
             - --endpoint=unix:///csi/csi.sock
+            - --v={{ .Values.logging.verbosity }}
             - --kvp-pool-dir=/var/lib/hyperv
           volumeMounts:
             - name: socket-dir

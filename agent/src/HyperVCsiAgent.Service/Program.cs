@@ -12,7 +12,10 @@ using HyperVCsiAgent.Service.Security;
 using HyperVCsiAgent.Service.Storage;
 using Microsoft.Extensions.Configuration.CommandLine;
 using Microsoft.Extensions.Configuration.Json;
+using Microsoft.Extensions.Hosting.WindowsServices;
+using Microsoft.Extensions.Logging.EventLog;
 using Microsoft.Extensions.Options;
+using System.Runtime.Versioning;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -71,6 +74,17 @@ configSources.Insert(configFileIndex, configSource);
 var agentOptions = builder.Configuration
     .GetSection(AgentOptions.SectionName)
     .Get<AgentOptions>() ?? new AgentOptions();
+
+// Gated on IsWindowsService(), not just OperatingSystem.IsWindows(): dotnet run
+// and the test hosts are also Windows processes, and neither should touch the
+// real Event Log. Only a process the SCM actually started needs this - which is
+// also the only case CreateWindowsService above changes anything for.
+if (OperatingSystem.IsWindows() && WindowsServiceHelpers.IsWindowsService())
+{
+    EventLogRegistration.Configure(builder.Logging);
+}
+
+builder.Logging.SetMinimumLevel(agentOptions.Logging.MinimumLevel);
 
 builder.Services.ConfigureHttpJsonOptions(options => AgentJson.Apply(options.SerializerOptions));
 builder.Services.AddSingleton(Options.Create(agentOptions));
@@ -319,3 +333,21 @@ app.Run();
 /// AgentJson alone, so it has to be asserted against the real thing.
 /// </summary>
 public partial class Program;
+
+/// <summary>
+/// Just the <see cref="EventLogSettings"/> touch, split out of the top-level
+/// statements above and into an actual attributed type: the platform
+/// compatibility analyzer does not track an <c>OperatingSystem.IsWindows()</c>
+/// guard through to a local function the way it does a direct call, so the
+/// guarded call site above needs something it recognizes on its own -
+/// [SupportedOSPlatform] on a real method - instead.
+/// </summary>
+[SupportedOSPlatform("windows")]
+internal static class EventLogRegistration
+{
+    public static void Configure(ILoggingBuilder logging) => logging.AddEventLog(settings =>
+    {
+        settings.SourceName = "hyperv-csi-agent";
+        settings.LogName = "Application";
+    });
+}

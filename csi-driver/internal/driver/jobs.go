@@ -3,10 +3,12 @@ package driver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/klog/v2"
 
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/agentclient"
 )
@@ -60,6 +62,7 @@ func awaitJob(ctx context.Context, agent *agentclient.Client, jobID string, budg
 			// restarted. ABORTED rather than INTERNAL because re-driving the
 			// operation from scratch is safe: the agent decides what's left to
 			// do by inspecting the CSV, not by remembering this job.
+			klog.ErrorS(err, "awaitJob: agent no longer knows this job, it likely restarted", "jobId", jobID)
 			return nil, status.Errorf(codes.Aborted,
 				"agent no longer knows job %s (it likely restarted); retry the operation", jobID)
 		case err != nil:
@@ -72,11 +75,14 @@ func awaitJob(ctx context.Context, agent *agentclient.Client, jobID string, budg
 			// brief, tolerable window per design.md. Fall through to the same
 			// backoff-and-retry tail a Pending/Running observation gets,
 			// rather than giving up on the first blip.
+			klog.V(3).ErrorS(err, "awaitJob: poll failed, retrying", "jobId", jobID)
 		case job.Status == agentclient.JobSucceeded:
+			klog.V(2).InfoS("awaitJob: job succeeded", "jobId", jobID)
 			return job, nil
 		case job.Status == agentclient.JobFailed:
 			return nil, translateJobFailure(job)
 		default:
+			klog.V(5).InfoS("awaitJob: still polling", "jobId", jobID, "status", job.Status)
 			lastStatus = job.Status
 			lastJob = job
 		}
@@ -122,11 +128,14 @@ func pollStopped(
 	}
 
 	if lastJob != nil && lastJob.QueuedBehind != nil {
+		klog.Warningf("job %s is still %s after %s (queued behind %s on %s); operation in progress, retry",
+			jobID, lastStatus, budget, lastJob.QueuedBehind.OperationType, lastJob.QueuedBehind.Target)
 		return status.Errorf(codes.Aborted,
 			"job %s is still %s after %s (queued behind %s on %s); operation in progress, retry",
 			jobID, lastStatus, budget, lastJob.QueuedBehind.OperationType, lastJob.QueuedBehind.Target)
 	}
 
+	klog.Warningf("job %s is still %s after %s; operation in progress, retry", jobID, lastStatus, budget)
 	return status.Errorf(codes.Aborted,
 		"job %s is still %s after %s; operation in progress, retry", jobID, lastStatus, budget)
 }
@@ -138,6 +147,7 @@ func enqueueFailed(ctx context.Context, err error, format string, args ...any) e
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return status.FromContextError(ctxErr).Err()
 	}
+	klog.ErrorS(err, "EnqueueJob failed", "reason", fmt.Sprintf(format, args...))
 	return status.Errorf(codes.Unavailable, format+": %v", append(args, err)...)
 }
 
@@ -149,6 +159,7 @@ func findAttachedNodeFailed(ctx context.Context, err error, format string, args 
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return status.FromContextError(ctxErr).Err()
 	}
+	klog.ErrorS(err, "findAttachedNode failed", "reason", fmt.Sprintf(format, args...))
 	return status.Errorf(codes.Internal, format+": %v", append(args, err)...)
 }
 
@@ -161,6 +172,8 @@ func translateJobFailure(job *agentclient.Job) error {
 	if detail == "" {
 		detail = "the agent reported no detail"
 	}
+
+	klog.ErrorS(nil, "job failed", "jobId", job.ID, "operationType", job.OperationType, "errorCode", job.ErrorCode, "detail", detail)
 
 	switch job.ErrorCode {
 	case agentclient.ErrorCodeAlreadyExists:

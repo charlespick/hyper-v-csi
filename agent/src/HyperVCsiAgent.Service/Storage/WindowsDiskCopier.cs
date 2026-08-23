@@ -95,6 +95,8 @@ public sealed class WindowsDiskCopier : IDiskCopier
         Task.Run(
             () =>
             {
+                _logger.LogDebug("inspecting copy target {Directory}", directoryPath);
+
                 if (remainingBudget <= TimeSpan.Zero)
                 {
                     throw new TimeoutException(
@@ -141,6 +143,8 @@ public sealed class WindowsDiskCopier : IDiskCopier
         // burned real time, and a fallback given the whole budget again could
         // double the caller's worst case.
         var elapsed = Stopwatch.StartNew();
+
+        _logger.LogDebug("copying {Source} to {Destination}", sourcePath, destinationPath);
 
         var cloned = await Task.Run(
             () => TryBlockClone(sourcePath, destinationPath, remainingBudget, elapsed, cancellationToken),

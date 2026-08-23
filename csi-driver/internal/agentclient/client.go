@@ -17,6 +17,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"k8s.io/klog/v2"
 )
 
 type JobStatus string
@@ -398,6 +400,7 @@ func (c *Client) GetVMClusterState(ctx context.Context, vmID string) (*VMCluster
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
+		klog.ErrorS(err, "agentclient: GetVMClusterState request failed", "vmId", vmID)
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -407,15 +410,19 @@ func (c *Client) GetVMClusterState(ctx context.Context, vmID string) (*VMCluster
 		// Drained so the connection goes back to the pool rather than being
 		// torn down and redialed on every poll.
 		drainBody(resp)
+		klog.V(2).InfoS("agentclient: no cluster resource for VM", "vmId", vmID)
 		return nil, ErrVMClusterResourceNotFound
 	case resp.StatusCode == http.StatusServiceUnavailable:
 		// This is the routine, repeating response while a fencing event is in
 		// progress — draining matters here more than anywhere else in this
 		// file, since it recurs every poll for the duration of the outage.
 		drainBody(resp)
+		klog.V(3).InfoS("agentclient: cluster unavailable for VM cluster-state read", "vmId", vmID)
 		return nil, ErrClusterUnavailable
 	case resp.StatusCode >= 300:
-		return nil, readAgentError(resp, req.URL.Path)
+		agentErr := readAgentError(resp, req.URL.Path)
+		klog.ErrorS(agentErr, "agentclient: GetVMClusterState returned an error status", "vmId", vmID, "status", resp.StatusCode)
+		return nil, agentErr
 	}
 
 	var state VMClusterState
@@ -423,21 +430,30 @@ func (c *Client) GetVMClusterState(ctx context.Context, vmID string) (*VMCluster
 		return nil, fmt.Errorf("decoding cluster state from %s: %w", req.URL.Path, err)
 	}
 
+	klog.V(3).InfoS("agentclient: VM cluster state read", "vmId", vmID, "state", state)
 	return &state, nil
 }
 
 func (c *Client) do(req *http.Request) (*Job, error) {
+	start := time.Now()
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
+		klog.V(2).ErrorS(err, "agentclient: request failed", "method", req.Method, "path", req.URL.Path)
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	klog.V(3).InfoS("agentclient: request completed",
+		"method", req.Method, "path", req.URL.Path, "status", resp.StatusCode, "elapsed", time.Since(start))
 
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
 		return nil, ErrJobNotFound
 	case resp.StatusCode >= 300:
-		return nil, readAgentError(resp, req.URL.Path)
+		agentErr := readAgentError(resp, req.URL.Path)
+		klog.V(2).ErrorS(agentErr, "agentclient: agent returned an error status",
+			"method", req.Method, "path", req.URL.Path, "status", resp.StatusCode)
+		return nil, agentErr
 	}
 
 	var job Job

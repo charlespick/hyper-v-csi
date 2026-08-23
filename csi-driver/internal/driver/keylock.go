@@ -1,6 +1,10 @@
 package driver
 
-import "sync"
+import (
+	"sync"
+
+	"k8s.io/klog/v2"
+)
 
 // keyLock provides per-key mutual exclusion without blocking: TryLock reports
 // immediately whether some other call already holds the key, rather than
@@ -58,12 +62,15 @@ func (l *keyLock) TryLock(key string) (unlock func(), ok bool) {
 
 	if !entry.mu.TryLock() {
 		l.release(key, entry)
+		klog.V(5).InfoS("keyLock: contended, another call already holds this key", "key", key)
 		return nil, false
 	}
 
+	klog.V(5).InfoS("keyLock: acquired", "key", key)
 	return func() {
 		entry.mu.Unlock()
 		l.release(key, entry)
+		klog.V(5).InfoS("keyLock: released", "key", key)
 	}, true
 }
 

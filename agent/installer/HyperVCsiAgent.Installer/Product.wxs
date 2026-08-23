@@ -109,6 +109,23 @@
                   Execute="immediate"
                   Return="check" />
 
+    <!--
+      Deferred and unimpersonated, the same "only mutate during the
+      already-elevated install/rollback window" rule GenerateServerCertificate
+      above follows: creating a brand-new Event Log source needs registry
+      rights under HKLM\SYSTEM that [SERVICEACCOUNT] is not guaranteed to
+      have, and .NET's own EventLogLoggerProvider swallows that failure
+      silently rather than surfacing it - see EnsureEventLogSourceCommand's
+      own remarks. Needs no CustomActionData: the source name is fixed, so
+      there is nothing here for a wizard page to collect.
+    -->
+    <CustomAction Id="EnsureEventLogSource"
+                  BinaryRef="ActionsExe"
+                  ExeCommand="ensure-eventlog-source"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
     <CustomAction Id="ValidateClientThumbprints"
                   BinaryRef="ActionsExe"
                   ExeCommand="validate-thumbprints --values &quot;[CLIENTTHUMBPRINTS]&quot;"
@@ -226,6 +243,12 @@
     -->
     <InstallExecuteSequence>
       <Custom Action="GenerateServerCertificate" After="InstallInitialize" Condition="NOT REMOVE" />
+      <!-- No ordering dependency on GenerateServerCertificate or any other
+           elevated action here - registering the Event Log source is
+           independent of certificates, config and the firewall alike, so
+           this just needs to land somewhere in the elevated sequence before
+           the service can plausibly start (InstallServices, further down). -->
+      <Custom Action="EnsureEventLogSource" After="GenerateServerCertificate" Condition="NOT REMOVE" />
       <Custom Action="ValidateServerCertificate" Before="InstallValidate" Condition="SERVERCERTTHUMBPRINT AND NOT REMOVE" />
       <Custom Action="ValidateClientThumbprints" After="ValidateServerCertificate" Condition="CLIENTTHUMBPRINTS AND NOT REMOVE" />
       <!-- SERVERCERTTHUMBPRINT OR GENERATECERTSUBJECT, not SERVERCERTTHUMBPRINT

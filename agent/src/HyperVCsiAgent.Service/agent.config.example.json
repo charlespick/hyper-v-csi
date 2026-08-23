@@ -30,6 +30,11 @@
       "AllowedClientCertificateThumbprints": [
         "A1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4"
       ]
+    },
+
+    "//Logging": "Optional. Trace, Debug, Information (default), Warning, Error, Critical, or None. Not written by the installer - add this section by hand and restart the service to change it.",
+    "Logging": {
+      "MinimumLevel": "Debug"
     }
   }
 }

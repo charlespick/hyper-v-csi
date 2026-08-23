@@ -12,6 +12,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/klog/v2"
 	mount "k8s.io/mount-utils"
 
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/fsstats"
@@ -138,43 +139,59 @@ func (s *nodeServer) acquireMountLock(rpcName, volumeID, target string) (func(),
 func (s *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
 	volumeID := req.GetVolumeId()
 	target := req.GetStagingTargetPath()
+
+	klog.V(2).InfoS("NodeStageVolume", "volumeId", volumeID, "target", target)
+
 	if err := validateStagingRequest(volumeID, target); err != nil {
+		klog.V(2).InfoS("NodeStageVolume: rejected, invalid request", "volumeId", volumeID, "target", target, "err", err)
 		return nil, err
 	}
 
 	capability := req.GetVolumeCapability()
 	if capability == nil {
+		klog.V(2).InfoS("NodeStageVolume: rejected, no volume capability", "volumeId", volumeID, "target", target)
 		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
 	}
 	if err := validateVolumeCapabilities([]*csi.VolumeCapability{capability}); err != nil {
+		klog.V(2).InfoS("NodeStageVolume: rejected, unsupported volume capability",
+			"volumeId", volumeID, "target", target, "err", err)
 		return nil, err
 	}
 	mountVolume, err := requireMountVolume(capability)
 	if err != nil {
+		klog.V(2).InfoS("NodeStageVolume: rejected, not a mount volume", "volumeId", volumeID, "target", target, "err", err)
 		return nil, err
 	}
 	readOnly := capability.GetAccessMode().GetMode() == csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY
 
 	controllerID := req.GetPublishContext()[publishContextController]
 	if controllerID == "" {
+		klog.V(2).InfoS("NodeStageVolume: rejected, missing publish context controller id",
+			"volumeId", volumeID, "target", target)
 		return nil, status.Errorf(codes.InvalidArgument, "publish context %q is required", publishContextController)
 	}
 	lunValue, ok := req.GetPublishContext()[publishContextLun]
 	if !ok || lunValue == "" {
+		klog.V(2).InfoS("NodeStageVolume: rejected, missing publish context lun", "volumeId", volumeID, "target", target)
 		return nil, status.Errorf(codes.InvalidArgument, "publish context %q is required", publishContextLun)
 	}
 	lun, err := strconv.ParseInt(lunValue, 10, 32)
 	if err != nil {
+		klog.V(2).InfoS("NodeStageVolume: rejected, invalid publish context lun",
+			"volumeId", volumeID, "target", target, "lun", lunValue, "err", err)
 		return nil, status.Errorf(codes.InvalidArgument,
 			"publish context %q is %q, which is not a valid integer: %v", publishContextLun, lunValue, err)
 	}
 	if lun < 0 {
+		klog.V(2).InfoS("NodeStageVolume: rejected, negative publish context lun",
+			"volumeId", volumeID, "target", target, "lun", lunValue)
 		return nil, status.Errorf(codes.InvalidArgument,
 			"publish context %q is %q, which is not a non-negative integer", publishContextLun, lunValue)
 	}
 
 	unlock, err := s.acquireMountLock("NodeStageVolume", volumeID, target)
 	if err != nil {
+		klog.V(2).InfoS("NodeStageVolume: rejected, already in progress", "volumeId", volumeID, "target", target)
 		return nil, err
 	}
 
@@ -188,8 +205,11 @@ func (s *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolu
 		return s.stageVolume(controllerID, int32(lun), target, fsType, options, readOnly)
 	})
 	if err != nil {
+		klog.ErrorS(err, "NodeStageVolume: staging failed",
+			"volumeId", volumeID, "target", target, "controllerId", controllerID, "lun", lun)
 		return nil, err
 	}
+	klog.V(2).InfoS("NodeStageVolume: volume staged", "volumeId", volumeID, "target", target, "fsType", fsType)
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
@@ -436,12 +456,17 @@ func mountOptions(mountFlags []string, readOnly bool) []string {
 func (s *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
 	volumeID := req.GetVolumeId()
 	target := req.GetStagingTargetPath()
+
+	klog.V(2).InfoS("NodeUnstageVolume", "volumeId", volumeID, "target", target)
+
 	if err := validateStagingRequest(volumeID, target); err != nil {
+		klog.V(2).InfoS("NodeUnstageVolume: rejected, invalid request", "volumeId", volumeID, "target", target, "err", err)
 		return nil, err
 	}
 
 	unlock, err := s.acquireMountLock("NodeUnstageVolume", volumeID, target)
 	if err != nil {
+		klog.V(2).InfoS("NodeUnstageVolume: rejected, already in progress", "volumeId", volumeID, "target", target)
 		return nil, err
 	}
 
@@ -458,8 +483,10 @@ func (s *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstage
 		return nil
 	})
 	if err != nil {
+		klog.ErrorS(err, "NodeUnstageVolume: unstaging failed", "volumeId", volumeID, "target", target)
 		return nil, err
 	}
+	klog.V(2).InfoS("NodeUnstageVolume: volume unstaged", "volumeId", volumeID, "target", target)
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
@@ -486,6 +513,7 @@ func (s *nodeServer) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCa
 // decisions. NodeID must match what ControllerPublishVolume resolves
 // through cluster APIs (the VM's identity), not the guest hostname.
 func (s *nodeServer) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
+	klog.V(2).InfoS("NodeGetInfo", "nodeId", s.driver.NodeID)
 	return &csi.NodeGetInfoResponse{NodeId: s.driver.NodeID}, nil
 }
 
@@ -499,28 +527,38 @@ func (s *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 	volumeID := req.GetVolumeId()
 	target := req.GetTargetPath()
 	stagingTarget := req.GetStagingTargetPath()
+
+	klog.V(2).InfoS("NodePublishVolume", "volumeId", volumeID, "target", target)
+
 	if volumeID == "" {
+		klog.V(2).InfoS("NodePublishVolume: rejected, no volume id")
 		return nil, status.Error(codes.InvalidArgument, "volume id is required")
 	}
 	if target == "" {
+		klog.V(2).InfoS("NodePublishVolume: rejected, no target path", "volumeId", volumeID)
 		return nil, status.Error(codes.InvalidArgument, "target path is required")
 	}
 	if stagingTarget == "" {
 		// CSI only requires this field from a plugin advertising
 		// STAGE_UNSTAGE_VOLUME. This one does, so kubelet always stages first
 		// and always sets it, and there is nothing to bind without it.
+		klog.V(2).InfoS("NodePublishVolume: rejected, no staging target path", "volumeId", volumeID, "target", target)
 		return nil, status.Error(codes.InvalidArgument, "staging target path is required")
 	}
 
 	capability := req.GetVolumeCapability()
 	if capability == nil {
+		klog.V(2).InfoS("NodePublishVolume: rejected, no volume capability", "volumeId", volumeID, "target", target)
 		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
 	}
 	if err := validateVolumeCapabilities([]*csi.VolumeCapability{capability}); err != nil {
+		klog.V(2).InfoS("NodePublishVolume: rejected, unsupported volume capability",
+			"volumeId", volumeID, "target", target, "err", err)
 		return nil, err
 	}
 	mountVolume, err := requireMountVolume(capability)
 	if err != nil {
+		klog.V(2).InfoS("NodePublishVolume: rejected, not a mount volume", "volumeId", volumeID, "target", target, "err", err)
 		return nil, err
 	}
 
@@ -533,6 +571,7 @@ func (s *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 
 	unlock, err := s.acquireMountLock("NodePublishVolume", volumeID, target)
 	if err != nil {
+		klog.V(2).InfoS("NodePublishVolume: rejected, already in progress", "volumeId", volumeID, "target", target)
 		return nil, err
 	}
 
@@ -542,8 +581,10 @@ func (s *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 		return s.publishVolume(stagingTarget, target, options, readOnly)
 	})
 	if err != nil {
+		klog.ErrorS(err, "NodePublishVolume: publishing failed", "volumeId", volumeID, "target", target, "stagingTarget", stagingTarget)
 		return nil, err
 	}
+	klog.V(2).InfoS("NodePublishVolume: volume published", "volumeId", volumeID, "target", target)
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
@@ -625,15 +666,21 @@ func (s *nodeServer) publishVolume(stagingTarget, target string, options []strin
 func (s *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
 	volumeID := req.GetVolumeId()
 	target := req.GetTargetPath()
+
+	klog.V(2).InfoS("NodeUnpublishVolume", "volumeId", volumeID, "target", target)
+
 	if volumeID == "" {
+		klog.V(2).InfoS("NodeUnpublishVolume: rejected, no volume id")
 		return nil, status.Error(codes.InvalidArgument, "volume id is required")
 	}
 	if target == "" {
+		klog.V(2).InfoS("NodeUnpublishVolume: rejected, no target path", "volumeId", volumeID)
 		return nil, status.Error(codes.InvalidArgument, "target path is required")
 	}
 
 	unlock, err := s.acquireMountLock("NodeUnpublishVolume", volumeID, target)
 	if err != nil {
+		klog.V(2).InfoS("NodeUnpublishVolume: rejected, already in progress", "volumeId", volumeID, "target", target)
 		return nil, err
 	}
 
@@ -651,8 +698,10 @@ func (s *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpub
 		return nil
 	})
 	if err != nil {
+		klog.ErrorS(err, "NodeUnpublishVolume: unpublishing failed", "volumeId", volumeID, "target", target)
 		return nil, err
 	}
+	klog.V(2).InfoS("NodeUnpublishVolume: volume unpublished", "volumeId", volumeID, "target", target)
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
@@ -672,15 +721,21 @@ func (s *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpub
 func (s *nodeServer) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
 	volumeID := req.GetVolumeId()
 	volumePath := req.GetVolumePath()
+
+	klog.V(2).InfoS("NodeGetVolumeStats", "volumeId", volumeID, "volumePath", volumePath)
+
 	if volumeID == "" {
+		klog.V(2).InfoS("NodeGetVolumeStats: rejected, no volume id")
 		return nil, status.Error(codes.InvalidArgument, "volume id is required")
 	}
 	if volumePath == "" {
+		klog.V(2).InfoS("NodeGetVolumeStats: rejected, no volume path", "volumeId", volumeID)
 		return nil, status.Error(codes.InvalidArgument, "volume path is required")
 	}
 
 	unlock, err := s.acquireMountLock("NodeGetVolumeStats", volumeID, volumePath)
 	if err != nil {
+		klog.V(2).InfoS("NodeGetVolumeStats: rejected, already in progress", "volumeId", volumeID, "volumePath", volumePath)
 		return nil, err
 	}
 
@@ -691,8 +746,12 @@ func (s *nodeServer) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVol
 		return statsErr
 	})
 	if err != nil {
+		klog.ErrorS(err, "NodeGetVolumeStats: reading stats failed", "volumeId", volumeID, "volumePath", volumePath)
 		return nil, err
 	}
+
+	klog.V(2).InfoS("NodeGetVolumeStats: stats read",
+		"volumeId", volumeID, "volumePath", volumePath, "totalBytes", stats.TotalBytes, "usedBytes", stats.UsedBytes)
 
 	return &csi.NodeGetVolumeStatsResponse{
 		Usage: []*csi.VolumeUsage{
@@ -767,10 +826,15 @@ func (s *nodeServer) volumeStats(volumePath string) (fsstats.Stats, error) {
 func (s *nodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
 	volumeID := req.GetVolumeId()
 	volumePath := req.GetVolumePath()
+
+	klog.V(2).InfoS("NodeExpandVolume", "volumeId", volumeID, "volumePath", volumePath)
+
 	if volumeID == "" {
+		klog.V(2).InfoS("NodeExpandVolume: rejected, no volume id")
 		return nil, status.Error(codes.InvalidArgument, "volume id is required")
 	}
 	if volumePath == "" {
+		klog.V(2).InfoS("NodeExpandVolume: rejected, no volume path", "volumeId", volumeID)
 		return nil, status.Error(codes.InvalidArgument, "volume path is required")
 	}
 
@@ -779,15 +843,20 @@ func (s *nodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVo
 	// else: nothing in this driver handles raw block devices.
 	if capability := req.GetVolumeCapability(); capability != nil {
 		if err := validateVolumeCapabilities([]*csi.VolumeCapability{capability}); err != nil {
+			klog.V(2).InfoS("NodeExpandVolume: rejected, unsupported volume capability",
+				"volumeId", volumeID, "volumePath", volumePath, "err", err)
 			return nil, err
 		}
 		if _, err := requireMountVolume(capability); err != nil {
+			klog.V(2).InfoS("NodeExpandVolume: rejected, not a mount volume",
+				"volumeId", volumeID, "volumePath", volumePath, "err", err)
 			return nil, err
 		}
 	}
 
 	unlock, err := s.acquireMountLock("NodeExpandVolume", volumeID, volumePath)
 	if err != nil {
+		klog.V(2).InfoS("NodeExpandVolume: rejected, already in progress", "volumeId", volumeID, "volumePath", volumePath)
 		return nil, err
 	}
 
@@ -795,8 +864,10 @@ func (s *nodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVo
 		return s.expandVolume(volumePath)
 	})
 	if err != nil {
+		klog.ErrorS(err, "NodeExpandVolume: expanding failed", "volumeId", volumeID, "volumePath", volumePath)
 		return nil, err
 	}
+	klog.V(2).InfoS("NodeExpandVolume: volume expanded", "volumeId", volumeID, "volumePath", volumePath)
 
 	// capacity_bytes is deliberately left unset, which CSI permits. The only
 	// number available after a grow is the filesystem's usable total, and that

@@ -199,6 +199,8 @@ public sealed class AgentOptions
 
     public AuthenticationOptions Authentication { get; set; } = new();
 
+    public LoggingOptions Logging { get; set; } = new();
+
     public void Validate()
     {
         Tls.Validate();

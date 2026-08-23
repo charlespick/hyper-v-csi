@@ -24,6 +24,14 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- EventLog.SourceExists/CreateEventSource (EnsureEventLogSourceCommand)
+         moved out of the shared framework after .NET Core 3.0 - the type is
+         still in namespace System.Diagnostics, but the assembly is this
+         separate, Windows-only package now. -->
+    <PackageReference Include="System.Diagnostics.EventLog" Version="10.0.10" />
+  </ItemGroup>
+
+  <ItemGroup>
     <InternalsVisibleTo Include="HyperVCsiAgent.Installer.Actions.Tests" />
   </ItemGroup>
 

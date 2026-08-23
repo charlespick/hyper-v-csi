@@ -22,6 +22,15 @@ image:
 
 imagePullSecrets: []
 
+logging:
+  # klog -v level for the hyperv-csi-driver container, controller and node
+  # alike. 0 = warnings/errors only. 1 = + driver lifecycle (start/stop,
+  # node identity resolution). 2 = + RPC call lifecycle: method, key
+  # identifiers, outcome (default). 4 = + full request objects and every
+  # HTTP call to the agent. 5 = + per-poll-iteration and lock-contention
+  # detail.
+  verbosity: 2
+
 # The hyperv-csi-agent running as a clustered role on the Hyper-V failover
 # cluster. Must be https:// — the driver refuses a plaintext address whenever a
 # client certificate is configured, since over plaintext the certificate proves

@@ -7,6 +7,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/klog/v2"
 )
 
 // findAttachedNode looks up which CSI node ID currently has volumeID
@@ -22,6 +23,8 @@ import (
 // Kubernetes node, and CSINode is where that node's own CSI node ID - this
 // driver's Hyper-V VM ID, reported by NodeGetInfo - is recorded against it.
 func findAttachedNode(ctx context.Context, client kubernetes.Interface, volumeID string) (string, error) {
+	klog.V(4).InfoS("findAttachedNode", "volumeId", volumeID)
+
 	attachments, err := client.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return "", fmt.Errorf("listing VolumeAttachments: %w", err)
@@ -48,6 +51,7 @@ func findAttachedNode(ctx context.Context, client kubernetes.Interface, volumeID
 	}
 
 	if nodeName == "" {
+		klog.V(4).InfoS("findAttachedNode: no attachment found", "volumeId", volumeID)
 		return "", nil
 	}
 
@@ -58,6 +62,7 @@ func findAttachedNode(ctx context.Context, client kubernetes.Interface, volumeID
 			// error: the caller's local read is the fallback either way, and
 			// a node that no longer registers this driver has nothing
 			// attached to it that this driver knows about.
+			klog.V(4).InfoS("findAttachedNode: CSINode deregistered since the list", "volumeId", volumeID, "kubeNodeName", nodeName)
 			return "", nil
 		}
 		return "", fmt.Errorf("reading CSINode %s: %w", nodeName, err)
@@ -65,9 +70,11 @@ func findAttachedNode(ctx context.Context, client kubernetes.Interface, volumeID
 
 	for _, d := range csiNode.Spec.Drivers {
 		if d.Name == DriverName {
+			klog.V(4).InfoS("findAttachedNode: resolved", "volumeId", volumeID, "nodeId", d.NodeID)
 			return d.NodeID, nil
 		}
 	}
 
+	klog.V(4).InfoS("findAttachedNode: CSINode has no entry for this driver", "volumeId", volumeID, "kubeNodeName", nodeName)
 	return "", nil
 }

@@ -57,6 +57,7 @@ public static class CimJobs
         var returnValue = Convert.ToUInt32(result.ReturnValue.Value);
         if (returnValue == Completed)
         {
+            logger.LogDebug("{MethodName} completed inline", methodName);
             return true;
         }
 
@@ -69,6 +70,8 @@ public static class CimJobs
         {
             throw new InvalidOperationException($"{methodName} reported a started job but returned no job reference");
         }
+
+        logger.LogDebug("{MethodName} started a job; polling it every {PollInterval}", methodName, JobPollInterval);
 
         while (true)
         {
@@ -98,6 +101,10 @@ public static class CimJobs
                         state,
                         string.IsNullOrWhiteSpace(warning) ? "no warning description" : warning);
                 }
+                else
+                {
+                    logger.LogDebug("{MethodName}'s job completed", methodName);
+                }
 
                 return false;
             }
@@ -105,6 +112,12 @@ public static class CimJobs
             if (state > JobStateCompleted && state <= JobStateException)
             {
                 var description = job.CimInstanceProperties["ErrorDescription"]?.Value as string;
+
+                // Thrown rather than logged here: every caller in this file
+                // either surfaces this to an operator itself (the attach/detach/
+                // checkpoint paths already log their own outcome) or lets it
+                // propagate to whatever ultimately reports the job as failed -
+                // logging it here too would double it up rather than fill a gap.
                 throw new InvalidOperationException(
                     $"{methodName} job ended in state {state}: {(string.IsNullOrWhiteSpace(description) ? "no error description" : description)}");
             }
