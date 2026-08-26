@@ -3,6 +3,13 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
     <DockPanel>
         <TextBlock DockPanel.Dock="Top" Text="Hyper-V CSI Agent Setup" FontSize="20" FontWeight="Bold" Margin="0,0,0,4" />
+        <!-- SetupSummary shows both versions once Mode resolves - e.g.
+             "Upgrading Hyper-V CSI Agent from 0.1.0-beta.1 to 0.2.0 on this
+             node." It starts blank/generic until OnDetectComplete's
+             ComputeSetupMode result arrives (typically well before the
+             operator reads this page), rather than blocking Welcome on
+             Detect completing first. -->
+        <TextBlock DockPanel.Dock="Top" TextWrapping="Wrap" Margin="0,0,0,4" FontWeight="SemiBold" Text="{Binding SetupSummary}" />
         <TextBlock DockPanel.Dock="Top" TextWrapping="Wrap" Margin="0,0,0,12"
                    Text="Please review the license terms before installing the Hyper-V CSI Agent." />
 

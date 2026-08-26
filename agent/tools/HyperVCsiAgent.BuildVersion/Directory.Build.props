@@ -1,0 +1,17 @@
+<Project>
+
+  <!--
+    Intentionally empty. Its only job is to exist here so MSBuild's walk up
+    the directory tree for the nearest Directory.Build.props stops at this
+    file instead of continuing on to agent/Directory.Build.props, which
+    computes HyperVCsiBuildKey/HyperVCsiVersion and friends.
+
+    That props file's version derivation runs `dotnet run` against this very
+    tool project to get its answer. If this tool inherited that props file,
+    building the tool would require the version it exists to produce -
+    a bootstrap cycle with no valid starting point. Shadowing it here with an
+    empty override breaks the cycle: this project participates in none of the
+    shared build-wide properties agent/Directory.Build.props will define.
+  -->
+
+</Project>

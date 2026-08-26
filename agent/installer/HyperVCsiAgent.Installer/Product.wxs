@@ -1,50 +1,55 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
-  <!-- The one channel GenerateServerCertificate has to hand its result to
+  <!-- The channel GenerateServerCertificate uses to hand its result to
        ValidateServerCertificate/GrantServiceAccountCertificateAccess/
-       WriteAgentConfig - see EffectiveThumbprint (HyperVCsiAgent.Installer.Actions)
-       for why a deferred custom action cannot do that through an MSI
-       property. [TempFolder] is left as literal text for the MSI engine
-       itself to resolve, at each consuming CustomAction's own scheduling
-       moment - only the fixed filename after it is a build-time constant. -->
+       WriteAgentConfig - a deferred custom action can't read this back
+       through an MSI property (see EffectiveThumbprint). [TempFolder] is
+       left as literal text for the MSI engine to resolve at each
+       CustomAction's own scheduling moment. -->
   <?define GeneratedCertThumbprintPath = "[TempFolder]HyperVCsiAgent.GeneratedServerCert.thumbprint" ?>
+  <!-- ProductVersion here is HyperVCsiMsiVersion (see this project's own
+       .wixproj), not the semver Bundle.wixproj feeds to Bundle.wxs's
+       Version - the bundle carries meaning, the MSI carries order. Chained
+       Visible="no", so it's never seen by a human; it only needs to be a
+       valid, distinct-per-build MSI version. -->
   <Package
     Name="Hyper-V CSI Agent"
     Manufacturer="Hyper-V CSI Driver"
     Version="$(var.ProductVersion)"
     UpgradeCode="7F4DC474-BB07-4124-822F-AFB224EE7D2E">
 
-    <!-- AllowSameVersionUpgrades="yes": without it, MSI's default upgrade
-         search only matches STRICTLY OLDER versions, so reinstalling the
-         exact same ProductVersion (e.g. two builds off an unbumped dev
-         version, or two prerelease tags sharing the same numeric core once
-         validate-cert/thumbprints strip their suffix - see ci.yml's
-         msi-version) creates a second, unrelated product instead of
-         upgrading the first. Confirmed the hard way: this is exactly what
-         left two products registered in Programs and Features on one node,
-         each holding half a reference count on the same Component GUIDs, so
-         removing either one alone left files and the service behind.
+    <!-- Version above is HyperVCsiMsiVersion, a 32-bit build-clock key, not
+         the semver - so a same-version reinstall now only happens when two
+         builds land in the same build-key second. AllowSameVersionUpgrades
+         compensated for the old scheme's more routine collisions; that case
+         is gone, so the flag has been dropped with it.
 
-         Schedule="afterInstallExecute": the default (afterInstallValidate)
-         removes the whole old product - including, via ServiceControl's
-         Remove="uninstall" below, the service itself - before the new
-         product installs anything. ServiceExeComponent's Component Guid is
-         fixed across versions specifically so the old and new product share
-         a reference count on it, but afterInstallValidate tears the old
-         product down before the new one ever registers its own claim, so
-         the shared count still hits zero and the service gets deleted then
-         recreated on every upgrade. Confirmed the hard way: that recreation
-         is a real ServiceInstall/CreateService call, which does not honor a
-         blank Password as "leave the account's password unchanged" the way
-         a reconfigure of an already-existing service does - it sets an
-         actual empty password, breaking the service account's logon until
-         someone notices. afterInstallExecute installs the new product "on
-         top of" the old one first, so the shared component's reference
-         count never drops to zero and the service survives the upgrade
-         untouched. -->
-    <MajorUpgrade
-      AllowSameVersionUpgrades="yes"
-      Schedule="afterInstallExecute"
-      DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+         Default Schedule (afterInstallValidate, sequence 1401, before the
+         new product stages anything) rather than the late
+         afterInstallExecute this used to carry. The late schedule was
+         protecting the service's password, but the actual cause was
+         ServiceControl's Remove="uninstall" flag, not the RemoveExistingProducts
+         timing - that flag is gone now too (see ServiceControl's own
+         comment), so the service survives RemoveExistingProducts at any
+         schedule. Deleting the service on a genuine uninstall is instead
+         authored explicitly below (RemoveAgentService), guarded so it
+         doesn't fire on this same early removal when it's only a step
+         inside a chained major upgrade.
+
+         AllowDowngrades="yes" - mutually exclusive with both
+         DowngradeErrorMessage and AllowSameVersionUpgrades - retires
+         ProductVersion as an ordering gate entirely: one Upgrade row with
+         VersionMin=0 and no VersionMax, so RemoveExistingProducts fires
+         regardless of version direction. It emits warning WIX1076 (ICE61);
+         that's the expected acknowledgement, not a defect - ci.yml's
+         WarningsAsErrors is scoped to WIX1148 alone so this one doesn't fail
+         the build.
+
+         Downgrade *protection* moves to Burn's own comparison of real
+         semantic versions - the only layer positioned to compare them
+         correctly. That gate now lives in the bootstrapper
+         (SetupMode.Downgrade, WizardViewModel.OnDetectComplete/OnApplyDowngrade);
+         this MSI is a pure executor of whatever Burn decided. -->
+    <MajorUpgrade AllowDowngrades="yes" />
     <MediaTemplate EmbedCab="yes" />
 
     <!--
@@ -197,6 +202,20 @@
                   Impersonate="no"
                   Return="check" />
 
+    <!-- Deletes the hyperv-csi-agent service - see ServiceControl's own
+         comment above for why MSI no longer does this itself, and
+         RemoveAgentServiceCommand's remarks for the deletion mechanism.
+         Deferred and unimpersonated like the other elevated actions here.
+         No rollback counterpart: if a genuine uninstall fails after this
+         runs, the service is gone for good. That mirrors CloseFirewallPort
+         above and is an accepted, deliberate gap. -->
+    <CustomAction Id="RemoveAgentService"
+                  BinaryRef="ActionsExe"
+                  ExeCommand="remove-service"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
     <!--
       Only the values an operator (or a CM tool) actually supplied end up in
       agent.config.json - see WriteConfigCommand's own remarks for why
@@ -285,6 +304,13 @@
            case here leaves a genuine `msiexec /x` still closing the port
            behind it, same as always. -->
       <Custom Action="CloseFirewallPort" Before="RemoveFiles" Condition="REMOVE AND NOT UPGRADINGPRODUCTCODE" />
+      <!-- Same guard as CloseFirewallPort above, same reason: a named
+           service in the SCM is an imperative side effect MSI's component
+           reference-counting can't see. Before="RemoveFiles" isn't a real
+           dependency - ActionsExe is a Binary table stream MSI extracts to
+           temp, not an installed file - it just keeps both imperative
+           teardowns together before anything on disk disappears. -->
+      <Custom Action="RemoveAgentService" Before="RemoveFiles" Condition="REMOVE AND NOT UPGRADINGPRODUCTCODE" />
     </InstallExecuteSequence>
 
     <StandardDirectory Id="ProgramFiles64Folder">
@@ -311,6 +337,20 @@
     <ComponentGroup Id="AgentComponents" Directory="INSTALLFOLDER">
       <Files Include="$(var.ServicePublishDir)**">
         <Exclude Files="$(var.ServicePublishDir)HyperVCsiAgent.Service.exe" />
+        <!-- Belt-and-braces with DebugType=none (agent/Directory.Build.props),
+             which is conditioned on Release: a Debug build still produces
+             .pdbs, and this exclusion keeps them out of the package
+             regardless of which configuration produced it. -->
+        <Exclude Files="$(var.ServicePublishDir)**\*.pdb" />
+        <!-- These four are authored explicitly below instead, as
+             <File CompanionFile="ServiceExe"> in ServiceExeComponent - a
+             component's keypath file can't itself be a companion, so they
+             can't stay in this glob harvest. Excluded here so each is
+             authored exactly once. -->
+        <Exclude Files="$(var.ServicePublishDir)HyperVCsiAgent.Service.deps.json" />
+        <Exclude Files="$(var.ServicePublishDir)HyperVCsiAgent.Service.runtimeconfig.json" />
+        <Exclude Files="$(var.ServicePublishDir)appsettings.json" />
+        <Exclude Files="$(var.ServicePublishDir)System.Diagnostics.EventLog.Messages.dll" />
       </Files>
     </ComponentGroup>
   </Fragment>
@@ -322,8 +362,34 @@
   -->
   <Fragment>
     <DirectoryRef Id="INSTALLFOLDER">
+      <!-- Guid is fixed (not "*") so this component's identity survives a
+           rebuild, even though its file set below changes from one file to
+           five - normally a reason for a new Guid, but the early
+           RemoveExistingProducts (1401) removes the old product entirely
+           before the new one installs anything, so old and new definitions
+           of this Guid never coexist. -->
       <Component Id="ServiceExeComponent" Guid="9D6E9F9C-9F2E-4C7D-9E9E-2B7C7B9F6D01">
         <File Id="ServiceExe" Source="$(var.ServicePublishDir)HyperVCsiAgent.Service.exe" KeyPath="yes" />
+
+        <!-- CompanionFile="ServiceExe" rather than the glob harvest above:
+             a component's keypath file (ServiceExe, above) can't itself
+             carry CompanionFile, so this makes these four follow
+             ServiceExe's own version compare instead of falling back to a
+             timestamp heuristic - a distinction that only matters if
+             RemoveExistingProducts is ever moved later than its current
+             early schedule. -->
+        <File Id="ServiceDepsJson"
+              Source="$(var.ServicePublishDir)HyperVCsiAgent.Service.deps.json"
+              CompanionFile="ServiceExe" />
+        <File Id="ServiceRuntimeConfigJson"
+              Source="$(var.ServicePublishDir)HyperVCsiAgent.Service.runtimeconfig.json"
+              CompanionFile="ServiceExe" />
+        <File Id="AppSettingsJson"
+              Source="$(var.ServicePublishDir)appsettings.json"
+              CompanionFile="ServiceExe" />
+        <File Id="EventLogMessagesDll"
+              Source="$(var.ServicePublishDir)System.Diagnostics.EventLog.Messages.dll"
+              CompanionFile="ServiceExe" />
 
         <!-- Start="demand", not "auto": this service is meant to be run
              under cluster management (or otherwise started deliberately per
@@ -339,14 +405,18 @@
           Account="[SERVICEACCOUNT]"
           Password="[SERVICEPASSWORD]" />
 
-        <!-- Always stop and remove the service on uninstall regardless of
-             whether it was ever started. Install never starts it - see the
-             Start="demand" note above. -->
+        <!-- Stop only. No Remove="uninstall": that flag is what makes MSI
+             delete the service during an uninstall, and deleting a service
+             installed with a password can't be rolled back - MSI has no way
+             to restore a password once removed ("stored in a protected part
+             of the system", per the ServiceInstall table's own remark).
+             Deletion is instead a deliberate, conditioned custom action
+             (RemoveAgentService, below). Install never starts the service -
+             see the Start="demand" note above. -->
         <ServiceControl
           Id="ServiceControlStop"
           Name="hyperv-csi-agent"
           Stop="both"
-          Remove="uninstall"
           Wait="yes" />
       </Component>
     </DirectoryRef>

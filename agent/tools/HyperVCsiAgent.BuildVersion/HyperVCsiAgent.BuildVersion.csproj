@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- This is a build-time tool invoked by MSBuild to compute a version
+         string, not shipped payload - so unlike
+         HyperVCsiAgent.Installer.Actions it has no need to be self-contained
+         or published for a specific RID. It runs on whatever .NET SDK is
+         already building the repo. -->
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Shared source, not a ProjectReference: HyperVCsiAgent.Installer.Actions
+         owns VersionPipeline.cs so its test project
+         (HyperVCsiAgent.Installer.Actions.Tests) can unit test it directly,
+         and this tool compiles that exact same file into a second assembly so
+         the value the build stamps everywhere and the value its tests
+         verify can never drift apart into two implementations of the same
+         rules. A ProjectReference would also reintroduce the bootstrap
+         problem Directory.Build.props in this folder exists to avoid: this
+         tool must be buildable before anything that depends on the version it
+         produces. -->
+    <Compile Include="..\..\installer\HyperVCsiAgent.Installer.Actions\VersionPipeline.cs" Link="VersionPipeline.cs" />
+  </ItemGroup>
+
+</Project>

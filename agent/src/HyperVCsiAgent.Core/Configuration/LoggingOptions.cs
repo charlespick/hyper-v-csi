@@ -13,7 +13,7 @@ namespace HyperVCsiAgent.Core.Configuration;
 /// fill the Application log with noise no operator asked for.
 /// </summary>
 /// <remarks>
-/// Deliberately never written by the installer - see <c>agent.config.example.json</c>'s
+/// Deliberately never written by the installer - see <c>docs/agent.config.example.json</c>'s
 /// own <c>//Logging</c> entry. Turning this up is a diagnostic act an operator
 /// takes deliberately, on one node, for as long as an incident needs it, the
 /// same reasoning that keeps <see cref="AgentOptions.Tls"/> and

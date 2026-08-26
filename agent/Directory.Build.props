@@ -1,0 +1,120 @@
+<Project>
+
+  <!--
+    Single place the version is derived for anything under agent/: the key
+    must be computed once and passed down, not recomputed per project.
+
+    agent/tools/HyperVCsiAgent.BuildVersion/Directory.Build.props deliberately
+    shadows this file with an empty override, so the tool that derives the
+    version is not itself subject to the derivation - see that file's own
+    comment for why that would otherwise be a bootstrap cycle.
+  -->
+
+  <!--
+    The SDK appends SourceRevisionId to InformationalVersion by default, which
+    on top of the provenance the version pipeline already authors produces a
+    doubled commit sha - e.g.
+    "0.1.0-beta.6.209682984+d7c2242.dirty.d7c2242f0d75..." where the pipeline
+    wrote only "+d7c2242.dirty". InformationalVersion is the value humans and
+    logs read ("Product version" in Explorer), so it should say what we meant
+    it to say and nothing else. The build key and the short sha are already
+    in there deliberately; the SDK's copy adds no information.
+  -->
+  <PropertyGroup>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+  </PropertyGroup>
+
+  <!--
+    No .pdb ships. Set here rather than per project because every compiled
+    project under agent/ ends up inside an installer
+    artifact, and the two that would be missed are the ones easiest to
+    forget. HyperVCsiAgent.Core is a ProjectReference, so the Service's own
+    DebugType does not reach it and its .pdb rode along in the MSI; the
+    bootstrapper's .pdb ships in the bundle rather than the MSI, harvested
+    out of its publish directory by ba.xslt's sibling glob, so no amount of
+    tidying the MSI's payload would have caught it. One rule in one place
+    covers both artifacts.
+
+    Release only - Debug builds keep their symbols, since nothing about a
+    local debugging session ends up on a node.
+  -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>none</DebugType>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <HyperVCsiRepoRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..'))</HyperVCsiRepoRoot>
+    <HyperVCsiBuildVersionToolProject>$(MSBuildThisFileDirectory)tools\HyperVCsiAgent.BuildVersion\HyperVCsiAgent.BuildVersion.csproj</HyperVCsiBuildVersionToolProject>
+  </PropertyGroup>
+
+  <!--
+    Guarded on HyperVCsiBuildKey being empty: that guard is the whole point.
+    A build that was *handed* K (and the values derived from it) - e.g. a
+    nested `dotnet publish` invoked by one of the .wixproj files - must never
+    recompute its own, or the two builds can disagree by however many seconds
+    passed between the two `dotnet run` invocations - a version skew from two
+    independently-evaluated wall clocks. A cache file was deliberately not
+    used instead - staleness is worse than
+    the second or two `dotnet run` costs.
+  -->
+  <Target Name="HyperVCsiDeriveVersion"
+          BeforeTargets="GetAssemblyVersion;GenerateAssemblyInfo;CoreCompile"
+          Condition="'$(HyperVCsiBuildKey)' == ''">
+
+    <Exec Command="dotnet run --project &quot;$(HyperVCsiBuildVersionToolProject)&quot; -- --repo &quot;$(HyperVCsiRepoRoot)&quot;"
+          ConsoleToMSBuild="true"
+          StandardOutputImportance="low">
+      <Output TaskParameter="ConsoleOutput" ItemName="_HyperVCsiVersionToolOutputLines" />
+    </Exec>
+
+    <PropertyGroup>
+      <_HyperVCsiVersionToolOutput>@(_HyperVCsiVersionToolOutputLines, '%0a')</_HyperVCsiVersionToolOutput>
+
+      <HyperVCsiBuildKey>$([System.Text.RegularExpressions.Regex]::Match($(_HyperVCsiVersionToolOutput), '(?m)^HyperVCsiBuildKey=(.*)$').Groups[1].Value)</HyperVCsiBuildKey>
+      <HyperVCsiVersion>$([System.Text.RegularExpressions.Regex]::Match($(_HyperVCsiVersionToolOutput), '(?m)^HyperVCsiVersion=(.*)$').Groups[1].Value)</HyperVCsiVersion>
+      <HyperVCsiInformationalVersion>$([System.Text.RegularExpressions.Regex]::Match($(_HyperVCsiVersionToolOutput), '(?m)^HyperVCsiInformationalVersion=(.*)$').Groups[1].Value)</HyperVCsiInformationalVersion>
+      <HyperVCsiMsiVersion>$([System.Text.RegularExpressions.Regex]::Match($(_HyperVCsiVersionToolOutput), '(?m)^HyperVCsiMsiVersion=(.*)$').Groups[1].Value)</HyperVCsiMsiVersion>
+      <HyperVCsiFileVersion>$([System.Text.RegularExpressions.Regex]::Match($(_HyperVCsiVersionToolOutput), '(?m)^HyperVCsiFileVersion=(.*)$').Groups[1].Value)</HyperVCsiFileVersion>
+      <HyperVCsiAssemblyVersion>$([System.Text.RegularExpressions.Regex]::Match($(_HyperVCsiVersionToolOutput), '(?m)^HyperVCsiAssemblyVersion=(.*)$').Groups[1].Value)</HyperVCsiAssemblyVersion>
+    </PropertyGroup>
+
+    <!--
+      Mapped here, at target-execution time, rather than in a top-level
+      evaluation-time PropertyGroup: at evaluation time (before this target
+      has run) the HyperVCsi* properties above do not exist yet on this path,
+      so an eval-time assignment would see them empty. The mirror-image
+      assignment below (outside this target, unconditioned on the guard)
+      covers the other path - where HyperVCsiBuildKey and the derived values
+      were all passed in explicitly on the command line and are therefore
+      already populated at evaluation time, so this target's Condition is
+      false and it never runs at all.
+    -->
+    <PropertyGroup>
+      <Version Condition="'$(Version)' == ''">$(HyperVCsiVersion)</Version>
+      <FileVersion Condition="'$(FileVersion)' == ''">$(HyperVCsiFileVersion)</FileVersion>
+      <AssemblyVersion Condition="'$(AssemblyVersion)' == ''">$(HyperVCsiAssemblyVersion)</AssemblyVersion>
+      <InformationalVersion Condition="'$(InformationalVersion)' == ''">$(HyperVCsiInformationalVersion)</InformationalVersion>
+    </PropertyGroup>
+
+  </Target>
+
+  <!--
+    Covers the "values were handed to us" path: when a nested build is
+    invoked with -p:HyperVCsiBuildKey=...;HyperVCsiVersion=...;... (as
+    Bundle.wixproj and Installer.wixproj now do for every nested
+    dotnet build/publish - see their own comments), HyperVCsiDeriveVersion's
+    guard is false and it never runs, so the mapping above never executes.
+    These evaluation-time assignments pick it up instead: the HyperVCsi*
+    properties are already present as global properties by the time this
+    file is evaluated in that case. Each is still guarded so an
+    explicitly-passed Version/FileVersion/AssemblyVersion/InformationalVersion
+    always wins over the derived one.
+  -->
+  <PropertyGroup>
+    <Version Condition="'$(Version)' == '' and '$(HyperVCsiVersion)' != ''">$(HyperVCsiVersion)</Version>
+    <FileVersion Condition="'$(FileVersion)' == '' and '$(HyperVCsiFileVersion)' != ''">$(HyperVCsiFileVersion)</FileVersion>
+    <AssemblyVersion Condition="'$(AssemblyVersion)' == '' and '$(HyperVCsiAssemblyVersion)' != ''">$(HyperVCsiAssemblyVersion)</AssemblyVersion>
+    <InformationalVersion Condition="'$(InformationalVersion)' == '' and '$(HyperVCsiInformationalVersion)' != ''">$(HyperVCsiInformationalVersion)</InformationalVersion>
+  </PropertyGroup>
+
+</Project>

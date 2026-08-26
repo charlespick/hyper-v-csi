@@ -39,10 +39,19 @@ internal sealed class WizardViewModel : ViewModelBase
     private bool _licenseAccepted;
     private bool _snapshotsEnabled;
     private bool _passwordLocked;
+    private SetupMode _mode;
     private Dispatcher? _dispatcher;
 
     private readonly IEngine _engine;
     private readonly IBootstrapperCommand _command;
+
+    // Highest DetectRelatedBundle Version seen so far, restricted to
+    // RelationType.Upgrade (see OnDetectRelatedBundle) - null means no
+    // related bundle has been reported at all, which ComputeSetupMode reads
+    // as "nothing else under this UpgradeCode is registered". Finalized by
+    // the time OnDetectComplete fires; DetectRelatedBundle only ever arrives
+    // during Detect, never after.
+    private string? _highestRelatedVersion;
 
     public WizardViewModel(IEngine engine, IBootstrapperCommand command)
     {
@@ -59,6 +68,18 @@ internal sealed class WizardViewModel : ViewModelBase
         // scripting a cluster-wide rollout would use. Full is the only mode
         // that gets the interactive wizard.
         IsHeadless = command.Display is Display.Embedded or Display.None or Display.Passive;
+
+        // Only Install/Uninstall are knowable this early - Upgrade/Repair/
+        // Downgrade all depend on DetectRelatedBundle and WixBundleInstalled,
+        // neither of which is meaningful before the engine's own Detect()
+        // runs (see OnDetectComplete, which replaces this with
+        // ComputeSetupMode()'s real answer). Uninstall is set correctly
+        // here and for good: ComputeSetupMode's own Uninstall branch depends
+        // on nothing but command.Action, so it can never disagree with this
+        // once Detect completes - including for Display.Embedded, whose
+        // relaunch always carries Action == Uninstall (see IsHeadless's own
+        // remarks above).
+        Mode = IsUninstall ? SetupMode.Uninstall : SetupMode.Install;
 
         // bal:CommandLineVariables (Bundle.wxs) only wires command-line
         // NAME=value overrides into the built-in themed BA - confirmed by
@@ -87,6 +108,7 @@ internal sealed class WizardViewModel : ViewModelBase
             if (existing.ServiceAccount is { } account)
             {
                 ServiceAccount = account;
+                ServiceAccountCarriedOver = true;
 
                 // A real account is already configured with SCM, so there is
                 // a real password already in place too - SCM has no API that
@@ -103,11 +125,13 @@ internal sealed class WizardViewModel : ViewModelBase
             if (existing.CsvVolumesRoot is { } volumesRoot)
             {
                 CsvVolumesRoot = volumesRoot;
+                CsvVolumesRootCarriedOver = true;
             }
 
             if (existing.CsvSnapshotsRoot is { } snapshotsRoot)
             {
                 CsvSnapshotsRoot = snapshotsRoot;
+                CsvSnapshotsRootCarriedOver = true;
                 SnapshotsEnabled = true;
             }
 
@@ -121,6 +145,7 @@ internal sealed class WizardViewModel : ViewModelBase
                     certificate.Thumbprint?.Equals(serverCertThumbprint, StringComparison.OrdinalIgnoreCase) == true) is { } existingCertificate)
             {
                 SelectedCertificateKey = existingCertificate.Key;
+                ServerCertificateCarriedOver = true;
             }
 
             foreach (var clientThumbprint in existing.ClientThumbprints)
@@ -165,8 +190,45 @@ internal sealed class WizardViewModel : ViewModelBase
     // of the install-only pages.
     public const int UninstallConfirmPageIndex = 10;
 
+    // Same reasoning as UninstallConfirmPageIndex, and reached the same way:
+    // OnDetectComplete jumps straight here once Mode resolves to Downgrade,
+    // bypassing every page that leads to InstallCommand. This is what makes
+    // "No Install button" structural rather than a Visibility binding
+    // someone could miss on a page still reachable via Back/Next - there is
+    // no path from here to ReadyToInstallPageIndex at all.
+    public const int DowngradePageIndex = 11;
+
     /// <summary>Whether this launch is Burn's Uninstall action (Control Panel "Uninstall") rather than a fresh install.</summary>
     public bool IsUninstall { get; }
+
+    /// <summary>
+    /// What this run is actually doing - see <see cref="SetupMode"/>. Starts
+    /// as <see cref="SetupMode.Install"/> or <see cref="SetupMode.Uninstall"/>
+    /// (the only two knowable from the command line alone) and is replaced
+    /// with <see cref="ComputeSetupMode"/>'s real answer once Detect
+    /// completes. Every page heading, button label, and plan decision reads
+    /// this instead of keeping its own opinion.
+    /// </summary>
+    public SetupMode Mode
+    {
+        get => _mode;
+        private set
+        {
+            if (SetField(ref _mode, value))
+            {
+                RaisePropertyChanged(nameof(InstallButtonLabel));
+                RaisePropertyChanged(nameof(ProgressTitle));
+                RaisePropertyChanged(nameof(FinishTitle));
+                RaisePropertyChanged(nameof(SetupSummary));
+            }
+        }
+    }
+
+    /// <summary>This build's own version, exactly as Burn assigned it to the bundle - not cached, since IEngine exposes no cheaper way to read it than a variable lookup and it never changes over the process lifetime anyway.</summary>
+    public string BundleVersion => _engine.GetVariableString("WixBundleVersion");
+
+    /// <summary>The highest related bundle Version Detect reported (see OnDetectRelatedBundle), or null if none was - i.e. what, if anything, this node already has under a different build. Drives the "from X to Y" wording in SetupSummary.</summary>
+    public string? InstalledVersion => _highestRelatedVersion;
 
     /// <summary>True for /quiet, /passive, and Burn's own embedded relaunch of a related bundle - see the constructor's own remarks. No wizard page ever shows in this mode.</summary>
     public bool IsHeadless { get; }
@@ -184,6 +246,17 @@ internal sealed class WizardViewModel : ViewModelBase
 
     /// <summary>Candidate server certificates for the Certificate page's table - see AddPendingCertificate for why this isn't just populated once.</summary>
     public IReadOnlyList<CertificateEntry> Certificates { get; private set; }
+
+    // Set alongside each field's own pre-fill in the constructor, above -
+    // ReadyToInstallPage binds these to a "(carried over)" suffix next to
+    // the affected rows so an upgrade's pre-filled values read as detected,
+    // not as silent defaults the operator might assume they typed
+    // themselves (the installer upgrade validation checklist's check 3 is
+    // a human confirming exactly this).
+    public bool ServiceAccountCarriedOver { get; private set; }
+    public bool CsvVolumesRootCarriedOver { get; private set; }
+    public bool CsvSnapshotsRootCarriedOver { get; private set; }
+    public bool ServerCertificateCarriedOver { get; private set; }
 
     public int ExitCode { get; private set; }
 
@@ -324,6 +397,7 @@ internal sealed class WizardViewModel : ViewModelBase
                 RaisePropertyChanged(nameof(IsProgressPage));
                 RaisePropertyChanged(nameof(IsFinishPage));
                 RaisePropertyChanged(nameof(IsUninstallConfirmPage));
+                RaisePropertyChanged(nameof(IsDowngradePage));
                 RaisePropertyChanged(nameof(ShowBackButton));
                 RaisePropertyChanged(nameof(ShowNextButton));
                 RaisePropertyChanged(nameof(ShowInstallButton));
@@ -345,6 +419,7 @@ internal sealed class WizardViewModel : ViewModelBase
     public bool IsProgressPage => CurrentPageIndex == ProgressPageIndex;
     public bool IsFinishPage => CurrentPageIndex == FinishPageIndex;
     public bool IsUninstallConfirmPage => CurrentPageIndex == UninstallConfirmPageIndex;
+    public bool IsDowngradePage => CurrentPageIndex == DowngradePageIndex;
 
     public bool ShowBackButton => !IsUninstall && CurrentPageIndex is > WelcomePageIndex and < ProgressPageIndex;
     public bool ShowNextButton => !IsUninstall && CurrentPageIndex < ReadyToInstallPageIndex;
@@ -375,21 +450,65 @@ internal sealed class WizardViewModel : ViewModelBase
     public bool LicenseAccepted { get => _licenseAccepted; set => SetField(ref _licenseAccepted, value); }
     public bool SnapshotsEnabled { get => _snapshotsEnabled; set => SetField(ref _snapshotsEnabled, value); }
 
-    /// <summary>ProgressPage's own heading - the one piece of UI text that has to read differently for the two flows.</summary>
-    public string ProgressTitle => IsUninstall ? "Uninstalling Hyper-V CSI Agent" : "Installing Hyper-V CSI Agent";
+    /// <summary>
+    /// ProgressPage's own heading - now Mode's case, not just IsUninstall's.
+    /// Downgrade has no case of its own: it never reaches
+    /// Plan, so ProgressPage is never shown for it in either display mode
+    /// (interactive redirects to DowngradePageIndex; RunHeadlessPlan exits
+    /// before calling Plan) - the "_" fallback below exists only so this
+    /// switch is exhaustive, not because it is ever actually read.
+    /// </summary>
+    public string ProgressTitle => Mode switch
+    {
+        SetupMode.Upgrade => "Upgrading Hyper-V CSI Agent",
+        SetupMode.Repair => "Repairing Hyper-V CSI Agent",
+        SetupMode.Uninstall => "Uninstalling Hyper-V CSI Agent",
+        _ => "Installing Hyper-V CSI Agent",
+    };
 
     /// <summary>
-    /// FinishPage's own heading. Depends on InstallSucceeded, not just
-    /// IsUninstall like ProgressTitle - this used to say "Setup Complete"
-    /// even when StatusText right underneath it was reporting a failure,
-    /// which reads as the installer contradicting itself.
+    /// FinishPage's own heading. Depends on InstallSucceeded, not just Mode
+    /// - this used to say "Setup Complete" even when StatusText right
+    /// underneath it was reporting a failure, which reads as the installer
+    /// contradicting itself; that guarantee (a failure never reads as
+    /// success) is preserved unchanged, just re-keyed on Mode instead of
+    /// IsUninstall. Downgrade has no case for the same reason as
+    /// ProgressTitle - FinishPage is never reached for it - so it falls
+    /// through to the same "Setup ..." wording as Install.
     /// </summary>
-    public string FinishTitle => (IsUninstall, InstallSucceeded) switch
+    public string FinishTitle => (Mode, InstallSucceeded) switch
     {
-        (true, true) => "Uninstall Complete",
-        (true, false) => "Uninstall Encountered an Error",
-        (false, true) => "Setup Complete",
-        (false, false) => "Setup Encountered an Error",
+        (SetupMode.Uninstall, true) => "Uninstall Complete",
+        (SetupMode.Uninstall, false) => "Uninstall Encountered an Error",
+        (SetupMode.Upgrade, true) => "Upgrade Complete",
+        (SetupMode.Upgrade, false) => "Upgrade Encountered an Error",
+        (SetupMode.Repair, true) => "Repair Complete",
+        (SetupMode.Repair, false) => "Repair Encountered an Error",
+        (_, true) => "Setup Complete",
+        (_, false) => "Setup Encountered an Error",
+    };
+
+    /// <summary>ReadyToInstallPage's action button text - MainWindow.xaml binds Content to this instead of the old hardcoded "Install". Uninstall uses its own separate UninstallCommand/button instead; Downgrade never reaches this page at all (see DowngradePageIndex), so "Install" is a safe, never-shown fallback for it.</summary>
+    public string InstallButtonLabel => Mode switch
+    {
+        SetupMode.Repair => "Repair",
+        SetupMode.Upgrade => "Upgrade",
+        _ => "Install",
+    };
+
+    /// <summary>
+    /// Welcome and Ready-to-Install's version line - shows both versions,
+    /// e.g. "Upgrading Hyper-V CSI Agent from 0.1.0-beta.1 to 0.2.0 on this
+    /// node." Null on Uninstall, whose pages never bind to this.
+    /// </summary>
+    public string? SetupSummary => Mode switch
+    {
+        SetupMode.Install => $"Installing Hyper-V CSI Agent {BundleVersion} on this node.",
+        SetupMode.Upgrade => $"Upgrading Hyper-V CSI Agent from {InstalledVersion} to {BundleVersion} on this node.",
+        SetupMode.Repair => $"Repairing Hyper-V CSI Agent {BundleVersion} on this node.",
+        SetupMode.Downgrade =>
+            $"Hyper-V CSI Agent {InstalledVersion} is already installed on this node, which is newer than this package ({BundleVersion}).",
+        _ => null,
     };
 
     /// <summary>Only on failure - a successful run has nothing worth sending an operator digging through a log for.</summary>
@@ -588,7 +707,16 @@ internal sealed class WizardViewModel : ViewModelBase
         CurrentPageIndex = ProgressPageIndex;
         IsInstalling = true;
         StatusText = "Installing...";
-        _engine.Plan(LaunchAction.Install);
+
+        // Repair in Repair mode, Install otherwise - this is also what fixes
+        // the old oddity where re-running the same bundle planned Install
+        // again, did nothing, and reported "Setup Complete". Never reached
+        // in Downgrade mode: InstallCommand's own
+        // CanExecute only allows firing from ReadyToInstallPageIndex, and
+        // Downgrade is redirected to DowngradePageIndex before that page is
+        // ever reachable (see OnDetectComplete) - so there is no path from
+        // here into planning a downgrade at all.
+        _engine.Plan(Mode == SetupMode.Repair ? LaunchAction.Repair : LaunchAction.Install);
     }
 
     private void BeginUninstall()
@@ -675,6 +803,124 @@ internal sealed class WizardViewModel : ViewModelBase
         }
     }
 
+    /// <summary>
+    /// Called once per related bundle Detect finds under this bundle's
+    /// UpgradeCode (BootstrapperApp wires this to IEngine's own
+    /// DetectRelatedBundle event). Filters to RelationType.Upgrade -
+    /// verified against the API surface that RelationType has no separate
+    /// "Downgrade" value (None/Detect/Upgrade/Addon/Patch/DependentAddon/
+    /// DependentPatch/Update/ChainPackage): Burn reports Upgrade for any
+    /// other bundle sharing this UpgradeCode regardless of which direction
+    /// the version difference runs, so direction is ours to work out by
+    /// comparing Version, which ComputeSetupMode does once Detect finishes.
+    /// </summary>
+    public void OnDetectRelatedBundle(DetectRelatedBundleEventArgs e)
+    {
+        if (e.RelationType != RelationType.Upgrade)
+        {
+            return;
+        }
+
+        // More than one related bundle is possible in principle (e.g. a
+        // botched prior upgrade left two registered under the same
+        // UpgradeCode) - keeping the highest Version seen means a downgrade
+        // against ANY of them still gets caught. Comparison is via IEngine, same as
+        // everywhere else in this file - see ComputeSetupMode's remarks on
+        // why there is exactly one comparer in this process.
+        if (_highestRelatedVersion is null || _engine.CompareVersions(e.Version, _highestRelatedVersion) > 0)
+        {
+            _highestRelatedVersion = e.Version;
+        }
+    }
+
+    /// <summary>
+    /// Backstop only: this code refuses a downgrade BEFORE ever
+    /// calling Plan (see ComputeSetupMode/OnDetectComplete/RunHeadlessPlan),
+    /// so Burn itself reaching this event means that refusal did not fire -
+    /// worth a log line, not worth silently overriding. e.Status is left at
+    /// its recommended value on purpose: the entire point of retiring the
+    /// MSI's own AllowDowngrades="yes" gate was to move enforcement here,
+    /// not to remove it, so this handler never sets e.Status to force
+    /// success.
+    /// </summary>
+    public void OnApplyDowngrade(ApplyDowngradeEventArgs e)
+    {
+        _engine.Log(LogLevel.Error,
+            $"Burn refused to apply a downgrade (recommended HRESULT 0x{e.Recommendation:X8}). " +
+            "This should already have been caught before Plan - see SetupMode.Downgrade.");
+    }
+
+    /// <summary>
+    /// The single place SetupMode is decided. Uninstall is
+    /// checked FIRST and unconditionally returns - this is the fix for the
+    /// UPGRADINGPRODUCTCODE class of bug: Display.Embedded's relaunch (an
+    /// OLDER bundle asked to uninstall itself while a NEWER one is mid-
+    /// install) always carries Action == Uninstall, so it is structurally
+    /// impossible for that relaunch to ever reach the version comparison
+    /// below and refuse its own removal as a "downgrade". See
+    /// IsHeadless's own remarks for how that relaunch is identified, and
+    /// SetupMode.Downgrade's remarks for the incident this mirrors.
+    /// <para>
+    /// This short-circuit is the ONLY place an action is exempted from the
+    /// downgrade comparison. Both refusal sites - OnDetectComplete's
+    /// interactive redirect and RunHeadlessPlan's 1638 - act on the resulting
+    /// Mode alone and carry no action check of their own, deliberately: two
+    /// guards of different shapes needing to stay in agreement is what
+    /// previously let `/repair /quiet` slip past the headless refusal.
+    /// </para>
+    /// <para>
+    /// One thing to revisit if Bundle.wxs ever gains an &lt;Update&gt;
+    /// element: Burn's self-update path relaunches through
+    /// UpdateReplace/UpdateReplaceEmbedded rather than Uninstall, so such a
+    /// relaunch would reach the comparison below and could refuse itself the
+    /// same way the Embedded case would have. There is no &lt;Update&gt;
+    /// element today, so those actions are unreachable.
+    /// </para>
+    /// </summary>
+    private SetupMode ComputeSetupMode()
+    {
+        if (_command.Action == LaunchAction.Uninstall)
+        {
+            return SetupMode.Uninstall;
+        }
+
+        if (_highestRelatedVersion is { } related)
+        {
+            // IEngine.CompareVersions is the ONLY version comparison in this
+            // codebase, by design: Burn decides relatedness with
+            // verutil.cpp's own rules (including a case-insensitive
+            // prerelease-label quirk), and a second, hand-rolled or
+            // NuGet.Versioning-based comparer that disagreed with it would
+            // let the BA and the engine reach different conclusions about
+            // the same pair of versions. Do not add one.
+            var comparison = _engine.CompareVersions(related, BundleVersion);
+            if (comparison > 0)
+            {
+                return SetupMode.Downgrade;
+            }
+
+            if (comparison < 0)
+            {
+                return SetupMode.Upgrade;
+            }
+
+            // Equal Version under a different related bundle entry: since
+            // WiX v3.8 (issue 4583) Burn upgrades a same-version
+            // related bundle in place rather than reporting it as a second
+            // installed product, so in practice this bundle is already the
+            // one WixBundleInstalled reports below, not a separate "related"
+            // one. If it is ever seen anyway, there is nothing destructive
+            // about treating it the same as re-running this exact build.
+            return SetupMode.Repair;
+        }
+
+        // No related bundle at all: either a clean node, or this exact
+        // build re-run (WixBundleInstalled != 0) - the case that, before
+        // this mode existed, silently replayed the full install wizard and
+        // reported "Setup Complete" having done nothing.
+        return _engine.GetVariableNumeric("WixBundleInstalled") != 0 ? SetupMode.Repair : SetupMode.Install;
+    }
+
     public void OnDetectComplete(DetectCompleteEventArgs e)
     {
         if (IsHeadless)
@@ -687,25 +933,77 @@ internal sealed class WizardViewModel : ViewModelBase
                 return;
             }
 
+            Mode = ComputeSetupMode();
             RunHeadlessPlan();
             return;
         }
 
-        // Bare-bones wizard only supports fresh install and uninstall today
-        // - no modify/repair flow - so detection results beyond "did it
-        // succeed" are not acted on.
         if (e.Status < 0)
         {
             RunOnUiThread(() => StatusText = $"Detection failed (0x{e.Status:X8}).");
+            return;
         }
+
+        var mode = ComputeSetupMode();
+        RunOnUiThread(() =>
+        {
+            Mode = mode;
+
+            // Structural, not a Visibility binding: redirect straight past
+            // every page that leads to InstallCommand so there is no path
+            // left to Plan a downgrade interactively at all ("No Install
+            // button"). See DowngradePageIndex's own remarks.
+            if (Mode == SetupMode.Downgrade)
+            {
+                CurrentPageIndex = DowngradePageIndex;
+            }
+        });
     }
 
     // No wizard page ever runs in headless mode, so this is BeginInstall/
-    // BeginUninstall's equivalent: validate (Install only) then plan
-    // straight from Detect completing, instead of waiting on a button click
-    // that will never come.
+    // BeginUninstall's equivalent: refuse a downgrade, validate the
+    // variables an unattended install needs, then plan - straight from Detect
+    // completing, instead of waiting on a button click that will never come.
     private void RunHeadlessPlan()
     {
+        // Unconditional on Mode, deliberately NOT nested inside an
+        // Action == Install check, and placed before both the
+        // missing-variable validation and any call to Plan. The requirement
+        // is that in Downgrade mode the BA must not call Plan at all - so
+        // keying this off the mode alone is what
+        // makes it match the interactive path in OnDetectComplete, which also
+        // refuses on Mode alone. An earlier version of this scoped the check
+        // to Action == Install and had a real hole: `bundle.exe /repair
+        // /quiet` on a node carrying a newer bundle computes
+        // SetupMode.Downgrade, skipped the whole block because the action was
+        // Repair rather than Install, and fell through to Plan with no
+        // refusal, no log line and no 1638.
+        //
+        // This is safe to leave unconditional precisely because the one
+        // action that must never be refused - Burn's Display.Embedded
+        // relaunch of an older bundle to uninstall itself - carries
+        // Action == Uninstall, and ComputeSetupMode short-circuits that to
+        // SetupMode.Uninstall on its first line, so it can never *be*
+        // Downgrade to begin with. The exemption lives in exactly one place;
+        // do not add a second copy of it here, because two guards of
+        // different shapes needing to agree is what produced the hole above.
+        //
+        // 1638 is ERROR_PRODUCT_VERSION, the code msiexec itself returned for
+        // a blocked downgrade before the MSI's AllowDowngrades="yes" moved
+        // that enforcement here. Reusing it means existing runbooks and CM error
+        // handling (Puppet/Ansible/DSC exec resources keying off this exit
+        // code) keep working unchanged, and the headless path fails loudly
+        // rather than silently no-opping.
+        if (Mode == SetupMode.Downgrade)
+        {
+            const int ErrorProductVersion = 1638;
+            _engine.Log(LogLevel.Error,
+                $"Refusing to install Hyper-V CSI Agent {BundleVersion}: {InstalledVersion} is already installed on this node and is newer. Uninstall it first.");
+            ExitCode = ErrorProductVersion;
+            SignalHeadlessCompletion();
+            return;
+        }
+
         if (_command.Action == LaunchAction.Install)
         {
             var missing = GetMissingRequiredVariables();
@@ -720,7 +1018,14 @@ internal sealed class WizardViewModel : ViewModelBase
             }
         }
 
-        _engine.Plan(_command.Action);
+        // Repair in Repair mode, same as BeginInstall's interactive
+        // equivalent - only ever substituted for an Install action; an
+        // explicit /uninstall or /repair on the command line is left
+        // exactly as the operator asked.
+        var action = _command.Action == LaunchAction.Install && Mode == SetupMode.Repair
+            ? LaunchAction.Repair
+            : _command.Action;
+        _engine.Plan(action);
     }
 
     public void OnPlanComplete(PlanCompleteEventArgs e)
@@ -754,12 +1059,18 @@ internal sealed class WizardViewModel : ViewModelBase
         RunOnUiThread(() => _engine.Apply(GetApplyParentHandle()));
     }
 
-    private string GetOutcomeMessage(bool succeeded, int status) => (succeeded, IsUninstall) switch
+    // Re-keyed on Mode instead of IsUninstall so Upgrade/Repair get their
+    // own wording too - Downgrade has no case of its own (falls through to
+    // Install's) because Apply is never reached in that mode in the first
+    // place (see ComputeSetupMode/OnDetectComplete/RunHeadlessPlan).
+    private string GetOutcomeMessage(bool succeeded, int status) => (succeeded, Mode) switch
     {
-        (true, true) => "Hyper-V CSI Agent was removed successfully.",
-        (true, false) => "Hyper-V CSI Agent was installed successfully.",
-        (false, true) => $"Uninstall failed (0x{status:X8}). See the log for details.",
-        (false, false) => $"Setup failed (0x{status:X8}). See the log for details.",
+        (true, SetupMode.Uninstall) => "Hyper-V CSI Agent was removed successfully.",
+        (true, SetupMode.Upgrade) => "Hyper-V CSI Agent was upgraded successfully.",
+        (true, SetupMode.Repair) => "Hyper-V CSI Agent was repaired successfully.",
+        (true, _) => "Hyper-V CSI Agent was installed successfully.",
+        (false, SetupMode.Uninstall) => $"Uninstall failed (0x{status:X8}). See the log for details.",
+        (false, _) => $"Setup failed (0x{status:X8}). See the log for details.",
     };
 
     public void OnApplyComplete(ApplyCompleteEventArgs e)

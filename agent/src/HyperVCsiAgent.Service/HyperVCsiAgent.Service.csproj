@@ -16,5 +16,30 @@
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
 
+  <!--
+    Payload hygiene. None of these are behavioural - they stop development
+    artifacts from landing in the self-contained publish output the MSI
+    harvests wholesale.
+  -->
+  <PropertyGroup>
+    <!-- This project is hosted as a Windows service, never under IIS - web.config is dead weight on a node. -->
+    <IsTransformWebConfigDisabled>true</IsTransformWebConfigDisabled>
+    <!-- No static web assets are served by this service; the manifest has nothing to describe. -->
+    <StaticWebAssetsEnabled>false</StaticWebAssetsEnabled>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      appsettings.Development.json and agent.config.dev.json are local dev
+      artifacts. CopyToPublishDirectory="Never" only - CopyToOutputDirectory
+      is left at its default so `dotnet run` / F5 debugging (which resolve
+      launchSettings.json's "config" argument, agent.config.dev.json, against
+      the build output / project directory, not the publish directory) keep
+      working.
+    -->
+    <Content Update="appsettings.Development.json" CopyToPublishDirectory="Never" />
+    <Content Update="agent.config.dev.json" CopyToPublishDirectory="Never" />
+  </ItemGroup>
+
 </Project>
 

@@ -7,14 +7,14 @@ permissions:
   packages: write
 
 jobs:
-  # Tags drive the version used for images, the chart, and the installer, so
-  # every downstream job reads it from here rather than re-deriving it.
+  # Tags drive the version used for images and the chart, so those two jobs
+  # read it from here rather than re-deriving it. The installer does NOT
+  # consume this job's output - see the installer job's own comment for why.
   version:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
       is-release: ${{ steps.v.outputs.is-release }}
-      msi-version: ${{ steps.v.outputs.msi-version }}
     steps:
       - id: v
         run: |
@@ -27,15 +27,6 @@ jobs:
             echo "version=$VERSION" >> "$GITHUB_OUTPUT"
             echo "is-release=false" >> "$GITHUB_OUTPUT"
           fi
-          # MSI/Burn ProductVersion is strictly major.minor.build (each
-          # numeric, no prerelease suffix) - this repo's own tags don't fit
-          # that as-is (e.g. v0.1.0-beta1), so strip anything from the first
-          # "-" onward for the installer specifically. Two prereleases off
-          # the same numeric core (0.1.0-beta1, 0.1.0-beta2) then map to the
-          # same MSI version, which AllowSameVersionUpgrades="yes"
-          # (Product.wxs) is exactly what's needed to still treat as an
-          # upgrade rather than a second, unrelated product.
-          echo "msi-version=${VERSION%%-*}" >> "$GITHUB_OUTPUT"
 
   go:
     name: Go test & build
@@ -60,7 +51,15 @@ jobs:
     name: .NET test
     runs-on: windows-latest
     steps:
+      # fetch-depth: 0 (full history + tags): agent/Directory.Build.props runs
+      # the version tool for anything under agent/, and `dotnet test` below
+      # builds everything under agent/ - including it. The tool deliberately
+      # refuses to run against a shallow clone (see
+      # HyperVCsiAgent.BuildVersion's Program.cs) rather than inventing a
+      # version, so without full history this job fails outright.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
@@ -69,6 +68,32 @@ jobs:
           path: ~/.nuget/packages
           key: nuget-${{ hashFiles('agent/**/*.csproj') }}
           restore-keys: nuget-
+      # Run once and seed into the environment, same as the installer job's
+      # own step and for the same reason: `dotnet test` builds every project
+      # under agent/ in parallel, and left alone each one independently hits
+      # HyperVCsiDeriveVersion and shells out to this same tool project. Two
+      # such invocations racing corrupts the tool's own obj/ output - csc.exe
+      # in one fails with CS2012 because VBCSCompiler still has the other's
+      # DLL open. Deriving it once up front and letting MSBuild pick it up
+      # from the environment means the guard in
+      # agent/Directory.Build.props is already false everywhere and the
+      # target never runs during the solution build at all.
+      - shell: bash
+        run: |
+          set -o pipefail
+          dotnet run --project agent/tools/HyperVCsiAgent.BuildVersion/HyperVCsiAgent.BuildVersion.csproj -- --repo "$(pwd)" | grep -E '^HyperVCsi[A-Za-z]+=' >> "$GITHUB_ENV"
+      # HyperVCsiAgent.Installer.Package.Tests carries a build-order-only
+      # ProjectReference to this .wixproj specifically so that building the
+      # test project also produces the MSI/bundle it inspects - see that
+      # project's own remark. That holds for `dotnet build`/`dotnet test` on
+      # the test project alone, but not for `dotnet test` on the whole
+      # solution below: the test project's build completes and its tests run
+      # before the referenced .wixproj has actually been built, so the
+      # fixture's MSI is missing. Building it explicitly here first, the same
+      # command the test's own failure message names, sidesteps whatever
+      # solution-level graph pruning drops the order-only reference rather
+      # than trying to fix that pruning itself.
+      - run: dotnet build agent/installer/HyperVCsiAgent.Installer.Bundle/HyperVCsiAgent.Installer.Bundle.wixproj -c Release -p:Platform=x64
       - run: dotnet test agent/HyperVCsiAgent.slnx -c Release
 
   docker:
@@ -96,8 +121,8 @@ jobs:
           cache-to: type=gha,mode=max
 
   # Chart version is packaged from the tag rather than the value committed in
-  # Chart.yaml, the same way the container image and installer take their
-  # version from the tag rather than a hardcoded value.
+  # Chart.yaml, the same way the container image takes its version from the
+  # tag rather than a hardcoded value.
   chart:
     name: Helm chart
     if: needs.version.outputs.is-release == 'true'
@@ -117,13 +142,38 @@ jobs:
   # Only the bundle .exe is built (not the bare MSI) since it's the one thing
   # documented as the thing an operator downloads and runs - see README.md's
   # "Agent Installation".
+  #
+  # Built on every push, not gated on a tag: today a broken installer isn't
+  # discovered until a tag is cut, and this is a build, not an install -
+  # cheap and not flaky. The workflow artifact is always uploaded; only the
+  # release job (gated on is-release) attaches it to a GitHub release.
+  #
+  # This job deliberately does NOT take `needs.version.outputs.version` (and
+  # no longer depends on the `version` job at all): that job's string is a
+  # single alphanumeric prerelease label computed by a different mechanism
+  # than the installer's own version pipeline, and feeding it to the bundle
+  # would produce two disagreeing version mechanisms. Instead,
+  # agent/Directory.Build.props runs the version tool itself during this
+  # build. With fetch-depth: 0 below, `git describe --tags --long` on a
+  # tagged commit resolves to `<tag>-0-g<sha>`, which VersionPipeline already
+  # recognises as the exact-tag case (GitDescribe.IsTagged) and returns the
+  # normalised tag with no build key appended - so the tagged case is handled
+  # correctly without a second, CI-supplied version path. Do not reintroduce
+  # a `-p:InstallerVersion=...` (or similar) override here; that second path
+  # is exactly what this bullet is guarding against.
   installer:
     name: Agent installer
-    if: needs.version.outputs.is-release == 'true'
-    needs: [version, dotnet]
+    needs: [dotnet]
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.installer-version.outputs.version }}
     steps:
+      # fetch-depth: 0: same reason as the dotnet job, and additionally
+      # required so `git describe --tags --long` can see the tag on a
+      # tagged build.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
@@ -132,7 +182,32 @@ jobs:
           path: ~/.nuget/packages
           key: nuget-${{ hashFiles('agent/**/*.csproj') }}
           restore-keys: nuget-
-      - run: dotnet build agent/installer/HyperVCsiAgent.Installer.Bundle/HyperVCsiAgent.Installer.Bundle.wixproj -c Release -p:Platform=x64 -p:InstallerVersion=${{ needs.version.outputs.msi-version }}
+      # Runs the version tool ONCE, before the build, and publishes its six
+      # Name=Value lines into the environment. MSBuild seeds properties from
+      # environment variables, so agent/Directory.Build.props sees
+      # HyperVCsiBuildKey already set and its own derivation target skips -
+      # the same "computed once and passed down" guard nested builds rely
+      # on. Running the tool AFTER the build instead, to find out what it
+      # had produced, would be a second read of the clock: on an untagged
+      # push the two reads differ by however long the build took, and the
+      # asset would be named after a different build key than the bundle it
+      # contains - a version skew reintroduced one layer up.
+      #
+      # The tool's own stdout is exactly $GITHUB_ENV's format, but `dotnet run`
+      # wraps it with MSBuild's restore/build progress lines on stdout too, so
+      # the grep strips everything down to the tool's six Name=Value lines
+      # before $GITHUB_ENV sees them - an unfiltered non-Name=Value line fails
+      # the step. `version` is additionally lifted to a step output because
+      # the release job needs it across a job boundary, where the environment
+      # does not reach.
+      - id: installer-version
+        shell: bash
+        run: |
+          set -o pipefail
+          dotnet run --project agent/tools/HyperVCsiAgent.BuildVersion/HyperVCsiAgent.BuildVersion.csproj -- --repo "$(pwd)" | grep -E '^HyperVCsi[A-Za-z]+=' | tee "$RUNNER_TEMP/hyperv-csi-version.txt" >> "$GITHUB_ENV"
+          cat "$RUNNER_TEMP/hyperv-csi-version.txt"
+          echo "version=$(grep '^HyperVCsiVersion=' "$RUNNER_TEMP/hyperv-csi-version.txt" | cut -d= -f2-)" >> "$GITHUB_OUTPUT"
+      - run: dotnet build agent/installer/HyperVCsiAgent.Installer.Bundle/HyperVCsiAgent.Installer.Bundle.wixproj -c Release -p:Platform=x64
       - uses: actions/upload-artifact@v4
         with:
           name: installer
@@ -148,7 +223,7 @@ jobs:
         with:
           name: installer
           path: dist
-      - run: mv dist/HyperVCsiAgent.Installer.Bundle.exe "dist/hyperv-csi-agent-installer-${{ needs.version.outputs.version }}.exe"
+      - run: mv dist/HyperVCsiAgent.Installer.Bundle.exe "dist/hyperv-csi-agent-installer-${{ needs.installer.outputs.version }}.exe"
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/hyperv-csi-agent-installer-*.exe

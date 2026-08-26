@@ -31,6 +31,15 @@ internal sealed class BootstrapperApp : BootstrapperApplication
         // Apply() still elevates on its own when it actually needs to,
         // exactly as any per-machine Burn bundle does without any BA code
         // asking for it.
+        // DetectRelatedBundle is how the view model learns
+        // what else is registered under this bundle's UpgradeCode (feeding
+        // SetupMode's Upgrade/Downgrade/Repair split), and ApplyDowngrade is
+        // the backstop for the case where the engine reaches a downgrade
+        // conclusion despite this code's own pre-Plan refusal (see
+        // WizardViewModel.OnApplyDowngrade's own remarks on why that should
+        // never actually fire).
+        this.DetectRelatedBundle += (_, e) => _viewModel.OnDetectRelatedBundle(e);
+        this.ApplyDowngrade += (_, e) => _viewModel.OnApplyDowngrade(e);
         this.DetectComplete += (_, e) => _viewModel.OnDetectComplete(e);
         this.PlanComplete += (_, e) => _viewModel.OnPlanComplete(e);
         this.ApplyComplete += (_, e) => _viewModel.OnApplyComplete(e);

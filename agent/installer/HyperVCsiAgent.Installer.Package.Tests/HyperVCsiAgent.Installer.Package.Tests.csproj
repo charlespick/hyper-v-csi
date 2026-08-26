@@ -1,0 +1,98 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <!-- Mirrors HyperVCsiAgent.Installer.Bundle.wixproj's own MsiPath property
+         (and that project's implicit bundle output path) rather than
+         re-deriving them independently: both wixproj files declare
+         <Platforms>x64</Platforms> and nothing else, so "bin\x64\$(Configuration)"
+         is not a guess, it is the only path either project's own build can
+         ever produce. If that convention ever changes, these two properties
+         stop matching reality and PackageDatabaseFixture's own existence
+         check below turns that into a loud, actionable test failure instead
+         of a silent wrong path. -->
+    <BundleProjectDir>$(MSBuildThisFileDirectory)..\HyperVCsiAgent.Installer.Bundle\</BundleProjectDir>
+    <BundlePath>$(BundleProjectDir)bin\x64\$(Configuration)\HyperVCsiAgent.Installer.Bundle.exe</BundlePath>
+    <MsiProjectDir>$(MSBuildThisFileDirectory)..\HyperVCsiAgent.Installer\</MsiProjectDir>
+    <MsiPath>$(MsiProjectDir)bin\x64\$(Configuration)\HyperVCsiAgent.Installer.msi</MsiPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.4" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Shared with HyperVCsiAgent.Core.Tests rather than duplicated: same
+         attribute, same skip rationale, one source of truth. -->
+    <Compile Include="..\..\tests\HyperVCsiAgent.Core.Tests\WindowsOnlyFactAttribute.cs" Link="WindowsOnlyFactAttribute.cs" />
+    <!-- Compiled a second time from HyperVCsiAgent.Installer.Actions's own
+         source file, exactly the way agent/tools/HyperVCsiAgent.BuildVersion
+         already does it - see that project's own csproj remark. VersionPipeline
+         is `internal`, so this Compile Include (rather than a second
+         InternalsVisibleTo on the Actions project) is what gives assertion 9
+         access to ToMsiVersion without widening Actions' public/internal
+         surface for a second consumer, and without a ProjectReference that
+         would drag the Actions project's own self-contained/win-x64 publish
+         shape into an AnyCPU test project. VersionPipeline has no dependency
+         beyond the BCL (by design - see its own remarks), which is exactly
+         what makes compiling it twice safe rather than fragile. -->
+    <Compile Include="..\HyperVCsiAgent.Installer.Actions\VersionPipeline.cs" Link="VersionPipeline.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- This is the only reference in the whole build graph from a plain
+         AnyCPU test project into a WiX v5 x64-only wixproj, so it is where
+         the platform-negotiation friction lands: MSBuild's default
+         cross-project TargetFramework/Platform negotiation
+         (GetTargetFrameworks) tries to find a TargetFramework the wixproj
+         doesn't publish in the way an SDK-style csproj does, and the
+         wixproj's own <Platforms>x64</Platforms> has nothing in common with
+         this project's default AnyCPU. ReferenceOutputAssembly="false" is
+         needed regardless (a Package/Bundle output type has no managed
+         assembly to reference), and it is also what makes the other two
+         switches safe: since nothing is actually consumed from the
+         referenced project's output, telling MSBuild not to negotiate a
+         shared TargetFramework (SkipGetTargetFrameworkProperties) and to
+         build the reference as x64 outright (SetPlatform) cannot produce a
+         mismatched assembly reference - there is no assembly reference at
+         all. What this ProjectReference buys is purely build-order: `dotnet
+         build`/`dotnet test` on this project now builds
+         HyperVCsiAgent.Installer.Bundle.wixproj first, every time, which is
+         what nests the MSI build inside it (see that wixproj's own
+         PublishBootstrapperUiAndMsi target) and produces both artifacts this
+         project's tests read. -->
+    <ProjectReference Include="..\HyperVCsiAgent.Installer.Bundle\HyperVCsiAgent.Installer.Bundle.wixproj"
+                       ReferenceOutputAssembly="false"
+                       SkipGetTargetFrameworkProperties="true"
+                       SetPlatform="Platform=x64" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The paths the nested WiX build actually produced, for whatever
+         Configuration this project itself was built with - injected rather
+         than hardcoded or re-derived at test time, so there is exactly one
+         place (the PropertyGroup above) that knows the convention. -->
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>MsiPath</_Parameter1>
+      <_Parameter2>$(MsiPath)</_Parameter2>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>BundlePath</_Parameter1>
+      <_Parameter2>$(BundlePath)</_Parameter2>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+</Project>

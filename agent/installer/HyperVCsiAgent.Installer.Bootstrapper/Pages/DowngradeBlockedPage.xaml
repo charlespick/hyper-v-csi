@@ -1,0 +1,19 @@
+<UserControl x:Class="HyperVCsiAgent.Installer.Bootstrapper.Pages.DowngradeBlockedPage"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <!--
+      Reached only via WizardViewModel.OnDetectComplete redirecting straight
+      here when Mode resolves to Downgrade - never part of Back/Next's
+      linear page order, the same way UninstallConfirmPage is not. There is
+      no Install button on this page and nothing here calls InstallCommand:
+      the only commands reachable from here are Cancel and the window's own
+      close chrome, both of which just back out of setup having planned
+      nothing at all.
+    -->
+    <StackPanel VerticalAlignment="Center">
+        <TextBlock Text="Cannot Install an Older Version" FontSize="18" FontWeight="Bold" Margin="0,0,0,12" />
+        <TextBlock TextWrapping="Wrap" Text="{Binding SetupSummary}" Margin="0,0,0,12" />
+        <TextBlock TextWrapping="Wrap"
+                   Text="To install this version, first uninstall the Hyper-V CSI Agent from Programs and Features, then run this setup again." />
+    </StackPanel>
+</UserControl>

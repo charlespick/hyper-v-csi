@@ -99,7 +99,7 @@ Alternatively, install the agent silently using your configuration management
 system of choice
 
 ```powershell
-.\hyperv-csi-agent-installer-<version>.exe /quiet SERVICEACCOUNT="DOMAIN\svc-hyperv-csi" SERVICEPASSWORD="..." CSVVOLUMESROOT="C:\ClusterStorage\Volume1\hyperv-csi\volumes" CSVSNAPSHOTSROOT="C:\ClusterStorage\Volume1\hyperv-csi\snapshots" TLSHOSTNAME="hyperv-csi-agent.example.com" SERVERCERTTHUMBPRINT="<server cert thumbprint>" CLIENTTHUMBPRINTS="<thumbprint from step 1>"
+.\hyperv-csi-agent-installer-<version>.exe /quiet SERVICEACCOUNT="DOMAIN\svc-hyperv-csi" SERVICEPASSWORD="..." CSVVOLUMESROOT="C:\ClusterStorage\Volume1\hyperv-csi\volumes" CSVSNAPSHOTSROOT="C:\ClusterStorage\Volume1\hyperv-csi\snapshots" SERVERCERTTHUMBPRINT="<server cert thumbprint>" CLIENTTHUMBPRINTS="<thumbprint from step 1>"
 ```
 
 Any property can be left out — the service always installs, but the config file

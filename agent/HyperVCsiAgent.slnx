@@ -10,8 +10,12 @@
   <Folder Name="/installer/">
     <Project Path="installer/HyperVCsiAgent.Installer.Actions/HyperVCsiAgent.Installer.Actions.csproj" />
     <Project Path="installer/HyperVCsiAgent.Installer.Actions.Tests/HyperVCsiAgent.Installer.Actions.Tests.csproj" />
+    <Project Path="installer/HyperVCsiAgent.Installer.Package.Tests/HyperVCsiAgent.Installer.Package.Tests.csproj" />
     <Project Path="installer/HyperVCsiAgent.Installer/HyperVCsiAgent.Installer.wixproj" />
     <Project Path="installer/HyperVCsiAgent.Installer.Bootstrapper/HyperVCsiAgent.Installer.Bootstrapper.csproj" />
     <Project Path="installer/HyperVCsiAgent.Installer.Bundle/HyperVCsiAgent.Installer.Bundle.wixproj" />
+  </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/HyperVCsiAgent.BuildVersion/HyperVCsiAgent.BuildVersion.csproj" />
   </Folder>
 </Solution>

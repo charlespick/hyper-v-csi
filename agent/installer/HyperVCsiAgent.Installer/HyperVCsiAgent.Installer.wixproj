@@ -3,31 +3,38 @@
   <PropertyGroup>
     <OutputType>Package</OutputType>
     <Platforms>x64</Platforms>
-    <!-- Only a fallback for a bare `dotnet build` with no -p:InstallerVersion
-         - ci.yml's installer job always passes the real one derived from the
-         release tag. major pinned to 0 so a real release (major >= 1) always
-         outranks any dev build; minor/build are Unix seconds split into two
-         base-65536 "digits" (minor further wrapped mod 256), so comparing
-         (minor, build) as a pair is exactly comparing time - unlike an
-         earlier 0.HH.mmss version of this, which reset every UTC midnight
-         and, the one time it mattered, made a genuinely newer build compare
-         as older than one from earlier the same day, tripping MSI 1638
-         ("another version of this product is already installed") against a
-         real cluster node. This resets every ~194 days (256 * 65536
-         seconds) instead of every 24 hours - still not forever, but long
-         enough that no single dev/test cycle should ever cross it. -->
-    <InstallerUnixSeconds>$([System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds())</InstallerUnixSeconds>
-    <InstallerVersion Condition="'$(InstallerVersion)' == ''">0.$([MSBuild]::Modulo($([MSBuild]::Divide($(InstallerUnixSeconds), 65536)), 256)).$([MSBuild]::Modulo($(InstallerUnixSeconds), 65536))</InstallerVersion>
+    <!-- WIX1148 (invalid MSI package version) must fail the build, not just
+         warn. Scoped to this one code deliberately - do NOT change to a
+         blanket -warnaserror or <TreatWarningsAsErrors>: Product.wxs's
+         MajorUpgrade AllowDowngrades="yes" emits the expected WIX1076
+         (ICE61) warning, which a blanket setting would also fail on. -->
+    <WarningsAsErrors>1148</WarningsAsErrors>
     <ServiceProjectDir>$(MSBuildThisFileDirectory)..\..\src\HyperVCsiAgent.Service\</ServiceProjectDir>
     <ServicePublishDir>$(ServiceProjectDir)bin\$(Configuration)\net10.0\win-x64\publish\</ServicePublishDir>
     <ActionsProjectDir>$(MSBuildThisFileDirectory)..\HyperVCsiAgent.Installer.Actions\</ActionsProjectDir>
     <ActionsPublishDir>$(ActionsProjectDir)bin\$(Configuration)\net10.0\win-x64\publish\</ActionsPublishDir>
-    <DefineConstants>ServicePublishDir=$(ServicePublishDir);ActionsExePath=$(ActionsPublishDir)HyperVCsiAgent.Installer.Actions.exe;ProductVersion=$(InstallerVersion)</DefineConstants>
+    <DefineConstants>ServicePublishDir=$(ServicePublishDir);ActionsExePath=$(ActionsPublishDir)HyperVCsiAgent.Installer.Actions.exe</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="WixToolset.UI.wixext" Version="5.0.2" />
   </ItemGroup>
+
+  <!-- The MSI gets the MSI key (HyperVCsiMsiVersion), not the semver
+       (HyperVCsiVersion) - see this project's own MajorUpgrade remarks in
+       Product.wxs: the bundle carries meaning, the MSI carries order. MSI
+       ProductVersion is 32 bits of pure ordering and cannot hold a
+       prerelease label.
+
+       Can't live in the eval-time PropertyGroup above: HyperVCsiMsiVersion
+       is set by agent/Directory.Build.props's HyperVCsiDeriveVersion target
+       (or handed down from HyperVCsiAgent.Installer.Bundle.wixproj's nested
+       build), so its value only exists once that target has run. -->
+  <Target Name="SetProductVersionDefineConstant" DependsOnTargets="HyperVCsiDeriveVersion" BeforeTargets="CoreCompile">
+    <PropertyGroup>
+      <DefineConstants>$(DefineConstants);ProductVersion=$(HyperVCsiMsiVersion)</DefineConstants>
+    </PropertyGroup>
+  </Target>
 
   <!-- The MSI packages two other projects' published output rather than
        their build output: HyperVCsiAgent.Service has to be self-contained so
@@ -36,10 +43,23 @@
        so it can be embedded as one MSI Binary stream. Both only exist once
        `dotnet publish` has actually run - a plain build of either leaves a
        framework-dependent apphost that fails the moment it is extracted
-       somewhere without its dependency DLLs alongside it. -->
-  <Target Name="PublishAgentPayload" BeforeTargets="CoreCompile">
-    <Exec Command="dotnet publish &quot;$(ServiceProjectDir)HyperVCsiAgent.Service.csproj&quot; -c $(Configuration) -r win-x64 --self-contained -o &quot;$(ServicePublishDir)&quot;" />
-    <Exec Command="dotnet publish &quot;$(ActionsProjectDir)HyperVCsiAgent.Installer.Actions.csproj&quot; -c $(Configuration) -r win-x64 --self-contained -o &quot;$(ActionsPublishDir)&quot;" />
+       somewhere without its dependency DLLs alongside it.
+
+       Both nested publishes are given HyperVCsiBuildKey and the version
+       properties this project itself ended up with (whether derived here or
+       handed down from HyperVCsiAgent.Installer.Bundle.wixproj), so neither
+       publish recomputes its own build key. -->
+  <Target Name="PublishAgentPayload" DependsOnTargets="HyperVCsiDeriveVersion" BeforeTargets="CoreCompile">
+    <!-- The extra literal backslash right before each closing &quot; on the
+         -o paths below is deliberate, not a typo: ServicePublishDir/
+         ActionsPublishDir already end in \, and CommandLineToArgvW treats an
+         odd run of backslashes before a quote as an escaped literal quote
+         rather than a closing one - which silently swallowed every argument
+         after it into the same token once this target started appending
+         -p: switches after -o. Doubling the trailing backslash keeps the
+         path's own trailing \ while actually closing the quoted argument. -->
+    <Exec Command="dotnet publish &quot;$(ServiceProjectDir)HyperVCsiAgent.Service.csproj&quot; -c $(Configuration) -r win-x64 --self-contained -o &quot;$(ServicePublishDir)\&quot; -p:HyperVCsiBuildKey=$(HyperVCsiBuildKey) -p:Version=$(Version) -p:FileVersion=$(FileVersion) -p:AssemblyVersion=$(AssemblyVersion) -p:InformationalVersion=&quot;$(InformationalVersion)&quot;" />
+    <Exec Command="dotnet publish &quot;$(ActionsProjectDir)HyperVCsiAgent.Installer.Actions.csproj&quot; -c $(Configuration) -r win-x64 --self-contained -o &quot;$(ActionsPublishDir)\&quot; -p:HyperVCsiBuildKey=$(HyperVCsiBuildKey) -p:Version=$(Version) -p:FileVersion=$(FileVersion) -p:AssemblyVersion=$(AssemblyVersion) -p:InformationalVersion=&quot;$(InformationalVersion)&quot;" />
   </Target>
 
 </Project>

@@ -4,20 +4,36 @@
     <OutputType>Bundle</OutputType>
     <TargetExt>.exe</TargetExt>
     <Platforms>x64</Platforms>
+    <!-- WIX1148 (invalid MSI package version) must fail the build, not just
+         warn. Scoped to this one code deliberately - do NOT change to a
+         blanket -warnaserror or <TreatWarningsAsErrors>: Product.wxs's
+         MajorUpgrade AllowDowngrades="yes" emits the expected WIX1076
+         (ICE61) warning, which a blanket setting would also fail on. -->
+    <WarningsAsErrors>1148</WarningsAsErrors>
     <InstallerPlatform>x64</InstallerPlatform>
     <HarvestDirectoryAdditionalOptions>-generate payloadgroup</HarvestDirectoryAdditionalOptions>
-    <!-- Same fallback, same reasoning, as HyperVCsiAgent.Installer.wixproj's
-         own InstallerVersion - kept in lockstep with the chained MSI's own
-         Package/@Version (passed through explicitly to the nested build
-         below) so Bundle and MSI never report different versions. -->
-    <InstallerUnixSeconds>$([System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds())</InstallerUnixSeconds>
-    <InstallerVersion Condition="'$(InstallerVersion)' == ''">0.$([MSBuild]::Modulo($([MSBuild]::Divide($(InstallerUnixSeconds), 65536)), 256)).$([MSBuild]::Modulo($(InstallerUnixSeconds), 65536))</InstallerVersion>
     <BootstrapperProjectDir>$(MSBuildThisFileDirectory)..\HyperVCsiAgent.Installer.Bootstrapper\</BootstrapperProjectDir>
     <BootstrapperPublishDir>$(BootstrapperProjectDir)bin\$(Configuration)\net10.0-windows\win-x64\publish\</BootstrapperPublishDir>
     <MsiProjectDir>$(MSBuildThisFileDirectory)..\HyperVCsiAgent.Installer\</MsiProjectDir>
     <MsiPath>$(MsiProjectDir)bin\x64\$(Configuration)\HyperVCsiAgent.Installer.msi</MsiPath>
-    <DefineConstants>MsiPath=$(MsiPath);BootstrapperPublishDir=$(BootstrapperPublishDir);ProductVersion=$(InstallerVersion)</DefineConstants>
+    <DefineConstants>MsiPath=$(MsiPath);BootstrapperPublishDir=$(BootstrapperPublishDir)</DefineConstants>
   </PropertyGroup>
+
+  <!-- The bundle carries meaning, the MSI carries order: this gets
+       HyperVCsiVersion, the real SemVer with its prerelease label intact,
+       while HyperVCsiAgent.Installer.wixproj's own
+       SetProductVersionDefineConstant gives the chained MSI
+       HyperVCsiMsiVersion instead - 32 bits of pure ordering with no room
+       for a prerelease label. Do not "fix" this into matching.
+
+       Composed in a target rather than the eval-time PropertyGroup above
+       because HyperVCsiVersion is only populated once HyperVCsiDeriveVersion
+       (agent/Directory.Build.props) has run. -->
+  <Target Name="SetProductVersionDefineConstant" DependsOnTargets="HyperVCsiDeriveVersion" BeforeTargets="CoreCompile">
+    <PropertyGroup>
+      <DefineConstants>$(DefineConstants);ProductVersion=$(HyperVCsiVersion)</DefineConstants>
+    </PropertyGroup>
+  </Target>
 
   <!-- The BA exe is harvested from its own publish output (all the
        self-contained runtime DLLs alongside it) rather than its plain build
@@ -47,10 +63,25 @@
   <!-- Same shape as HyperVCsiAgent.Installer.wixproj's own PublishAgentPayload
        target: the MSI and the BA exe are each a separately built/published
        artifact this bundle only embeds, so both need to exist before this
-       project's own CoreCompile runs. -->
-  <Target Name="PublishBootstrapperUiAndMsi" BeforeTargets="HarvestDirectory;CoreCompile">
-    <Exec Command="dotnet publish &quot;$(BootstrapperProjectDir)HyperVCsiAgent.Installer.Bootstrapper.csproj&quot; -c $(Configuration) -r win-x64 --self-contained -o &quot;$(BootstrapperPublishDir)&quot;" />
-    <Exec Command="dotnet build &quot;$(MsiProjectDir)HyperVCsiAgent.Installer.wixproj&quot; -c $(Configuration) -p:Platform=x64 -p:InstallerVersion=$(InstallerVersion)" />
+       project's own CoreCompile runs.
+
+       Both nested builds are given HyperVCsiBuildKey and the version
+       properties this project itself ended up with, so a full bundle build
+       invokes the version tool exactly once - here - rather than once per
+       nested project. The nested MSI build additionally needs
+       HyperVCsiMsiVersion, which this project's own DefineConstants above
+       deliberately does not use (see SetProductVersionDefineConstant). -->
+  <Target Name="PublishBootstrapperUiAndMsi" DependsOnTargets="HyperVCsiDeriveVersion" BeforeTargets="HarvestDirectory;CoreCompile">
+    <!-- The extra literal backslash right before the closing &quot; on the -o
+         path below is deliberate, not a typo: BootstrapperPublishDir already
+         ends in \, and CommandLineToArgvW treats an odd run of backslashes
+         before a quote as an escaped literal quote rather than a closing one
+         - which silently swallowed every argument after it into the same
+         token once this target started appending -p: switches after -o.
+         Doubling the trailing backslash keeps the path's own trailing \
+         while actually closing the quoted argument. -->
+    <Exec Command="dotnet publish &quot;$(BootstrapperProjectDir)HyperVCsiAgent.Installer.Bootstrapper.csproj&quot; -c $(Configuration) -r win-x64 --self-contained -o &quot;$(BootstrapperPublishDir)\&quot; -p:HyperVCsiBuildKey=$(HyperVCsiBuildKey) -p:Version=$(Version) -p:FileVersion=$(FileVersion) -p:AssemblyVersion=$(AssemblyVersion) -p:InformationalVersion=&quot;$(InformationalVersion)&quot;" />
+    <Exec Command="dotnet build &quot;$(MsiProjectDir)HyperVCsiAgent.Installer.wixproj&quot; -c $(Configuration) -p:Platform=x64 -p:HyperVCsiBuildKey=$(HyperVCsiBuildKey) -p:HyperVCsiMsiVersion=$(HyperVCsiMsiVersion) -p:Version=$(Version) -p:FileVersion=$(FileVersion) -p:AssemblyVersion=$(AssemblyVersion) -p:InformationalVersion=&quot;$(InformationalVersion)&quot;" />
   </Target>
 
 </Project>

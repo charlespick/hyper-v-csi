@@ -9,8 +9,16 @@
     </UserControl.Resources>
     <StackPanel>
         <TextBlock Text="Ready to Install" FontSize="18" FontWeight="Bold" Margin="0,0,0,4" />
-        <TextBlock TextWrapping="Wrap" Margin="0,0,0,16"
-                   Text="Review these settings, then click Install to set up the Hyper-V CSI Agent." />
+        <!-- SetupSummary - "Upgrading Hyper-V CSI Agent from X to Y on
+             this node." for Upgrade, the equivalent line for Install/Repair.
+             Never Downgrade's text: that mode is redirected to
+             DowngradeBlockedPage before this page is ever reachable. -->
+        <TextBlock TextWrapping="Wrap" Margin="0,0,0,4" FontWeight="SemiBold" Text="{Binding SetupSummary}" />
+        <TextBlock TextWrapping="Wrap" Margin="0,0,0,16">
+            <Run Text="Review these settings, then click" />
+            <Run Text="{Binding InstallButtonLabel, Mode=OneWay}" FontWeight="SemiBold" />
+            <Run Text="to continue." />
+        </TextBlock>
 
         <Grid>
             <Grid.ColumnDefinitions>
@@ -28,27 +36,46 @@
             </Grid.RowDefinitions>
 
             <TextBlock Grid.Row="0" Grid.Column="0" Text="Service account:" FontWeight="SemiBold" Margin="0,0,0,6" />
-            <TextBlock Grid.Row="0" Grid.Column="1" Text="{Binding ServiceAccount}" Margin="0,0,0,6" />
+            <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" Margin="0,0,0,6">
+                <TextBlock Text="{Binding ServiceAccount}" />
+                <!-- Labelled, not silently pre-filled - the installer upgrade
+                     validation checklist's check 3 is a human confirming
+                     this reads as detected, not typed. -->
+                <TextBlock Text=" (carried over)" FontStyle="Italic" Foreground="#FF6E6E6E"
+                           Visibility="{Binding ServiceAccountCarriedOver, Converter={StaticResource BoolToVis}}" />
+            </StackPanel>
 
             <TextBlock Grid.Row="1" Grid.Column="0" Text="Volumes directory:" FontWeight="SemiBold" Margin="0,0,0,6" />
-            <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding CsvVolumesRoot}" Margin="0,0,0,6" />
+            <StackPanel Grid.Row="1" Grid.Column="1" Orientation="Horizontal" Margin="0,0,0,6">
+                <TextBlock Text="{Binding CsvVolumesRoot}" />
+                <TextBlock Text=" (carried over)" FontStyle="Italic" Foreground="#FF6E6E6E"
+                           Visibility="{Binding CsvVolumesRootCarriedOver, Converter={StaticResource BoolToVis}}" />
+            </StackPanel>
 
             <TextBlock Grid.Row="2" Grid.Column="0" Text="Snapshots support:" FontWeight="SemiBold" Margin="0,0,0,6" />
-            <TextBlock Grid.Row="2" Grid.Column="1" Margin="0,0,0,6">
-                <TextBlock.Style>
-                    <Style TargetType="TextBlock">
-                        <Setter Property="Text" Value="Disabled" />
-                        <Style.Triggers>
-                            <DataTrigger Binding="{Binding SnapshotsEnabled}" Value="True">
-                                <Setter Property="Text" Value="{Binding CsvSnapshotsRoot}" />
-                            </DataTrigger>
-                        </Style.Triggers>
-                    </Style>
-                </TextBlock.Style>
-            </TextBlock>
+            <StackPanel Grid.Row="2" Grid.Column="1" Orientation="Horizontal" Margin="0,0,0,6">
+                <TextBlock>
+                    <TextBlock.Style>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="Text" Value="Disabled" />
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding SnapshotsEnabled}" Value="True">
+                                    <Setter Property="Text" Value="{Binding CsvSnapshotsRoot}" />
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </TextBlock.Style>
+                </TextBlock>
+                <TextBlock Text=" (carried over)" FontStyle="Italic" Foreground="#FF6E6E6E"
+                           Visibility="{Binding CsvSnapshotsRootCarriedOver, Converter={StaticResource BoolToVis}}" />
+            </StackPanel>
 
             <TextBlock Grid.Row="3" Grid.Column="0" Text="Server certificate:" FontWeight="SemiBold" Margin="0,0,0,6" />
-            <TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding CertificateSummary}" Margin="0,0,0,6" TextWrapping="Wrap" />
+            <StackPanel Grid.Row="3" Grid.Column="1" Orientation="Horizontal" Margin="0,0,0,6">
+                <TextBlock Text="{Binding CertificateSummary}" TextWrapping="Wrap" />
+                <TextBlock Text=" (carried over)" FontStyle="Italic" Foreground="#FF6E6E6E"
+                           Visibility="{Binding ServerCertificateCarriedOver, Converter={StaticResource BoolToVis}}" />
+            </StackPanel>
 
             <TextBlock Grid.Row="4" Grid.Column="0" Text="HTTPS port:" FontWeight="SemiBold" Margin="0,0,0,6" />
             <TextBlock Grid.Row="4" Grid.Column="1" Text="{Binding TlsPort}" Margin="0,0,0,6" />

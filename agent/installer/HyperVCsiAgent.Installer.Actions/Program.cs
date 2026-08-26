@@ -19,7 +19,7 @@ using HyperVCsiAgent.Installer.Actions;
 // the agent itself binds and enforces at startup.
 if (args.Length == 0)
 {
-    Console.Error.WriteLine("usage: HyperVCsiAgent.Installer.Actions <validate-cert|validate-thumbprints|grant-cert-access|grant-logon-as-service|open-firewall-port|close-firewall-port|write-config|generate-server-cert|ensure-eventlog-source> [options]");
+    Console.Error.WriteLine("usage: HyperVCsiAgent.Installer.Actions <validate-cert|validate-thumbprints|grant-cert-access|grant-logon-as-service|open-firewall-port|close-firewall-port|write-config|generate-server-cert|ensure-eventlog-source|remove-service> [options]");
     return 1;
 }
 
@@ -36,6 +36,7 @@ try
         "write-config" => WriteConfigCommand.Run(args[1..]),
         "generate-server-cert" => GenerateServerCertificateCommand.Run(args[1..]),
         "ensure-eventlog-source" => EnsureEventLogSourceCommand.Run(args[1..]),
+        "remove-service" => RemoveAgentServiceCommand.Run(args[1..]),
         var unknown => Fail($"unknown command '{unknown}'"),
     };
 }

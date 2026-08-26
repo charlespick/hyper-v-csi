@@ -23,6 +23,7 @@
             <pages:ClusteringPage Visibility="{Binding IsClusteringPage, Converter={StaticResource BoolToVis}}" />
             <pages:ReadyToInstallPage Visibility="{Binding IsReadyToInstallPage, Converter={StaticResource BoolToVis}}" />
             <pages:UninstallConfirmPage Visibility="{Binding IsUninstallConfirmPage, Converter={StaticResource BoolToVis}}" />
+            <pages:DowngradeBlockedPage Visibility="{Binding IsDowngradePage, Converter={StaticResource BoolToVis}}" />
             <pages:ProgressPage Visibility="{Binding IsProgressPage, Converter={StaticResource BoolToVis}}" />
             <pages:FinishPage Visibility="{Binding IsFinishPage, Converter={StaticResource BoolToVis}}" />
         </Grid>
@@ -32,7 +33,14 @@
                     Visibility="{Binding ShowBackButton, Converter={StaticResource BoolToVis}}" />
             <Button Content="Next" Width="80" Margin="0,0,8,0" Command="{Binding NextCommand}" IsDefault="True"
                     Visibility="{Binding ShowNextButton, Converter={StaticResource BoolToVis}}" />
-            <Button Content="Install" Width="80" Margin="0,0,8,0" Command="{Binding InstallCommand}"
+            <!-- Content bound to InstallButtonLabel instead of a
+                 hardcoded "Install" - it reads "Install"/"Upgrade"/"Repair"
+                 depending on WizardViewModel.Mode; there is no case for
+                 Downgrade because ShowInstallButton is only ever true on
+                 ReadyToInstallPageIndex, which Downgrade mode is redirected
+                 away from before it is ever reachable (see
+                 WizardViewModel.DowngradePageIndex). -->
+            <Button Content="{Binding InstallButtonLabel}" Width="80" Margin="0,0,8,0" Command="{Binding InstallCommand}"
                     Visibility="{Binding ShowInstallButton, Converter={StaticResource BoolToVis}}" />
             <Button Content="Uninstall" Width="80" Margin="0,0,8,0" Command="{Binding UninstallCommand}"
                     Visibility="{Binding ShowUninstallButton, Converter={StaticResource BoolToVis}}" />
