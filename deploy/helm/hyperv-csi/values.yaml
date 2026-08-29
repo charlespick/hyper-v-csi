@@ -94,6 +94,12 @@ controller:
     timeout: 60s
     extraArgs: []
 
+  # livenessprobe exposes the driver's CSI Probe RPC as an HTTP /healthz on
+  # port 9808 for a kubelet livenessProbe — the driver binary serves no HTTP
+  # itself. Pinned to the same sidecar release wave as the three above.
+  livenessProbe:
+    image: registry.k8s.io/sig-storage/livenessprobe:v2.14.0
+
   # external-snapshotter. Off by default, and this is the implemented-versus-
   # exercised line rather than an implemented-or-not one: CreateSnapshot,
   # DeleteSnapshot and ListSnapshots exist, so the sidecar would do real work
@@ -204,6 +210,14 @@ controller:
     limits:
       memory: 128Mi
 
+  # A built-in PriorityClass present on every cluster (value 2000000000).
+  # Losing the controller halts provisioning, attach/detach and resize for
+  # every managed volume, so it should outrank ordinary workloads when kubelet
+  # is choosing what to evict. Set to "" to opt out. A ResourceQuota with a
+  # priorityClass scopeSelector in this namespace can forbid the name, in which
+  # case override it with one you are allowed to use.
+  priorityClassName: system-cluster-critical
+
   nodeSelector: {}
   tolerations: []
   affinity: {}
@@ -232,6 +246,12 @@ node:
   registrar:
     image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0
 
+  # livenessprobe exposes the driver's CSI Probe RPC as an HTTP /healthz on
+  # port 9808 for a kubelet livenessProbe — the driver binary serves no HTTP
+  # itself. Pinned to the same sidecar release wave as the registrar above.
+  livenessProbe:
+    image: registry.k8s.io/sig-storage/livenessprobe:v2.14.0
+
   kubeletDir: /var/lib/kubelet
 
   # Where hv_kvp_daemon keeps the Hyper-V key-value pools. The node plugin reads
@@ -248,6 +268,13 @@ node:
       memory: 32Mi
     limits:
       memory: 128Mi
+
+  # A built-in PriorityClass present on every cluster (value 2000001000). If
+  # kubelet evicts the node plugin under resource pressure, no pod on that node
+  # can stage, mount or unmount one of this driver's volumes, so it ranks with
+  # the other node-critical infrastructure DaemonSets. Set to "" to opt out;
+  # override if a ResourceQuota in this namespace forbids the name.
+  priorityClassName: system-node-critical
 
   nodeSelector: {}
   tolerations:

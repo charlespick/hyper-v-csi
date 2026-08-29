@@ -23,6 +23,13 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "hyperv-csi.serviceAccountName" . }}
+      {{- with .Values.node.priorityClassName }}
+      # The node plugin is on the mount path of every pod with one of this
+      # driver's volumes. If kubelet evicts it under resource pressure, those
+      # pods cannot stage, mount or unmount — so it ranks alongside the other
+      # node-critical infrastructure DaemonSets.
+      priorityClassName: {{ . }}
+      {{- end }}
       hostNetwork: false
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -41,6 +48,24 @@ spec:
               mountPath: /registration
           securityContext:
             allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+        # Turns the driver's CSI Probe RPC into an HTTP /healthz kubelet can
+        # poll — the driver process has no HTTP surface of its own. Without it a
+        # node plugin whose gRPC server has wedged stays registered and nothing
+        # restarts it, so pods scheduled to this node hang in staging.
+        - name: liveness-probe
+          image: {{ .Values.node.livenessProbe.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --health-port=9808
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
 
@@ -85,6 +110,20 @@ spec:
             - name: hyperv-kvp
               mountPath: /var/lib/hyperv
               readOnly: true
+          # Served by the liveness-probe sidecar above, which shares this pod's
+          # network namespace; named here so the probe below can reference it.
+          ports:
+            - name: healthz
+              containerPort: 9808
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 10
+            timeoutSeconds: 3
+            periodSeconds: 10
+            failureThreshold: 5
           resources:
             {{- toYaml .Values.node.resources | nindent 12 }}
           securityContext:

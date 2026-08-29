@@ -23,6 +23,13 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "hyperv-csi.serviceAccountName" . }}
+      {{- with .Values.controller.priorityClassName }}
+      # Losing the controller stops all provisioning, attach/detach and resize
+      # for every volume this driver manages, so it should outrank ordinary
+      # workloads when a node is under resource pressure and kubelet is deciding
+      # what to evict.
+      priorityClassName: {{ . }}
+      {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -171,6 +178,24 @@ spec:
               drop: ["ALL"]
         {{- end }}
 
+        # Turns the driver's CSI Probe RPC into an HTTP /healthz kubelet can
+        # poll — the driver process has no HTTP surface of its own. Without it a
+        # controller whose gRPC server has wedged keeps its endpoints and its
+        # leader-election lease and nothing restarts it.
+        - name: liveness-probe
+          image: {{ .Values.controller.livenessProbe.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --health-port=9808
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
         - name: hyperv-csi-driver
           image: {{ include "hyperv-csi.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -229,6 +254,20 @@ spec:
               mountPath: /etc/hyperv-csi
               readOnly: true
             {{- end }}
+          # Served by the liveness-probe sidecar above, which shares this pod's
+          # network namespace; named here so the probe below can reference it.
+          ports:
+            - name: healthz
+              containerPort: 9808
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 10
+            timeoutSeconds: 3
+            periodSeconds: 10
+            failureThreshold: 5
           resources:
             {{- toYaml .Values.controller.resources | nindent 12 }}
           securityContext:
