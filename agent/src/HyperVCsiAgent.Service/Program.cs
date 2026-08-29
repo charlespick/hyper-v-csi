@@ -81,7 +81,7 @@ var agentOptions = builder.Configuration
 // also the only case CreateWindowsService above changes anything for.
 if (OperatingSystem.IsWindows() && WindowsServiceHelpers.IsWindowsService())
 {
-    EventLogRegistration.Configure(builder.Logging);
+    EventLogRegistration.Configure(builder.Logging, agentOptions.Logging.MinimumLevel);
 }
 
 builder.Logging.SetMinimumLevel(agentOptions.Logging.MinimumLevel);
@@ -345,9 +345,28 @@ public partial class Program;
 [SupportedOSPlatform("windows")]
 internal static class EventLogRegistration
 {
-    public static void Configure(ILoggingBuilder logging) => logging.AddEventLog(settings =>
+    public static void Configure(ILoggingBuilder logging, LogLevel minimumLevel)
     {
-        settings.SourceName = "hyperv-csi-agent";
-        settings.LogName = "Application";
-    });
+        logging.AddEventLog(settings =>
+        {
+            settings.SourceName = "hyperv-csi-agent";
+            settings.LogName = "Application";
+        });
+
+        // The EventLog provider floors itself at Warning regardless of the
+        // root Logging:LogLevel section (and regardless of the
+        // SetMinimumLevel call below, which only sets the ambient default
+        // used when no provider-specific rule matches) - see
+        // https://learn.microsoft.com/en-us/dotnet/core/extensions/logging-providers#windows-eventlog.
+        // Without this, every Information call site the rest of this
+        // codebase relies on - AttachService, VhdxService, SnapshotService,
+        // the CIM clients, the job dispatch path - is silently dropped
+        // before it reaches the Event Log, while WindowsServiceLifetime's
+        // own start/stop messages still appear regardless, because those
+        // bypass ILogger and write straight through EventLog.WriteEntry.
+        // Tied to the same configured level rather than a hardcoded
+        // Information so turning LoggingOptions up to Debug for one node's
+        // incident reaches the Event Log too, not just Console/Debug.
+        logging.AddFilter<EventLogLoggerProvider>(null, minimumLevel);
+    }
 }
