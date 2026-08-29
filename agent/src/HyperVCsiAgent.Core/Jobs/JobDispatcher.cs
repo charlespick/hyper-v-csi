@@ -1,6 +1,7 @@
 ﻿using System.Text.Json;
 using HyperVCsiAgent.Core.HostControl;
 using HyperVCsiAgent.Core.Storage;
+using Microsoft.Extensions.Logging;
 
 namespace HyperVCsiAgent.Core.Jobs;
 
@@ -19,7 +20,9 @@ namespace HyperVCsiAgent.Core.Jobs;
 /// repeat what it was told to say, and cannot be held to spelling a VM ID the
 /// same way this side does. See <see cref="JobTargets"/>.
 /// </remarks>
-public sealed class JobDispatcher(IVhdxService vhdxService, IAttachService attachService, ISnapshotService snapshotService)
+public sealed class JobDispatcher(
+    IVhdxService vhdxService, IAttachService attachService, ISnapshotService snapshotService,
+    ILogger<JobDispatcher> logger)
 {
     public const string CreateVolume = "CreateVolume";
 
@@ -43,6 +46,24 @@ public sealed class JobDispatcher(IVhdxService vhdxService, IAttachService attac
     /// The operation is unknown or its payload is unusable.
     /// </exception>
     public ResolvedJob Resolve(string operationType, JsonElement payload, JsonSerializerOptions jsonOptions)
+    {
+        // One catch here rather than one log call at each of the throws
+        // below: every rejection in this method is an InvalidJobRequestException,
+        // and POST /v1/jobs already turns that into the 400 the controller
+        // sees, so this is the one place that needs to say why before it
+        // does.
+        try
+        {
+            return ResolveCore(operationType, payload, jsonOptions);
+        }
+        catch (InvalidJobRequestException ex)
+        {
+            logger.LogWarning("Rejected {OperationType}: {Message}", operationType, ex.Message);
+            throw;
+        }
+    }
+
+    private ResolvedJob ResolveCore(string operationType, JsonElement payload, JsonSerializerOptions jsonOptions)
     {
         switch (operationType)
         {

@@ -204,7 +204,8 @@ app.MapPost("/v1/jobs", (
     IJobStore jobStore,
     JobDispatcher dispatcher,
     JobIntakeGate gate,
-    IOptions<Microsoft.AspNetCore.Http.Json.JsonOptions> jsonOptions) =>
+    IOptions<Microsoft.AspNetCore.Http.Json.JsonOptions> jsonOptions,
+    ILogger<Program> logger) =>
 {
     // Closed until OrphanedCheckpointReaper's startup sweep has finished
     // discovery-and-enqueue for every orphan it found (see that class's own
@@ -219,17 +220,25 @@ app.MapPost("/v1/jobs", (
     // connection rather than this handler hanging until the gate opens.
     if (!gate.IsOpen)
     {
+        // Information, not Warning: the comment above is explicit that this
+        // is an expected startup window a sidecar's own retry already
+        // absorbs, not a caller doing anything wrong.
+        logger.LogInformation(
+            "{OperationType} {IdempotencyKey}: rejected, the agent is still recovering orphaned checkpoints",
+            request.OperationType, request.IdempotencyKey);
         return Results.Json(new { error = "the agent is still recovering orphaned checkpoints; retry shortly" },
             statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 
     if (string.IsNullOrWhiteSpace(request.OperationType))
     {
+        logger.LogWarning("Rejected job request: operationType is required");
         return Results.BadRequest(new { error = "operationType is required" });
     }
 
     if (string.IsNullOrWhiteSpace(request.IdempotencyKey))
     {
+        logger.LogWarning("Rejected {OperationType} request: idempotencyKey is required", request.OperationType);
         return Results.BadRequest(new { error = "idempotencyKey is required" });
     }
 
@@ -243,10 +252,15 @@ app.MapPost("/v1/jobs", (
     }
     catch (InvalidJobRequestException ex)
     {
+        // Not logged here too - JobDispatcher already logs the rejection
+        // itself, with the same operationType this handler would repeat.
         return Results.BadRequest(new { error = ex.Message });
     }
 
     var job = jobStore.GetOrCreate(request.IdempotencyKey, request.OperationType, resolved.Targets, resolved.Run);
+    logger.LogInformation(
+        "{OperationType} {IdempotencyKey}: accepted as job {JobId} targeting {Targets}",
+        request.OperationType, request.IdempotencyKey, job.Id, job.Targets);
     return Results.Accepted($"/v1/jobs/{job.Id}", job);
 });
 

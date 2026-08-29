@@ -2,6 +2,7 @@
 using HyperVCsiAgent.Core.HostControl;
 using HyperVCsiAgent.Core.Jobs;
 using HyperVCsiAgent.Core.Storage;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace HyperVCsiAgent.Core.Tests;
 
@@ -13,7 +14,7 @@ public class JobDispatcherTests
     public async Task Resolve_CreateVolume_RunsTheCreateAndPublishesItsResult()
     {
         var vhdx = new RecordingVhdxService();
-        var resolved = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService()).Resolve(
+        var resolved = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService(), NullLogger<JobDispatcher>.Instance).Resolve(
             JobDispatcher.CreateVolume, Payload("""{"name":"pvc-1","sizeBytes":2048}"""), WireOptions);
 
         var job = NewJob();
@@ -31,7 +32,7 @@ public class JobDispatcherTests
         // the wire contract adds sourceSnapshotId to the same payload rather than
         // growing a CreateVolumeFromSnapshot operation.
         var vhdx = new RecordingVhdxService();
-        var resolved = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService()).Resolve(
+        var resolved = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService(), NullLogger<JobDispatcher>.Instance).Resolve(
             JobDispatcher.CreateVolume,
             Payload("""{"name":"pvc-2","sizeBytes":2048,"sourceSnapshotId":"pvc-1~snap-a"}"""),
             WireOptions);
@@ -45,7 +46,7 @@ public class JobDispatcherTests
     public async Task Resolve_DeleteVolume_RunsTheDeleteAndPublishesNoResult()
     {
         var vhdx = new RecordingVhdxService();
-        var resolved = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService()).Resolve(
+        var resolved = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService(), NullLogger<JobDispatcher>.Instance).Resolve(
             JobDispatcher.DeleteVolume, Payload("""{"volumeId":"pvc-1"}"""), WireOptions);
 
         var job = NewJob();
@@ -62,7 +63,7 @@ public class JobDispatcherTests
     public async Task Resolve_ExpandVolume_RunsTheExpandAndPublishesTheNewCapacity()
     {
         var vhdx = new RecordingVhdxService();
-        var resolved = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService()).Resolve(
+        var resolved = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService(), NullLogger<JobDispatcher>.Instance).Resolve(
             JobDispatcher.ExpandVolume, Payload("""{"volumeId":"pvc-1","sizeBytes":4096}"""), WireOptions);
 
         var job = NewJob();
@@ -81,7 +82,7 @@ public class JobDispatcherTests
         // The driver's own lookup, not re-derived here - see
         // VhdxService.ExpandAsync for when it actually gets consulted.
         var vhdx = new RecordingVhdxService();
-        var resolved = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService()).Resolve(
+        var resolved = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService(), NullLogger<JobDispatcher>.Instance).Resolve(
             JobDispatcher.ExpandVolume,
             Payload("""{"volumeId":"pvc-1","sizeBytes":4096,"nodeId":"7a446141-becd-4c7e-968a-65257139f98c"}"""),
             WireOptions);
@@ -101,7 +102,8 @@ public class JobDispatcherTests
         // detach do. volume: comes first because that is the target every
         // expand holds regardless of the hint; vm: is the one this slice adds.
         var resolved = new JobDispatcher(
-            new RecordingVhdxService(), new RecordingAttachService(), new RecordingSnapshotService()).Resolve(
+            new RecordingVhdxService(), new RecordingAttachService(), new RecordingSnapshotService(),
+            NullLogger<JobDispatcher>.Instance).Resolve(
             JobDispatcher.ExpandVolume,
             Payload("""{"volumeId":"pvc-1","sizeBytes":4096,"nodeId":"{4B2C1F0E-1111-2222-3333-444455556666}"}"""),
             WireOptions);
@@ -120,7 +122,8 @@ public class JobDispatcherTests
         // attached as far as the controller could tell, so ExpandAsync never
         // reaches ExpandAttachedAsync and there is no VM to hold.
         var resolved = new JobDispatcher(
-            new RecordingVhdxService(), new RecordingAttachService(), new RecordingSnapshotService()).Resolve(
+            new RecordingVhdxService(), new RecordingAttachService(), new RecordingSnapshotService(),
+            NullLogger<JobDispatcher>.Instance).Resolve(
             JobDispatcher.ExpandVolume, Payload("""{"volumeId":"pvc-1","sizeBytes":4096}"""), WireOptions);
 
         Assert.Equal(["volume:pvc-1"], resolved.Targets);
@@ -134,7 +137,8 @@ public class JobDispatcherTests
         // target has to be the identical FIFO queue AttachVolume enqueues
         // against for the same node, so the two actually block each other.
         var dispatcher = new JobDispatcher(
-            new RecordingVhdxService(), new RecordingAttachService(), new RecordingSnapshotService());
+            new RecordingVhdxService(), new RecordingAttachService(), new RecordingSnapshotService(),
+            NullLogger<JobDispatcher>.Instance);
         using var store = new InMemoryJobStore();
         var release = new TaskCompletionSource();
 
@@ -168,7 +172,7 @@ public class JobDispatcherTests
     public async Task Resolve_VolumeExists_RunsTheLookupAndPublishesNoResult()
     {
         var vhdx = new RecordingVhdxService();
-        var resolved = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService()).Resolve(
+        var resolved = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService(), NullLogger<JobDispatcher>.Instance).Resolve(
             JobDispatcher.VolumeExists, Payload("""{"volumeId":"pvc-1"}"""), WireOptions);
 
         var job = NewJob();
@@ -185,7 +189,7 @@ public class JobDispatcherTests
     public async Task Resolve_AttachVolume_RunsTheAttachAndPublishesWhereItLanded()
     {
         var attach = new RecordingAttachService();
-        var resolved = new JobDispatcher(new RecordingVhdxService(), attach, new RecordingSnapshotService()).Resolve(
+        var resolved = new JobDispatcher(new RecordingVhdxService(), attach, new RecordingSnapshotService(), NullLogger<JobDispatcher>.Instance).Resolve(
             JobDispatcher.AttachVolume, Payload("""{"volumeId":"pvc-1","nodeId":"node-a"}"""), WireOptions);
 
         var job = NewJob();
@@ -204,7 +208,7 @@ public class JobDispatcherTests
     public async Task Resolve_DetachVolume_RunsTheDetachAndPublishesNoResult()
     {
         var attach = new RecordingAttachService();
-        var resolved = new JobDispatcher(new RecordingVhdxService(), attach, new RecordingSnapshotService()).Resolve(
+        var resolved = new JobDispatcher(new RecordingVhdxService(), attach, new RecordingSnapshotService(), NullLogger<JobDispatcher>.Instance).Resolve(
             JobDispatcher.DetachVolume, Payload("""{"volumeId":"pvc-1","nodeId":"node-a"}"""), WireOptions);
 
         var job = NewJob();
@@ -219,7 +223,7 @@ public class JobDispatcherTests
     public async Task Resolve_CreateSnapshot_RunsTheCreateAndPublishesItsObservedState()
     {
         var snapshots = new RecordingSnapshotService();
-        var resolved = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), snapshots).Resolve(
+        var resolved = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), snapshots, NullLogger<JobDispatcher>.Instance).Resolve(
             JobDispatcher.CreateSnapshot,
             Payload("""{"sourceVolumeId":"pvc-1","snapshotName":"snapshot-abc"}"""),
             WireOptions);
@@ -246,7 +250,7 @@ public class JobDispatcherTests
         // see SnapshotService.InspectSourceAsync - so it has to survive the
         // wire decode intact.
         var snapshots = new RecordingSnapshotService();
-        var resolved = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), snapshots).Resolve(
+        var resolved = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), snapshots, NullLogger<JobDispatcher>.Instance).Resolve(
             JobDispatcher.CreateSnapshot,
             Payload("""{"sourceVolumeId":"pvc-1","snapshotName":"snapshot-abc","nodeId":"node-a"}"""),
             WireOptions);
@@ -260,7 +264,7 @@ public class JobDispatcherTests
     public async Task Resolve_DeleteSnapshot_RunsTheDeleteAndPublishesNoResult()
     {
         var snapshots = new RecordingSnapshotService();
-        var resolved = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), snapshots).Resolve(
+        var resolved = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), snapshots, NullLogger<JobDispatcher>.Instance).Resolve(
             JobDispatcher.DeleteSnapshot, Payload("""{"snapshotId":"pvc-1~snapshot-abc"}"""), WireOptions);
 
         var job = NewJob();
@@ -277,7 +281,7 @@ public class JobDispatcherTests
     public async Task Resolve_ListSnapshots_PassesEveryFilterAndPageFieldThrough()
     {
         var snapshots = new RecordingSnapshotService();
-        var resolved = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), snapshots).Resolve(
+        var resolved = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), snapshots, NullLogger<JobDispatcher>.Instance).Resolve(
             JobDispatcher.ListSnapshots,
             Payload("""{"snapshotId":"pvc-1~a","sourceVolumeId":"pvc-1","startingToken":"3","maxEntries":10}"""),
             WireOptions);
@@ -296,7 +300,7 @@ public class JobDispatcherTests
         // Every field is optional and mirrors one of CSI's own, so an empty
         // object is an unfiltered listing rather than a malformed request.
         var snapshots = new RecordingSnapshotService();
-        var resolved = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), snapshots).Resolve(
+        var resolved = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), snapshots, NullLogger<JobDispatcher>.Instance).Resolve(
             JobDispatcher.ListSnapshots, Payload("{}"), WireOptions);
 
         await resolved.Run(NewJob(), CancellationToken.None);
@@ -312,7 +316,9 @@ public class JobDispatcherTests
         // check and the attached-source refusal included - and start a
         // multi-hour write to the CSV nobody asked for.
         Assert.Throws<InvalidJobRequestException>(
-            () => new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), new RecordingSnapshotService())
+            () => new JobDispatcher(
+                new RecordingVhdxService(), new RecordingAttachService(), new RecordingSnapshotService(),
+                NullLogger<JobDispatcher>.Instance)
                 .Resolve(SnapshotService.CopySnapshot, Payload("""{"sourceVolumeId":"pvc-1"}"""), WireOptions));
     }
 
@@ -363,7 +369,8 @@ public class JobDispatcherTests
         var snapshots = new RecordingSnapshotService();
 
         Assert.Throws<InvalidJobRequestException>(
-            () => new JobDispatcher(vhdx, attach, snapshots).Resolve(operationType, Payload(payload), WireOptions));
+            () => new JobDispatcher(vhdx, attach, snapshots, NullLogger<JobDispatcher>.Instance)
+                .Resolve(operationType, Payload(payload), WireOptions));
 
         Assert.Null(vhdx.LastCreate);
         Assert.Null(vhdx.LastExpand);
@@ -384,7 +391,9 @@ public class JobDispatcherTests
         // and two spellings of one VM would be two FIFO queues - which is not a
         // weaker serialization but none, arrived at without a symptom. Attach and
         // detach happen to be the pair that would go wrong first.
-        var dispatcher = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), new RecordingSnapshotService());
+        var dispatcher = new JobDispatcher(
+            new RecordingVhdxService(), new RecordingAttachService(), new RecordingSnapshotService(),
+            NullLogger<JobDispatcher>.Instance);
 
         var attach = dispatcher.Resolve(
             JobDispatcher.AttachVolume,
@@ -408,7 +417,7 @@ public class JobDispatcherTests
         // can only read as "the agent is unreachable" and retry forever - a
         // terminal fault rendered as a transient one.
         var snapshots = new RecordingSnapshotService();
-        var resolved = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), snapshots).Resolve(
+        var resolved = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), snapshots, NullLogger<JobDispatcher>.Instance).Resolve(
             JobDispatcher.CreateSnapshot,
             Payload("""{"sourceVolumeId":"pvc-1","snapshotName":"not/a/name"}"""),
             WireOptions);
