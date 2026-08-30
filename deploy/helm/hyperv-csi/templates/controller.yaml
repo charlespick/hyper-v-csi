@@ -142,11 +142,12 @@ spec:
               drop: ["ALL"]
 
         {{- if .Values.controller.snapshotter.enabled }}
-        # Opt-in, unlike the three above: the snapshot RPCs are implemented but
-        # have not been exercised against a real Hyper-V cluster. See
-        # controller.snapshotter in values.yaml, and note that this sidecar
-        # needs the snapshot.storage.k8s.io CRDs and the cluster-wide
-        # snapshot-controller, neither of which this chart installs.
+        # Opt-in, unlike the three above — not because the snapshot RPCs are
+        # unproven (the upstream snapshottable e2e suite exercises them against
+        # a real cluster) but because this sidecar needs the
+        # snapshot.storage.k8s.io CRDs and the cluster-wide snapshot-controller,
+        # neither of which this chart installs. See controller.snapshotter in
+        # values.yaml.
         - name: csi-snapshotter
           image: {{ .Values.controller.snapshotter.image }}
           args:

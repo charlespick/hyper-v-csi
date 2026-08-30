@@ -16,12 +16,10 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 driver: {{ include "hyperv-csi.driverName" . }}
-# Delete by default, and worth understanding before the first snapshot the same
-# way the chart's StorageClass reclaimPolicy is: under Delete, removing a
-# VolumeSnapshot removes the snapshot on the Hyper-V side for real, through
-# DeleteSnapshot, and it is not recoverable. Retain keeps both the
+# Delete by default: removing a VolumeSnapshot removes the snapshot on the
+# Hyper-V side for real, through DeleteSnapshot. Retain keeps both the
 # VolumeSnapshotContent and the underlying snapshot, at the cost of leaking
 # both — see volumeSnapshotClass.deletionPolicy in values.yaml for why Delete
-# is nonetheless the default here while the StorageClass stays on Retain.
+# is the default here.
 deletionPolicy: {{ .Values.volumeSnapshotClass.deletionPolicy }}
 {{- end }}

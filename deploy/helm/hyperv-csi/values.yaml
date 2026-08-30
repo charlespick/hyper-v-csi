@@ -1,18 +1,17 @@
 # hyperv-csi
 #
-# Scoped to what the driver actually implements today: provisioning, reclaim,
-# attach/detach, the full mount path, expansion, and snapshotting. The snapshot
-# RPCs — CreateSnapshot, DeleteSnapshot, ListSnapshots, and restore through
-# CreateVolume's VolumeContentSource — are implemented now, so external-
-# snapshotter would no longer sit in a retry loop against RPCs that cannot
-# succeed. Its knobs are here as promised, under controller.snapshotter and
-# volumeSnapshotClass, and they are defaulted off.
+# Scoped to what the driver implements and the upstream external-storage e2e
+# suite exercises against a real Hyper-V failover cluster: provisioning,
+# reclaim (delete and retain), attach/detach, the full mount path, online
+# expansion, and single-volume snapshots — CreateSnapshot, DeleteSnapshot,
+# ListSnapshots, and restore through CreateVolume's VolumeContentSource. See
+# testing.md.
 #
-# Implemented is not the same as exercised. Provisioning, reclaim,
-# attach/detach, staging, and single-volume snapshot create/delete/list/
-# restore have all run against a real Hyper-V cluster; see testing.md. Group
-# snapshots and snapshot metadata are not implemented, which is what the
-# defaults below stay conservative for.
+# external-snapshotter and node fencing are defaulted off, but not because
+# they are unproven — each has a cluster-side prerequisite this chart cannot
+# supply (the snapshot CRDs + snapshot-controller; real host fencing under the
+# failover cluster). Group snapshots, snapshot metadata, and volume cloning
+# are not implemented.
 
 image:
   repository: ghcr.io/charlespick/hyperv-csi-driver
@@ -100,23 +99,21 @@ controller:
   livenessProbe:
     image: registry.k8s.io/sig-storage/livenessprobe:v2.14.0
 
-  # external-snapshotter. Off by default, and this is the implemented-versus-
-  # exercised line rather than an implemented-or-not one: CreateSnapshot,
-  # DeleteSnapshot and ListSnapshots exist, so the sidecar would do real work
-  # instead of retrying against Unimplemented — but none of them has yet run
-  # against a real Hyper-V cluster. Turning this on is what makes a
-  # VolumeSnapshot delete reach DeleteSnapshot, and under the default Delete
-  # deletion policy below the first time that ever runs would destroy a real
-  # checkpoint. Same caution, and the same fix, as storageClass.reclaimPolicy:
-  # watch the snapshot path work on your own hosts, then enable it.
+  # external-snapshotter. Off by default — not because the snapshot path is
+  # unproven (CreateSnapshot, DeleteSnapshot, ListSnapshots and
+  # restore-from-snapshot through CreateVolume's VolumeContentSource are all
+  # exercised by the upstream snapshottable e2e suite against a real cluster;
+  # see testing.md) but because the sidecar is inert without two things this
+  # chart does not install: the snapshot.storage.k8s.io CRDs and the
+  # cluster-wide snapshot-controller. Both ship with external-snapshotter and
+  # are shared by every CSI driver on the cluster, so a per-driver chart
+  # installing them would fight whichever driver got there first. Without them
+  # the sidecar starts and finds nothing to watch, and the VolumeSnapshotClass
+  # this chart renders fails to apply for want of its CRD. Enable this once
+  # those are present.
   #
-  # Two things have to be true of the cluster first, and neither is this
-  # chart's to install: the snapshot.storage.k8s.io CRDs and the cluster-wide
-  # snapshot-controller. Both ship with external-snapshotter and are shared by
-  # every CSI driver on the cluster, so a per-driver chart installing them
-  # would fight whichever driver got there first. Without them the sidecar
-  # starts and finds nothing to watch, and the VolumeSnapshotClass this chart
-  # renders fails to apply for want of its CRD.
+  # Group snapshots and snapshot metadata are a separate matter — not
+  # implemented, so nothing here reaches them.
   #
   # A snapshot freezes the whole VM its source volume is attached to for the
   # duration of the copy behind it — see README.md's "Snapshot storage
@@ -282,34 +279,57 @@ node:
   affinity: {}
   podAnnotations: {}
 
-storageClass:
-  create: true
-  name: hyperv-csi
-  isDefault: false
+# StorageClasses for this driver. Each list entry renders one StorageClass
+# whose provisioner is fixed to the driver name; set the list to [] to have the
+# chart create none. The common shape is two classes:
+#
+#   - a Retain class for volumes whose data should outlive their PVC, and
+#   - a Delete class for disposable ones — CI scratch space, or the
+#     clone-and-copy PVCs a backup tool (Kasten, Velero, ...) provisions per
+#     export from a snapshot and then deletes. On a Retain class that leaks a
+#     Released PV and its VHDX every run.
+#
+# Per-entry fields and their defaults:
+#   name                  (required)
+#   isDefault             false  — storageclass.kubernetes.io/is-default-class.
+#                                  At most one class on the cluster, from any
+#                                  provisioner, may set it.
+#   reclaimPolicy         Retain — Retain or Delete. Delete runs DeleteVolume
+#                                  when the PVC is removed and the VHDX on the
+#                                  CSV goes with it. The whole provision->delete
+#                                  lifecycle, this included, is covered by the
+#                                  upstream external-storage e2e suite against a
+#                                  real failover cluster (testing.md).
+#   volumeBindingMode     Immediate — a VHDX on the CSV is reachable from every
+#                                  node, so there is no placement decision to
+#                                  defer with WaitForFirstConsumer; deferring
+#                                  would only hold the PVC Pending.
+#   allowVolumeExpansion  true   — ControllerExpandVolume + NodeExpandVolume,
+#                                  online, exercised against a running VM.
+#   annotations           {}     — extra StorageClass annotations.
+#   parameters            {}     — StorageClass.parameters for CreateVolume;
+#                                  none are required today.
+#
+# The first class here defaults to Retain not because Delete is unproven, but
+# because a cluster-wide default class that deletes the backing disk the moment
+# a PVC is removed is the wrong default for volumes that hold data. Add a
+# Delete-reclaim class alongside it for the disposable case.
+storageClasses:
+  - name: hyperv-csi
+    isDefault: false
+    reclaimPolicy: Retain
+    volumeBindingMode: Immediate
+    allowVolumeExpansion: true
+    annotations: {}
+    parameters: {}
 
-  # Retain, not Delete. DeleteVolume is implemented now, so Delete would work —
-  # but it has not yet run against a real Hyper-V host, and under Delete the
-  # first time it ever does would be an irreversible disk deletion triggered by
-  # someone removing a PVC. Retain never calls it, so the VHDX outlives the PV
-  # and is removed by hand. Switch this to Delete once you have watched a
-  # DeleteVolume succeed on your cluster.
-  reclaimPolicy: Retain
-
-  # WaitForFirstConsumer exists to let a topology-aware driver place the volume
-  # where the pod landed. This one advertises no topology at all — a VHDX on the
-  # CSV is reachable from every node in the failover cluster, and see CSI
-  # Spec.md on why VOLUME_ACCESSIBILITY_CONSTRAINTS is deliberately omitted — so
-  # deferring the bind would buy nothing and only hold the PVC Pending until
-  # something scheduled against it.
-  volumeBindingMode: Immediate
-
-  # Both halves of an expansion exist now — ControllerExpandVolume grows the
-  # VHDX, NodeExpandVolume grows the filesystem in it — so editing a PVC's
-  # request is accepted rather than silently rejected by the API server. Both
-  # have run against a real cluster, including a volume attached to a running
-  # VM, and the guest filesystem growing online with no pod restart.
-  allowVolumeExpansion: true
-  parameters: {}
+  # - name: hyperv-csi-delete
+  #   isDefault: false
+  #   reclaimPolicy: Delete
+  #   volumeBindingMode: Immediate
+  #   allowVolumeExpansion: true
+  #   annotations: {}
+  #   parameters: {}
 
 # The VolumeSnapshotClass that points VolumeSnapshots at this driver. Rendered
 # only when controller.snapshotter.enabled is set — the class is inert without
@@ -323,15 +343,12 @@ volumeSnapshotClass:
   # VolumeSnapshotClass by annotation rather than by convention.
   annotations: {}
 
-  # Delete, unlike storageClass.reclaimPolicy above, and the consequence is the
-  # same one that entry describes: deleting a VolumeSnapshot calls
-  # DeleteSnapshot and destroys the snapshot on the Hyper-V side for real. It
-  # defaults to Delete anyway because Retain is the worse trade here — a
-  # retained snapshot leaves both a VolumeSnapshotContent object and its
-  # on-cluster snapshot behind with nothing referencing them, which accumulates
-  # invisibly rather than as a leftover PV somebody notices. The safety comes
-  # from the whole feature being off by default: nobody reaches this line
-  # without having opted in above.
+  # Delete: deleting a VolumeSnapshot calls DeleteSnapshot and removes the
+  # snapshot on the Hyper-V side for real (exercised by the snapshottable e2e
+  # suite, same as the rest of the snapshot path). Defaults to Delete rather
+  # than Retain because a retained snapshot leaves both a VolumeSnapshotContent
+  # object and its on-cluster snapshot behind with nothing referencing them,
+  # accumulating invisibly rather than as a leftover PV somebody notices.
   deletionPolicy: Delete
 
 rbac:

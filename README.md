@@ -135,8 +135,9 @@ helm install hyperv-csi oci://ghcr.io/charlespick/charts/hyperv-csi \
 ```
 
 See [values.yaml](deploy/helm/hyperv-csi/values.yaml) for the rest of the
-chart's configuration, including the sidecar images/timeouts, StorageClass
-reclaim policy, and the opt-in VolumeSnapshotClass.
+chart's configuration, including the sidecar images/timeouts, the list of
+StorageClasses it creates (`storageClasses` — one Retain class by default; add
+a Delete class for disposable volumes), and the opt-in VolumeSnapshotClass.
 
 ## Node fencing
 

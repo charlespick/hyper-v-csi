@@ -1,19 +1,25 @@
-{{- if .Values.storageClass.create }}
+{{- range .Values.storageClasses }}
+---
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
-  name: {{ .Values.storageClass.name }}
+  name: {{ .name }}
   labels:
-    {{- include "hyperv-csi.labels" . | nindent 4 }}
-  {{- if .Values.storageClass.isDefault }}
+    {{- include "hyperv-csi.labels" $ | nindent 4 }}
+  {{- if or .isDefault .annotations }}
   annotations:
+    {{- if .isDefault }}
     storageclass.kubernetes.io/is-default-class: "true"
+    {{- end }}
+    {{- with .annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
   {{- end }}
-provisioner: {{ include "hyperv-csi.driverName" . }}
-reclaimPolicy: {{ .Values.storageClass.reclaimPolicy }}
-volumeBindingMode: {{ .Values.storageClass.volumeBindingMode }}
-allowVolumeExpansion: {{ .Values.storageClass.allowVolumeExpansion }}
-{{- with .Values.storageClass.parameters }}
+provisioner: {{ include "hyperv-csi.driverName" $ }}
+reclaimPolicy: {{ dig "reclaimPolicy" "Retain" . }}
+volumeBindingMode: {{ dig "volumeBindingMode" "Immediate" . }}
+allowVolumeExpansion: {{ dig "allowVolumeExpansion" true . }}
+{{- with .parameters }}
 parameters:
   {{- toYaml . | nindent 2 }}
 {{- end }}
