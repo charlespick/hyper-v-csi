@@ -174,8 +174,29 @@ public sealed class VhdxService : IVhdxService, IDisposable
             // never ran) and starts over cleanly.
             if (File.Exists(path))
             {
-                var existingSize = await _diskManager.GetVirtualSizeAsync(
-                    path, _options.DiskOperationTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
+                long existingSize;
+                try
+                {
+                    existingSize = await _diskManager.GetVirtualSizeAsync(
+                        path, _options.DiskOperationTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
+                }
+                catch (VhdxInUseException)
+                {
+                    // Attached to a running VM - the normal state of any
+                    // already-bound PVC replaying CreateVolume, and exactly
+                    // what ExpandAsync's own GetVirtualSizeAsync call falls
+                    // back on. Unlike ExpandVolume, CreateVolume's request
+                    // carries no node ID to resolve the VM's owning host and
+                    // check the size through it instead, so there is no
+                    // cheaper way to verify it here - existing and attached
+                    // already answers idempotency, so this reports the
+                    // requested size rather than failing a routine replay.
+                    _logger.LogInformation(
+                        "CreateVolume {VolumeName}: {Path} already exists and is attached to a running VM; treating it as satisfying the requested {RequestedSize}",
+                        volumeName, path, sizeBytes);
+                    return new CreateVolumeResult(volumeName, sizeBytes, AlreadyPresent: true);
+                }
+
                 if (existingSize >= sizeBytes && existingSize - sizeBytes <= SizeTolerance)
                 {
                     var existingDiskId = await VhdxDiskIdentity.ReadAsync(path, attempt.Token).ConfigureAwait(false);
@@ -310,8 +331,24 @@ public sealed class VhdxService : IVhdxService, IDisposable
             // larger than requested.
             if (File.Exists(path))
             {
-                var existingSize = await _diskManager.GetVirtualSizeAsync(
-                    path, _options.SnapshotCopyTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
+                long existingSize;
+                try
+                {
+                    existingSize = await _diskManager.GetVirtualSizeAsync(
+                        path, _options.SnapshotCopyTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
+                }
+                catch (VhdxInUseException)
+                {
+                    // Same reasoning as CreateEmptyAsync's own catch: attached
+                    // to a running VM already answers idempotency, and a
+                    // restore's request carries no node ID either to verify
+                    // the exact size through its owning host instead.
+                    _logger.LogInformation(
+                        "CreateVolume {VolumeName}: {Path} already exists and is attached to a running VM; treating it as satisfying the requested {RequestedSize}",
+                        volumeName, path, sizeBytes);
+                    return new CreateVolumeResult(volumeName, sizeBytes, AlreadyPresent: true);
+                }
+
                 if (existingSize >= sizeBytes)
                 {
                     var existingDiskId = await VhdxDiskIdentity.ReadAsync(path, attempt.Token).ConfigureAwait(false);

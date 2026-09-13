@@ -186,6 +186,30 @@ public sealed class VhdxServiceTests : IDisposable
         Assert.True(replay.AlreadyPresent);
     }
 
+    [Fact]
+    public async Task CreateAsync_WhenTheExistingDiskIsAttachedToARunningVm_TreatsItAsSatisfyingTheRequest()
+    {
+        // The real-cluster failure this guards against: a replayed
+        // CreateVolume for an already-bound PVC finds the disk, but the
+        // running VM it's attached to already has it open, so the idempotency
+        // check's own size read fails with VhdxInUseException. CreateVolume's
+        // request carries no node ID to check the size through the VM's
+        // owning host the way ExpandVolume's fallback does, so existing and
+        // attached has to be enough on its own.
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks);
+
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
+        disks.Created.Clear();
+        disks.VhdxInUse = true;
+
+        var replay = await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
+
+        Assert.Equal(1024, replay.ActualSizeBytes);
+        Assert.True(replay.AlreadyPresent);
+        Assert.Empty(disks.Created);
+    }
+
     [Theory]
     [InlineData(1024, 4096)] // existing disk is smaller than the request
     [InlineData(1L << 40, 1024)] // far larger: a real collision, not our rounding
@@ -362,6 +386,27 @@ public sealed class VhdxServiceTests : IDisposable
         Assert.False(result.AlreadyPresent);
         Assert.True(File.Exists(VolumePath("pvc-2")));
         Assert.Equal(InProgressPath("pvc-2"), Assert.Single(copier.Destinations));
+    }
+
+    [Fact]
+    public async Task CreateAsync_FromASnapshot_WhenTheExistingDiskIsAttachedToARunningVm_TreatsItAsSatisfyingTheRequest()
+    {
+        // Same idempotency-check failure as the empty-create case, on the
+        // restore path's own existence check.
+        var disks = new FakeVirtualDiskManager();
+        var copier = new FakeDiskCopier();
+        WriteSnapshot("pvc-1~snap-a", 4096);
+        using var service = NewService(disks, copier: copier);
+
+        await service.CreateAsync("pvc-2", 4096, "pvc-1~snap-a", CancellationToken.None);
+        copier.Destinations.Clear();
+        disks.VhdxInUse = true;
+
+        var replay = await service.CreateAsync("pvc-2", 4096, "pvc-1~snap-a", CancellationToken.None);
+
+        Assert.Equal(4096, replay.ActualSizeBytes);
+        Assert.True(replay.AlreadyPresent);
+        Assert.Empty(copier.Destinations);
     }
 
     [Fact]
