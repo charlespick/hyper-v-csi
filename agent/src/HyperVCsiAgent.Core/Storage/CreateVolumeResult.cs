@@ -18,4 +18,12 @@ namespace HyperVCsiAgent.Core.Storage;
 /// Lets the controller tell a genuine name collision apart from a disk it just
 /// created, which matters when the size doesn't fit the request.
 /// </param>
-public sealed record CreateVolumeResult(string VolumeId, long ActualSizeBytes, bool AlreadyPresent);
+/// <param name="DiskId">
+/// The VHDX's VirtualDiskId (Hyper-V's DiskIdentifier; see
+/// <see cref="VhdxDiskIdentity"/>), read directly off the file. The Go
+/// controller carries it into <c>volume_context</c> so <c>NodeStageVolume</c>
+/// can confirm the disk it resolves by controller/LUN position is actually
+/// this volume before ever formatting it, rather than trusting the slot -
+/// see resolve github issue 30.
+/// </param>
+public sealed record CreateVolumeResult(string VolumeId, long ActualSizeBytes, bool AlreadyPresent, Guid DiskId);

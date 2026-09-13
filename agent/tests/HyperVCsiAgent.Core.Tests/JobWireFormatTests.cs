@@ -70,7 +70,8 @@ public class JobWireFormatTests
             OperationType = "CreateVolume",
             Targets = ["vol-pvc-1"],
             Status = JobStatus.Succeeded,
-            Result = new CreateVolumeResult("pvc-1", 10737418240, AlreadyPresent: true),
+            Result = new CreateVolumeResult(
+                "pvc-1", 10737418240, AlreadyPresent: true, Guid.Parse("98b51c04-ecbd-429c-a184-994be8c35390")),
         };
 
         using var document = JsonDocument.Parse(JsonSerializer.Serialize(job, WireOptions()));
@@ -79,6 +80,9 @@ public class JobWireFormatTests
         Assert.Equal("pvc-1", result.GetProperty("volumeId").GetString());
         Assert.Equal(10737418240, result.GetProperty("actualSizeBytes").GetInt64());
         Assert.True(result.GetProperty("alreadyPresent").GetBoolean());
+        // The Go controller decodes this into volume_context, verbatim
+        // string-for-string - see resolve github issue 30.
+        Assert.Equal("98b51c04-ecbd-429c-a184-994be8c35390", result.GetProperty("diskId").GetString());
     }
 
     [Fact]

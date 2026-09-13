@@ -15,12 +15,12 @@
 // the block device (for example sda), and the device node is /dev/<name>.
 //
 // This is the piece docs/node-identity-and-attach.md flags as unconfirmed
-// against real hardware beyond the one guest configuration tested so far;
-// the fallback named there, if the VMBus GUID assumption doesn't hold, is
-// matching on the disk's SCSI page-83 identifier instead. That fallback is
-// not implemented here — it would need a different publish context field —
-// and is worth raising again if this package's assumption turns out wrong
-// against a real host.
+// against real hardware beyond the one guest configuration tested so far.
+// Resolve only ever locates by this coordinate; it never confirms the device
+// it finds is the right one. That confirmation - reading the disk's SCSI
+// page-83 identifier and checking it against the VHDX's own VirtualDiskId -
+// is package diskidentity's job, called from node.go's stageVolume right
+// after Resolve returns and before anything is formatted or mounted.
 package vmbusdisk
 
 import (

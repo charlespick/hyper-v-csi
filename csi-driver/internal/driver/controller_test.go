@@ -41,6 +41,11 @@ func TestCreateVolumeReturnsTheVolumeTheAgentCreated(t *testing.T) {
 	if got := resp.GetVolume().GetCapacityBytes(); got != 10*gibibyte {
 		t.Errorf("capacity = %d, want %d", got, 10*gibibyte)
 	}
+	// The one channel that reaches NodeStageVolume with a value read at
+	// creation time - see volumeContextDiskID and package diskidentity.
+	if got := resp.GetVolume().GetVolumeContext()[volumeContextDiskID]; got != testDiskID {
+		t.Errorf("volume_context[%q] = %q, want %q", volumeContextDiskID, got, testDiskID)
+	}
 }
 
 func TestCreateVolumeEnqueuesUnderTheVolumeNameAsIdempotencyKey(t *testing.T) {
@@ -194,7 +199,8 @@ func TestCreateVolumeRestoreOverTheLimitIsOutOfRange(t *testing.T) {
 		{
 			// The same is true on a replay of an already-finished restore.
 			name: "replay of a finished restore",
-			job:  succeeded(`{"volumeId":"pvc-2","actualSizeBytes":10737418240,"alreadyPresent":true}`),
+			job: succeeded(fmt.Sprintf(
+				`{"volumeId":"pvc-2","actualSizeBytes":10737418240,"alreadyPresent":true,"diskId":%q}`, testDiskID)),
 		},
 	}
 
@@ -494,6 +500,7 @@ func TestCreateVolumeRejectsAnUnusableResult(t *testing.T) {
 	}{
 		{name: "not decodable", job: succeeded(`"nonsense"`)},
 		{name: "no volume id", job: succeeded(`{"actualSizeBytes":1024}`)},
+		{name: "no disk id", job: succeeded(`{"volumeId":"pvc-1","actualSizeBytes":1024}`)},
 		{name: "no result at all", job: agentclient.Job{Status: agentclient.JobSucceeded}},
 	}
 
@@ -513,7 +520,8 @@ func TestCreateVolumeRejectsAnUnusableResult(t *testing.T) {
 func TestCreateVolumeExistingVolumeOverTheLimitIsAlreadyExists(t *testing.T) {
 	// A replay for a name whose disk is bigger than this request allows: the
 	// existing volume is incompatible, which CSI spells ALREADY_EXISTS.
-	server := newControllerServer(newFakeAgent(t, succeeded(`{"volumeId":"pvc-1","actualSizeBytes":10737418240,"alreadyPresent":true}`)))
+	server := newControllerServer(newFakeAgent(t, succeeded(fmt.Sprintf(
+		`{"volumeId":"pvc-1","actualSizeBytes":10737418240,"alreadyPresent":true,"diskId":%q}`, testDiskID))))
 
 	_, err := server.CreateVolume(context.Background(), createVolumeRequest("pvc-1", gibibyte, 2*gibibyte))
 
@@ -538,7 +546,8 @@ func TestCreateVolumeCreatingAVolumeOverTheLimitIsOurBugNotACollision(t *testing
 func TestCreateVolumeExistingVolumeUnderTheMinimumIsAlreadyExists(t *testing.T) {
 	// A replay for a name whose disk is smaller than this request requires:
 	// the existing volume is incompatible, which CSI spells ALREADY_EXISTS.
-	server := newControllerServer(newFakeAgent(t, succeeded(`{"volumeId":"pvc-1","actualSizeBytes":1073741824,"alreadyPresent":true}`)))
+	server := newControllerServer(newFakeAgent(t, succeeded(fmt.Sprintf(
+		`{"volumeId":"pvc-1","actualSizeBytes":1073741824,"alreadyPresent":true,"diskId":%q}`, testDiskID))))
 
 	_, err := server.CreateVolume(context.Background(), createVolumeRequest("pvc-1", 2*gibibyte, 0))
 
@@ -2151,7 +2160,8 @@ func succeeded(result string) agentclient.Job {
 // created is a job that provisioned a new disk of the given size, as opposed
 // to finding one already there.
 func created(sizeBytes int64) agentclient.Job {
-	return succeeded(fmt.Sprintf(`{"volumeId":"pvc-1","actualSizeBytes":%d,"alreadyPresent":false}`, sizeBytes))
+	return succeeded(fmt.Sprintf(
+		`{"volumeId":"pvc-1","actualSizeBytes":%d,"alreadyPresent":false,"diskId":%q}`, sizeBytes, testDiskID))
 }
 
 // enqueuedJob is what the agent sees on POST /v1/jobs. Deliberately no target

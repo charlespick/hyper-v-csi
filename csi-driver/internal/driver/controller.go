@@ -114,6 +114,15 @@ type createVolumeResult struct {
 	// already on the CSV, which is the difference between our own bug and a
 	// genuine name collision when the size doesn't fit the request.
 	AlreadyPresent bool `json:"alreadyPresent"`
+	// DiskID is the VHDX's VirtualDiskId (Hyper-V's DiskIdentifier), read
+	// fresh off the file the agent just created or confirmed. It travels to
+	// NodeStageVolume via volume_context (volumeContextDiskID), not the
+	// publish context attach returns, because this is a once-at-creation
+	// value and the VHDX is guaranteed readable right here - see resolve
+	// github issue 30 and docs/node-identity-and-attach.md for why
+	// NodeStageVolume cannot trust the controller/LUN slot it resolves a
+	// device from without checking this against it.
+	DiskID string `json:"diskId"`
 }
 
 // CreateVolume provisions a new VHDX on the CSV. Idempotency key: volume name.
@@ -180,6 +189,14 @@ func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	if result.VolumeID == "" {
 		err := status.Errorf(codes.Internal, "agent returned no volume id for %s", req.GetName())
 		klog.ErrorS(err, "CreateVolume: agent returned no volume id", "name", req.GetName())
+		return nil, err
+	}
+	if result.DiskID == "" {
+		// Without it NodeStageVolume has nothing to verify the disk it
+		// resolves by controller/LUN against, which is the whole point of
+		// this field - see createVolumeResult.DiskID.
+		err := status.Errorf(codes.Internal, "agent returned no disk id for %s", req.GetName())
+		klog.ErrorS(err, "CreateVolume: agent returned no disk id", "name", req.GetName())
 		return nil, err
 	}
 
@@ -254,6 +271,11 @@ func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 			// name-to-ID mapping that would be lost on an agent restart.
 			VolumeId:      result.VolumeID,
 			CapacityBytes: result.ActualSizeBytes,
+			// external-provisioner persists volume_context onto the PV and
+			// hands it back on every later NodeStageVolume for this volume -
+			// the one channel that reaches the node with a value read at
+			// creation time, before anything else has ever touched the VHDX.
+			VolumeContext: map[string]string{volumeContextDiskID: result.DiskID},
 			// CSI requires a restored volume to report where it came from;
 			// external-provisioner records this on the PV. Nil for an empty
 			// create, exactly mirroring the request.
@@ -449,6 +471,17 @@ const (
 	publishContextLun        = "lun"
 	publishContextVhdxPath   = "vhdxPath"
 )
+
+// volumeContextDiskID is the volume_context key CreateVolume sets to the
+// VHDX's VirtualDiskId (createVolumeResult.DiskID). Unlike the publish
+// context keys above, this travels through CreateVolumeResponse rather than
+// ControllerPublishVolumeResponse: external-provisioner persists
+// volume_context onto the PV once, at creation, and hands it back on every
+// NodeStageVolume for the volume's lifetime, which is what lets the node
+// verify the device vmbusdisk.Resolve finds by controller/LUN actually is
+// this volume before ever formatting it - see
+// docs/node-identity-and-attach.md and package diskidentity.
+const volumeContextDiskID = "diskId"
 
 // ControllerPublishVolume attaches a VHDX to the node VM by resolving its
 // owning host via cluster APIs, then attaching through that host.

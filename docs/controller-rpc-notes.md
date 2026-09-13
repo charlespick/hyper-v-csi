@@ -118,13 +118,17 @@ keeps.
 
 ## CreateVolume
 
-StorageClass `parameters` are ignored rather than consumed or rejected,
-and `volume_context` is left empty — tracked in
-[#23](https://github.com/charlespick/hyper-v-csi/issues/23). Cloning a
-volume from another volume (`VolumeContentSource_Volume`) returns
-`Unimplemented` — `CLONE_VOLUME` is not advertised — but restoring from a
-snapshot (`VolumeContentSource_Snapshot`) is implemented and goes through
-the same RPC.
+StorageClass `parameters` are ignored rather than consumed or rejected —
+tracked in [#23](https://github.com/charlespick/hyper-v-csi/issues/23).
+`volume_context` is no longer empty, though: it carries one entry,
+`diskId` — the VHDX's own `VirtualDiskId`, read off the file at creation
+time — which `NodeStageVolume` checks the resolved device against before
+ever formatting it. See "Publish context locates; volume_context
+verifies" in docs/node-identity-and-attach.md. Cloning a volume from
+another volume (`VolumeContentSource_Volume`) returns `Unimplemented` —
+`CLONE_VOLUME` is not advertised — but restoring from a snapshot
+(`VolumeContentSource_Snapshot`) is implemented and goes through the same
+RPC.
 
 ## DeleteVolume
 

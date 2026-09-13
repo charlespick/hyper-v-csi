@@ -178,10 +178,11 @@ public sealed class VhdxService : IVhdxService, IDisposable
                     path, _options.DiskOperationTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
                 if (existingSize >= sizeBytes && existingSize - sizeBytes <= SizeTolerance)
                 {
+                    var existingDiskId = await VhdxDiskIdentity.ReadAsync(path, attempt.Token).ConfigureAwait(false);
                     _logger.LogInformation(
                         "CreateVolume {VolumeName}: {Path} already exists at {ExistingSize} bytes, satisfying the requested {RequestedSize}",
                         volumeName, path, existingSize, sizeBytes);
-                    return new CreateVolumeResult(volumeName, existingSize, AlreadyPresent: true);
+                    return new CreateVolumeResult(volumeName, existingSize, AlreadyPresent: true, existingDiskId);
                 }
 
                 // CSI mandates ALREADY_EXISTS - not an overwrite, not a second
@@ -206,9 +207,14 @@ public sealed class VhdxService : IVhdxService, IDisposable
                 inProgressPath, sizeBytes, _options.DiskOperationTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
 
             File.Move(inProgressPath, path);
+            // Read fresh off the file the create just published, not the
+            // in-progress path: the rename above is what makes this "the
+            // volume", and reading before it would describe a file that may
+            // yet be discarded if something below still fails.
+            var diskId = await VhdxDiskIdentity.ReadAsync(path, attempt.Token).ConfigureAwait(false);
             _logger.LogInformation(
                 "CreateVolume {VolumeName}: created {Path} at {ActualSize} bytes", volumeName, path, actualSize);
-            return new CreateVolumeResult(volumeName, actualSize, AlreadyPresent: false);
+            return new CreateVolumeResult(volumeName, actualSize, AlreadyPresent: false, diskId);
         }
         catch (TimeoutException ex)
         {
@@ -308,10 +314,11 @@ public sealed class VhdxService : IVhdxService, IDisposable
                     path, _options.SnapshotCopyTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
                 if (existingSize >= sizeBytes)
                 {
+                    var existingDiskId = await VhdxDiskIdentity.ReadAsync(path, attempt.Token).ConfigureAwait(false);
                     _logger.LogInformation(
                         "CreateVolume {VolumeName}: {Path} already exists at {ExistingSize} bytes, satisfying the requested {RequestedSize}",
                         volumeName, path, existingSize, sizeBytes);
-                    return new CreateVolumeResult(volumeName, existingSize, AlreadyPresent: true);
+                    return new CreateVolumeResult(volumeName, existingSize, AlreadyPresent: true, existingDiskId);
                 }
 
                 throw JobFailureException.AlreadyExists(
@@ -394,7 +401,11 @@ public sealed class VhdxService : IVhdxService, IDisposable
                 _logger.LogInformation(
                     "CreateVolume {VolumeName}: restored {Path} from snapshot {SnapshotId} at {ActualSize} bytes in {Elapsed}",
                     volumeName, path, sourceSnapshotId, actualSize, elapsed.Elapsed);
-                return new CreateVolumeResult(volumeName, actualSize, AlreadyPresent: false);
+                // newId is already this file's identity - ResetDiskIdentifierAsync
+                // set it above, before the copy was ever grown or published, so
+                // there is no reason to pay for a second read of the file to
+                // learn what this call already knows.
+                return new CreateVolumeResult(volumeName, actualSize, AlreadyPresent: false, newId);
             }
             finally
             {

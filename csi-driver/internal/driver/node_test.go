@@ -22,6 +22,26 @@ import (
 
 const testControllerID = "7c2a4e1b-3d9f-4a52-8b61-0e5d7c3a9f24"
 
+// testDiskID and testDiskIDVpdBytes are a real (VHDX DiskIdentifier, VPD page
+// 0x83 vendor-specific identifier) pair captured from a real guest VM
+// (csidevnode01) attached to a real Hyper-V host (CSIDEV01) - see
+// diskidentity's own package doc and tests for the full measurement. Reusing
+// it here, rather than an arbitrary GUID, means putVpd's fixture is
+// hardware-shaped: the same 16 bytes a real guest's kernel would actually
+// report for a disk with this DiskIdentifier.
+const testDiskID = "98b51c04-ecbd-429c-a184-994be8c35390"
+
+var testDiskIDVpdBytes = [16]byte{
+	0x04, 0x1c, 0xb5, 0x98, 0xbd, 0xec, 0x9c, 0x42, 0xa1, 0x84, 0x99, 0x4b, 0xe8, 0xc3, 0x53, 0x90,
+}
+
+// otherDiskIDVpdBytes is a second, different real capture (see
+// diskidentity_test.go's realCapturedPairs) - used wherever a test needs a
+// device whose disk identity is definitely not testDiskID's.
+var otherDiskIDVpdBytes = [16]byte{
+	0x8d, 0xa9, 0x35, 0xc5, 0xb6, 0x94, 0x21, 0x4f, 0xb2, 0x53, 0xfc, 0xc1, 0xfb, 0xa0, 0xe1, 0x45,
+}
+
 // newTestNodeServer wires a nodeServer against a FakeMounter (backed by a
 // FakeExec that reports every disk as already formatted, so FormatAndMount
 // never actually shells out to mkfs) and a scratch sysfs/dev tree, mirroring
@@ -100,6 +120,43 @@ func mkdirAllT(t *testing.T, dir string) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// putVpd writes the VPD page 0x83 data putDevice's device would carry in a
+// real guest, wrapping diskIDBytes in the same T10 vendor-ID descriptor
+// (vendor id "MSFT    ") diskidentity's package doc measured against a real
+// Hyper-V host - see testDiskIDVpdBytes and otherDiskIDVpdBytes.
+func putVpd(t *testing.T, sysRoot, deviceName string, diskIDBytes [16]byte) {
+	t.Helper()
+	dir := filepath.Join(sysRoot, "block", deviceName, "device")
+	mkdirAllT(t, dir)
+
+	page := make([]byte, 0, 32)
+	page = append(page, 0x00, 0x83, 0x00, 0x18) // header: device type 0, page code 0x83, page length 0x18
+	page = append(page, 0x01, 0x01, 0x00, 0x18) // descriptor header: binary codeset, T10 vendor id, length 24
+	page = append(page, []byte("MSFT    ")...)  // 8-byte vendor id
+	page = append(page, diskIDBytes[:]...)      // 16-byte vendor-specific id: the VirtualDiskId
+
+	if err := os.WriteFile(filepath.Join(dir, "vpd_pg83"), page, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// putDeviceWithIdentity is putDevice plus a matching vpd_pg83, the fixture
+// every test that expects stageVolume to actually reach FormatAndMount
+// needs, now that diskidentity.Verify runs between resolving the device and
+// mounting it.
+func putDeviceWithIdentity(t *testing.T, sysRoot, controller string, hostNum, lun int, deviceName string, diskIDBytes [16]byte) {
+	t.Helper()
+	putDevice(t, sysRoot, controller, hostNum, lun, deviceName)
+	putVpd(t, sysRoot, deviceName, diskIDBytes)
+}
+
+// volumeContext builds the volume_context NodeStageVolume reads the disk
+// identifier from - CreateVolume's counterpart to publishContext's
+// controller/lun pair.
+func volumeContext(diskID string) map[string]string {
+	return map[string]string{volumeContextDiskID: diskID}
 }
 
 func mountVolumeCapability(fsType string, mode csi.VolumeCapability_AccessMode_Mode) *csi.VolumeCapability {
@@ -249,9 +306,41 @@ func TestNodeStageVolumeRejectsANegativeLun(t *testing.T) {
 	}
 }
 
-func TestNodeStageVolumeFormatsAndMountsOnTheHappyPath(t *testing.T) {
-	s, fakeMounter, sysRoot := newTestNodeServer(t)
-	putDevice(t, sysRoot, testControllerID, 3, 7, "sdb")
+func TestNodeStageVolumeRejectsMissingDiskID(t *testing.T) {
+	s, _, _ := newTestNodeServer(t)
+	_, err := s.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+		VolumeId:          "vol-1",
+		StagingTargetPath: t.TempDir(),
+		VolumeCapability:  mountVolumeCapability("", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
+		PublishContext:    publishContext(testControllerID, 7),
+	})
+	if got := grpcCode(t, err); got != codes.InvalidArgument {
+		t.Errorf("code = %s, want InvalidArgument", got)
+	}
+}
+
+func TestNodeStageVolumeRejectsAMalformedDiskID(t *testing.T) {
+	s, _, _ := newTestNodeServer(t)
+	_, err := s.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+		VolumeId:          "vol-1",
+		StagingTargetPath: t.TempDir(),
+		VolumeCapability:  mountVolumeCapability("", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
+		PublishContext:    publishContext(testControllerID, 7),
+		VolumeContext:     volumeContext("not-a-guid"),
+	})
+	if got := grpcCode(t, err); got != codes.InvalidArgument {
+		t.Errorf("code = %s, want InvalidArgument", got)
+	}
+}
+
+func TestNodeStageVolumeFailsWhenTheDeviceIsAnotherVolumesDisk(t *testing.T) {
+	// The controller/LUN slot resolves to a real disk, but diskidentity.Verify
+	// finds a different VirtualDiskId than the one CreateVolume set for this
+	// volume - resolve github issue 30's exact scenario: the coordinate found
+	// something, just not this volume's own VHDX. Guessing and mounting it
+	// anyway is the failure this whole check exists to rule out.
+	s, _, sysRoot := newTestNodeServer(t)
+	putDeviceWithIdentity(t, sysRoot, testControllerID, 3, 7, "sdb", otherDiskIDVpdBytes)
 	target := filepath.Join(t.TempDir(), "globalmount")
 	if err := os.MkdirAll(target, 0o750); err != nil {
 		t.Fatal(err)
@@ -262,6 +351,51 @@ func TestNodeStageVolumeFormatsAndMountsOnTheHappyPath(t *testing.T) {
 		StagingTargetPath: target,
 		VolumeCapability:  mountVolumeCapability("", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
 		PublishContext:    publishContext(testControllerID, 7),
+		VolumeContext:     volumeContext(testDiskID),
+	})
+	if got := grpcCode(t, err); got != codes.Internal {
+		t.Errorf("code = %s, want Internal", got)
+	}
+}
+
+func TestNodeStageVolumeFailsWhenTheGuestExposesNoDiskIdentity(t *testing.T) {
+	// The "Open decision" resolve github issue 30 raised: an older kernel or
+	// storage stack with no VPD page 0x83 for this device. Failing closed here
+	// rather than falling back to the coordinate alone is deliberate - see
+	// stageVolume's own comment.
+	s, _, sysRoot := newTestNodeServer(t)
+	putDevice(t, sysRoot, testControllerID, 3, 7, "sdb") // no matching putVpd
+	target := filepath.Join(t.TempDir(), "globalmount")
+	if err := os.MkdirAll(target, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := s.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+		VolumeId:          "vol-1",
+		StagingTargetPath: target,
+		VolumeCapability:  mountVolumeCapability("", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
+		PublishContext:    publishContext(testControllerID, 7),
+		VolumeContext:     volumeContext(testDiskID),
+	})
+	if got := grpcCode(t, err); got != codes.Internal {
+		t.Errorf("code = %s, want Internal", got)
+	}
+}
+
+func TestNodeStageVolumeFormatsAndMountsOnTheHappyPath(t *testing.T) {
+	s, fakeMounter, sysRoot := newTestNodeServer(t)
+	putDeviceWithIdentity(t, sysRoot, testControllerID, 3, 7, "sdb", testDiskIDVpdBytes)
+	target := filepath.Join(t.TempDir(), "globalmount")
+	if err := os.MkdirAll(target, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := s.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+		VolumeId:          "vol-1",
+		StagingTargetPath: target,
+		VolumeCapability:  mountVolumeCapability("", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
+		PublishContext:    publishContext(testControllerID, 7),
+		VolumeContext:     volumeContext(testDiskID),
 	})
 	if err != nil {
 		t.Fatalf("NodeStageVolume: %v", err)
@@ -284,7 +418,7 @@ func TestNodeStageVolumeFormatsAndMountsOnTheHappyPath(t *testing.T) {
 
 func TestNodeStageVolumeIsIdempotentOnAMatchingRepeatCall(t *testing.T) {
 	s, fakeMounter, sysRoot := newTestNodeServer(t)
-	putDevice(t, sysRoot, testControllerID, 3, 7, "sdb")
+	putDeviceWithIdentity(t, sysRoot, testControllerID, 3, 7, "sdb", testDiskIDVpdBytes)
 	target := filepath.Join(t.TempDir(), "globalmount")
 	if err := os.MkdirAll(target, 0o750); err != nil {
 		t.Fatal(err)
@@ -294,6 +428,7 @@ func TestNodeStageVolumeIsIdempotentOnAMatchingRepeatCall(t *testing.T) {
 		StagingTargetPath: target,
 		VolumeCapability:  mountVolumeCapability("", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
 		PublishContext:    publishContext(testControllerID, 7),
+		VolumeContext:     volumeContext(testDiskID),
 	}
 
 	if _, err := s.NodeStageVolume(context.Background(), req); err != nil {
@@ -314,7 +449,7 @@ func TestNodeStageVolumeIsIdempotentOnAMatchingRepeatCall(t *testing.T) {
 
 func TestNodeStageVolumeReturnsAlreadyExistsOnAMismatchedReadOnlyFlag(t *testing.T) {
 	s, _, sysRoot := newTestNodeServer(t)
-	putDevice(t, sysRoot, testControllerID, 3, 7, "sdb")
+	putDeviceWithIdentity(t, sysRoot, testControllerID, 3, 7, "sdb", testDiskIDVpdBytes)
 	target := filepath.Join(t.TempDir(), "globalmount")
 	if err := os.MkdirAll(target, 0o750); err != nil {
 		t.Fatal(err)
@@ -325,6 +460,7 @@ func TestNodeStageVolumeReturnsAlreadyExistsOnAMismatchedReadOnlyFlag(t *testing
 		StagingTargetPath: target,
 		VolumeCapability:  mountVolumeCapability("", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
 		PublishContext:    publishContext(testControllerID, 7),
+		VolumeContext:     volumeContext(testDiskID),
 	}
 	if _, err := s.NodeStageVolume(context.Background(), rw); err != nil {
 		t.Fatalf("first (rw) NodeStageVolume: %v", err)
@@ -335,6 +471,7 @@ func TestNodeStageVolumeReturnsAlreadyExistsOnAMismatchedReadOnlyFlag(t *testing
 		StagingTargetPath: target,
 		VolumeCapability:  mountVolumeCapability("", csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY),
 		PublishContext:    publishContext(testControllerID, 7),
+		VolumeContext:     volumeContext(testDiskID),
 	}
 	_, err := s.NodeStageVolume(context.Background(), ro)
 	if got := grpcCode(t, err); got != codes.AlreadyExists {
@@ -348,7 +485,7 @@ func TestNodeStageVolumeMountsReadOnlyWithRoOption(t *testing.T) {
 	// mountOptions' "ro" append reaching FormatAndMount. This one stages
 	// fresh, read-only, and checks the resulting mount actually carries "ro".
 	s, fakeMounter, sysRoot := newTestNodeServer(t)
-	putDevice(t, sysRoot, testControllerID, 3, 7, "sdb")
+	putDeviceWithIdentity(t, sysRoot, testControllerID, 3, 7, "sdb", testDiskIDVpdBytes)
 	target := filepath.Join(t.TempDir(), "globalmount")
 	if err := os.MkdirAll(target, 0o750); err != nil {
 		t.Fatal(err)
@@ -359,6 +496,7 @@ func TestNodeStageVolumeMountsReadOnlyWithRoOption(t *testing.T) {
 		StagingTargetPath: target,
 		VolumeCapability:  mountVolumeCapability("", csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY),
 		PublishContext:    publishContext(testControllerID, 7),
+		VolumeContext:     volumeContext(testDiskID),
 	})
 	if err != nil {
 		t.Fatalf("NodeStageVolume: %v", err)
@@ -400,6 +538,7 @@ func TestNodeStageVolumeReturnsAbortedWhenAnotherCallIsAlreadyInProgress(t *test
 		StagingTargetPath: target,
 		VolumeCapability:  mountVolumeCapability("", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
 		PublishContext:    publishContext(testControllerID, 7),
+		VolumeContext:     volumeContext(testDiskID),
 	})
 	if got := grpcCode(t, err); got != codes.Aborted {
 		t.Errorf("code = %s, want Aborted", got)
@@ -415,7 +554,7 @@ func TestNodeStageVolumeReleasesTheLockOnceTheBackgroundWorkFinishes(t *testing.
 	// under stageOperationBudget rather than this test needing to wait out
 	// the real 30s constant.
 	s, _, sysRoot := newTestNodeServer(t)
-	putDevice(t, sysRoot, testControllerID, 3, 7, "sdb")
+	putDeviceWithIdentity(t, sysRoot, testControllerID, 3, 7, "sdb", testDiskIDVpdBytes)
 	target := filepath.Join(t.TempDir(), "globalmount")
 	if err := os.MkdirAll(target, 0o750); err != nil {
 		t.Fatal(err)
@@ -425,6 +564,7 @@ func TestNodeStageVolumeReleasesTheLockOnceTheBackgroundWorkFinishes(t *testing.
 		StagingTargetPath: target,
 		VolumeCapability:  mountVolumeCapability("", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
 		PublishContext:    publishContext(testControllerID, 7),
+		VolumeContext:     volumeContext(testDiskID),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -486,7 +626,7 @@ func TestNodeUnstageVolumeIsIdempotentWhenNothingIsThere(t *testing.T) {
 
 func TestNodeUnstageVolumeUndoesNodeStageVolume(t *testing.T) {
 	s, fakeMounter, sysRoot := newTestNodeServer(t)
-	putDevice(t, sysRoot, testControllerID, 3, 7, "sdb")
+	putDeviceWithIdentity(t, sysRoot, testControllerID, 3, 7, "sdb", testDiskIDVpdBytes)
 	target := filepath.Join(t.TempDir(), "globalmount")
 	if err := os.MkdirAll(target, 0o750); err != nil {
 		t.Fatal(err)
@@ -497,6 +637,7 @@ func TestNodeUnstageVolumeUndoesNodeStageVolume(t *testing.T) {
 		StagingTargetPath: target,
 		VolumeCapability:  mountVolumeCapability("", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
 		PublishContext:    publishContext(testControllerID, 7),
+		VolumeContext:     volumeContext(testDiskID),
 	}); err != nil {
 		t.Fatalf("NodeStageVolume: %v", err)
 	}
@@ -543,7 +684,7 @@ func TestNodeUnstageVolumeReturnsAbortedWhenAnotherCallIsAlreadyInProgress(t *te
 // is what publishVolume's precondition check reads. It returns that path.
 func stagePublishSource(t *testing.T, s *nodeServer, sysRoot string) string {
 	t.Helper()
-	putDevice(t, sysRoot, testControllerID, 3, 7, "sdb")
+	putDeviceWithIdentity(t, sysRoot, testControllerID, 3, 7, "sdb", testDiskIDVpdBytes)
 	staging := filepath.Join(t.TempDir(), "globalmount")
 	mkdirAllT(t, staging)
 
@@ -552,6 +693,7 @@ func stagePublishSource(t *testing.T, s *nodeServer, sysRoot string) string {
 		StagingTargetPath: staging,
 		VolumeCapability:  mountVolumeCapability("", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
 		PublishContext:    publishContext(testControllerID, 7),
+		VolumeContext:     volumeContext(testDiskID),
 	}); err != nil {
 		t.Fatalf("NodeStageVolume: %v", err)
 	}

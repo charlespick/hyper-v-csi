@@ -10,6 +10,8 @@ public class JobDispatcherTests
 {
     private static readonly JsonSerializerOptions WireOptions = new(JsonSerializerDefaults.Web);
 
+    private static readonly Guid TestDiskId = Guid.Parse("98b51c04-ecbd-429c-a184-994be8c35390");
+
     [Fact]
     public async Task Resolve_CreateVolume_RunsTheCreateAndPublishesItsResult()
     {
@@ -22,7 +24,7 @@ public class JobDispatcherTests
 
         Assert.Equal(["volume:pvc-1"], resolved.Targets);
         Assert.Equal(("pvc-1", 2048L, (string?)null), vhdx.LastCreate);
-        Assert.Equal(new CreateVolumeResult("pvc-1", 2048, AlreadyPresent: false), job.Result);
+        Assert.Equal(new CreateVolumeResult("pvc-1", 2048, AlreadyPresent: false, TestDiskId), job.Result);
     }
 
     [Fact]
@@ -477,7 +479,7 @@ public class JobDispatcherTests
             string volumeName, long sizeBytes, string? sourceSnapshotId, CancellationToken cancellationToken)
         {
             LastCreate = (volumeName, sizeBytes, sourceSnapshotId);
-            return Task.FromResult(new CreateVolumeResult(volumeName, sizeBytes, AlreadyPresent: false));
+            return Task.FromResult(new CreateVolumeResult(volumeName, sizeBytes, AlreadyPresent: false, TestDiskId));
         }
 
         public Task<ExpandVolumeResult> ExpandAsync(string volumeId, long newSizeBytes, string? nodeId, CancellationToken cancellationToken)

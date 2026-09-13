@@ -144,6 +144,34 @@ public sealed class VhdxServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateAsync_ReportsTheVhdxsOwnVirtualDiskId()
+    {
+        // NodeStageVolume verifies against this value (see resolve github
+        // issue 30), so it has to be the real one the disk actually carries,
+        // not a value invented on this side of the CIM seam.
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks);
+
+        var result = await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
+
+        var bytes = await File.ReadAllBytesAsync(VolumePath("pvc-1"));
+        Assert.Equal(MinimalVhdxBuilder.ReadDiskId(bytes), result.DiskId);
+        Assert.NotEqual(Guid.Empty, result.DiskId);
+    }
+
+    [Fact]
+    public async Task CreateAsync_WhenTheVolumeAlreadyExists_ReportsTheSameDiskIdAgain()
+    {
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks);
+
+        var first = await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
+        var replay = await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
+
+        Assert.Equal(first.DiskId, replay.DiskId);
+    }
+
+    [Fact]
     public async Task CreateAsync_WhenTheExistingDiskWasRoundedUp_IsStillCompatible()
     {
         // A disk rounded up past the request still satisfies it, so a retry
@@ -205,7 +233,11 @@ public sealed class VhdxServiceTests : IDisposable
         var result = await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
 
         Assert.Equal(1024, result.ActualSizeBytes);
-        Assert.Equal("fake vhdx", await File.ReadAllTextAsync(VolumePath("pvc-1")));
+        // A real disk replaced the half-written leftover, not a second
+        // leftover of the same kind - readable back as a minimal VHDX proves
+        // that rather than just checking some bytes changed.
+        var bytes = await File.ReadAllBytesAsync(VolumePath("pvc-1"));
+        Assert.Equal(1024, MinimalVhdxBuilder.ReadVirtualSize(bytes));
     }
 
     [Fact]
@@ -351,6 +383,24 @@ public sealed class VhdxServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateAsync_FromASnapshot_ReportsTheResetDiskId()
+    {
+        // The reset, not a second read of the file: ResetDiskIdentifierAsync
+        // already answers this, and re-reading it back off the copy would
+        // both cost an extra file open and risk disagreeing with the value
+        // this call itself just set, if the fake (or CIM) ever raced it.
+        var disks = new FakeVirtualDiskManager();
+        var copier = new FakeDiskCopier();
+        WriteSnapshot("pvc-1~snap-a", 4096);
+        using var service = NewService(disks, copier: copier);
+
+        var result = await service.CreateAsync("pvc-2", 4096, "pvc-1~snap-a", CancellationToken.None);
+
+        var reset = Assert.Single(disks.DiskIdentifiersReset);
+        Assert.Equal(reset.DiskId, result.DiskId);
+    }
+
+    [Fact]
     public async Task CreateAsync_FromASnapshot_WhenResettingTheDiskIdentifierFails_CleansUpAndFails()
     {
         var disks = new FakeVirtualDiskManager { FailNextResetDiskIdentifier = true };
@@ -432,6 +482,11 @@ public sealed class VhdxServiceTests : IDisposable
         Assert.Equal(8192, replay.ActualSizeBytes);
         Assert.True(replay.AlreadyPresent);
         Assert.Single(copier.Destinations);
+        // Read fresh off the restored volume's own file, same as the
+        // already-exists branch of an empty create - not the snapshot's
+        // identifier, which the first call's reset already replaced.
+        var bytes = await File.ReadAllBytesAsync(VolumePath("pvc-2"));
+        Assert.Equal(MinimalVhdxBuilder.ReadDiskId(bytes), replay.DiskId);
     }
 
     [Fact]
@@ -1223,8 +1278,13 @@ public sealed class VhdxServiceTests : IDisposable
                     throw new InvalidOperationException("CIM said no");
                 }
 
-                await File.WriteAllTextAsync(path, "fake vhdx", cancellationToken);
                 var rounded = (maxInternalSizeBytes + RoundUpTo - 1) / RoundUpTo * RoundUpTo;
+                // A real minimal VHDX, not placeholder text: VhdxService now
+                // reads VirtualDiskId back out of the file it just created,
+                // the same way VhdxDiskIdentity.ReadAsync reads a real
+                // Hyper-V-written one - a plain text file has no Metadata
+                // Region for that read to find.
+                await File.WriteAllBytesAsync(path, MinimalVhdxBuilder.Build(rounded, Guid.NewGuid()), cancellationToken);
                 lock (_gate)
                 {
                     Created.Add(path);
