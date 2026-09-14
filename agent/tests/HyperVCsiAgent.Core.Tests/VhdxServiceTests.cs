@@ -212,6 +212,51 @@ public sealed class VhdxServiceTests : IDisposable
         Assert.Empty(disks.Created);
     }
 
+    [WindowsOnlyFact]
+    public async Task CreateAsync_WhenTheExistingDiskIsHeldByAVmOnThisSameHost_ReadsItsIdentityThroughThatHost()
+    {
+        // The agent sharing a host with the VM, which the clustered role does
+        // routinely: the local size read is answered by the very vmms holding
+        // the disk, so it succeeds, and only the plain file open for the disk's
+        // identity is refused. Seen on the real cluster, where that refusal
+        // used to fail the replay outright.
+        var disks = new FakeVirtualDiskManager();
+        var host = new FakeHostClient();
+        using var service = NewService(disks, location: new FakeVhdxLocationService { VmIds = ["vm-1"] }, host: host);
+        var created = await service.CreateAsync("pvc-1", 4096, null, CancellationToken.None);
+
+        CreateVolumeResult replay;
+        using (HoldOpenExclusively(VolumePath("pvc-1")))
+        {
+            replay = await service.CreateAsync("pvc-1", 4096, null, CancellationToken.None);
+        }
+
+        Assert.True(replay.AlreadyPresent);
+        Assert.Equal(created.ActualSizeBytes, replay.ActualSizeBytes);
+        Assert.Equal(host.DiskIdOnHost, replay.DiskId);
+        Assert.Equal("host-a", host.ReadOnHost);
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_WhenTheExistingDisksIdentityIsHeldByNoClusteredVm_FailsAsInternal()
+    {
+        // Same refused open, but nothing traces it to a clustered VM - so there
+        // is no host known to be able to read the identity past the hold.
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks, location: new FakeVhdxLocationService(), host: new NeverCalledHostClient());
+        await service.CreateAsync("pvc-1", 4096, null, CancellationToken.None);
+
+        using (HoldOpenExclusively(VolumePath("pvc-1")))
+        {
+            var failure = await Assert.ThrowsAsync<JobFailureException>(
+                () => service.CreateAsync("pvc-1", 4096, null, CancellationToken.None));
+
+            Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
+        }
+
+        Assert.True(File.Exists(VolumePath("pvc-1")));
+    }
+
     [Theory]
     [InlineData(1024, 4096)] // existing disk is smaller than the request
     [InlineData(1L << 40, 1024)] // far larger: a real collision, not our rounding
@@ -432,6 +477,34 @@ public sealed class VhdxServiceTests : IDisposable
         Assert.True(replay.AlreadyPresent);
         Assert.Equal(host.DiskIdOnHost, replay.DiskId);
         Assert.Equal("host-a", host.ReadOnHost);
+        Assert.Empty(copier.Destinations);
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_FromASnapshot_WhenTheExistingDiskIsHeldByAVmOnThisSameHost_ReadsItsIdentityThroughThatHost()
+    {
+        // The restore path's own existence check, in the same co-located
+        // shape. Grown past the snapshot's size on restore, so the fake has a
+        // size on record for it and never needs to open the held file to
+        // answer the size read the real vmms would answer.
+        var disks = new FakeVirtualDiskManager();
+        var copier = new FakeDiskCopier();
+        var host = new FakeHostClient();
+        WriteSnapshot("pvc-1~snap-a", 4096);
+        using var service = NewService(
+            disks, location: new FakeVhdxLocationService { VmIds = ["vm-1"] }, host: host, copier: copier);
+        await service.CreateAsync("pvc-2", 8192, "pvc-1~snap-a", CancellationToken.None);
+        copier.Destinations.Clear();
+
+        CreateVolumeResult replay;
+        using (HoldOpenExclusively(VolumePath("pvc-2")))
+        {
+            replay = await service.CreateAsync("pvc-2", 8192, "pvc-1~snap-a", CancellationToken.None);
+        }
+
+        Assert.True(replay.AlreadyPresent);
+        Assert.Equal(8192, replay.ActualSizeBytes);
+        Assert.Equal(host.DiskIdOnHost, replay.DiskId);
         Assert.Empty(copier.Destinations);
     }
 

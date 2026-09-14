@@ -223,7 +223,7 @@ public sealed class VhdxService : IVhdxService, IDisposable
                 if (existingSize >= sizeBytes && existingSize - sizeBytes <= SizeTolerance)
                 {
                     var existingDiskId = heldDiskId
-                        ?? await VhdxDiskIdentity.ReadAsync(path, attempt.Token).ConfigureAwait(false);
+                        ?? await ReadExistingDiskIdAsync(volumeName, path, attempt.Token).ConfigureAwait(false);
                     _logger.LogInformation(
                         "CreateVolume {VolumeName}: {Path} already exists at {ExistingSize} bytes, satisfying the requested {RequestedSize}",
                         volumeName, path, existingSize, sizeBytes);
@@ -374,7 +374,7 @@ public sealed class VhdxService : IVhdxService, IDisposable
                 if (existingSize >= sizeBytes)
                 {
                     var existingDiskId = heldDiskId
-                        ?? await VhdxDiskIdentity.ReadAsync(path, attempt.Token).ConfigureAwait(false);
+                        ?? await ReadExistingDiskIdAsync(volumeName, path, attempt.Token).ConfigureAwait(false);
                     _logger.LogInformation(
                         "CreateVolume {VolumeName}: {Path} already exists at {ExistingSize} bytes, satisfying the requested {RequestedSize}",
                         volumeName, path, existingSize, sizeBytes);
@@ -834,6 +834,31 @@ public sealed class VhdxService : IVhdxService, IDisposable
                 AgentErrorCodes.Internal,
                 $"volume {volumeId} at {path} is open by something this agent could not trace: {ex.Message}",
                 ex);
+        }
+    }
+
+    /// <summary>
+    /// An existing volume's VirtualDiskId, for a CreateVolume replay: read off
+    /// the file itself, or - when a running VM's hold refuses that open -
+    /// through the host that VM runs on.
+    /// </summary>
+    /// <remarks>
+    /// Needed even though the replay's size read already succeeded locally. On
+    /// the VM's own host that CIM read is answered by the very vmms holding the
+    /// file, so no VhdxInUseException ever fires - measured - while this plain
+    /// file open is still refused by the VM's exclusive hold. The agent sharing
+    /// a host with the VM is ordinary, not an edge: the clustered role runs
+    /// wherever the cluster places it.
+    /// </remarks>
+    private async Task<Guid> ReadExistingDiskIdAsync(string volumeName, string path, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await VhdxDiskIdentity.ReadAsync(path, cancellationToken).ConfigureAwait(false);
+        }
+        catch (IOException ex) when (ex.HResult is SharingViolationHResult or LockViolationHResult)
+        {
+            return (await ReadThroughHolderAsync(volumeName, path, cancellationToken).ConfigureAwait(false)).DiskId;
         }
     }
 
