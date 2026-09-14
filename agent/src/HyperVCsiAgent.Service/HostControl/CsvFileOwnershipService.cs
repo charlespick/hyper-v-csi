@@ -35,6 +35,16 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
 
     private readonly IClusterService _cluster;
     private readonly IHyperVHostClient _host;
+
+    /// <summary>
+    /// The per-host cap every other vmms call in this agent takes - issue #14's
+    /// D4. Tracing asks each candidate VM's host in turn, and a burst of
+    /// snapshots or expands traces many disks at once; left unbounded, those
+    /// reads would stack up against a host's vmms beside the attaches and
+    /// checkpoints the cap exists to protect.
+    /// </summary>
+    private readonly HostOperationSlots _hostSlots;
+
     private readonly ICsvNodeProbe _probe;
     private readonly NetFtAddressTable _addresses;
     private readonly TimeProvider _timeProvider;
@@ -47,6 +57,7 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
     public CsvFileOwnershipService(
         IClusterService cluster,
         IHyperVHostClient host,
+        HostOperationSlots hostSlots,
         ICsvNodeProbe probe,
         NetFtAddressTable addresses,
         TimeProvider timeProvider,
@@ -54,6 +65,7 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
     {
         _cluster = cluster;
         _host = host;
+        _hostSlots = hostSlots;
         _probe = probe;
         _addresses = addresses;
         _timeProvider = timeProvider;
@@ -185,8 +197,24 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
             {
                 try
                 {
-                    if (await _host.ReferencesDiskAsync(
-                            hostName, vm.VmId, fullPath, includeDifferencingChains, cancellationToken).ConfigureAwait(false))
+                    // Taken and released around each VM's one call, never held
+                    // across the whole walk: no caller of this service holds a
+                    // host slot while it traces, and holding one here for every
+                    // VM on a node would starve that node's attaches for the
+                    // length of the walk.
+                    await _hostSlots.WaitAsync(hostName, cancellationToken).ConfigureAwait(false);
+                    bool references;
+                    try
+                    {
+                        references = await _host.ReferencesDiskAsync(
+                            hostName, vm.VmId, fullPath, includeDifferencingChains, cancellationToken).ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        _hostSlots.Release(hostName);
+                    }
+
+                    if (references)
                     {
                         matches.Add(new VhdxLocation(hostName, vm.VmId));
                     }

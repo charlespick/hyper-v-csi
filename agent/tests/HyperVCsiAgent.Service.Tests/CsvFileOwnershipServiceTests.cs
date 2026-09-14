@@ -1,5 +1,7 @@
 using HyperVCsiAgent.Core.Cluster;
+using HyperVCsiAgent.Core.Configuration;
 using HyperVCsiAgent.Core.HostControl;
+using Microsoft.Extensions.Options;
 using HyperVCsiAgent.Service.HostControl;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -277,6 +279,7 @@ public sealed class CsvFileOwnershipServiceTests
         new(
             _cluster,
             _host,
+            new HostOperationSlots(Options.Create(new AgentOptions { MaxConcurrentHostOperations = 4 })),
             _probe,
             new NetFtAddressTable(_cluster, _probe, _clock, NullLogger<NetFtAddressTable>.Instance),
             _clock,

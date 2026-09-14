@@ -35,7 +35,11 @@ namespace HyperVCsiAgent.Service.HostControl;
 /// Each rebuild asks every node independently. A node that does not answer
 /// keeps the entries it already had rather than costing every other node
 /// theirs: its addresses only change if its adapter was reconfigured, and the
-/// next rebuild it does answer puts that right.
+/// next rebuild it does answer puts that right. A node the cluster reports
+/// Down is different, and its entries go with it: a Down node holds nothing
+/// open, so an address of its that a coordinator still lists is a stale open
+/// in the moment before CSVFS clears it - one that failing to resolve, and the
+/// caller retrying, answers correctly.
 /// </para>
 /// </remarks>
 public sealed class NetFtAddressTable

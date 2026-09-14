@@ -544,11 +544,15 @@ public sealed class VhdxService : IVhdxService, IDisposable
             ? [JobTargets.Volume(volumeId)]
             : [JobTargets.Volume(volumeId), JobTargets.Vm(vmId)];
 
-        // Keyed on the volume, so a retry after AwaitExpandDiskAsync gives up
-        // waits on the resize already queued rather than lining up a second
-        // one behind it.
+        // Keyed on the volume and the size together, so a retry after
+        // AwaitExpandDiskAsync gives up waits on the resize already queued
+        // rather than lining up a second one behind it - but a request for a
+        // larger size, which the PVC being edited again produces, never
+        // attaches to a queued resize that will only grow the disk to the
+        // earlier, smaller one. It queues behind that resize on the same
+        // targets instead, and grows the disk the rest of the way.
         var resize = _jobs.GetOrCreate(
-            volumeId, ExpandDisk, targets,
+            $"{volumeId}@{newSizeBytes}", ExpandDisk, targets,
             async (job, ct) => job.Result = await ExpandDiskAsync(volumeId, newSizeBytes, vmId, ct).ConfigureAwait(false));
 
         return await AwaitExpandDiskAsync(resize, volumeId, cancellationToken).ConfigureAwait(false);
@@ -671,14 +675,23 @@ public sealed class VhdxService : IVhdxService, IDisposable
                 throw JobFailureException.NotFound($"volume {volumeId} has no disk at {path} to expand");
             }
 
-            // Anything holding the disk open goes through the traced host, and
+            // A disk a clustered VM holds goes through the traced host, and
             // only a VM this job holds vm: for is grown there - including a VM
             // on this very host, whose hold the local read below would not
             // report: that read succeeds there, answered by the vmms holding
             // the file. See OpenHandleProbe.
-            if (OpenHandleProbe.IsHeldOpen(path))
+            //
+            // Held, but by no clustered VM, falls through to the local path:
+            // a reader that shares - a backup or a scanner, or another
+            // operation's own probe of this file in that same moment - is not
+            // in the way of a local read or resize, and not anything to hold
+            // a vm: target for. A holder that does refuse the local read is
+            // reported by the catch below.
+            if (OpenHandleProbe.IsHeldOpen(path)
+                && await TryExpandThroughHolderAsync(volumeId, path, newSizeBytes, heldVmId, attempt).ConfigureAwait(false)
+                    is { } throughHolder)
             {
-                return await ExpandAttachedAsync(volumeId, path, newSizeBytes, heldVmId, attempt).ConfigureAwait(false);
+                return throughHolder;
             }
 
             // Read first, and this read is what makes the whole operation
@@ -697,7 +710,16 @@ public sealed class VhdxService : IVhdxService, IDisposable
             }
             catch (VhdxInUseException)
             {
-                return await ExpandAttachedAsync(volumeId, path, newSizeBytes, heldVmId, attempt).ConfigureAwait(false);
+                // Open, and refusing the local read, but no clustered VM on any
+                // node that could be holding it references it. A genuine
+                // inconsistency - an unmanaged handle on the CSV, most
+                // plausibly - not a transient state a retry fixes on its own,
+                // so it is reported rather than guessed past.
+                return await TryExpandThroughHolderAsync(volumeId, path, newSizeBytes, heldVmId, attempt).ConfigureAwait(false)
+                    ?? throw new JobFailureException(
+                        AgentErrorCodes.Internal,
+                        $"volume {volumeId} at {path} is open, but no clustered VM on a node that could be holding it " +
+                        "has it attached; check for an unmanaged handle on the CSV");
             }
 
             // Only ever grows. Hyper-V will happily shrink a VHDX, and doing so
@@ -744,29 +766,23 @@ public sealed class VhdxService : IVhdxService, IDisposable
     }
 
     /// <summary>
-    /// ExpandDiskAsync's fallback for a VHDX that could not be read locally
-    /// because something has it open: traces it to the host holding it and the
-    /// VM on that host, then reads and grows the disk through that host instead
-    /// of locally. The host is the whole of what the calls need - measured, the
-    /// same path-only call from any other host fails with the same "used by
-    /// another process" the local read did, and succeeds at once from the
-    /// holder. The VM is what the job has to be holding while it grows it.
+    /// ExpandDiskAsync's path for a VHDX something has open: traces it to the
+    /// clustered VM holding it and the host that VM runs on, then reads and
+    /// grows the disk through that host instead of locally - or returns null
+    /// when no clustered VM holds it, leaving the caller to decide what that
+    /// means for its own path. The host is the whole of what the calls need -
+    /// measured, the same path-only call from any other host fails with the
+    /// same "used by another process" the local read does, and succeeds at
+    /// once from the holder. The VM is what the job has to be holding while it
+    /// grows it.
     /// </summary>
-    private async Task<ExpandVolumeResult> ExpandAttachedAsync(
+    private async Task<ExpandVolumeResult?> TryExpandThroughHolderAsync(
         string volumeId, string path, long newSizeBytes, string? heldVmId, CancellationTokenSource attempt)
     {
         var location = await LocateHolderAsync(volumeId, path, attempt.Token).ConfigureAwait(false);
-
         if (location is null)
         {
-            // Open, but no clustered VM on any node that could be holding it
-            // references it. A genuine inconsistency - an unmanaged handle on
-            // the CSV, most plausibly - not a transient state a retry fixes on
-            // its own, so it is reported rather than guessed past.
-            throw new JobFailureException(
-                AgentErrorCodes.Internal,
-                $"volume {volumeId} at {path} is open, but no clustered VM on a node that could be holding it has " +
-                "it attached; check for an unmanaged handle on the CSV");
+            return null;
         }
 
         var (host, vmId) = (location.HostName, location.VmId);
@@ -849,7 +865,7 @@ public sealed class VhdxService : IVhdxService, IDisposable
         {
             return await VhdxDiskIdentity.ReadAsync(path, cancellationToken).ConfigureAwait(false);
         }
-        catch (IOException ex) when (ex.HResult is SharingViolationHResult or LockViolationHResult)
+        catch (IOException ex) when (ex.HResult is SharingViolationHResult or LockViolationHResult or UserMappedFileHResult)
         {
             return (await ReadThroughHolderAsync(volumeName, path, cancellationToken).ConfigureAwait(false)).DiskId;
         }

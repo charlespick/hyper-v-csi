@@ -1005,15 +1005,34 @@ public sealed class VhdxServiceTests : IDisposable
     }
 
     [WindowsOnlyFact]
-    public async Task ExpandAsync_WhenNoClusteredVmHasTheDiskOpen_FailsAsInternal()
+    public async Task ExpandAsync_WhenTheDiskIsHeldOnlyByAReaderThatShares_GrowsItLocally()
     {
-        // Open, but no clustered VM that could be holding it references it -
-        // an unmanaged handle on the CSV, most plausibly. A genuine
-        // inconsistency, not something a retry resolves on its own - and not a
-        // disk to grow locally either, with something holding it.
+        // A backup or a scanner reading the file, or another operation's own
+        // probe of it in that moment: open, but by no clustered VM, and not in
+        // the way of the local read or resize. The expand from before tracing
+        // grew such a disk without complaint, and so does this.
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks, location: new FakeVhdxLocationService(), host: new NeverCalledHostClient());
         await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
+        using var reader = new FileStream(VolumePath("pvc-1"), FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+
+        var result = await service.ExpandAsync("pvc-1", 4096, CancellationToken.None);
+
+        Assert.Equal(4096, result.ActualSizeBytes);
+        Assert.Equal(4096, Assert.Single(disks.Resized).SizeBytes);
+    }
+
+    [WindowsOnlyFact]
+    public async Task ExpandAsync_WhenNoClusteredVmHasTheDiskOpen_FailsAsInternal()
+    {
+        // Open, refusing the local read, and no clustered VM that could be
+        // holding it references it - an unmanaged handle on the CSV, most
+        // plausibly. A genuine inconsistency, not something a retry resolves
+        // on its own.
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks, location: new FakeVhdxLocationService(), host: new NeverCalledHostClient());
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
+        disks.VhdxInUse = true;
         using var held = HoldOpenExclusively(VolumePath("pvc-1"));
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
@@ -1097,6 +1116,42 @@ public sealed class VhdxServiceTests : IDisposable
         var retried = await service.ExpandAsync("pvc-1", 4096, CancellationToken.None);
         Assert.Equal(4096, retried.ActualSizeBytes);
         Assert.Equal(4096, host.ResizedTo);
+    }
+
+    [Fact]
+    public async Task ExpandAsync_ALargerRequestNeverWaitsOnAQueuedResizeToTheEarlierSize()
+    {
+        // The PVC edited again while the first resize is still queued behind
+        // other work on the volume. Attaching to that resize would report the
+        // earlier, smaller size, which the controller rejects as expanded below
+        // what it asked for. Each size queues its own resize instead, in order.
+        var disks = new FakeVirtualDiskManager();
+        using var jobs = new InMemoryJobStore();
+        using var service = NewService(disks, jobs: jobs, expandDiskWaitTimeout: TimeSpan.FromMilliseconds(300));
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
+
+        var release = new TaskCompletionSource();
+        var ahead = jobs.GetOrCreate("pvc-1", JobDispatcher.DeleteVolume, [JobTargets.Volume("pvc-1")], (_, _) => release.Task);
+        await WaitFor(() => ahead.Status == JobStatus.Running);
+
+        try
+        {
+            foreach (var size in new[] { 2048L, 4096L })
+            {
+                var queued = await Assert.ThrowsAsync<JobFailureException>(
+                    () => service.ExpandAsync("pvc-1", size, CancellationToken.None));
+                Assert.Equal(AgentErrorCodes.Aborted, queued.ErrorCode);
+            }
+        }
+        finally
+        {
+            release.SetResult();
+        }
+
+        var retried = await service.ExpandAsync("pvc-1", 4096, CancellationToken.None);
+
+        Assert.Equal(4096, retried.ActualSizeBytes);
+        Assert.Equal([2048L, 4096L], disks.Resized.Select(resize => resize.SizeBytes));
     }
 
     [Fact]
