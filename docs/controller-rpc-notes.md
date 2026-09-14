@@ -430,8 +430,8 @@ call](host-cim-and-timeouts.md#host-cim-calls-are-bounded-per-call) for how
 that wait is timed out.
 
 **The agent's idempotency check opens the VHDX directly, which fails on an
-attached, running disk — the fallback is why this RPC talks to
-Kubernetes.** `VhdxService.ExpandAsync`'s read-before-write check
+attached, running disk — the fallback traces the disk to the host holding
+it.** `VhdxService.ExpandAsync`'s read-before-write check
 (`GetVirtualSizeAsync` → `GetVirtualHardDiskSettingData`) opens the VHDX
 file the same way `ResizeVirtualHardDisk` itself does, and that open fails
 with a sharing violation whenever a running VM already has the disk open —
@@ -446,27 +446,32 @@ purely local CIM session, on whichever host happens to own the agent
 role — a different host from the VM's the moment the two aren't the same
 node. So `ExpandAsync` tries the local read first — correct and cheaper
 whenever it works — and only on `VhdxInUseException` falls back to
-`IHyperVHostClient.GetDiskSizeAsync`/`ResizeDiskAsync`, host-targeted
+`IHyperVHostClient.GetDiskInfoAsync`/`ResizeDiskAsync`, host-targeted
 methods that read and grow the disk through the VM's own host instead.
 
-That fallback needs to know which VM has the disk attached, and CSI's
-`ControllerExpandVolumeRequest` carries no node ID the way
-`ControllerPublishVolume`/`UnpublishVolume`'s does. Rather than have the
-agent search the cluster for it — the same expensive reverse query
-[node identity resolution](node-identity-and-attach.md) prices, a fan-out
-this RPC has no cheaper reason to pay than `DeleteVolume` does — the Go
-driver looks it up itself before enqueueing the job: a `VolumeAttachment`
-names the Kubernetes node, and `CSINode` is where that node's own CSI node
-ID (this driver's Hyper-V VM ID) is recorded, the same two lookups
-`external-attacher` itself makes to build the node ID it hands
-`ControllerPublishVolume`. A lookup that finds nothing (the common case:
-an unattached or not-yet-attached volume) leaves the hint empty and
-changes nothing — the local read already handles that case. A lookup that
-errors fails the RPC outright rather than guessing "unattached," since a
-Kubernetes API this driver cannot reach is indistinguishable from "nothing
-attached" if the error is swallowed, and reporting an attached volume as
-unattached is exactly the state that would send the agent's local read
-into a sharing violation with no hint left to recover from.
+That fallback needs two things CSI's `ControllerExpandVolumeRequest` does
+not carry, unlike `ControllerPublishVolume`/`UnpublishVolume`'s node ID: the
+host to send the path-only CIM calls to, and the VM whose `vm:` target the
+resize has to hold (see design.md's "Snapshots and VM serialization"). The
+agent works both out from the path, with no Kubernetes lookup and no node ID:
+the VHDX's CSV coordinator lists which node has the file open through the CSV
+metadata channel, that node's NetFT address maps it to a host name, and the
+clustered VMs on that one host are asked which of them references the disk —
+[docs/csv-file-open-ownership.md](csv-file-open-ownership.md) has the
+mechanism and what was measured. An empty listing means the coordinator holds
+the file itself, which is only unambiguous because the local read has already
+proven the file is open somewhere.
+
+Because the VM is only known once that trace has run, and a job's targets are
+fixed when it is enqueued, the ExpandVolume job holds only `expand:<volumeId>`:
+it traces the disk, enqueues an internal `ExpandDisk` job under
+`volume:<volumeId>` plus `vm:<vmId>`, and waits for it up to the agent's
+`ExpandDiskWaitTimeout` (20s, inside the controller's own poll budget). A
+resize still queued behind a snapshot copy on that VM when the wait runs out
+comes back ABORTED naming what it is queued behind, and the resizer's retry
+waits on the same queued job rather than starting another. `ExpandDisk`
+traces the disk again when it runs, and refuses with ABORTED to grow it
+through any VM but the one it holds.
 
 **`external-resizer` is deployed, and `allowVolumeExpansion` defaults to
 true.** Without the sidecar this RPC has no caller — the same relationship

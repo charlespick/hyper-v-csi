@@ -101,10 +101,10 @@ DriverInfo:
     seLinuxMount: false        # no SELinux mount option support
 
     # --- Supported in principle, silenced for the first run -------------
-    # Two PVs sharing one volume handle. findAttachedNode matches a
-    # VolumeAttachment by PV name and relies on PV name == volume handle, so a
-    # second PV with the same handle can resolve expansion to the wrong node.
-    # A real driver-side limitation, not a test-harness one.
+    # Two PVs sharing one volume handle. The limitation this was silenced for -
+    # the controller resolving an expansion's node from a VolumeAttachment by
+    # PV name - is gone: the agent now traces attachment from the VHDX path.
+    # Left off until the case has actually been run against the suite.
     multiplePVsSameID: false
 
   # singleNodeVolume is deliberately absent (false): a VHDX is not node-local

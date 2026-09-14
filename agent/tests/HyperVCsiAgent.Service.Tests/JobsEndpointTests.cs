@@ -382,6 +382,12 @@ public sealed class JobsEndpointTests : IDisposable
             throw new NotSupportedException("a VM list of zero means the sweep never asks this");
 
         public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) => _discovery.Task;
+
+        public Task<IReadOnlyList<ClusterSharedVolume>> ListSharedVolumesAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException("no disk in this file is held open, so nothing traces one to a shared volume");
+
+        public Task<IReadOnlyList<string>> ListNodesAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException("no disk in this file is held open, so nothing traces one to a node");
     }
 
     private static object CreateVolumeRequest(string name, long sizeBytes) => new

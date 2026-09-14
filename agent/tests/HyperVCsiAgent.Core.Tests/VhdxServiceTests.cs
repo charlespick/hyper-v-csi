@@ -1,4 +1,3 @@
-using HyperVCsiAgent.Core.Cluster;
 using HyperVCsiAgent.Core.Configuration;
 using HyperVCsiAgent.Core.HostControl;
 using HyperVCsiAgent.Core.Jobs;
@@ -17,7 +16,7 @@ public sealed class VhdxServiceTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), "hyperv-csi-tests", Guid.NewGuid().ToString("n"));
     private readonly string _snapshotsRoot = Path.Combine(Path.GetTempPath(), "hyperv-csi-tests", Guid.NewGuid().ToString("n"), "snapshots");
-    private readonly List<IDisposable> _copySlots = [];
+    private readonly List<IDisposable> _disposables = [];
 
     private string VolumePath(string volumeName) => Path.Combine(_root, volumeName + ".vhdx");
 
@@ -51,9 +50,9 @@ public sealed class VhdxServiceTests : IDisposable
 
     public void Dispose()
     {
-        foreach (var slots in _copySlots)
+        foreach (var disposable in _disposables)
         {
-            slots.Dispose();
+            disposable.Dispose();
         }
 
         if (Directory.Exists(_root))
@@ -187,17 +186,18 @@ public sealed class VhdxServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task CreateAsync_WhenTheExistingDiskIsAttachedToARunningVm_TreatsItAsSatisfyingTheRequest()
+    public async Task CreateAsync_WhenTheExistingDiskIsAttachedToARunningVm_AnswersWithWhatTheHostHoldingItReads()
     {
         // The real-cluster failure this guards against: a replayed
         // CreateVolume for an already-bound PVC finds the disk, but the
         // running VM it's attached to already has it open, so the idempotency
-        // check's own size read fails with VhdxInUseException. CreateVolume's
-        // request carries no node ID to check the size through the VM's
-        // owning host the way ExpandVolume's fallback does, so existing and
-        // attached has to be enough on its own.
-        var disks = new FakeVirtualDiskManager();
-        using var service = NewService(disks);
+        // check's size read fails with VhdxInUseException - and a local read
+        // of its identity would fail the same way. The host holding it can
+        // still read both. Its size here is the rounded 4096, not the 1024
+        // asked for, so a replay reporting the request on trust would show.
+        var disks = new FakeVirtualDiskManager { RoundUpTo = 4096 };
+        var host = new FakeHostClient { SizeOnHost = 4096 };
+        using var service = NewService(disks, location: new FakeVhdxLocationService(), host: host);
 
         await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
         disks.Created.Clear();
@@ -205,8 +205,10 @@ public sealed class VhdxServiceTests : IDisposable
 
         var replay = await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
 
-        Assert.Equal(1024, replay.ActualSizeBytes);
+        Assert.Equal(4096, replay.ActualSizeBytes);
         Assert.True(replay.AlreadyPresent);
+        Assert.Equal(host.DiskIdOnHost, replay.DiskId);
+        Assert.Equal("host-a", host.ReadOnHost);
         Assert.Empty(disks.Created);
     }
 
@@ -389,14 +391,17 @@ public sealed class VhdxServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task CreateAsync_FromASnapshot_WhenTheExistingDiskIsAttachedToARunningVm_TreatsItAsSatisfyingTheRequest()
+    public async Task CreateAsync_FromASnapshot_WhenTheExistingDiskIsAttachedToARunningVm_AnswersWithWhatTheHostHoldingItReads()
     {
         // Same idempotency-check failure as the empty-create case, on the
-        // restore path's own existence check.
+        // restore path's own existence check. The volume has been expanded
+        // online since it was restored, which the host's size says and the
+        // request does not.
         var disks = new FakeVirtualDiskManager();
         var copier = new FakeDiskCopier();
+        var host = new FakeHostClient { SizeOnHost = 8192 };
         WriteSnapshot("pvc-1~snap-a", 4096);
-        using var service = NewService(disks, copier: copier);
+        using var service = NewService(disks, location: new FakeVhdxLocationService(), host: host, copier: copier);
 
         await service.CreateAsync("pvc-2", 4096, "pvc-1~snap-a", CancellationToken.None);
         copier.Destinations.Clear();
@@ -404,8 +409,10 @@ public sealed class VhdxServiceTests : IDisposable
 
         var replay = await service.CreateAsync("pvc-2", 4096, "pvc-1~snap-a", CancellationToken.None);
 
-        Assert.Equal(4096, replay.ActualSizeBytes);
+        Assert.Equal(8192, replay.ActualSizeBytes);
         Assert.True(replay.AlreadyPresent);
+        Assert.Equal(host.DiskIdOnHost, replay.DiskId);
+        Assert.Equal("host-a", host.ReadOnHost);
         Assert.Empty(copier.Destinations);
     }
 
@@ -666,7 +673,7 @@ public sealed class VhdxServiceTests : IDisposable
         using var service = NewService(disks);
         await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
 
-        var result = await service.ExpandAsync("pvc-1", 4096, null, CancellationToken.None);
+        var result = await service.ExpandAsync("pvc-1", 4096, CancellationToken.None);
 
         Assert.Equal(4096, result.ActualSizeBytes);
         Assert.False(result.AlreadyLargeEnough);
@@ -685,7 +692,7 @@ public sealed class VhdxServiceTests : IDisposable
         using var service = NewService(disks);
         await service.CreateAsync("pvc-1", 4096, null, CancellationToken.None);
 
-        var result = await service.ExpandAsync("pvc-1", 5000, null, CancellationToken.None);
+        var result = await service.ExpandAsync("pvc-1", 5000, CancellationToken.None);
 
         Assert.Equal(8192, result.ActualSizeBytes);
     }
@@ -700,7 +707,7 @@ public sealed class VhdxServiceTests : IDisposable
         using var service = NewService(disks);
         await service.CreateAsync("pvc-1", 4096, null, CancellationToken.None);
 
-        var result = await service.ExpandAsync("pvc-1", 4096, null, CancellationToken.None);
+        var result = await service.ExpandAsync("pvc-1", 4096, CancellationToken.None);
 
         Assert.Equal(4096, result.ActualSizeBytes);
         Assert.True(result.AlreadyLargeEnough);
@@ -717,7 +724,7 @@ public sealed class VhdxServiceTests : IDisposable
         using var service = NewService(disks);
         await service.CreateAsync("pvc-1", 1L << 30, null, CancellationToken.None);
 
-        var result = await service.ExpandAsync("pvc-1", 4096, null, CancellationToken.None);
+        var result = await service.ExpandAsync("pvc-1", 4096, CancellationToken.None);
 
         Assert.Equal(1L << 30, result.ActualSizeBytes);
         Assert.True(result.AlreadyLargeEnough);
@@ -733,7 +740,7 @@ public sealed class VhdxServiceTests : IDisposable
         using var service = NewService(disks);
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
-            () => service.ExpandAsync("pvc-1", 4096, null, CancellationToken.None));
+            () => service.ExpandAsync("pvc-1", 4096, CancellationToken.None));
 
         Assert.Equal(AgentErrorCodes.NotFound, failure.ErrorCode);
     }
@@ -747,7 +754,7 @@ public sealed class VhdxServiceTests : IDisposable
         using var service = NewService(disks);
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
-            () => service.ExpandAsync(volumeId, 4096, null, CancellationToken.None));
+            () => service.ExpandAsync(volumeId, 4096, CancellationToken.None));
 
         Assert.Equal(AgentErrorCodes.NotFound, failure.ErrorCode);
         Assert.Empty(disks.Resized);
@@ -763,7 +770,7 @@ public sealed class VhdxServiceTests : IDisposable
         await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
-            () => service.ExpandAsync("pvc-1", sizeBytes, null, CancellationToken.None));
+            () => service.ExpandAsync("pvc-1", sizeBytes, CancellationToken.None));
 
         Assert.Equal(AgentErrorCodes.InvalidArgument, failure.ErrorCode);
     }
@@ -778,11 +785,14 @@ public sealed class VhdxServiceTests : IDisposable
         using var service = NewService(disks);
         await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
 
-        await Assert.ThrowsAsync<InvalidOperationException>(
-            () => service.ExpandAsync("pvc-1", 4096, null, CancellationToken.None));
+        // The resize runs as a job of its own, so its failure comes back
+        // through that job, message intact.
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => service.ExpandAsync("pvc-1", 4096, CancellationToken.None));
+        Assert.Contains("CIM said no", failure.Message, StringComparison.Ordinal);
 
         Assert.True(File.Exists(VolumePath("pvc-1")));
-        var stillThere = await service.ExpandAsync("pvc-1", 4096, null, CancellationToken.None);
+        var stillThere = await service.ExpandAsync("pvc-1", 4096, CancellationToken.None);
         Assert.Equal(4096, stillThere.ActualSizeBytes);
     }
 
@@ -804,7 +814,7 @@ public sealed class VhdxServiceTests : IDisposable
         disks.BeforeResize = token => release.WaitAsync(token);
 
         var expands = Enumerable.Range(0, 5)
-            .Select(i => service.ExpandAsync($"pvc-{i}", 4096, null, CancellationToken.None))
+            .Select(i => service.ExpandAsync($"pvc-{i}", 4096, CancellationToken.None))
             .ToArray();
 
         await WaitFor(() => disks.InFlightPeak >= 2);
@@ -816,23 +826,24 @@ public sealed class VhdxServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task ExpandAsync_WhenTheDiskIsAttachedToARunningVm_GrowsItThroughTheOwningHost()
+    public async Task ExpandAsync_WhenTheDiskIsAttachedToARunningVm_GrowsItThroughTheHostHoldingItWhileHoldingThatVm()
     {
-        // The real-cluster failure this fallback exists for: GetVirtualSizeAsync
-        // can't read the disk locally because a running VM already has it open,
-        // so ExpandAsync resolves the node hint the Go driver found via
-        // Kubernetes and goes through that VM's own host instead - which does
-        // not share the local read's limitation.
+        // The real-cluster case this exists for: GetVirtualSizeAsync can't read
+        // the disk locally because a running VM already has it open, so the
+        // disk is traced to the host holding it and the VM there, and grown
+        // through that host - which does not share the local read's
+        // limitation. Through the asserting client, so a resize that ran
+        // holding only volume: (issue #14's D10) fails the job instead.
         var disks = new FakeVirtualDiskManager();
         var host = new FakeHostClient { SizeOnHost = 1024 };
         using var service = NewService(
             disks,
-            cluster: new FakeClusterService { Vms = { ["node-1"] = new ClusteredVm("vm-1", "host-a") } },
-            host: host);
+            location: new FakeVhdxLocationService { VmIds = ["vm-1"] },
+            host: new VmTargetAssertingHyperVHostClient(host));
         await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
         disks.VhdxInUse = true;
 
-        var result = await service.ExpandAsync("pvc-1", 4096, "node-1", CancellationToken.None);
+        var result = await service.ExpandAsync("pvc-1", 4096, CancellationToken.None);
 
         Assert.Equal(4096, result.ActualSizeBytes);
         Assert.False(result.AlreadyLargeEnough);
@@ -845,56 +856,121 @@ public sealed class VhdxServiceTests : IDisposable
     {
         var disks = new FakeVirtualDiskManager();
         var host = new FakeHostClient { SizeOnHost = 1L << 30 };
-        using var service = NewService(
-            disks,
-            cluster: new FakeClusterService { Vms = { ["node-1"] = new ClusteredVm("vm-1", "host-a") } },
-            host: host);
+        using var service = NewService(disks, location: new FakeVhdxLocationService { VmIds = ["vm-1"] }, host: host);
         await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
         disks.VhdxInUse = true;
 
-        var result = await service.ExpandAsync("pvc-1", 4096, "node-1", CancellationToken.None);
+        var result = await service.ExpandAsync("pvc-1", 4096, CancellationToken.None);
 
         Assert.Equal(1L << 30, result.ActualSizeBytes);
         Assert.True(result.AlreadyLargeEnough);
+        Assert.Equal("host-a", host.ReadOnHost);
         Assert.Null(host.ResizedTo);
     }
 
     [Fact]
-    public async Task ExpandAsync_WhenTheGivenNodeDoesNotResolve_FailsAsInternal()
+    public async Task ExpandAsync_WhenWhatHasTheDiskOpenCannotBeTraced_FailsAsInternal()
     {
-        // The hint named a node, but the cluster does not know it - stale by
-        // the time the job ran, most plausibly. Not something a blind retry of
-        // the same hint fixes; the controller has to re-derive it.
+        // The local read failed because something has the file open, but the
+        // open could not be pinned to one host. Refused rather than guessed
+        // past, and not something a retry resolves on its own.
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(
+            disks, location: new FakeVhdxLocationService { Untraceable = true }, host: new NeverCalledHostClient());
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
+        disks.VhdxInUse = true;
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => service.ExpandAsync("pvc-1", 4096, CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
+    }
+
+    [Fact]
+    public async Task ExpandAsync_WhenNoClusteredVmHasTheDiskOpen_FailsAsInternal()
+    {
+        // Open on a host where no clustered VM references it - an unmanaged
+        // handle on the CSV, most plausibly. A genuine inconsistency, not
+        // something a retry resolves on its own.
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks, location: new FakeVhdxLocationService(), host: new NeverCalledHostClient());
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
+        disks.VhdxInUse = true;
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => service.ExpandAsync("pvc-1", 4096, CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
+        Assert.Contains("no clustered VM", failure.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("vm-1")]
+    [InlineData(null)]
+    public async Task ExpandAsync_WhenTheDiskIsOpenByAVmTheResizeWasNotQueuedAgainst_FailsAsAborted(string? vmAtEnqueue)
+    {
+        // The resize can sit queued for hours, and by the time it runs the
+        // disk can belong to another VM - or to one at all, having been found
+        // unattached. Growing it without holding that VM is D10 again.
+        // Aborted, since a retry traces the disk afresh and queues behind the
+        // right VM.
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(
             disks,
-            cluster: new FakeClusterService(),
+            location: new FakeVhdxLocationService { VmIds = [vmAtEnqueue, "vm-2"] },
             host: new NeverCalledHostClient());
         await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
         disks.VhdxInUse = true;
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
-            () => service.ExpandAsync("pvc-1", 4096, "node-1", CancellationToken.None));
+            () => service.ExpandAsync("pvc-1", 4096, CancellationToken.None));
 
-        Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
+        Assert.Equal(AgentErrorCodes.Aborted, failure.ErrorCode);
+        Assert.Contains("vm-2", failure.Message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task ExpandAsync_WhenNoNodeHintWasGiven_FailsAsInternal()
+    public async Task ExpandAsync_WhileTheResizeIsQueuedBehindWorkOnTheSameVm_GivesUpAsAbortedNamingIt()
     {
-        // The local read failed because something has the file open, but the
-        // driver found no VolumeAttachment naming a node - nothing to check
-        // instead. A genuine inconsistency (an unmanaged handle on the CSV,
-        // most plausibly), not something a retry resolves on its own.
+        // Holding vm: means waiting behind anything else on that VM, and a
+        // snapshot copy of a sibling disk can take hours. The wait is bounded
+        // by ExpandDiskWaitTimeout, and gives up without cancelling the
+        // resize: it keeps its place, and runs once its turn comes.
         var disks = new FakeVirtualDiskManager();
-        using var service = NewService(disks, cluster: new NeverCalledClusterService(), host: new NeverCalledHostClient());
+        var host = new FakeHostClient { SizeOnHost = 1024 };
+        using var jobs = new InMemoryJobStore();
+        using var service = NewService(
+            disks,
+            location: new FakeVhdxLocationService { VmIds = ["vm-1"] },
+            host: host,
+            jobs: jobs,
+            expandDiskWaitTimeout: TimeSpan.FromMilliseconds(300));
         await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
         disks.VhdxInUse = true;
 
-        var failure = await Assert.ThrowsAsync<JobFailureException>(
-            () => service.ExpandAsync("pvc-1", 4096, null, CancellationToken.None));
+        var release = new TaskCompletionSource();
+        var copy = jobs.GetOrCreate("pvc-9~snap", SnapshotService.CopySnapshot, [JobTargets.Vm("vm-1")], (_, _) => release.Task);
+        await WaitFor(() => copy.Status == JobStatus.Running);
 
-        Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
+        try
+        {
+            var failure = await Assert.ThrowsAsync<JobFailureException>(
+                () => service.ExpandAsync("pvc-1", 4096, CancellationToken.None));
+
+            Assert.Equal(AgentErrorCodes.Aborted, failure.ErrorCode);
+            Assert.Contains($"queued behind {SnapshotService.CopySnapshot} on vm:vm-1", failure.Message, StringComparison.Ordinal);
+            Assert.Null(host.ResizedTo);
+        }
+        finally
+        {
+            release.SetResult();
+        }
+
+        // Awaited through a retry rather than polled, so the resize has
+        // finished - not merely started - before the service is disposed.
+        var retried = await service.ExpandAsync("pvc-1", 4096, CancellationToken.None);
+        Assert.Equal(4096, retried.ActualSizeBytes);
+        Assert.Equal(4096, host.ResizedTo);
     }
 
     [Fact]
@@ -1208,17 +1284,29 @@ public sealed class VhdxServiceTests : IDisposable
         IVirtualDiskManager disks,
         int maxConcurrentDiskOperations = 4,
         TimeSpan? diskOperationTimeout = null,
-        IClusterService? cluster = null,
+        IVhdxLocationService? location = null,
         IHyperVHostClient? host = null,
         IDiskCopier? copier = null,
         int maxConcurrentSnapshotCopies = 4,
-        TimeSpan? snapshotCopyTimeout = null)
+        TimeSpan? snapshotCopyTimeout = null,
+        IJobStore? jobs = null,
+        TimeSpan? expandDiskWaitTimeout = null)
     {
         var copySlots = new SnapshotCopySlots(Options.Create(new AgentOptions
         {
             MaxConcurrentSnapshotCopies = maxConcurrentSnapshotCopies,
         }));
-        _copySlots.Add(copySlots);
+        _disposables.Add(copySlots);
+
+        // A real store unless a test brings its own: ExpandAsync's resize runs
+        // as a job under volume: and vm:, and those targets only serialize
+        // anything in the store that actually honours them.
+        if (jobs is null)
+        {
+            var store = new InMemoryJobStore();
+            _disposables.Add(store);
+            jobs = store;
+        }
 
         return new VhdxService(
             disks,
@@ -1227,10 +1315,11 @@ public sealed class VhdxServiceTests : IDisposable
             copier ?? new NeverCalledDiskCopier(),
             // Defaults to something that throws if ever called: most tests
             // never make GetVirtualSizeAsync fail with VhdxInUseException, so
-            // ExpandAsync's fallback should never be reached in them, and a
+            // nothing should trace the disk or reach its host in them, and a
             // fake that answers something plausible instead would hide that.
-            cluster ?? new NeverCalledClusterService(),
+            location ?? new NeverCalledVhdxLocationService(),
             host ?? new NeverCalledHostClient(),
+            jobs,
             copySlots,
             Options.Create(new AgentOptions
             {
@@ -1240,6 +1329,7 @@ public sealed class VhdxServiceTests : IDisposable
                 DiskOperationTimeout = diskOperationTimeout ?? TimeSpan.FromMinutes(10),
                 MaxConcurrentSnapshotCopies = maxConcurrentSnapshotCopies,
                 SnapshotCopyTimeout = snapshotCopyTimeout ?? TimeSpan.FromHours(6),
+                ExpandDiskWaitTimeout = expandDiskWaitTimeout ?? TimeSpan.FromSeconds(20),
             }),
             NullLogger<VhdxService>.Instance);
     }
@@ -1508,62 +1598,56 @@ public sealed class VhdxServiceTests : IDisposable
     }
 
     /// <summary>
-    /// Stands in for the cluster in ExpandAsync's attached-disk fallback:
-    /// resolves exactly the node IDs listed in <see cref="Vms"/>, the same
-    /// (nodeId -&gt; VM) mapping <see cref="MsClusterService.ResolveVmAsync"/>
-    /// answers from CLUSDB - not a fan-out, since the node ID itself now comes
-    /// from the Go driver's own Kubernetes lookup rather than being discovered
-    /// here.
+    /// Stands in for tracing a disk something has open: always to
+    /// <see cref="Host"/>, and to the VMs in <see cref="VmIds"/> one lookup at
+    /// a time, the last repeating - so two entries are the disk changing hands
+    /// between ExpandAsync's own trace and the resize job's.
     /// </summary>
-    private sealed class FakeClusterService : IClusterService
+    private sealed class FakeVhdxLocationService : IVhdxLocationService
     {
-        public bool IsClusterMember() => true;
+        private int _vmLookups;
 
-        public Dictionary<string, ClusteredVm> Vms { get; init; } = [];
+        public string Host { get; init; } = "host-a";
 
-        public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
-            Task.FromResult(Vms.TryGetValue(nodeId, out var vm) ? vm : null);
+        public IReadOnlyList<string?> VmIds { get; init; } = [null];
 
-        public Task<ClusteredVmState?> GetVmClusterStateAsync(string nodeId, CancellationToken cancellationToken) =>
-            throw new NotSupportedException("ExpandAsync's fallback never reads a VM's cluster resource state");
+        /// <summary>Fails the trace, the way an open that cannot be pinned to one host does.</summary>
+        public bool Untraceable { get; init; }
 
-        public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
-            throw new NotSupportedException("ExpandAsync's fallback never checks host liveness");
+        public Task<string> ResolveHostAsync(string path, CancellationToken cancellationToken) =>
+            Untraceable
+                ? throw new InvalidOperationException($"{path} is open from more than one node at once")
+                : Task.FromResult(Host);
 
-        public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) =>
-            throw new NotSupportedException("ExpandAsync's fallback never lists cluster VMs");
+        public Task<string?> ResolveVmOnHostAsync(string hostName, string path, CancellationToken cancellationToken)
+        {
+            var lookup = Interlocked.Increment(ref _vmLookups) - 1;
+            return Task.FromResult(VmIds[Math.Min(lookup, VmIds.Count - 1)]);
+        }
     }
 
     /// <summary>
-    /// Stands in for the VM's own host in ExpandAsync's attached-disk fallback:
-    /// answers size/resize the way the real cluster test proved a remote
-    /// CimSession targeted at the owning host can, unlike a local read.
+    /// Stands in for the host holding an attached disk open: answers its size
+    /// and identity, and grows it, the way the real cluster test proved a
+    /// CimSession targeted at that host can, unlike a local read.
     /// </summary>
     private sealed class FakeHostClient : IHyperVHostClient
     {
         public long SizeOnHost { get; init; }
 
+        public Guid DiskIdOnHost { get; init; } = Guid.NewGuid();
+
+        public string? ReadOnHost { get; private set; }
+
         public long? ResizedTo { get; private set; }
 
         public string? ResizedOnHost { get; private set; }
 
-        public Task<AttachedDisk?> FindAttachedDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
-            throw new NotSupportedException("ExpandAsync's fallback never asks for an address, only size");
-
-        public Task<bool> IsDiskAttachedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
-            throw new NotSupportedException("ExpandAsync's fallback never checks presence; it goes straight to size");
-
-        public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
-            throw new NotSupportedException("ExpandAsync's fallback never attaches anything");
-
-        public Task AttachDiskAsync(string hostName, string vmId, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken) =>
-            throw new NotSupportedException("ExpandAsync's fallback never attaches anything");
-
-        public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
-            throw new NotSupportedException("ExpandAsync's fallback never detaches anything");
-
-        public Task<long> GetDiskSizeAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
-            Task.FromResult(SizeOnHost);
+        public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken)
+        {
+            ReadOnHost = hostName;
+            return Task.FromResult(new HostDiskInfo(SizeOnHost, DiskIdOnHost));
+        }
 
         public Task<long> ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken)
         {
@@ -1572,56 +1656,65 @@ public sealed class VhdxServiceTests : IDisposable
             return Task.FromResult(newSizeBytes);
         }
 
+        public Task<bool> ReferencesDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+            throw new NotSupportedException("VhdxService learns the VM from IVhdxLocationService, never VM by VM");
+
+        public Task<AttachedDisk?> FindAttachedDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+            throw new NotSupportedException("VhdxService never asks for an address, only size");
+
+        public Task<bool> IsDiskAttachedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+            throw new NotSupportedException("VhdxService never checks presence; it goes straight to size");
+
+        public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
+            throw new NotSupportedException("VhdxService never attaches anything");
+
+        public Task AttachDiskAsync(string hostName, string vmId, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken) =>
+            throw new NotSupportedException("VhdxService never attaches anything");
+
+        public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+            throw new NotSupportedException("VhdxService never detaches anything");
+
         public Task<VolumeAttachment> ClassifyAttachmentAsync(
             string hostName, string vmId, string vhdxPath, string thisSnapshotElementName, CancellationToken cancellationToken) =>
-            throw new NotSupportedException("ExpandAsync's fallback never checkpoints anything");
+            throw new NotSupportedException("VhdxService never checkpoints anything");
 
         public Task<Checkpoint> CreateCheckpointAsync(
             string hostName, string vmId, string elementName, string notesJson, CancellationToken cancellationToken) =>
-            throw new NotSupportedException("ExpandAsync's fallback never checkpoints anything");
+            throw new NotSupportedException("VhdxService never checkpoints anything");
 
         public Task<Checkpoint?> FindOwnedCheckpointAsync(
             string hostName, string vmId, string elementName, CancellationToken cancellationToken) =>
-            throw new NotSupportedException("ExpandAsync's fallback never checkpoints anything");
+            throw new NotSupportedException("VhdxService never checkpoints anything");
 
         public Task DestroyCheckpointAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
-            throw new NotSupportedException("ExpandAsync's fallback never checkpoints anything");
+            throw new NotSupportedException("VhdxService never checkpoints anything");
 
         public Task<IReadOnlyList<Checkpoint>> ListOwnedCheckpointsAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
-            throw new NotSupportedException("ExpandAsync's fallback never sweeps for owned checkpoints");
+            throw new NotSupportedException("VhdxService never sweeps for owned checkpoints");
 
         public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
-            throw new NotSupportedException("ExpandAsync's fallback never checkpoints anything");
+            throw new NotSupportedException("VhdxService never checkpoints anything");
 
         public Task<bool> IsChainCollapsedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
-            throw new NotSupportedException("ExpandAsync's fallback never checkpoints anything");
+            throw new NotSupportedException("VhdxService never checkpoints anything");
     }
 
     /// <summary>
     /// The default for tests that never make GetVirtualSizeAsync fail with
-    /// VhdxInUseException: ExpandAsync's attached-disk fallback should not be
-    /// reached in them at all, and answering something plausible instead of
-    /// throwing would hide it if it ever were.
+    /// VhdxInUseException: nothing in them has the disk open, so nothing
+    /// should trace it, and answering something plausible instead of throwing
+    /// would hide it if anything ever did.
     /// </summary>
-    private sealed class NeverCalledClusterService : IClusterService
+    private sealed class NeverCalledVhdxLocationService : IVhdxLocationService
     {
-        public bool IsClusterMember() =>
-            throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
+        public Task<string> ResolveHostAsync(string path, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("nothing has the disk open in this test, so nothing should trace it");
 
-        public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
-            throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
-
-        public Task<ClusteredVmState?> GetVmClusterStateAsync(string nodeId, CancellationToken cancellationToken) =>
-            throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
-
-        public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
-            throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
-
-        public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) =>
-            throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
+        public Task<string?> ResolveVmOnHostAsync(string hostName, string path, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("nothing has the disk open in this test, so nothing should trace it");
     }
 
-    /// <summary>NeverCalledClusterService's counterpart for IHyperVHostClient.</summary>
+    /// <summary>NeverCalledVhdxLocationService's counterpart for IHyperVHostClient.</summary>
     private sealed class NeverCalledHostClient : IHyperVHostClient
     {
         public Task<AttachedDisk?> FindAttachedDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
@@ -1639,7 +1732,10 @@ public sealed class VhdxServiceTests : IDisposable
         public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
 
-        public Task<long> GetDiskSizeAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+        public Task<bool> ReferencesDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
+
+        public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
 
         public Task<long> ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
@@ -1670,7 +1766,7 @@ public sealed class VhdxServiceTests : IDisposable
             throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
     }
 
-    /// <summary>NeverCalledClusterService's counterpart for IDiskCopier: only restore tests should ever reach it.</summary>
+    /// <summary>NeverCalledVhdxLocationService's counterpart for IDiskCopier: only restore tests should ever reach it.</summary>
     private sealed class NeverCalledDiskCopier : IDiskCopier
     {
         public Task<DiskCopyTarget> InspectTargetAsync(string directoryPath, TimeSpan remainingBudget, CancellationToken cancellationToken) =>

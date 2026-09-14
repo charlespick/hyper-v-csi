@@ -3,7 +3,6 @@ package driver
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,9 +14,6 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"k8s.io/apimachinery/pkg/runtime"
-	fake "k8s.io/client-go/kubernetes/fake"
-	ktesting "k8s.io/client-go/testing"
 
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/agentclient"
 )
@@ -1239,76 +1235,21 @@ func TestControllerExpandVolumeEnqueuesUnderTheVolumeIDAsIdempotencyKey(t *testi
 	if enqueued.Payload.VolumeID != "pvc-1" || enqueued.Payload.SizeBytes != 4*gibibyte {
 		t.Errorf("payload = %+v, want volumeId pvc-1 and sizeBytes %d", enqueued.Payload, 4*gibibyte)
 	}
-	if enqueued.Payload.NodeID != "" {
-		t.Errorf("nodeId = %q, want empty: nothing attaches this volume in the fake cluster", enqueued.Payload.NodeID)
-	}
 }
 
-func TestControllerExpandVolumeIncludesTheAttachedNodeWhenOneHoldsTheVolume(t *testing.T) {
-	// The whole point of the lookup: the agent's own local read fails on an
-	// attached, running disk, and this is the hint that lets it recover
-	// without a cluster-wide search of its own.
+func TestControllerExpandVolumePayloadCarriesNoNodeID(t *testing.T) {
+	// The agent resolves where an attached disk is open from the VHDX path, so
+	// the request has no node hint to send - not even an empty one.
 	agent := newFakeAgent(t, expanded(4*gibibyte, false))
-	server := &controllerServer{driver: New("", agentclient.New(agent.URL),
-		fake.NewSimpleClientset(
-			volumeAttachment(DriverName, "pvc-1", "csidevnode01"),
-			csiNode("csidevnode01", DriverName, "7a446141-becd-4c7e-968a-65257139f98c"),
-		))}
+	server := newControllerServer(agent)
 
 	if _, err := server.ControllerExpandVolume(context.Background(),
 		expandRequest("pvc-1", 4*gibibyte, 0)); err != nil {
 		t.Fatalf("ControllerExpandVolume: %v", err)
 	}
 
-	enqueued := agent.onlyEnqueued(t)
-	if enqueued.Payload.NodeID != "7a446141-becd-4c7e-968a-65257139f98c" {
-		t.Errorf("nodeId = %q, want the attached VM's ID", enqueued.Payload.NodeID)
-	}
-}
-
-func TestControllerExpandVolumeFailsRatherThanSilentlyDroppingAKubernetesLookupError(t *testing.T) {
-	// A Kubernetes API the driver cannot reach is indistinguishable from
-	// "nothing attached" if the error is swallowed - and reporting an
-	// attached volume as unattached is exactly the state that would send the
-	// agent's local read into a sharing violation with no hint to recover
-	// from. Failing the RPC costs a CSI retry, which is cheap; guessing wrong
-	// does not recover.
-	client := fake.NewSimpleClientset()
-	client.PrependReactor("list", "volumeattachments", func(ktesting.Action) (bool, runtime.Object, error) {
-		return true, nil, errors.New("connection refused")
-	})
-	agent := newFakeAgent(t, expanded(4*gibibyte, false))
-	server := &controllerServer{driver: New("", agentclient.New(agent.URL), client)}
-
-	_, err := server.ControllerExpandVolume(context.Background(), expandRequest("pvc-1", 4*gibibyte, 0))
-
-	if got := status.Code(err); got != codes.Internal {
-		t.Fatalf("code = %s, want Internal (err: %v)", got, err)
-	}
-	if len(agent.enqueued) != 0 {
-		t.Error("expected no job to be enqueued once the node lookup failed")
-	}
-}
-
-func TestControllerExpandVolumeCanceledCallerContextDuringNodeLookupIsNotInternal(t *testing.T) {
-	// The caller's own context ending while the VolumeAttachments lookup is in
-	// flight says nothing about whether Kubernetes is reachable, so it must not
-	// come back looking like the "API server unreachable" case above does -
-	// the same distinction enqueueFailed/pollStopped already make elsewhere.
-	client := fake.NewSimpleClientset()
-	client.PrependReactor("list", "volumeattachments", func(ktesting.Action) (bool, runtime.Object, error) {
-		return true, nil, errors.New("connection refused")
-	})
-	agent := newFakeAgent(t, expanded(4*gibibyte, false))
-	server := &controllerServer{driver: New("", agentclient.New(agent.URL), client)}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	_, err := server.ControllerExpandVolume(ctx, expandRequest("pvc-1", 4*gibibyte, 0))
-
-	if got := status.Code(err); got != codes.Canceled {
-		t.Fatalf("code = %s, want Canceled (err: %v)", got, err)
+	if raw, ok := agent.onlyEnqueued(t).PayloadFields["nodeId"]; ok {
+		t.Errorf("payload has nodeId %s, want no nodeId key at all", raw)
 	}
 }
 
@@ -1503,7 +1444,9 @@ func TestCreateSnapshotEnqueuesUnderTheSnapshotNameAsIdempotencyKey(t *testing.T
 	}
 }
 
-func TestCreateSnapshotEnqueuesNoNodeIdWhenTheSourceIsUnattached(t *testing.T) {
+func TestCreateSnapshotPayloadCarriesNoNodeID(t *testing.T) {
+	// Same as ControllerExpandVolume's: the agent resolves where an attached
+	// source is open from the VHDX path, so there is no node hint to send.
 	agent := newFakeAgent(t, succeeded(snapshotJSON("pvc-1~snap-1", "pvc-1", gibibyte, 1770000000, true)))
 	server := newControllerServer(agent)
 
@@ -1511,72 +1454,8 @@ func TestCreateSnapshotEnqueuesNoNodeIdWhenTheSourceIsUnattached(t *testing.T) {
 		t.Fatalf("CreateSnapshot: %v", err)
 	}
 
-	if got := agent.onlyEnqueued(t).Payload.NodeID; got != "" {
-		t.Errorf("nodeId = %q, want empty: nothing attaches this volume in the fake cluster", got)
-	}
-}
-
-func TestCreateSnapshotIncludesTheAttachedNodeWhenOneHoldsTheSource(t *testing.T) {
-	// The reason the lookup exists at all: the agent can only freeze an
-	// attached volume's base through a checkpoint if it knows which VM to
-	// take one on, and CreateSnapshotRequest itself carries no such hint.
-	agent := newFakeAgent(t, succeeded(snapshotJSON("pvc-1~snap-1", "pvc-1", gibibyte, 1770000000, false)))
-	server := &controllerServer{driver: New("", agentclient.New(agent.URL),
-		fake.NewSimpleClientset(
-			volumeAttachment(DriverName, "pvc-1", "csidevnode01"),
-			csiNode("csidevnode01", DriverName, "7a446141-becd-4c7e-968a-65257139f98c"),
-		))}
-
-	if _, err := server.CreateSnapshot(context.Background(), createSnapshotRequest("pvc-1", "snap-1")); err != nil {
-		t.Fatalf("CreateSnapshot: %v", err)
-	}
-
-	if got := agent.onlyEnqueued(t).Payload.NodeID; got != "7a446141-becd-4c7e-968a-65257139f98c" {
-		t.Errorf("nodeId = %q, want the attached VM's ID", got)
-	}
-}
-
-func TestCreateSnapshotFailsRatherThanSilentlyDroppingAKubernetesLookupError(t *testing.T) {
-	// Same reasoning as ControllerExpandVolume's own version of this test: a
-	// Kubernetes API the driver cannot reach is indistinguishable from
-	// "nothing attached" if swallowed, and reporting an attached source as
-	// unattached would send the agent's own local read into a sharing
-	// violation with no node hint to recover from.
-	client := fake.NewSimpleClientset()
-	client.PrependReactor("list", "volumeattachments", func(ktesting.Action) (bool, runtime.Object, error) {
-		return true, nil, errors.New("connection refused")
-	})
-	agent := newFakeAgent(t, succeeded(snapshotJSON("pvc-1~snap-1", "pvc-1", gibibyte, 1770000000, true)))
-	server := &controllerServer{driver: New("", agentclient.New(agent.URL), client)}
-
-	_, err := server.CreateSnapshot(context.Background(), createSnapshotRequest("pvc-1", "snap-1"))
-
-	if got := status.Code(err); got != codes.Internal {
-		t.Fatalf("code = %s, want Internal (err: %v)", got, err)
-	}
-	if n := agent.enqueueCount(); n != 0 {
-		t.Errorf("enqueued %d jobs, want none once the node lookup failed", n)
-	}
-}
-
-func TestCreateSnapshotCanceledCallerContextDuringNodeLookupIsNotInternal(t *testing.T) {
-	// Same reasoning as ControllerExpandVolume's own version of this test: a
-	// caller context that ends mid-lookup is an ordinary retry, not an
-	// unclassified fault.
-	client := fake.NewSimpleClientset()
-	client.PrependReactor("list", "volumeattachments", func(ktesting.Action) (bool, runtime.Object, error) {
-		return true, nil, errors.New("connection refused")
-	})
-	agent := newFakeAgent(t, succeeded(snapshotJSON("pvc-1~snap-1", "pvc-1", gibibyte, 1770000000, true)))
-	server := &controllerServer{driver: New("", agentclient.New(agent.URL), client)}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	_, err := server.CreateSnapshot(ctx, createSnapshotRequest("pvc-1", "snap-1"))
-
-	if got := status.Code(err); got != codes.Canceled {
-		t.Fatalf("code = %s, want Canceled (err: %v)", got, err)
+	if raw, ok := agent.onlyEnqueued(t).PayloadFields["nodeId"]; ok {
+		t.Errorf("payload has nodeId %s, want no nodeId key at all", raw)
 	}
 }
 
@@ -2128,7 +2007,7 @@ func attached(controllerID string, lun int) agentclient.Job {
 }
 
 func newControllerServer(agent *fakeAgent) *controllerServer {
-	return &controllerServer{driver: New("", agentclient.New(agent.URL), fake.NewSimpleClientset())}
+	return &controllerServer{driver: New("", agentclient.New(agent.URL))}
 }
 
 func createVolumeRequest(name string, requiredBytes, limitBytes int64) *csi.CreateVolumeRequest {
@@ -2185,6 +2064,10 @@ type enqueuedJob struct {
 		StartingToken    string `json:"startingToken"`
 		MaxEntries       int32  `json:"maxEntries"`
 	} `json:"payload"`
+	// PayloadFields is the same payload keyed by JSON field name, for asserting
+	// a key is absent rather than merely empty - which the union above cannot
+	// tell apart.
+	PayloadFields map[string]json.RawMessage `json:"-"`
 }
 
 // fakeAgent stands in for hyperv-csi-agent's job API. GET walks the supplied
@@ -2224,10 +2107,21 @@ func newFakeAgent(t *testing.T, sequence ...agentclient.Job) *fakeAgent {
 				t.Errorf("enqueued to %q, want /v1/jobs", r.URL.Path)
 			}
 
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("reading enqueue request: %v", err)
+			}
 			var request enqueuedJob
-			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			if err := json.Unmarshal(body, &request); err != nil {
 				t.Errorf("decoding enqueue request: %v", err)
 			}
+			var fields struct {
+				Payload map[string]json.RawMessage `json:"payload"`
+			}
+			if err := json.Unmarshal(body, &fields); err != nil {
+				t.Errorf("decoding enqueue request payload fields: %v", err)
+			}
+			request.PayloadFields = fields.Payload
 			agent.enqueued = append(agent.enqueued, request)
 
 			w.WriteHeader(http.StatusAccepted)

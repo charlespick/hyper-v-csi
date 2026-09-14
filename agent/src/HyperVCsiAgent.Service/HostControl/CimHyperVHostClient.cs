@@ -359,14 +359,26 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             _logger.LogInformation("detached {VhdxPath} from {VmId} on {HostName}", vhdxPath, vmId, hostName);
         }, cancellationToken);
 
-    public Task<long> GetDiskSizeAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+    public Task<bool> ReferencesDiskAsync(
+        string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
-            _logger.LogDebug("reading the virtual size of {VhdxPath} for {VmId} on {HostName}", vhdxPath, vmId, hostName);
+            _logger.LogDebug("checking whether {VmId} on {HostName} references {VhdxPath}", vmId, hostName, vhdxPath);
+            var deadline = CimDeadline.After(_hostOperationTimeout);
+            using var session = CimSession.Create(hostName);
+            using var settings = GetActiveSettings(session, hostName, vmId, deadline, cancellationToken);
+            return ReferencesDisk(session, settings, vmId, vhdxPath, deadline, cancellationToken);
+        }, cancellationToken);
+
+    public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken) =>
+        Task.Run(() =>
+        {
+            _logger.LogDebug("reading the setting data of {VhdxPath} on {HostName}", vhdxPath, hostName);
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
             using var service = GetImageManagementService(session, deadline, cancellationToken);
-            return ReadVirtualSize(session, service, vhdxPath, deadline, cancellationToken);
+            var settingData = ReadSettingData(session, service, vhdxPath, deadline, cancellationToken);
+            return new HostDiskInfo(ReadMaxInternalSize(settingData, vhdxPath), ReadVirtualDiskId(settingData, vhdxPath));
         }, cancellationToken);
 
     public Task<long> ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
@@ -724,6 +736,93 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// <see cref="ReferencesDiskAsync"/>'s traversal - the walk
+    /// <see cref="IsChainCollapsed"/> does, asking the other question: whether
+    /// anything on this VM is <paramref name="vhdxPath"/> or is built on it.
+    /// </summary>
+    /// <remarks>
+    /// Its own copy, following this file's rule that walks differing in when
+    /// they throw are not shared. This one sits between the two existing
+    /// postures: a checkpoint over the disk is an answer, not a refusal - the
+    /// caller wants to know which VM owns the disk, not whether it is safe to
+    /// touch - but a chain it cannot walk to the end is still refused rather
+    /// than read as "not this VM", because the caller is choosing which VM
+    /// to act on and a wrong "no" sends it to act on none.
+    /// </remarks>
+    private static bool ReferencesDisk(
+        CimSession session,
+        CimInstance settings,
+        string vmId,
+        string vhdxPath,
+        CimDeadline deadline,
+        CancellationToken cancellationToken)
+    {
+        var otherDisks = new List<string>();
+
+        foreach (var disk in DeviceSettings(session, settings, "Msvm_StorageAllocationSettingData", deadline, cancellationToken))
+        {
+            using (disk)
+            {
+                if ((disk.CimInstanceProperties["ResourceSubType"]?.Value as string) != VirtualHardDiskSubType)
+                {
+                    continue;
+                }
+
+                if (disk.CimInstanceProperties["HostResource"]?.Value is not string[] { Length: > 0 } hostResource)
+                {
+                    continue;
+                }
+
+                if (SamePath(hostResource[0], vhdxPath))
+                {
+                    return true;
+                }
+
+                otherDisks.Add(hostResource[0]);
+            }
+        }
+
+        if (otherDisks.Count == 0)
+        {
+            return false;
+        }
+
+        using var imageService = GetImageManagementService(session, deadline, cancellationToken);
+
+        foreach (var attached in otherDisks)
+        {
+            var descendant = attached;
+            var depth = 0;
+
+            for (; depth < MaxDifferencingChainDepth; depth++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if (ParentPathOf(session, imageService, descendant, deadline, cancellationToken) is not { } parent)
+                {
+                    break;
+                }
+
+                if (SamePath(parent, vhdxPath))
+                {
+                    return true;
+                }
+
+                descendant = parent;
+            }
+
+            if (depth == MaxDifferencingChainDepth)
+            {
+                throw new InvalidOperationException(
+                    $"{attached}'s differencing chain on {vmId} is still {MaxDifferencingChainDepth} disks deep " +
+                    $"without reaching a disk with no parent; cannot determine whether it is built on {vhdxPath}");
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -1119,12 +1218,21 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
 
     /// <summary>
     /// Reads a VHDX's current virtual size using an already-open session and
-    /// service instance, shared by <see cref="GetDiskSizeAsync"/> (which opens
-    /// both just for this) and <see cref="ResizeDiskAsync"/> (which reuses the
-    /// ones its resize call already opened) - the same split
+    /// service instance, for <see cref="ResizeDiskAsync"/>'s read-back on the
+    /// session its resize call already opened - the same split
     /// CimVirtualDiskManager.ReadVirtualSize makes for the local case.
     /// </summary>
     private long ReadVirtualSize(
+        CimSession session, CimInstance service, string path, CimDeadline deadline, CancellationToken cancellationToken) =>
+        ReadMaxInternalSize(ReadSettingData(session, service, path, deadline, cancellationToken), path);
+
+    /// <summary>
+    /// A VHDX's <c>Msvm_VirtualHardDiskSettingData</c>, as the embedded-instance
+    /// XML GetVirtualHardDiskSettingData returns it. Shared by
+    /// <see cref="ReadVirtualSize"/> and <see cref="GetDiskInfoAsync"/>, which
+    /// read different properties out of the one document.
+    /// </summary>
+    private string ReadSettingData(
         CimSession session, CimInstance service, string path, CimDeadline deadline, CancellationToken cancellationToken)
     {
         var parameters = new CimMethodParametersCollection
@@ -1147,7 +1255,30 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                 : $"GetVirtualHardDiskSettingData for {path} deferred to a job, which does not populate its out parameters");
         }
 
-        return ReadMaxInternalSize(settingData, path);
+        return settingData;
+    }
+
+    /// <summary>
+    /// <c>VirtualDiskId</c> out of the same setting data
+    /// <see cref="ReadMaxInternalSize"/> reads. Measured to be the value
+    /// <c>Get-VHD</c> reports as <c>DiskIdentifier</c>, in the same byte
+    /// order - the identity <c>VhdxDiskIdentity</c> reads out of the file
+    /// itself when the file can be opened.
+    /// </summary>
+    private static Guid ReadVirtualDiskId(string settingDataXml, string path)
+    {
+        var value = XDocument.Parse(settingDataXml)
+            .Descendants("PROPERTY")
+            .FirstOrDefault(property => (string?)property.Attribute("NAME") == "VirtualDiskId")
+            ?.Element("VALUE")
+            ?.Value;
+
+        if (!Guid.TryParse(value, out var diskId) || diskId == Guid.Empty)
+        {
+            throw new InvalidOperationException($"could not read VirtualDiskId for {path} from its setting data");
+        }
+
+        return diskId;
     }
 
     /// <summary>

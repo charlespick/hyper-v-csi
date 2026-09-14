@@ -120,24 +120,7 @@ func main() {
 		}
 	}
 
-	// Only controller mode needs it: ControllerExpandVolume is the one RPC
-	// that has to ask Kubernetes something CSI's own request does not carry,
-	// which node (if any) currently has a volume attached. In-cluster config
-	// is what a pod running under its own ServiceAccount uses, the same way
-	// every sidecar in this chart already talks to the API server.
-	var kubeClient kubernetes.Interface
-	if *mode == "controller" {
-		config, err := rest.InClusterConfig()
-		if err != nil {
-			klog.Fatalf("building in-cluster Kubernetes config: %v", err)
-		}
-		kubeClient, err = kubernetes.NewForConfig(config)
-		if err != nil {
-			klog.Fatalf("building Kubernetes client: %v", err)
-		}
-	}
-
-	d := driver.New(*nodeID, agent, kubeClient)
+	d := driver.New(*nodeID, agent)
 
 	// Kubelet stops the container with SIGTERM. Established here rather than
 	// just before Serve because the node-fencing controller below shares it:
@@ -146,6 +129,19 @@ func main() {
 	defer stop()
 
 	if *nodeFencing {
+		// Node fencing is the only thing that talks to Kubernetes, so the client
+		// is built only when it is on. In-cluster config is what a pod running
+		// under its own ServiceAccount uses, the same way every sidecar in this
+		// chart already talks to the API server.
+		config, err := rest.InClusterConfig()
+		if err != nil {
+			klog.Fatalf("building in-cluster Kubernetes config: %v", err)
+		}
+		kubeClient, err := kubernetes.NewForConfig(config)
+		if err != nil {
+			klog.Fatalf("building Kubernetes client: %v", err)
+		}
+
 		fencer, err := nodefencing.New(nodefencing.Config{
 			KubeClient:    kubeClient,
 			ClusterStates: agent,

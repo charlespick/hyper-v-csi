@@ -34,6 +34,20 @@ public static class JobTargets
     public static string Volume(string volumeId) => "volume:" + volumeId;
 
     /// <summary>
+    /// The fast half of an ExpandVolume: repeat requests for one volume queue
+    /// behind each other here, while the resize itself - an internal job,
+    /// <c>VhdxService.ExpandDisk</c> - takes <see cref="Volume"/> and, for a
+    /// disk a VM has open, <see cref="Vm"/>.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately not <see cref="Volume"/>, for the same reason
+    /// <see cref="Snapshot"/> is not: the fast job waits on the internal one,
+    /// and a waiter holding the target the job it waits on needs would never
+    /// see that job start.
+    /// </remarks>
+    public static string Expansion(string volumeId) => "expand:" + volumeId;
+
+    /// <summary>
     /// The VM, for anything that reaches into it. Two attaches to one VM must
     /// not run at once - they would race for the same free SCSI slot - and,
     /// more sharply, nothing else may touch a VM while a snapshot copy is

@@ -61,12 +61,12 @@ namespace HyperVCsiAgent.Core.Storage;
 /// this service's logs rather than through the controller, which is why they are
 /// logged loudly rather than merely thrown.
 ///
-/// An attached source needs a node hint - <c>CreateAsync</c>'s
-/// <c>nodeId</c> parameter - because CSI's own CreateSnapshotRequest carries
-/// none; the Go controller resolves it the same way
-/// ControllerExpandVolume's attached-disk fallback does. With no hint, a
-/// locked source is refused exactly as it always has been: this agent has no
-/// way to freeze a disk it cannot even identify a VM for.
+/// An attached source is recognized from the disk itself: a source something
+/// has open is traced to the host holding it and the clustered VM there it
+/// belongs to (<see cref="IVhdxLocationService"/>), and that is the VM its
+/// checkpoint is taken through. A source held by anything else is refused
+/// exactly as it always has been: this agent has no way to freeze a disk it
+/// cannot identify a VM for.
 /// </remarks>
 public sealed class SnapshotService : ISnapshotService
 {
@@ -133,8 +133,18 @@ public sealed class SnapshotService : ISnapshotService
     /// </summary>
     private readonly IJobStore _jobs;
 
-    /// <summary>Resolves a node hint to the VM and host an attached source's checkpoint has to be taken through.</summary>
+    /// <summary>
+    /// Resolves the VM a copy is serialized on to the host it runs on now: by
+    /// the time a copy runs it already knows which VM it holds, and that VM
+    /// may have migrated since it was found.
+    /// </summary>
     private readonly IClusterService _cluster;
+
+    /// <summary>
+    /// Finds which VM, if any, has an attached source open - the question
+    /// <see cref="CreateAsync"/> starts from, with only a path to go on.
+    /// </summary>
+    private readonly IVhdxLocationService _location;
 
     /// <summary>Takes, tags and destroys the checkpoint that freezes an attached source's base VHDX.</summary>
     private readonly IHyperVHostClient _host;
@@ -206,6 +216,7 @@ public sealed class SnapshotService : ISnapshotService
         IDiskCopier copier,
         IJobStore jobs,
         IClusterService cluster,
+        IVhdxLocationService location,
         IHyperVHostClient host,
         HostOperationSlots hostSlots,
         SnapshotCopySlots copySlots,
@@ -216,6 +227,7 @@ public sealed class SnapshotService : ISnapshotService
         _copier = copier;
         _jobs = jobs;
         _cluster = cluster;
+        _location = location;
         _host = host;
         _hostSlots = hostSlots;
         _copySlots = copySlots;
@@ -223,8 +235,7 @@ public sealed class SnapshotService : ISnapshotService
         _logger = logger;
     }
 
-    public async Task<SnapshotResult> CreateAsync(
-        string sourceVolumeId, string snapshotName, string? nodeId, CancellationToken cancellationToken)
+    public async Task<SnapshotResult> CreateAsync(string sourceVolumeId, string snapshotName, CancellationToken cancellationToken)
     {
         var snapshotId = SnapshotNaming.ComposeId(sourceVolumeId, snapshotName);
         var snapshotPath = SnapshotNaming.ResolvePath(_options.CsvSnapshotsRoot, snapshotId);
@@ -300,8 +311,8 @@ public sealed class SnapshotService : ISnapshotService
             // one cannot assume the volume is still in the state the original
             // call found it in. A volume attached between an abandoned copy and
             // its restart is the case that makes this matter.
-            var allocatedBytes = await InspectSourceAsync(
-                snapshotId, sourceVolumeId, snapshotName, sourcePath, nodeId, attempt, cancellationToken).ConfigureAwait(false);
+            var source = await InspectSourceAsync(
+                snapshotId, sourceVolumeId, snapshotName, sourcePath, attempt, cancellationToken).ConfigureAwait(false);
 
             // Created before the volume is inspected for space, because
             // InspectTargetAsync reports a missing directory as NotFound - which
@@ -316,22 +327,21 @@ public sealed class SnapshotService : ISnapshotService
             // the copy actually has to move. SnapshotResult.SizeBytes is the
             // source's *virtual* size, what a restore will need. Mixing them up
             // refuses every snapshot of a sparsely used dynamic disk.
-            target.EnsureRoomFor(allocatedBytes, sourcePath, _options.CsvSnapshotsRoot);
+            target.EnsureRoomFor(source.AllocatedBytes, sourcePath, _options.CsvSnapshotsRoot);
 
             EnsureNameIsFree(snapshotId, sourceVolumeId, snapshotName);
 
-            // The node hint, not InspectSourceAsync's own classification: this
-            // job may or may not end up needing the VM - an attached source
-            // does, an unattached one (or no hint at all) does not - and
-            // RunCopyAsync re-derives which at the point it actually matters
-            // rather than trusting what was true at enqueue time. Taking the
-            // hint at face value here means a hint that is stale by the time
-            // the copy runs over-serializes slightly - a vm: target held
-            // against a VM this copy turns out not to touch - which is
-            // harmless and strictly the safe direction to be wrong in.
-            var targets = nodeId is null
+            // The VM InspectSourceAsync found holding the source, not its
+            // classification: this job may or may not end up needing the VM,
+            // and RunCopyAsync re-derives which at the point it actually
+            // matters rather than trusting what was true at enqueue time. A VM
+            // that has let go of the source by the time the copy runs
+            // over-serializes slightly - a vm: target held against a VM this
+            // copy turns out not to touch - which is harmless and strictly the
+            // safe direction to be wrong in.
+            var targets = source.VmId is null
                 ? new[] { JobTargets.Volume(sourceVolumeId) }
-                : new[] { JobTargets.Vm(nodeId), JobTargets.Volume(sourceVolumeId) };
+                : new[] { JobTargets.Vm(source.VmId), JobTargets.Volume(sourceVolumeId) };
 
             // IJobStore.GetOrCreate is doing the recovery reasoning here, not
             // this method, and the mapping is close to exact:
@@ -351,7 +361,7 @@ public sealed class SnapshotService : ISnapshotService
             var copy = _jobs.GetOrCreate(
                 snapshotId, CopySnapshot, targets,
                 (job, ct) => RunCopyAsync(
-                    job, snapshotId, sourceVolumeId, snapshotName, nodeId, sourcePath, snapshotPath, copyingPath, ct));
+                    job, snapshotId, sourceVolumeId, snapshotName, source.VmId, sourcePath, snapshotPath, copyingPath, ct));
 
             await AwaitCheckpointAsync(copy, snapshotId, snapshotPath, copyingPath, attempt.Token).ConfigureAwait(false);
 
@@ -772,7 +782,7 @@ public sealed class SnapshotService : ISnapshotService
     /// step (Decision 5) for the single most important choice in this file.
     /// </remarks>
     private async Task RunCopyAsync(
-        Job job, string snapshotId, string sourceVolumeId, string snapshotName, string? nodeId,
+        Job job, string snapshotId, string sourceVolumeId, string snapshotName, string? vmId,
         string sourcePath, string snapshotPath, string copyingPath, CancellationToken cancellationToken)
     {
         using var attempt = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -811,10 +821,10 @@ public sealed class SnapshotService : ISnapshotService
                 // waiting for the collapse before this delegate returns,
                 // rather than left standing: nothing else will ever revisit
                 // it.
-                if (nodeId is not null)
+                if (vmId is not null)
                 {
                     await DestroyOwnedCheckpointAndWaitAsync(
-                        snapshotId, sourceVolumeId, snapshotName, nodeId, sourcePath, attempt.Token).ConfigureAwait(false);
+                        snapshotId, sourceVolumeId, snapshotName, vmId, sourcePath, attempt.Token).ConfigureAwait(false);
                 }
 
                 return;
@@ -848,10 +858,10 @@ public sealed class SnapshotService : ISnapshotService
                 // else will ever revisit it - the same reasoning that makes
                 // the ordinary post-copy call below unconditional, not
                 // skippable just because there is nothing left to publish.
-                if (nodeId is not null)
+                if (vmId is not null)
                 {
                     await DestroyOwnedCheckpointAndWaitAsync(
-                        snapshotId, sourceVolumeId, snapshotName, nodeId, sourcePath, attempt.Token).ConfigureAwait(false);
+                        snapshotId, sourceVolumeId, snapshotName, vmId, sourcePath, attempt.Token).ConfigureAwait(false);
                 }
 
                 // The tombstone's own job is done: a fresh CreateSnapshot for
@@ -916,21 +926,20 @@ public sealed class SnapshotService : ISnapshotService
                 // the volume to have been detached entirely. Acting on a
                 // stale VM or a stale classification would checkpoint (or
                 // fail to checkpoint) the wrong host, or the wrong reality.
-                if (nodeId is not null)
+                if (vmId is not null)
                 {
-                    var vm = await _cluster.ResolveVmAsync(nodeId, attempt.Token).ConfigureAwait(false);
+                    var vm = await _cluster.ResolveVmAsync(vmId, attempt.Token).ConfigureAwait(false);
                     if (vm is null)
                     {
-                        // Go's hint no longer resolves to a VM at all -
-                        // detached, most plausibly, in the time this copy
-                        // spent queued. The copy proceeds with no
-                        // checkpoint; if the disk really is still open by
-                        // something, the copy below fails on a sharing
-                        // violation, which is the honest outcome rather
-                        // than a guess.
+                        // The VM this copy was queued against has left the
+                        // cluster in the time the copy spent queued. The
+                        // copy proceeds with no checkpoint; if the disk
+                        // really is still open by something, the copy below
+                        // fails on a sharing violation, which is the honest
+                        // outcome rather than a guess.
                         _logger.LogInformation(
-                            "CopySnapshot {SnapshotId}: {NodeId} no longer resolves to a VM; copying with no checkpoint",
-                            snapshotId, nodeId);
+                            "CopySnapshot {SnapshotId}: {VmId} no longer resolves to a clustered VM; copying with no checkpoint",
+                            snapshotId, vmId);
                     }
                     else
                     {
@@ -1114,8 +1123,9 @@ public sealed class SnapshotService : ISnapshotService
                 // until an operator deleted it by hand.
                 if (checkpointTaken)
                 {
+                    // Only ever set inside the vmId-is-not-null branch above.
                     await DestroyOwnedCheckpointAndWaitAsync(
-                        snapshotId, sourceVolumeId, snapshotName, nodeId, sourcePath, attempt.Token).ConfigureAwait(false);
+                        snapshotId, sourceVolumeId, snapshotName, vmId!, sourcePath, attempt.Token).ConfigureAwait(false);
                 }
 
                 // The publish. Until this rename the snapshot does not exist as far
@@ -1172,19 +1182,22 @@ public sealed class SnapshotService : ISnapshotService
 
     /// <summary>
     /// Preconditions 1 and 2, and the measurement precondition 3 needs - all
-    /// without taking a checkpoint. Taking one, when one is owed, is
-    /// RunCopyAsync's job now (Decision 5); this method only ever classifies
-    /// and measures the source, and - for any attached source - refuses one
-    /// whose VM cannot take a checkpoint at all.
+    /// without taking a checkpoint - plus the VM, if any, whose <c>vm:</c>
+    /// target the copy has to be enqueued under. Taking the checkpoint, when
+    /// one is owed, is RunCopyAsync's job now (Decision 5); this method only
+    /// ever classifies and measures the source, and - for any attached source
+    /// - refuses one whose VM cannot take a checkpoint at all.
     /// </summary>
     /// <remarks>
-    /// With no node hint, this is exactly the local-open check it always was:
-    /// there is no API that answers "is this VHDX attached to a running VM"
-    /// from the CSV side without one, so a sharing violation is read as
-    /// "attached, and this agent has nothing to resolve it with" and refused.
+    /// A source nothing has open is read locally, and that is the whole check.
+    /// A source something has open is traced to the host holding it and the
+    /// clustered VM on that host it belongs to, and a source held by anything
+    /// but such a VM is answered by the same local read, the way it always
+    /// was: it succeeds against a reader that shares, and is refused against
+    /// one that does not.
     ///
-    /// With a node hint, this asks Hyper-V directly instead of guessing from a
-    /// local open - <see cref="IHyperVHostClient.ClassifyAttachmentAsync"/>
+    /// For a VM, this asks Hyper-V directly instead of guessing from a local
+    /// open - <see cref="IHyperVHostClient.ClassifyAttachmentAsync"/>
     /// tells the difference between not attached, attached with nothing in the
     /// way, attached behind a checkpoint this driver already took for this
     /// exact snapshot, and attached behind one this driver took for a
@@ -1202,8 +1215,8 @@ public sealed class SnapshotService : ISnapshotService
     /// whether the VM is free to be copied - the copy queue (via <c>vm:</c>)
     /// decides that instead, and this method just measures.
     /// </remarks>
-    private async Task<long> InspectSourceAsync(
-        string snapshotId, string sourceVolumeId, string snapshotName, string sourcePath, string? nodeId,
+    private async Task<(long AllocatedBytes, string? VmId)> InspectSourceAsync(
+        string snapshotId, string sourceVolumeId, string snapshotName, string sourcePath,
         CancellationTokenSource attempt, CancellationToken callerToken)
     {
         if (!File.Exists(sourcePath))
@@ -1212,22 +1225,18 @@ public sealed class SnapshotService : ISnapshotService
                 $"snapshot {snapshotId} cannot be taken: source volume {sourceVolumeId} has no disk at {sourcePath}");
         }
 
-        if (string.IsNullOrEmpty(nodeId))
+        if (!IsHeldOpen(sourcePath))
         {
-            return OpenSourceLocally(snapshotId, sourceVolumeId, sourcePath);
+            return (OpenSourceLocally(snapshotId, sourceVolumeId, sourcePath), null);
         }
 
-        var vm = await _cluster.ResolveVmAsync(nodeId, attempt.Token).ConfigureAwait(false);
-        if (vm is null)
+        var (host, vmId) = await LocateHolderAsync(snapshotId, sourcePath, attempt.Token).ConfigureAwait(false);
+        if (vmId is null)
         {
-            // Go believes this volume is attached to a node the cluster
-            // cannot resolve. Reading it locally answers correctly either
-            // way: it succeeds if the volume is genuinely unattached (a stale
-            // VolumeAttachment, most plausibly) and reports the same refusal
-            // as always if something else still has it open.
-            return OpenSourceLocally(snapshotId, sourceVolumeId, sourcePath);
+            return (OpenSourceLocally(snapshotId, sourceVolumeId, sourcePath), null);
         }
 
+        var vm = new ClusteredVm(vmId, host);
         var elementName = CheckpointElementName(sourceVolumeId, snapshotName);
         VolumeAttachment attachment;
 
@@ -1261,9 +1270,9 @@ public sealed class SnapshotService : ISnapshotService
         switch (attachment.Kind)
         {
             case VolumeAttachmentKind.NotAttached:
-                // Go's hint did not pan out - answer from a local read, same
-                // as having no hint at all.
-                return OpenSourceLocally(snapshotId, sourceVolumeId, sourcePath);
+                // Let go of between the trace and this call - answer from a
+                // local read, the same as a source nothing had open.
+                return (OpenSourceLocally(snapshotId, sourceVolumeId, sourcePath), null);
 
             case VolumeAttachmentKind.BehindOwnedCheckpoint:
                 // Resuming: an earlier attempt already froze the base.
@@ -1322,7 +1331,7 @@ public sealed class SnapshotService : ISnapshotService
                         $"snapshot {snapshotId} cannot be taken: {vm.VmId} is not set to ProductionOnly checkpoints");
                 }
 
-                return new FileInfo(sourcePath).Length;
+                return (new FileInfo(sourcePath).Length, vm.VmId);
 
             default:
                 throw new JobFailureException(
@@ -1331,8 +1340,65 @@ public sealed class SnapshotService : ISnapshotService
     }
 
     /// <summary>
-    /// The no-hint (and no-longer-attached) case: open the source directly and
-    /// report its allocated size, or refuse if something else has it open.
+    /// Whether anything at all has <paramref name="path"/> open, readers
+    /// included - the premise <see cref="IVhdxLocationService.ResolveHostAsync"/>
+    /// needs before its answer means anything.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately stricter than <see cref="OpenSourceLocally"/>'s own open,
+    /// which shares reads. The base of a differencing chain is held open for
+    /// reading only - which is how several children can share one parent - so
+    /// a sharing open succeeds against a source that a checkpoint, this
+    /// driver's for a sibling volume or anyone else's, has already frozen, and
+    /// would read it as unattached. Denying all sharing is what trips on that
+    /// reader too.
+    /// </remarks>
+    private static bool IsHeldOpen(string path)
+    {
+        try
+        {
+            using var probe = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None);
+            return false;
+        }
+        catch (IOException ex) when (ex.HResult is SharingViolationHResult or LockViolationHResult or UserMappedFileHResult)
+        {
+            return true;
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException or UnauthorizedAccessException)
+        {
+            // Not this probe's to report: OpenSourceLocally makes the real
+            // open next, and says what each of these means for a snapshot.
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// The host holding <paramref name="sourcePath"/> open and the clustered VM
+    /// on it the source belongs to, or null for the VM when it belongs to none.
+    /// </summary>
+    private async Task<(string Host, string? VmId)> LocateHolderAsync(
+        string snapshotId, string sourcePath, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var host = await _location.ResolveHostAsync(sourcePath, cancellationToken).ConfigureAwait(false);
+            var vmId = await _location.ResolveVmOnHostAsync(host, sourcePath, cancellationToken).ConfigureAwait(false);
+            return (host, vmId);
+        }
+        catch (InvalidOperationException ex)
+        {
+            throw new JobFailureException(
+                AgentErrorCodes.Internal,
+                $"snapshot {snapshotId} cannot be taken yet: {sourcePath} is open by something this agent could not " +
+                $"trace: {ex.Message}",
+                ex);
+        }
+    }
+
+    /// <summary>
+    /// The unattached case, and the case of a source held by anything but a VM
+    /// this driver manages: open the source directly and report its allocated
+    /// size, or refuse if whatever has it open does not share it.
     /// </summary>
     private static long OpenSourceLocally(string snapshotId, string sourceVolumeId, string sourcePath)
     {
@@ -1354,14 +1420,14 @@ public sealed class SnapshotService : ISnapshotService
         }
         catch (IOException ex) when (ex.HResult is SharingViolationHResult or LockViolationHResult or UserMappedFileHResult)
         {
-            // Attached, with no node hint to resolve it through - this agent
-            // has nothing left to try. FailedPrecondition rather than Internal
-            // because no amount of retrying changes it on its own: either the
-            // volume gets detached, or a later CreateSnapshot arrives with a
-            // node hint the Go side could resolve.
+            // Held by something that is not a VM this driver manages, so there
+            // is no checkpoint to freeze it through and nothing left to try.
+            // FailedPrecondition rather than Internal because no amount of
+            // retrying changes it on its own: whatever has it open has to let
+            // go of it first.
             throw JobFailureException.FailedPrecondition(
-                $"snapshot {snapshotId} cannot be taken: {sourcePath} is open by something else, most likely a " +
-                "running VM with the volume attached, and no attaching node was given to freeze it through");
+                $"snapshot {snapshotId} cannot be taken: {sourcePath} is open by something other than a VM this " +
+                "driver manages, so there is no checkpoint to freeze it through");
         }
         catch (UnauthorizedAccessException ex)
         {
@@ -1645,7 +1711,7 @@ public sealed class SnapshotService : ISnapshotService
     /// </para>
     /// </remarks>
     private async Task DestroyOwnedCheckpointAndWaitAsync(
-        string snapshotId, string sourceVolumeId, string snapshotName, string? nodeId, string sourcePath,
+        string snapshotId, string sourceVolumeId, string snapshotName, string vmId, string sourcePath,
         CancellationToken cancellationToken)
     {
         var elementName = CheckpointElementName(sourceVolumeId, snapshotName);
@@ -1653,14 +1719,14 @@ public sealed class SnapshotService : ISnapshotService
         ClusteredVm? vm;
         try
         {
-            vm = await _cluster.ResolveVmAsync(nodeId!, cancellationToken).ConfigureAwait(false);
+            vm = await _cluster.ResolveVmAsync(vmId, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
             _logger.LogWarning(
-                "CopySnapshot {SnapshotId}: resolving {NodeId} for the merge of checkpoint {ElementName} was " +
+                "CopySnapshot {SnapshotId}: resolving {VmId} for the merge of checkpoint {ElementName} was " +
                 "cancelled; whatever stands is left for OrphanedCheckpointReaper's next sweep",
-                snapshotId, nodeId, elementName);
+                snapshotId, vmId, elementName);
             return;
         }
         catch (Exception ex)
@@ -1669,22 +1735,22 @@ public sealed class SnapshotService : ISnapshotService
             // has already read everything it needs, so a checkpoint problem
             // is not this snapshot's failure - see this method's own remarks.
             _logger.LogError(ex,
-                "CopySnapshot {SnapshotId}: resolving {NodeId} for the merge of checkpoint {ElementName} failed; " +
+                "CopySnapshot {SnapshotId}: resolving {VmId} for the merge of checkpoint {ElementName} failed; " +
                 "whatever stands is left for OrphanedCheckpointReaper's next sweep",
-                snapshotId, nodeId, elementName);
+                snapshotId, vmId, elementName);
             return;
         }
 
         if (vm is null)
         {
-            // The cluster no longer resolves this hint at all - the VM was
-            // removed, most plausibly. Nothing here can name a host to look
-            // a checkpoint up on, so there is nothing left to do; if a
-            // checkpoint genuinely stands somewhere, an operator finding the
-            // VM gone entirely has a bigger problem than this one snapshot.
+            // The cluster no longer knows this VM at all - removed, most
+            // plausibly. Nothing here can name a host to look a checkpoint up
+            // on, so there is nothing left to do; if a checkpoint genuinely
+            // stands somewhere, an operator finding the VM gone entirely has a
+            // bigger problem than this one snapshot.
             _logger.LogWarning(
-                "CopySnapshot {SnapshotId}: {NodeId} no longer resolves to a VM; skipping the merge-collapse wait",
-                snapshotId, nodeId);
+                "CopySnapshot {SnapshotId}: {VmId} no longer resolves to a clustered VM; skipping the merge-collapse wait",
+                snapshotId, vmId);
             return;
         }
 

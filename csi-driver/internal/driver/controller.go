@@ -761,15 +761,6 @@ func unsupportedCapability(capability *csi.VolumeCapability) string {
 type expandVolumePayload struct {
 	VolumeID  string `json:"volumeId"`
 	SizeBytes int64  `json:"sizeBytes"`
-	// NodeID is the CSI node ID of the VM currently holding this volume
-	// attached, when one does - empty otherwise, which covers the common case
-	// of an unattached or not-yet-attached volume. CSI's own request carries
-	// nothing like it, unlike ControllerPublishVolume/UnpublishVolume's, so
-	// this driver finds it itself via findAttachedNode before enqueueing. The
-	// agent's own local read already handles the unattached case without it;
-	// this only matters when a running VM has the disk open, which is exactly
-	// the case ONLINE expansion exists to grow.
-	NodeID string `json:"nodeId,omitempty"`
 }
 
 type expandVolumeResult struct {
@@ -818,23 +809,11 @@ func (s *controllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 		return nil, err
 	}
 
-	// Errors here fail the RPC rather than degrading to "no hint": Kubernetes
-	// is the only place that knows which node has this volume attached, so an
-	// API server this driver cannot reach is indistinguishable from "nothing
-	// attached" if silently swallowed - and reporting the volume falsely
-	// unattached is exactly the state that sends the agent's own local read
-	// into a sharing violation it has no hint left to recover from. CSI
-	// retries this RPC, so failing loudly on a transient API server blip costs
-	// a retry, not correctness.
-	nodeID, err := findAttachedNode(ctx, s.driver.KubeClient, req.GetVolumeId())
-	if err != nil {
-		return nil, findAttachedNodeFailed(ctx, err, "finding which node has %s attached", req.GetVolumeId())
-	}
-
+	// No node hint: the agent resolves where an attached disk is open from the
+	// VHDX path itself.
 	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetVolumeId(), operationExpandVolume, expandVolumePayload{
 		VolumeID:  req.GetVolumeId(),
 		SizeBytes: sizeBytes,
-		NodeID:    nodeID,
 	})
 	if err != nil {
 		return nil, enqueueFailed(ctx, err, "enqueueing ControllerExpandVolume for %s", req.GetVolumeId())
@@ -911,11 +890,6 @@ func pickExpandSize(capacityRange *csi.CapacityRange) (int64, error) {
 type createSnapshotPayload struct {
 	SourceVolumeID string `json:"sourceVolumeId"`
 	SnapshotName   string `json:"snapshotName"`
-	// NodeID is the CSI node ID of the VM currently holding the source volume
-	// attached, when one exists - found via findAttachedNode the same way
-	// expandVolumePayload.NodeID is, since CSI's own request carries neither.
-	// Empty for an unattached source.
-	NodeID string `json:"nodeId,omitempty"`
 }
 
 // snapshotResult is the agent's description of one snapshot, matching
@@ -1011,27 +985,15 @@ func (s *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 	// on them would look like support for them; dropping them here keeps the gap
 	// where it already is, and honest.
 
-	// CreateSnapshotRequest carries no node hint, unlike ControllerPublish/
-	// UnpublishVolume's own — the same gap ControllerExpandVolume has, and the
-	// same fix: ask Kubernetes which node the VolumeAttachment API says has
-	// this volume, so the agent can freeze it through a checkpoint if it's
-	// attached. An empty result is not an error - most snapshots are of
-	// unattached volumes, and the agent's own local read already handles that
-	// case without any hint at all.
-	nodeID, err := findAttachedNode(ctx, s.driver.KubeClient, req.GetSourceVolumeId())
-	if err != nil {
-		return nil, findAttachedNodeFailed(ctx, err, "finding which node has %s attached", req.GetSourceVolumeId())
-	}
-
 	// The snapshot name is the idempotency key (docs/rpc-surface-overview.md),
 	// so a retry from external-snapshotter for the same VolumeSnapshot
 	// re-attaches to the job in flight instead of starting a second copy of the
-	// same disk.
+	// same disk. No node hint: the agent resolves where an attached source is
+	// open from the VHDX path itself.
 	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetName(), operationCreateSnapshot,
 		createSnapshotPayload{
 			SourceVolumeID: req.GetSourceVolumeId(),
 			SnapshotName:   req.GetName(),
-			NodeID:         nodeID,
 		})
 	if err != nil {
 		return nil, enqueueFailed(ctx, err,

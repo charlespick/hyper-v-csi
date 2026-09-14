@@ -42,20 +42,20 @@ public interface IVhdxService
     /// shrink truncates the virtual disk regardless of what the guest
     /// filesystem has written up there, and CSI has no way to ask for one
     /// anyway - external-resizer only ever raises a PVC's request.
+    /// <para>
+    /// A disk a running VM has open cannot be read or grown locally; that case
+    /// is found from the path itself - the host that has it open, and the VM
+    /// on it - and grown through that host, serialized on that VM.
+    /// </para>
     /// </remarks>
-    /// <param name="nodeId">
-    /// The CSI node ID of the VM currently holding the volume attached, if the
-    /// Go driver found one - see <see cref="ExpandVolumePayload.NodeId"/>. Only
-    /// consulted when the disk cannot be read locally because something else
-    /// has it open: the local path is tried first regardless, since it is
-    /// correct and cheaper whenever it works.
-    /// </param>
     /// <exception cref="Jobs.JobFailureException">
     /// NotFound if no VHDX exists for this volume ID. Unlike DeleteAsync,
     /// absence is not success here - there is nothing to grow, and no retry
-    /// will bring the disk into existence.
+    /// will bring the disk into existence. Aborted if the resize is still
+    /// queued behind other work on the same volume or VM when this gives up
+    /// waiting for it; a retry attaches to that same queued resize.
     /// </exception>
-    Task<ExpandVolumeResult> ExpandAsync(string volumeId, long newSizeBytes, string? nodeId, CancellationToken cancellationToken);
+    Task<ExpandVolumeResult> ExpandAsync(string volumeId, long newSizeBytes, CancellationToken cancellationToken);
 
     /// <summary>
     /// Deletes the volume's VHDX. Succeeds when there is nothing to delete,

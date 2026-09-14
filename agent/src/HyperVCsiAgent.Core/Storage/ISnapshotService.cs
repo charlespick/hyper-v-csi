@@ -35,25 +35,21 @@ public interface ISnapshotService
     /// again until it flips true, which is also what makes an agent that
     /// restarted mid-copy answer correctly: readiness is re-derived from the
     /// files, which survive, not from the job record, which does not.
+    ///
+    /// Whether the source is attached is worked out from its path: a source
+    /// something has open is traced to the host holding it and the VM on that
+    /// host it belongs to, which is the VM its checkpoint is taken through.
     /// </remarks>
-    /// <param name="nodeId">
-    /// The CSI node ID of the VM currently holding the source volume attached,
-    /// if the Go driver found one - see <see cref="ExpandVolumePayload.NodeId"/>
-    /// for the same hint on ExpandVolume. Only consulted when the source cannot
-    /// be read locally because something else has it open; null or empty means
-    /// either an unattached source or nothing to resolve an attached one
-    /// through, both of which are answered the way they always have been.
-    /// </param>
     /// <exception cref="Jobs.JobFailureException">
     /// NotFound if the source volume has no VHDX; FailedPrecondition if the
-    /// source is held open and either no node hint was given or the VM it names
-    /// sits behind a differencing chain this driver did not create;
-    /// ResourceExhausted if the CSV has no room for the copy; AlreadyExists if
-    /// this snapshot name is already taken by a snapshot of a different volume,
-    /// which is what CSI requires for an incompatible name collision.
+    /// source is held open by something other than a VM this driver manages,
+    /// or the VM holding it sits behind a differencing chain this driver did
+    /// not create; ResourceExhausted if the CSV has no room for the copy;
+    /// AlreadyExists if this snapshot name is already taken by a snapshot of a
+    /// different volume, which is what CSI requires for an incompatible name
+    /// collision.
     /// </exception>
-    Task<SnapshotResult> CreateAsync(
-        string sourceVolumeId, string snapshotName, string? nodeId, CancellationToken cancellationToken);
+    Task<SnapshotResult> CreateAsync(string sourceVolumeId, string snapshotName, CancellationToken cancellationToken);
 
     /// <summary>
     /// Removes a snapshot and any in-progress copy of it. Succeeds when there is

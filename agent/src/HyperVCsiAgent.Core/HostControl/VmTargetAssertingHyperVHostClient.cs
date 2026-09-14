@@ -23,7 +23,8 @@ namespace HyperVCsiAgent.Core.HostControl;
 /// <para>
 /// Read-only calls are deliberately exempt: <see cref="FindAttachedDiskAsync"/>,
 /// <see cref="IsDiskAttachedAsync"/>, <see cref="FindFreeSlotAsync"/>,
-/// <see cref="GetDiskSizeAsync"/>, <see cref="ClassifyAttachmentAsync"/>,
+/// <see cref="ReferencesDiskAsync"/>, <see cref="GetDiskInfoAsync"/>,
+/// <see cref="ClassifyAttachmentAsync"/>,
 /// <see cref="FindOwnedCheckpointAsync"/>, <see cref="CanCheckpointAsync"/>,
 /// <see cref="IsChainCollapsedAsync"/> and
 /// <see cref="ListOwnedCheckpointsAsync"/>. Classification and size reads are
@@ -61,8 +62,11 @@ public sealed class VmTargetAssertingHyperVHostClient(IHyperVHostClient inner) :
         return inner.DetachDiskAsync(hostName, vmId, vhdxPath, cancellationToken);
     }
 
-    public Task<long> GetDiskSizeAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
-        inner.GetDiskSizeAsync(hostName, vmId, vhdxPath, cancellationToken);
+    public Task<bool> ReferencesDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+        inner.ReferencesDiskAsync(hostName, vmId, vhdxPath, cancellationToken);
+
+    public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken) =>
+        inner.GetDiskInfoAsync(hostName, vhdxPath, cancellationToken);
 
     public Task<long> ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken)
     {

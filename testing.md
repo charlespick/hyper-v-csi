@@ -180,7 +180,7 @@ flag is a statement about the driver, a skip regex is a statement about us.
 | **Topology-aware scheduling** | `topology: false` | `NodeGetInfo` reports no accessible topology, deliberately — a CSV is reachable from every host |
 | **Storage capacity reporting** | `capacity: false` | `GetCapacity` is not implemented |
 | **Volume limits per node** | `volumeLimits: false` | `NodeGetInfo` reports no `max_volumes_per_node`. There is a real Hyper-V SCSI controller limit behind this; reporting it is separate work |
-| **Two PVs sharing one volume handle** | `multiplePVsSameID: false` | A real driver-side limitation, not a harness one: `findAttachedNode` matches a `VolumeAttachment` by PV name and relies on PV name being the volume handle, so a second PV with the same handle can resolve an expansion to the wrong node |
+| **Two PVs sharing one volume handle** | `multiplePVsSameID: false` | The original reason — the controller resolving an expansion's node by matching a `VolumeAttachment` on PV name — is gone, since the agent now resolves attachment from the VHDX path. The capability stays off until the case has actually been run against the suite |
 | **xfs** | absent from `SupportedFsType`, `\[Feature:` | The node image ships only `e2fsprogs`. `NodeStageVolume` would fail at `mkfs`, and `NodeExpandVolume` has no `xfs_growfs` |
 | **VolumeAttributesClass, SELinux mount, Windows nodes** | `\[Feature:` in `skips.txt` | Not implemented, not implemented, and not what our nodes are |
 | **Inline CSI ephemeral volumes** | no `InlineVolumes` in `testdriver.yaml` | The CSIDriver object declares `Persistent` only. Generic ephemeral volumes — the PVC-backed kind — *are* tested |

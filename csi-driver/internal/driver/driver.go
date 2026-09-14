@@ -9,7 +9,6 @@ import (
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/agentclient"
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/vmbusdisk"
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"k8s.io/client-go/kubernetes"
 	mount "k8s.io/mount-utils"
 	utilexec "k8s.io/utils/exec"
 )
@@ -27,18 +26,14 @@ var Version = "dev"
 
 // Driver holds the state shared by the identity, controller, and node
 // servers: driver identity, the node's own ID (only meaningful in node
-// mode), the client used to talk to hyperv-csi-agent, and the Kubernetes API
-// client ControllerExpandVolume uses to find which node a volume is
-// currently attached to - only meaningful in controller mode, and nil in
-// node mode, the same way Agent is nil until an agent address is given.
+// mode), and the client used to talk to hyperv-csi-agent.
 type Driver struct {
-	NodeID     string
-	Agent      *agentclient.Client
-	KubeClient kubernetes.Interface
+	NodeID string
+	Agent  *agentclient.Client
 }
 
-func New(nodeID string, agent *agentclient.Client, kubeClient kubernetes.Interface) *Driver {
-	return &Driver{NodeID: nodeID, Agent: agent, KubeClient: kubeClient}
+func New(nodeID string, agent *agentclient.Client) *Driver {
+	return &Driver{NodeID: nodeID, Agent: agent}
 }
 
 func (d *Driver) IdentityServer() csi.IdentityServer {

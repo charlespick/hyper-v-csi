@@ -77,7 +77,7 @@ public sealed class HostOperationSlotsTests : IDisposable
         await second;
     }
 
-    [Fact]
+    [WindowsOnlyFact]
     public async Task AttachAndSnapshotClassification_ContendForTheSameHostCap()
     {
         // The property the extraction exists for. Before this, AttachService's
@@ -109,8 +109,16 @@ public sealed class HostOperationSlotsTests : IDisposable
         using var copySlots = new SnapshotCopySlots(snapshotOptions);
         using var jobs = new InMemoryJobStore();
         var snapshotService = new SnapshotService(
-            new NeverCalledVirtualDiskManager(), new ImmediateDiskCopier(), jobs, cluster, host,
+            new NeverCalledVirtualDiskManager(), new ImmediateDiskCopier(), jobs, cluster,
+            new FakeVhdxLocationService { Host = "host-1", VmId = "vm-1" }, host,
             hostSlots, copySlots, snapshotOptions, NullLogger<SnapshotService>.Instance);
+
+        // Something has to hold pvc-1 open for the snapshot to trace it to
+        // vm-1 and classify it on host-1 at all. A sharing reader is enough
+        // to trip that, and still lets the NotAttached classification below
+        // fall back to reading the file locally.
+        using var holder = new FileStream(
+            Path.Combine(volumesRoot, "pvc-1.vhdx"), FileMode.Open, FileAccess.Read, FileShare.Read);
 
         // pvc-1's fast CreateSnapshot job blocks inside its own precondition
         // check - InspectSourceAsync's classify call, which now takes a host
@@ -120,7 +128,7 @@ public sealed class HostOperationSlotsTests : IDisposable
         // not deadlock this test against a semaphore only released once.
         using var release = new SemaphoreSlim(0);
         host.DuringFirstClassify = () => release.WaitAsync();
-        var creatingSnapshot = snapshotService.CreateAsync("pvc-1", "snap", "node-a", CancellationToken.None);
+        var creatingSnapshot = snapshotService.CreateAsync("pvc-1", "snap", CancellationToken.None);
 
         await WaitForAsync(() => host.ClassifyCalls > 0);
 
@@ -165,6 +173,25 @@ public sealed class HostOperationSlotsTests : IDisposable
 
         public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) =>
             throw new NotSupportedException();
+
+        public Task<IReadOnlyList<ClusterSharedVolume>> ListSharedVolumesAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<IReadOnlyList<string>> ListNodesAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+    }
+
+    /// <summary>Traces every held-open disk to one VM on one host.</summary>
+    private sealed class FakeVhdxLocationService : IVhdxLocationService
+    {
+        public required string Host { get; init; }
+
+        public required string VmId { get; init; }
+
+        public Task<string> ResolveHostAsync(string path, CancellationToken cancellationToken) => Task.FromResult(Host);
+
+        public Task<string?> ResolveVmOnHostAsync(string hostName, string path, CancellationToken cancellationToken) =>
+            Task.FromResult<string?>(VmId);
     }
 
     private sealed class NeverCalledVirtualDiskManager : IVirtualDiskManager
@@ -255,7 +282,10 @@ public sealed class HostOperationSlotsTests : IDisposable
         public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
-        public Task<long> GetDiskSizeAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+        public Task<bool> ReferencesDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
         public Task<long> ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>

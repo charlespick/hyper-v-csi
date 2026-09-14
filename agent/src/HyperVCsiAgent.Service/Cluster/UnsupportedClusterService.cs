@@ -27,6 +27,12 @@ public sealed class UnsupportedClusterService : IClusterService
     public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) =>
         throw Unsupported();
 
+    public Task<IReadOnlyList<ClusterSharedVolume>> ListSharedVolumesAsync(CancellationToken cancellationToken) =>
+        throw Unsupported();
+
+    public Task<IReadOnlyList<string>> ListNodesAsync(CancellationToken cancellationToken) =>
+        throw Unsupported();
+
     private static PlatformNotSupportedException Unsupported() =>
         new("Failover Cluster queries require Windows; this agent is running on " +
             $"{Environment.OSVersion.Platform}");

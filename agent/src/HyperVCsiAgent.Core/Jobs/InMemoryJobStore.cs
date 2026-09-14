@@ -45,8 +45,8 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
     /// <para>
     /// That argument covers the waits this store installs itself. It says
     /// nothing about a job delegate blocking on something outside it, and there
-    /// are two such places. Both are bounded, and the bound is what carries
-    /// them - not the argument above, which does not reach either.
+    /// are three such places. All are bounded, and the bound is what carries
+    /// them - not the argument above, which does not reach any of them.
     /// </para>
     /// <para>
     /// The first is a snapshot copy waiting for one of <c>SnapshotCopySlots</c>,
@@ -73,6 +73,14 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
     /// target on the way out. Anything else that comes to wait on a job it
     /// enqueued needs the same bound, for the same reason.
     /// </para>
+    /// <para>
+    /// The third is that same shape again: <c>ExpandVolume</c>'s job, holding
+    /// only <c>expand:</c>, enqueues <c>VhdxService.ExpandDisk</c> under
+    /// <c>volume:</c> and possibly <c>vm:</c>, and waits for it to finish. It is
+    /// safe for the same two reasons - nothing that holds <c>volume:</c> or
+    /// <c>vm:</c> ever takes <c>expand:</c>, and
+    /// <c>AgentOptions.ExpandDiskWaitTimeout</c> bounds the wait regardless.
+    /// </para>
     /// </remarks>
     public Job GetOrCreate(
         string idempotencyKey, string operationType, IReadOnlyCollection<string> targets, Func<Job, CancellationToken, Task> run)
@@ -93,9 +101,8 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
                 return existing;
             }
 
-            // Deduplicated so a caller that names one resource twice - an expand
-            // whose stale node hint happens to name the volume's own target, say
-            // - does not double-count Pending and leave a queue that never
+            // Deduplicated so a caller that names one resource twice does not
+            // double-count Pending and leave a queue that never
             // reaches zero. Ordered so the recorded Targets read the same way
             // every time, which matters only for the operator staring at them.
             var distinct = targets.Distinct(StringComparer.Ordinal).OrderBy(t => t, StringComparer.Ordinal).ToArray();

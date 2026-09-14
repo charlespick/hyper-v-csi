@@ -552,16 +552,6 @@ func (c *Controller) reconcileNext(ctx context.Context) bool {
 // and only once per node — the result is cached on the node's state entry.
 // Keeping a CSINode cache warm for the whole cluster to serve a read that
 // happens a handful of times a year is the wrong trade.
-//
-// This restates the drivers-slice scan that findAttachedNode in
-// internal/driver/attachednode.go also does, rather than sharing it. Sharing
-// would mean either importing the driver package from here — which the driver
-// name being a Config parameter is specifically avoiding, since it is what
-// keeps this package testable on its own — or extracting a third package for
-// six lines. The duplication is the cheaper of the three, and the two copies
-// answer to the same API shape rather than to each other, so they are not
-// coupled in any way that could drift dangerously: CSINode.Spec.Drivers is
-// versioned Kubernetes API, not our own contract.
 func (c *Controller) resolveNodeID(ctx context.Context, nodeName string) (string, error) {
 	csiNode, err := c.kube.StorageV1().CSINodes().Get(ctx, nodeName, metav1.GetOptions{})
 	if err != nil {

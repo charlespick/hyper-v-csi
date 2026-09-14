@@ -112,6 +112,23 @@ public sealed class AgentOptions
     public TimeSpan SnapshotCheckpointWaitTimeout { get; set; } = TimeSpan.FromSeconds(20);
 
     /// <summary>
+    /// How long ExpandVolume waits for the internal job that actually grows
+    /// the disk, before giving up and telling the caller to retry.
+    /// </summary>
+    /// <remarks>
+    /// That job holds the volume and, for a disk a running VM has open, the
+    /// VM - so it queues behind anything else holding either, a snapshot copy
+    /// of any disk on that VM included, which can run for hours. Giving up
+    /// leaves it queued rather than cancelled, and a retry waits on the same
+    /// job again. Shorter than the controller's own polling budget
+    /// (<c>jobPollBudget</c>, 24s effective) for the reason
+    /// <see cref="SnapshotCheckpointWaitTimeout"/> gives: the caller is told
+    /// what the resize is queued behind rather than a generic "job still
+    /// Pending".
+    /// </remarks>
+    public TimeSpan ExpandDiskWaitTimeout { get; set; } = TimeSpan.FromSeconds(20);
+
+    /// <summary>
     /// How long a copy that has already been granted its VM and volume
     /// targets waits for one of the <see cref="MaxConcurrentSnapshotCopies"/>
     /// slots before giving up.
@@ -241,6 +258,12 @@ public sealed class AgentOptions
         {
             throw new InvalidOperationException(
                 $"{SectionName}:{nameof(SnapshotCheckpointWaitTimeout)} must be positive");
+        }
+
+        if (ExpandDiskWaitTimeout <= TimeSpan.Zero)
+        {
+            throw new InvalidOperationException(
+                $"{SectionName}:{nameof(ExpandDiskWaitTimeout)} must be positive");
         }
 
         if (SnapshotCopySlotWaitTimeout <= TimeSpan.Zero)

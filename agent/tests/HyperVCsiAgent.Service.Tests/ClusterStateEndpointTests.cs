@@ -238,5 +238,11 @@ public sealed class ClusterStateEndpointTests : IDisposable
             throw new NotSupportedException("no test in this file asks about host liveness");
 
         public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) => _discovery.Task;
+
+        public Task<IReadOnlyList<ClusterSharedVolume>> ListSharedVolumesAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException("no test in this file locates a disk");
+
+        public Task<IReadOnlyList<string>> ListNodesAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException("no test in this file locates a disk");
     }
 }

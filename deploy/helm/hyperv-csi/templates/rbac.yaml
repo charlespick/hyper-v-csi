@@ -14,22 +14,19 @@ metadata:
 {{- if .Values.rbac.create }}
 ---
 # Scoped to what the driver container itself needs, independent of any
-# sidecar: ControllerExpandVolume looks up which node (if any) currently has
-# a volume attached, since CSI's own request carries no node ID the way
-# ControllerPublishVolume/UnpublishVolume's does. The VolumeAttachment read is
-# the same one external-attacher makes to find a volume's node, and the
-# CSINode read is the same one it makes to turn that node into this driver's
-# own node ID - both already permitted by the attacher role below, but
-# declared again here because this need is the driver's own and does not
-# depend on external-attacher being deployed.
+# sidecar. The CSINode read is how node fencing turns a tainted node into this
+# driver's VM ID - the CSI node ID kubelet recorded there. The attacher role
+# below already permits the same read, but it is declared again here because
+# this need is the driver's own and does not depend on external-attacher being
+# deployed.
 #
-# Node fencing, when enabled, adds something of a different kind to this role.
-# The two rules above are reads of storage objects; the nodes rule below is a
-# write onto a core object outside storage, and its effect is to make
-# Kubernetes force-delete pods and detach their disks. It is rendered only when
-# controller.nodeFencing.enabled is set, for the same reason the snapshotter
-# role below is conditional — an install that has not opted in should not be
-# carrying a standing grant to write to every Node in the cluster.
+# The nodes rule below is of a different kind. The CSINode rule is a read of a
+# storage object; the nodes rule is a write onto a core object outside storage,
+# and its effect is to make Kubernetes force-delete pods and detach their
+# disks. It is rendered only when controller.nodeFencing.enabled is set, for
+# the same reason the snapshotter role below is conditional — an install that
+# has not opted in should not be carrying a standing grant to write to every
+# Node in the cluster.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -37,11 +34,6 @@ metadata:
   labels:
     {{- include "hyperv-csi.labels" . | nindent 4 }}
 rules:
-  - apiGroups: ["storage.k8s.io"]
-    resources: ["volumeattachments"]
-    verbs: ["get", "list", "watch"]
-  # Also how node fencing turns a tainted node into this driver's VM ID, so it
-  # needs nothing added when fencing is on.
   - apiGroups: ["storage.k8s.io"]
     resources: ["csinodes"]
     verbs: ["get", "list", "watch"]
