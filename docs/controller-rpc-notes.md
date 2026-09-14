@@ -429,25 +429,24 @@ bookkeeping — see [Host CIM calls are bounded per
 call](host-cim-and-timeouts.md#host-cim-calls-are-bounded-per-call) for how
 that wait is timed out.
 
-**The agent's idempotency check opens the VHDX directly, which fails on an
-attached, running disk — the fallback traces the disk to the host holding
-it.** `VhdxService.ExpandAsync`'s read-before-write check
-(`GetVirtualSizeAsync` → `GetVirtualHardDiskSettingData`) opens the VHDX
-file the same way `ResizeVirtualHardDisk` itself does, and that open fails
-with a sharing violation whenever a running VM already has the disk open —
-precisely the case this feature exists for: a pod is using the volume, the
-PVC is edited, and `--handle-volume-inuse-error=false` is what lets
-`external-resizer` even try.
+**A disk anything has open is grown through the host holding it, never
+locally — even where the local call would work.** `VhdxService`'s local
+read-before-write check (`GetVirtualSizeAsync` →
+`GetVirtualHardDiskSettingData`) and resize run on a purely local CIM session,
+on whichever host owns the agent role. Issued from any host but the running
+VM's, both fail on a disk that VM has open — precisely the case this feature
+exists for: a pod is using the volume, the PVC is edited, and
+`--handle-volume-inuse-error=false` is what lets `external-resizer` even try.
+Issued from the VM's own host, both succeed, answered by the vmms holding the
+file — which is why a successful local read is not proof nothing holds the
+disk, and why growing it locally there would skip the VM's `vm:`
+serialization.
 
-Both `GetVirtualHardDiskSettingData` and `ResizeVirtualHardDisk` work fine
-against an attached, running disk, but only when issued from the host
-actually running the VM. `CimVirtualDiskManager` otherwise always uses a
-purely local CIM session, on whichever host happens to own the agent
-role — a different host from the VM's the moment the two aren't the same
-node. So `ExpandAsync` tries the local read first — correct and cheaper
-whenever it works — and only on `VhdxInUseException` falls back to
-`IHyperVHostClient.GetDiskInfoAsync`/`ResizeDiskAsync`, host-targeted
-methods that read and grow the disk through the VM's own host instead.
+So `ExpandAsync` first opens the VHDX sharing nothing, an open every holder
+refuses on every host. Only a disk that open succeeds against is read and grown
+locally; anything else is read and grown through
+`IHyperVHostClient.GetDiskInfoAsync`/`ResizeDiskAsync` on the VM's own host,
+while holding that VM.
 
 That fallback needs two things CSI's `ControllerExpandVolumeRequest` does
 not carry, unlike `ControllerPublishVolume`/`UnpublishVolume`'s node ID: the

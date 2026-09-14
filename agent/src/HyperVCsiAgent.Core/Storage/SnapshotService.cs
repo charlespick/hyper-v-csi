@@ -1225,7 +1225,7 @@ public sealed class SnapshotService : ISnapshotService
                 $"snapshot {snapshotId} cannot be taken: source volume {sourceVolumeId} has no disk at {sourcePath}");
         }
 
-        if (!IsHeldOpen(sourcePath))
+        if (!OpenHandleProbe.IsHeldOpen(sourcePath))
         {
             return (OpenSourceLocally(snapshotId, sourceVolumeId, sourcePath), null);
         }
@@ -1336,39 +1336,6 @@ public sealed class SnapshotService : ISnapshotService
             default:
                 throw new JobFailureException(
                     AgentErrorCodes.Internal, $"unrecognized attachment classification {attachment.Kind}");
-        }
-    }
-
-    /// <summary>
-    /// Whether anything at all has <paramref name="path"/> open, readers
-    /// included - the premise <see cref="IVhdxLocationService.LocateAsync"/>
-    /// needs before its answer means anything.
-    /// </summary>
-    /// <remarks>
-    /// Deliberately stricter than <see cref="OpenSourceLocally"/>'s own open,
-    /// which shares reads. The base of a differencing chain is held open for
-    /// reading only - which is how several children can share one parent - so
-    /// a sharing open succeeds against a source that a checkpoint, this
-    /// driver's for a sibling volume or anyone else's, has already frozen, and
-    /// would read it as unattached. Denying all sharing is what trips on that
-    /// reader too.
-    /// </remarks>
-    private static bool IsHeldOpen(string path)
-    {
-        try
-        {
-            using var probe = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None);
-            return false;
-        }
-        catch (IOException ex) when (ex.HResult is SharingViolationHResult or LockViolationHResult or UserMappedFileHResult)
-        {
-            return true;
-        }
-        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException or UnauthorizedAccessException)
-        {
-            // Not this probe's to report: OpenSourceLocally makes the real
-            // open next, and says what each of these means for a snapshot.
-            return false;
         }
     }
 

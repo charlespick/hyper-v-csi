@@ -917,15 +917,15 @@ public sealed class VhdxServiceTests : IDisposable
         await Task.WhenAll(expands);
     }
 
-    [Fact]
+    [WindowsOnlyFact]
     public async Task ExpandAsync_WhenTheDiskIsAttachedToARunningVm_GrowsItThroughTheHostHoldingItWhileHoldingThatVm()
     {
-        // The real-cluster case this exists for: GetVirtualSizeAsync can't read
-        // the disk locally because a running VM already has it open, so the
-        // disk is traced to the host holding it and the VM there, and grown
-        // through that host - which does not share the local read's
-        // limitation. Through the asserting client, so a resize that ran
-        // holding only volume: (issue #14's D10) fails the job instead.
+        // The real-cluster case this exists for: a running VM on another host
+        // holds the disk, so neither the local read nor the local resize can
+        // reach it. The disk is traced to the host holding it and the VM there,
+        // and grown through that host. Through the asserting client, so a
+        // resize that ran holding only volume: (issue #14's D10) fails the job
+        // instead.
         var disks = new FakeVirtualDiskManager();
         var host = new FakeHostClient { SizeOnHost = 1024 };
         using var service = NewService(
@@ -934,6 +934,7 @@ public sealed class VhdxServiceTests : IDisposable
             host: new VmTargetAssertingHyperVHostClient(host));
         await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
         disks.VhdxInUse = true;
+        using var heldByVm = HoldOpenExclusively(VolumePath("pvc-1"));
 
         var result = await service.ExpandAsync("pvc-1", 4096, CancellationToken.None);
 
@@ -943,14 +944,39 @@ public sealed class VhdxServiceTests : IDisposable
         Assert.Equal("host-a", host.ResizedOnHost);
     }
 
-    [Fact]
+    [WindowsOnlyFact]
+    public async Task ExpandAsync_WhenAVmOnThisSameHostHoldsTheDisk_StillGrowsItThroughThatHostWhileHoldingThatVm()
+    {
+        // The agent sharing a host with the VM: the local read succeeds there,
+        // answered by the very vmms holding the disk, so it cannot be what
+        // decides whether a VM holds it - growing it locally on that answer
+        // skipped vm: altogether. The fake's local read and resize both stay
+        // available here, so either path would complete; only the open that
+        // shares nothing tells them apart.
+        var disks = new FakeVirtualDiskManager();
+        var host = new FakeHostClient { SizeOnHost = 1024 };
+        using var service = NewService(
+            disks,
+            location: new FakeVhdxLocationService { VmIds = ["vm-1"] },
+            host: new VmTargetAssertingHyperVHostClient(host));
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
+        using var heldByVm = HoldOpenExclusively(VolumePath("pvc-1"));
+
+        var result = await service.ExpandAsync("pvc-1", 4096, CancellationToken.None);
+
+        Assert.Equal(4096, result.ActualSizeBytes);
+        Assert.Equal("host-a", host.ResizedOnHost);
+        Assert.Empty(disks.Resized);
+    }
+
+    [WindowsOnlyFact]
     public async Task ExpandAsync_WhenTheAttachedDiskIsAlreadyLargeEnough_ReportsThatWithoutResizing()
     {
         var disks = new FakeVirtualDiskManager();
         var host = new FakeHostClient { SizeOnHost = 1L << 30 };
         using var service = NewService(disks, location: new FakeVhdxLocationService { VmIds = ["vm-1"] }, host: host);
         await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
-        disks.VhdxInUse = true;
+        using var heldByVm = HoldOpenExclusively(VolumePath("pvc-1"));
 
         var result = await service.ExpandAsync("pvc-1", 4096, CancellationToken.None);
 
@@ -960,17 +986,17 @@ public sealed class VhdxServiceTests : IDisposable
         Assert.Null(host.ResizedTo);
     }
 
-    [Fact]
+    [WindowsOnlyFact]
     public async Task ExpandAsync_WhenWhatHasTheDiskOpenCannotBeTraced_FailsAsInternal()
     {
-        // The local read failed because something has the file open, but the
-        // open could not be pinned to one host. Refused rather than guessed
-        // past, and not something a retry resolves on its own.
+        // Something has the file open, but the open could not be traced.
+        // Refused rather than guessed past, and not something a retry resolves
+        // on its own.
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(
             disks, location: new FakeVhdxLocationService { Untraceable = true }, host: new NeverCalledHostClient());
         await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
-        disks.VhdxInUse = true;
+        using var held = HoldOpenExclusively(VolumePath("pvc-1"));
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
             () => service.ExpandAsync("pvc-1", 4096, CancellationToken.None));
@@ -978,41 +1004,49 @@ public sealed class VhdxServiceTests : IDisposable
         Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
     }
 
-    [Fact]
+    [WindowsOnlyFact]
     public async Task ExpandAsync_WhenNoClusteredVmHasTheDiskOpen_FailsAsInternal()
     {
-        // Open on a host where no clustered VM references it - an unmanaged
-        // handle on the CSV, most plausibly. A genuine inconsistency, not
-        // something a retry resolves on its own.
+        // Open, but no clustered VM that could be holding it references it -
+        // an unmanaged handle on the CSV, most plausibly. A genuine
+        // inconsistency, not something a retry resolves on its own - and not a
+        // disk to grow locally either, with something holding it.
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(disks, location: new FakeVhdxLocationService(), host: new NeverCalledHostClient());
         await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
-        disks.VhdxInUse = true;
+        using var held = HoldOpenExclusively(VolumePath("pvc-1"));
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
             () => service.ExpandAsync("pvc-1", 4096, CancellationToken.None));
 
         Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
         Assert.Contains("no clustered VM", failure.Message, StringComparison.Ordinal);
+        Assert.Empty(disks.Resized);
     }
 
-    [Theory]
-    [InlineData("vm-1")]
-    [InlineData(null)]
-    public async Task ExpandAsync_WhenTheDiskIsOpenByAVmTheResizeWasNotQueuedAgainst_FailsAsAborted(string? vmAtEnqueue)
+    [WindowsOnlyFact]
+    public Task ExpandAsync_WhenTheDiskIsOpenByAnotherVmThanTheResizeWasQueuedAgainst_FailsAsAborted() =>
+        ExpandFailsAsAbortedWhenTheHolderChangedAsync(vmAtEnqueue: "vm-1");
+
+    [WindowsOnlyFact]
+    public Task ExpandAsync_WhenTheDiskIsOpenByAVmThoughTheResizeWasQueuedWithNone_FailsAsAborted() =>
+        ExpandFailsAsAbortedWhenTheHolderChangedAsync(vmAtEnqueue: null);
+
+    /// <summary>
+    /// The resize can sit queued for hours, and by the time it runs the disk
+    /// can belong to another VM - or to one at all, having been found held by
+    /// none. Growing it without holding that VM is D10 again. Aborted, since a
+    /// retry traces the disk afresh and queues behind the right VM.
+    /// </summary>
+    private async Task ExpandFailsAsAbortedWhenTheHolderChangedAsync(string? vmAtEnqueue)
     {
-        // The resize can sit queued for hours, and by the time it runs the
-        // disk can belong to another VM - or to one at all, having been found
-        // unattached. Growing it without holding that VM is D10 again.
-        // Aborted, since a retry traces the disk afresh and queues behind the
-        // right VM.
         var disks = new FakeVirtualDiskManager();
         using var service = NewService(
             disks,
             location: new FakeVhdxLocationService { VmIds = [vmAtEnqueue, "vm-2"] },
             host: new NeverCalledHostClient());
         await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
-        disks.VhdxInUse = true;
+        using var held = HoldOpenExclusively(VolumePath("pvc-1"));
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
             () => service.ExpandAsync("pvc-1", 4096, CancellationToken.None));
@@ -1021,7 +1055,7 @@ public sealed class VhdxServiceTests : IDisposable
         Assert.Contains("vm-2", failure.Message, StringComparison.Ordinal);
     }
 
-    [Fact]
+    [WindowsOnlyFact]
     public async Task ExpandAsync_WhileTheResizeIsQueuedBehindWorkOnTheSameVm_GivesUpAsAbortedNamingIt()
     {
         // Holding vm: means waiting behind anything else on that VM, and a
@@ -1038,7 +1072,7 @@ public sealed class VhdxServiceTests : IDisposable
             jobs: jobs,
             expandDiskWaitTimeout: TimeSpan.FromMilliseconds(300));
         await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
-        disks.VhdxInUse = true;
+        using var heldByVm = HoldOpenExclusively(VolumePath("pvc-1"));
 
         var release = new TaskCompletionSource();
         var copy = jobs.GetOrCreate("pvc-9~snap", SnapshotService.CopySnapshot, [JobTargets.Vm("vm-1")], (_, _) => release.Task);
@@ -1750,7 +1784,8 @@ public sealed class VhdxServiceTests : IDisposable
             return Task.FromResult(newSizeBytes);
         }
 
-        public Task<bool> ReferencesDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+        public Task<bool> ReferencesDiskAsync(
+            string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken) =>
             throw new NotSupportedException("VhdxService learns the VM from IVhdxLocationService, never VM by VM");
 
         public Task<AttachedDisk?> FindAttachedDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
@@ -1823,7 +1858,8 @@ public sealed class VhdxServiceTests : IDisposable
         public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
 
-        public Task<bool> ReferencesDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+        public Task<bool> ReferencesDiskAsync(
+            string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
 
         public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken) =>

@@ -2359,7 +2359,8 @@ public sealed class SnapshotServiceTests : IDisposable
         public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
             throw Unexpected();
 
-        public Task<bool> ReferencesDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+        public Task<bool> ReferencesDiskAsync(
+            string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken) =>
             throw Unexpected();
 
         public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken) =>
@@ -2621,7 +2622,8 @@ public sealed class SnapshotServiceTests : IDisposable
             throw new NotSupportedException(
                 "SnapshotService measures an attached source's allocated bytes from the CSV file directly, not through the host");
 
-        public Task<bool> ReferencesDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+        public Task<bool> ReferencesDiskAsync(
+            string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken) =>
             throw new NotSupportedException("SnapshotService learns the VM from IVhdxLocationService, never VM by VM");
 
         public Task<AttachedDisk?> FindAttachedDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>

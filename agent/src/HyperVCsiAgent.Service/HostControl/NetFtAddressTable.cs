@@ -24,6 +24,14 @@ namespace HyperVCsiAgent.Service.HostControl;
 /// case a change is ever missed that way.
 /// </para>
 /// <para>
+/// Only the first build and a miss make a lookup wait. Revalidation happens in
+/// the background while lookups keep answering from the table already built,
+/// and every rebuild leaves out nodes the cluster reports Down
+/// (<see cref="IClusterService.ListNodesAsync"/>) - so a node that has just
+/// died, the very moment an agent failing over onto a survivor first needs
+/// this table, costs no lookup a CIM timeout.
+/// </para>
+/// <para>
 /// Each rebuild asks every node independently. A node that does not answer
 /// keeps the entries it already had rather than costing every other node
 /// theirs: its addresses only change if its adapter was reconfigured, and the
@@ -33,9 +41,10 @@ namespace HyperVCsiAgent.Service.HostControl;
 public sealed class NetFtAddressTable
 {
     /// <summary>
-    /// How long a built table is used before the next lookup rebuilds it
-    /// anyway. Minutes, not the seconds the coordinator reading gets: this is
-    /// the fan-out, and what it caches does not move while membership holds.
+    /// How long a built table is used before the next lookup starts a
+    /// background rebuild. Minutes, not the seconds the coordinator reading
+    /// gets: this is the fan-out, and what it caches does not move while
+    /// membership holds.
     /// </summary>
     public static readonly TimeSpan RevalidationInterval = TimeSpan.FromMinutes(10);
 
@@ -56,6 +65,9 @@ public sealed class NetFtAddressTable
     /// Replaced wholesale, never mutated, so a lookup reads it without the lock.
     /// </summary>
     private volatile Table _table = Table.Empty;
+
+    /// <summary>1 while a background revalidation is under way, so lookups start at most one.</summary>
+    private int _revalidating;
 
     public NetFtAddressTable(
         IClusterService cluster, ICsvNodeProbe probe, TimeProvider timeProvider, ILogger<NetFtAddressTable> logger)
@@ -80,9 +92,16 @@ public sealed class NetFtAddressTable
         var key = Normalize(clientComputerName);
         var table = _table;
 
-        if (table.BuiltAt is not { } builtAt || _timeProvider.GetUtcNow() - builtAt >= RevalidationInterval)
+        if (table.BuiltAt is not { } builtAt)
         {
             table = await RebuildAsync(table, missed: false, cancellationToken).ConfigureAwait(false);
+        }
+        else if (_timeProvider.GetUtcNow() - builtAt >= RevalidationInterval)
+        {
+            // Due, not wrong: every entry was true when it was read and stays
+            // true while its node stays a member. Answered from it now, and
+            // rebuilt behind this lookup rather than in front of it.
+            StartRevalidation(table);
         }
 
         if (table.Find(key) is { } node)
@@ -126,6 +145,32 @@ public sealed class NetFtAddressTable
         }
 
         return address.ToString();
+    }
+
+    private void StartRevalidation(Table seen)
+    {
+        if (Interlocked.CompareExchange(ref _revalidating, 1, 0) != 0)
+        {
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                // No caller's token: no caller is waiting on this, and the
+                // per-node reads are bounded by their own CIM deadlines.
+                await RebuildAsync(seen, missed: false, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "revalidating the NetFT address table failed; keeping the entries it has");
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _revalidating, 0);
+            }
+        });
     }
 
     private async Task<Table> RebuildAsync(Table seen, bool missed, CancellationToken cancellationToken)

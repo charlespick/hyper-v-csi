@@ -783,12 +783,26 @@ public sealed class MsClusterService : IClusterService
             var options = deadline.Options("listing MSCluster_Node", cancellationToken);
 
             var nodes = new List<string>();
-            foreach (var node in session.QueryInstances(NamespaceName, "WQL", "SELECT Name FROM MSCluster_Node", options))
+            foreach (var node in session.QueryInstances(NamespaceName, "WQL", "SELECT Name, State FROM MSCluster_Node", options))
             {
-                if (node.CimInstanceProperties["Name"]?.Value is string name && !string.IsNullOrWhiteSpace(name))
+                if (node.CimInstanceProperties["Name"]?.Value is not string name || string.IsNullOrWhiteSpace(name))
                 {
-                    nodes.Add(name);
+                    continue;
                 }
+
+                // ClusterNodeState 1 is Down, the one state left out: a Down node
+                // has nothing open and cannot answer, and asking it anyway costs
+                // the caller a full CIM timeout. Paused and Joining stay in - a
+                // paused node keeps running its VMs until it is drained - and so
+                // does a state this cannot read, which is asked about rather than
+                // guessed Down.
+                if (ToRawState(node.CimInstanceProperties["State"]?.Value) == 1)
+                {
+                    _logger.LogDebug("{NodeName} is Down; leaving it out of the node list", name);
+                    continue;
+                }
+
+                nodes.Add(name);
             }
 
             return nodes;

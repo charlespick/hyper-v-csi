@@ -557,13 +557,19 @@ public sealed class VhdxService : IVhdxService, IDisposable
     /// <summary>
     /// The VM, if any, <see cref="ExpandAsync"/>'s resize will reach into - the
     /// one whose <c>vm:</c> target it has to be enqueued under. Null for a disk
-    /// that reads locally, and for a disk this cannot read for any other
-    /// reason: <see cref="ExpandDiskAsync"/> makes the same read under the
-    /// volume's own target and reports what it finds properly.
+    /// nothing has open, and for one no clustered VM holds:
+    /// <see cref="ExpandDiskAsync"/> looks again under the volume's own target
+    /// and reports what it finds properly.
     /// </summary>
+    /// <remarks>
+    /// Decided by <see cref="OpenHandleProbe"/>, not by whether a local read of
+    /// the disk fails: on the VM's own host that read succeeds - the vmms
+    /// holding the file answers it - so a VM sharing a host with the agent
+    /// would otherwise get resized with no <c>vm:</c> target held at all.
+    /// </remarks>
     private async Task<string?> FindHoldingVmAsync(string volumeId, string path, CancellationToken cancellationToken)
     {
-        if (!File.Exists(path))
+        if (!File.Exists(path) || !OpenHandleProbe.IsHeldOpen(path))
         {
             return null;
         }
@@ -571,31 +577,8 @@ public sealed class VhdxService : IVhdxService, IDisposable
         using var attempt = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         attempt.CancelAfter(_options.DiskOperationTimeout);
 
-        var elapsed = Stopwatch.StartNew();
-
         try
         {
-            await AcquireSlotAsync(attempt, cancellationToken, "expanding", volumeId).ConfigureAwait(false);
-            try
-            {
-                // The read ExpandDiskAsync opens with, for the signal it gives:
-                // a VhdxInUseException is a running VM's exclusive hold.
-                await _diskManager.GetVirtualSizeAsync(
-                    path, _options.DiskOperationTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
-                return null;
-            }
-            catch (VhdxInUseException)
-            {
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                return null;
-            }
-            finally
-            {
-                _concurrency.Release();
-            }
-
             var location = await LocateHolderAsync(volumeId, path, attempt.Token).ConfigureAwait(false);
             return location?.VmId;
         }
@@ -686,6 +669,16 @@ public sealed class VhdxService : IVhdxService, IDisposable
             if (!File.Exists(path))
             {
                 throw JobFailureException.NotFound($"volume {volumeId} has no disk at {path} to expand");
+            }
+
+            // Anything holding the disk open goes through the traced host, and
+            // only a VM this job holds vm: for is grown there - including a VM
+            // on this very host, whose hold the local read below would not
+            // report: that read succeeds there, answered by the vmms holding
+            // the file. See OpenHandleProbe.
+            if (OpenHandleProbe.IsHeldOpen(path))
+            {
+                return await ExpandAttachedAsync(volumeId, path, newSizeBytes, heldVmId, attempt).ConfigureAwait(false);
             }
 
             // Read first, and this read is what makes the whole operation

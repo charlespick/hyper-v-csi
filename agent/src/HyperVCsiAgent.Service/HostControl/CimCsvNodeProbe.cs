@@ -25,6 +25,14 @@ public sealed class CimCsvNodeProbe : ICsvNodeProbe
     /// </summary>
     private const uint CsvSmbInstance = 1;
 
+    /// <summary>
+    /// How long one node gets to report its NetFT addresses, when that is
+    /// shorter than <see cref="AgentOptions.HostOperationTimeout"/>. Measured at
+    /// 60-90ms; a node still silent after seconds is one whose answer is not
+    /// worth holding a table rebuild - and every lookup waiting on it - for.
+    /// </summary>
+    private static readonly TimeSpan NetFtAddressReadTimeout = TimeSpan.FromSeconds(10);
+
     private readonly TimeSpan _hostOperationTimeout;
     private readonly ILogger<CimCsvNodeProbe> _logger;
 
@@ -67,7 +75,8 @@ public sealed class CimCsvNodeProbe : ICsvNodeProbe
     public Task<IReadOnlyList<string>> ReadNetFtAddressesAsync(string nodeName, CancellationToken cancellationToken) =>
         Task.Run<IReadOnlyList<string>>(() =>
         {
-            var deadline = CimDeadline.After(_hostOperationTimeout);
+            var deadline = CimDeadline.After(
+                _hostOperationTimeout < NetFtAddressReadTimeout ? _hostOperationTimeout : NetFtAddressReadTimeout);
             using var session = CimSession.Create(nodeName);
 
             // Keyed on the adapter's driver service rather than its display

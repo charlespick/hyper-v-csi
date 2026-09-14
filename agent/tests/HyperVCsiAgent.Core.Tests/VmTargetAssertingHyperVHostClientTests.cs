@@ -136,7 +136,7 @@ public class VmTargetAssertingHyperVHostClientTests
         var client = new VmTargetAssertingHyperVHostClient(inner);
 
         var attached = await client.FindAttachedDiskAsync("hv-01", VmId, @"C:\path.vhdx", CancellationToken.None);
-        await client.ReferencesDiskAsync("hv-01", VmId, @"C:\path.vhdx", CancellationToken.None);
+        await client.ReferencesDiskAsync("hv-01", VmId, @"C:\path.vhdx", includeDifferencingChains: true, CancellationToken.None);
         await client.GetDiskInfoAsync("hv-01", @"C:\path.vhdx", CancellationToken.None);
 
         Assert.Null(attached);
@@ -187,7 +187,8 @@ public class VmTargetAssertingHyperVHostClientTests
             return Task.CompletedTask;
         }
 
-        public Task<bool> ReferencesDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken)
+        public Task<bool> ReferencesDiskAsync(
+            string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken)
         {
             LastReferencesDisk = (hostName, vmId, vhdxPath);
             return Task.FromResult(true);

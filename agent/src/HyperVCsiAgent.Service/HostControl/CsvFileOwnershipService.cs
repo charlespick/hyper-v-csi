@@ -91,49 +91,70 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
             volume = fresh;
         }
 
+        // The listed nodes first. More than one is not a contradiction to
+        // refuse: anything else reading the file from another node - this
+        // agent's own snapshot copy, most often - is listed right beside the
+        // VM, and the node that counts is the one running a VM that references
+        // the path. The coordinator comes last, and only when no listed node
+        // has such a VM: its own opens are local handles that never pass
+        // through the channel the listing reads, so a VM running on it shows up
+        // as nothing at all, or as only whatever else is reading the file.
+        var stages = new List<string[]> { holders!.Order(StringComparer.OrdinalIgnoreCase).ToArray() };
+        if (!holders!.Contains(volume.CoordinatorNode))
+        {
+            stages.Add([volume.CoordinatorNode]);
+        }
+
         var vms = await _cluster.ListVmsAsync(cancellationToken).ConfigureAwait(false);
 
-        // The listed nodes first. More than one is not a contradiction to refuse:
-        // anything else reading the file from another node - this agent's own
-        // snapshot copy, most often - is listed right beside the VM, and the
-        // node that counts is the one running a VM that references the path.
-        var matches = await FindReferencingVmsAsync(
-            vms, holders!.Order(StringComparer.OrdinalIgnoreCase), fullPath, cancellationToken).ConfigureAwait(false);
-
-        if (matches.Count == 0 && !holders!.Contains(volume.CoordinatorNode))
+        // Configuration alone first, across every stage, and differencing chains
+        // only once that has found nothing. A disk attached to its VM as itself
+        // is the ordinary case, answered in a few reads per VM - and walking
+        // chains first would make every VM on a candidate node pay a read per
+        // disk per hop before the one that simply lists the path is reached.
+        var failures = new List<string>();
+        foreach (var includeDifferencingChains in new[] { false, true })
         {
-            // The last resort, and the only one: the coordinator's own opens are
-            // local handles that never pass through the channel the listing
-            // reads, so a VM running on the coordinator shows up as nothing at
-            // all - or as only whatever else happens to be reading the file
-            // from another node.
-            _logger.LogDebug(
-                "no VM on the {Count} nodes listing {Path} open references it; checking its coordinator {Coordinator}",
-                holders.Count, fullPath, volume.CoordinatorNode);
-            matches = await FindReferencingVmsAsync(
-                vms, [volume.CoordinatorNode], fullPath, cancellationToken).ConfigureAwait(false);
+            failures.Clear();
+            foreach (var stage in stages)
+            {
+                var matches = await FindReferencingVmsAsync(
+                    vms, stage, fullPath, includeDifferencingChains, failures, cancellationToken).ConfigureAwait(false);
+
+                switch (matches.Count)
+                {
+                    case 0:
+                        continue;
+
+                    case 1:
+                        _logger.LogDebug(
+                            "{Path} belongs to {VmId} on {HostName}, per {Coordinator}'s CSV open files",
+                            fullPath, matches[0].VmId, matches[0].HostName, volume.CoordinatorNode);
+                        return matches[0];
+
+                    default:
+                        throw new InvalidOperationException(
+                            $"{path} is referenced by more than one VM " +
+                            $"({string.Join(", ", matches.Select(match => $"{match.VmId} on {match.HostName}"))}), " +
+                            "so no one of them is the VM holding it");
+                }
+            }
         }
 
-        switch (matches.Count)
+        if (failures.Count > 0)
         {
-            case 0:
-                _logger.LogDebug(
-                    "{Path} is open, but no clustered VM on {Candidates} or its coordinator {Coordinator} references it",
-                    fullPath, holders, volume.CoordinatorNode);
-                return null;
-
-            case 1:
-                _logger.LogDebug(
-                    "{Path} belongs to {VmId} on {HostName}, per {Coordinator}'s CSV open files",
-                    fullPath, matches[0].VmId, matches[0].HostName, volume.CoordinatorNode);
-                return matches[0];
-
-            default:
-                throw new InvalidOperationException(
-                    $"{path} is referenced by more than one VM " +
-                    $"({string.Join(", ", matches.Select(match => $"{match.VmId} on {match.HostName}"))}), " +
-                    "so no one of them is the VM holding it");
+            // Nothing matched, but not everything could be asked, and null would
+            // claim more than is known: callers read it as "no clustered VM holds
+            // this file".
+            throw new InvalidOperationException(
+                $"{path} is open, and no clustered VM on a node that could be holding it was found to reference it, " +
+                $"but {failures.Count} of those VMs could not be checked: {string.Join("; ", failures)}");
         }
+
+        _logger.LogDebug(
+            "{Path} is open, but no clustered VM on {Candidates} or its coordinator {Coordinator} references it",
+            fullPath, holders, volume.CoordinatorNode);
+        return null;
     }
 
     /// <summary>
@@ -143,8 +164,19 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
     /// scoping ListOwnedCheckpointsAsync's own remarks give for why VM
     /// discovery belongs to IClusterService.
     /// </summary>
+    /// <remarks>
+    /// A VM that cannot be checked - one whose configuration or some unrelated
+    /// disk of which cannot be read - is recorded in
+    /// <paramref name="failures"/> and passed over rather than allowed to stop
+    /// the rest: it says nothing about whether another VM references the path.
+    /// </remarks>
     private async Task<List<VhdxLocation>> FindReferencingVmsAsync(
-        IReadOnlyList<ClusteredVm> vms, IEnumerable<string> hostNames, string fullPath, CancellationToken cancellationToken)
+        IReadOnlyList<ClusteredVm> vms,
+        IEnumerable<string> hostNames,
+        string fullPath,
+        bool includeDifferencingChains,
+        List<string> failures,
+        CancellationToken cancellationToken)
     {
         var matches = new List<VhdxLocation>();
         foreach (var hostName in hostNames)
@@ -153,7 +185,8 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
             {
                 try
                 {
-                    if (await _host.ReferencesDiskAsync(hostName, vm.VmId, fullPath, cancellationToken).ConfigureAwait(false))
+                    if (await _host.ReferencesDiskAsync(
+                            hostName, vm.VmId, fullPath, includeDifferencingChains, cancellationToken).ConfigureAwait(false))
                     {
                         matches.Add(new VhdxLocation(hostName, vm.VmId));
                     }
@@ -163,6 +196,13 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
                     // Migrated off this node since the listing above. Wherever it
                     // went, it is not what has this file open here.
                     _logger.LogDebug("{VmId} left {HostName} while it was being checked for {Path}", vm.VmId, hostName, fullPath);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogWarning(ex,
+                        "could not tell whether {VmId} on {HostName} references {Path}; carrying on with the others",
+                        vm.VmId, hostName, fullPath);
+                    failures.Add($"{vm.VmId} on {hostName}: {ex.Message}");
                 }
             }
         }

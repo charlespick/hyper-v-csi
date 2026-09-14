@@ -28,7 +28,8 @@ public sealed class UnsupportedHyperVHostClient : IHyperVHostClient
     public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
         throw Unsupported();
 
-    public Task<bool> ReferencesDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+    public Task<bool> ReferencesDiskAsync(
+        string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken) =>
         throw Unsupported();
 
     public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken) =>

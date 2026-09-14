@@ -740,7 +740,8 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
         public Task<bool> IsChainCollapsedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
             Task.FromResult(!_byHost.TryGetValue(hostName, out var entries) || entries.Count == 0);
 
-        public Task<bool> ReferencesDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+        public Task<bool> ReferencesDiskAsync(
+            string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
         public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken) =>

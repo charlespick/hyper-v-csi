@@ -62,8 +62,9 @@ public sealed class VmTargetAssertingHyperVHostClient(IHyperVHostClient inner) :
         return inner.DetachDiskAsync(hostName, vmId, vhdxPath, cancellationToken);
     }
 
-    public Task<bool> ReferencesDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
-        inner.ReferencesDiskAsync(hostName, vmId, vhdxPath, cancellationToken);
+    public Task<bool> ReferencesDiskAsync(
+        string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken) =>
+        inner.ReferencesDiskAsync(hostName, vmId, vhdxPath, includeDifferencingChains, cancellationToken);
 
     public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken) =>
         inner.GetDiskInfoAsync(hostName, vhdxPath, cancellationToken);

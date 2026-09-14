@@ -51,19 +51,27 @@ public interface IHyperVHostClient
     Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Whether <paramref name="vhdxPath"/> is part of the VM's current storage
-    /// at all: referenced directly, or as the base of a differencing chain one
-    /// of its disks is built on. Unlike <see cref="IsDiskAttachedAsync"/>, a
-    /// checkpoint standing over the disk is an ordinary "yes" here rather than
-    /// a refusal - this answers which VM a disk belongs to, not whether an
-    /// operation on it is safe to start.
+    /// Whether <paramref name="vhdxPath"/> is part of the VM's current storage:
+    /// referenced directly, or - with <paramref name="includeDifferencingChains"/>
+    /// - as the base of a differencing chain one of its disks is built on.
+    /// Unlike <see cref="IsDiskAttachedAsync"/>, a checkpoint standing over the
+    /// disk is an ordinary "yes" here rather than a refusal - this answers which
+    /// VM a disk belongs to, not whether an operation on it is safe to start.
     /// </summary>
+    /// <param name="includeDifferencingChains">
+    /// False answers from the VM's configuration alone. True also walks every
+    /// other disk's chain, one read per disk per hop - worth paying only once
+    /// no VM has been found referencing the path directly.
+    /// </param>
     /// <exception cref="VmNotOnHostException">The VM is not registered on this host.</exception>
     /// <exception cref="InvalidOperationException">
-    /// One of the VM's differencing chains could not be walked far enough to
-    /// tell whether it is built on <paramref name="vhdxPath"/>.
+    /// No disk was found referencing <paramref name="vhdxPath"/>, and at least
+    /// one of the VM's differencing chains could not be walked far enough to
+    /// tell. A chain that cannot be walked never hides another disk that does
+    /// reference the path.
     /// </exception>
-    Task<bool> ReferencesDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken);
+    Task<bool> ReferencesDiskAsync(
+        string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken);
 
     /// <summary>
     /// Reads a VHDX's current virtual size and identity through the host that

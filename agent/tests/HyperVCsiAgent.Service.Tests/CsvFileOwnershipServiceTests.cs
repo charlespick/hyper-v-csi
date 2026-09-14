@@ -105,6 +105,58 @@ public sealed class CsvFileOwnershipServiceTests
     }
 
     [Fact]
+    public async Task LocateAsync_WalksDifferencingChainsOnlyOnceNothingReferencesThePathDirectly()
+    {
+        // A checkpoint re-points the VM at an .avhdx built on the path. Every
+        // candidate is first asked from configuration alone - the cheap
+        // question, and the ordinary answer - and only then are chains walked,
+        // in the same order: the listed node, then the coordinator.
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address)];
+        _host.ChainReferences.Add(("csidev02", "vm-2"));
+
+        Assert.Equal(new VhdxLocation("csidev02", "vm-2"), await NewService().LocateAsync(Pvc, CancellationToken.None));
+        Assert.Equal(["vm-1", "vm-2"], _host.Asked);
+        Assert.Equal(["vm-1", "vm-2"], _host.AskedForChains);
+    }
+
+    [Fact]
+    public async Task LocateAsync_FindsADirectReferenceOnTheCoordinatorBeforeWalkingAnyChainOnTheListedNodes()
+    {
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev03Address)];
+        _host.References.Add(("csidev02", "vm-2"));
+
+        Assert.Equal(new VhdxLocation("csidev02", "vm-2"), await NewService().LocateAsync(Pvc, CancellationToken.None));
+        Assert.Empty(_host.AskedForChains);
+    }
+
+    [Fact]
+    public async Task LocateAsync_AVmThatCannotBeChecked_DoesNotHideTheOneThatReferencesThePath()
+    {
+        // One VM on the node with a disk whose file is gone says nothing about
+        // whether another VM there has this one.
+        _cluster.Vms = [new("vm-1", "csidev01"), new("vm-4", "csidev01"), new("vm-2", "csidev02")];
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address)];
+        _host.Unreadable.Add("vm-1");
+        _host.References.Add(("csidev01", "vm-4"));
+
+        Assert.Equal(new VhdxLocation("csidev01", "vm-4"), await NewService().LocateAsync(Pvc, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task LocateAsync_RefusesRatherThanAnswerNoneWhenAVmCouldNotBeChecked()
+    {
+        // Null would tell callers no clustered VM holds the file, which is more
+        // than is known while a candidate VM could not be asked.
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address)];
+        _host.Unreadable.Add("vm-1");
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => NewService().LocateAsync(Pvc, CancellationToken.None));
+
+        Assert.Contains("vm-1 on csidev01", failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task LocateAsync_RefusesTwoVmsReferencingOnePath()
     {
         _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address), new(PvcRelative, Dev03Address)];
@@ -297,19 +349,41 @@ public sealed class CsvFileOwnershipServiceTests
 
     private sealed class FakeHost : IHyperVHostClient
     {
+        /// <summary>VMs whose configuration references the path directly.</summary>
         public HashSet<(string Host, string VmId)> References { get; } = [];
+
+        /// <summary>VMs a checkpoint has re-pointed at a differencing disk built on the path.</summary>
+        public HashSet<(string Host, string VmId)> ChainReferences { get; } = [];
 
         public HashSet<string> Migrated { get; } = [];
 
-        /// <summary>Every VM asked, in the order it was asked.</summary>
+        /// <summary>VMs with something - their configuration, or an unrelated disk - that cannot be read.</summary>
+        public HashSet<string> Unreadable { get; } = [];
+
+        /// <summary>Every VM asked from configuration alone, in the order it was asked.</summary>
         public List<string> Asked { get; } = [];
 
-        public Task<bool> ReferencesDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken)
+        /// <summary>Every VM asked with its differencing chains walked, in the order it was asked.</summary>
+        public List<string> AskedForChains { get; } = [];
+
+        public Task<bool> ReferencesDiskAsync(
+            string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken)
         {
-            Asked.Add(vmId);
-            return Migrated.Contains(vmId)
-                ? throw new VmNotOnHostException(hostName, vmId)
-                : Task.FromResult(References.Contains((hostName, vmId)));
+            (includeDifferencingChains ? AskedForChains : Asked).Add(vmId);
+
+            if (Migrated.Contains(vmId))
+            {
+                throw new VmNotOnHostException(hostName, vmId);
+            }
+
+            if (Unreadable.Contains(vmId))
+            {
+                throw new InvalidOperationException($"a disk on {vmId} could not be read");
+            }
+
+            return Task.FromResult(
+                References.Contains((hostName, vmId))
+                || (includeDifferencingChains && ChainReferences.Contains((hostName, vmId))));
         }
 
         public Task<AttachedDisk?> FindAttachedDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>

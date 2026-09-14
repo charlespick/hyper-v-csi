@@ -117,7 +117,9 @@ public interface IClusterService
     Task<IReadOnlyList<ClusterSharedVolume>> ListSharedVolumesAsync(CancellationToken cancellationToken);
 
     /// <summary>
-    /// The name of every node in the cluster, whatever state each is in.
+    /// The name of every node in the cluster the cluster does not report Down.
+    /// Paused and joining nodes are included: a paused node still runs VMs
+    /// until it is drained.
     /// </summary>
     Task<IReadOnlyList<string>> ListNodesAsync(CancellationToken cancellationToken);
 }

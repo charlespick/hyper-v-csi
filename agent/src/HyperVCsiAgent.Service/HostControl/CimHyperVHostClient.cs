@@ -360,14 +360,17 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         }, cancellationToken);
 
     public Task<bool> ReferencesDiskAsync(
-        string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+        string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
-            _logger.LogDebug("checking whether {VmId} on {HostName} references {VhdxPath}", vmId, hostName, vhdxPath);
+            _logger.LogDebug(
+                "checking whether {VmId} on {HostName} references {VhdxPath} (differencing chains: {IncludeChains})",
+                vmId, hostName, vhdxPath, includeDifferencingChains);
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
             using var settings = GetActiveSettings(session, hostName, vmId, deadline, cancellationToken);
-            return ReferencesDisk(session, settings, vmId, vhdxPath, deadline, cancellationToken);
+            return ReferencesDisk(
+                session, settings, vmId, vhdxPath, includeDifferencingChains, deadline, cancellationToken, _logger);
         }, cancellationToken);
 
     public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken) =>
@@ -751,14 +754,23 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     /// touch - but a chain it cannot walk to the end is still refused rather
     /// than read as "not this VM", because the caller is choosing which VM
     /// to act on and a wrong "no" sends it to act on none.
+    /// <para>
+    /// Refused only once every other chain has been walked, though. A disk
+    /// whose setting data cannot be read - one whose file is gone, most
+    /// plausibly - says nothing about whether a different disk on the same VM
+    /// is built on the path, so it is set aside rather than allowed to stop
+    /// the walk.
+    /// </para>
     /// </remarks>
     private static bool ReferencesDisk(
         CimSession session,
         CimInstance settings,
         string vmId,
         string vhdxPath,
+        bool includeDifferencingChains,
         CimDeadline deadline,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ILogger logger)
     {
         var otherDisks = new List<string>();
 
@@ -785,44 +797,78 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             }
         }
 
-        if (otherDisks.Count == 0)
+        if (!includeDifferencingChains || otherDisks.Count == 0)
         {
             return false;
         }
 
         using var imageService = GetImageManagementService(session, deadline, cancellationToken);
 
+        var unresolved = new List<string>();
         foreach (var attached in otherDisks)
         {
-            var descendant = attached;
-            var depth = 0;
-
-            for (; depth < MaxDifferencingChainDepth; depth++)
+            try
             {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                if (ParentPathOf(session, imageService, descendant, deadline, cancellationToken) is not { } parent)
-                {
-                    break;
-                }
-
-                if (SamePath(parent, vhdxPath))
+                if (IsBuiltOn(session, imageService, attached, vhdxPath, deadline, cancellationToken))
                 {
                     return true;
                 }
-
-                descendant = parent;
             }
-
-            if (depth == MaxDifferencingChainDepth)
+            catch (Exception ex) when (ex is InvalidOperationException or CimException)
             {
-                throw new InvalidOperationException(
-                    $"{attached}'s differencing chain on {vmId} is still {MaxDifferencingChainDepth} disks deep " +
-                    $"without reaching a disk with no parent; cannot determine whether it is built on {vhdxPath}");
+                logger.LogDebug(ex,
+                    "could not walk {Attached}'s differencing chain on {VmId}; carrying on with its other disks", attached, vmId);
+                unresolved.Add($"{attached}: {ex.Message}");
             }
         }
 
+        if (unresolved.Count > 0)
+        {
+            throw new InvalidOperationException(
+                $"no disk on {vmId} was found to be {vhdxPath} or built on it, but {unresolved.Count} of its " +
+                $"differencing chains could not be walked to tell: {string.Join("; ", unresolved)}");
+        }
+
         return false;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="attached"/>'s differencing chain reaches
+    /// <paramref name="vhdxPath"/> - <see cref="ReferencesDisk"/>'s walk of one
+    /// disk.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// A disk in the chain could not be read, or the chain is still
+    /// <see cref="MaxDifferencingChainDepth"/> disks deep without ending.
+    /// </exception>
+    private static bool IsBuiltOn(
+        CimSession session,
+        CimInstance imageService,
+        string attached,
+        string vhdxPath,
+        CimDeadline deadline,
+        CancellationToken cancellationToken)
+    {
+        var descendant = attached;
+        for (var depth = 0; depth < MaxDifferencingChainDepth; depth++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (ParentPathOf(session, imageService, descendant, deadline, cancellationToken) is not { } parent)
+            {
+                return false;
+            }
+
+            if (SamePath(parent, vhdxPath))
+            {
+                return true;
+            }
+
+            descendant = parent;
+        }
+
+        throw new InvalidOperationException(
+            $"the chain is still {MaxDifferencingChainDepth} disks deep without reaching a disk with no parent");
     }
 
     /// <summary>

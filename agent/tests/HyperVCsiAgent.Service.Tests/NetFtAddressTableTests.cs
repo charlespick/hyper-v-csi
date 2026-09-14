@@ -53,11 +53,37 @@ public sealed class NetFtAddressTableTests
         await table.ResolveAsync("fe80::1", CancellationToken.None);
         _clock.Advance(NetFtAddressTable.RevalidationInterval - TimeSpan.FromSeconds(1));
         await table.ResolveAsync("fe80::1", CancellationToken.None);
-        Assert.Equal(1, _probe.Reads["csidev01"]);
+        Assert.Equal(1, _probe.ReadCount("csidev01"));
 
         _clock.Advance(TimeSpan.FromSeconds(1));
         await table.ResolveAsync("fe80::1", CancellationToken.None);
-        Assert.Equal(2, _probe.Reads["csidev01"]);
+        await WaitForAsync(() => Task.FromResult(_probe.ReadCount("csidev01") == 2));
+    }
+
+    [Fact]
+    public async Task ResolveAsync_AnswersFromTheTableItHasWhileARevalidationIsStillRunning()
+    {
+        // A node slow to answer - one that just went away, most likely - must
+        // not stall lookups that the table already built can answer.
+        _cluster.Nodes = ["csidev01"];
+        _probe.Addresses["csidev01"] = ["fe80::1"];
+        var table = NewTable();
+        await table.ResolveAsync("fe80::1", CancellationToken.None);
+
+        var unblock = new TaskCompletionSource();
+        _probe.Gate = unblock.Task;
+        _clock.Advance(NetFtAddressTable.RevalidationInterval);
+
+        try
+        {
+            var answer = await table.ResolveAsync("fe80::1", CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal("csidev01", answer);
+            await WaitForAsync(() => Task.FromResult(_probe.ReadCount("csidev01") == 2));
+        }
+        finally
+        {
+            unblock.SetResult();
+        }
     }
 
     [Fact]
@@ -91,8 +117,10 @@ public sealed class NetFtAddressTableTests
         _probe.Failing.Add("csidev02");
         _clock.Advance(NetFtAddressTable.RevalidationInterval);
 
+        await table.ResolveAsync("fe80::1", CancellationToken.None);
+        await WaitForAsync(() => Task.FromResult(_probe.ReadCount("csidev02") == 2 && _probe.ReadCount("csidev01") == 2));
+
         Assert.Equal("csidev02", await table.ResolveAsync("fe80::2", CancellationToken.None));
-        Assert.Equal(2, _probe.Reads["csidev02"]);
     }
 
     [Fact]
@@ -107,7 +135,8 @@ public sealed class NetFtAddressTableTests
         _cluster.Nodes = ["csidev01"];
         _clock.Advance(NetFtAddressTable.RevalidationInterval);
 
-        Assert.Null(await table.ResolveAsync("fe80::2", CancellationToken.None));
+        // Answered from the table it has until the background rebuild lands.
+        await WaitForAsync(async () => await table.ResolveAsync("fe80::2", CancellationToken.None) is null);
     }
 
     [Fact]
@@ -148,6 +177,20 @@ public sealed class NetFtAddressTableTests
     private NetFtAddressTable NewTable() =>
         new(_cluster, _probe, _clock, NullLogger<NetFtAddressTable>.Instance);
 
+    private static async Task WaitForAsync(Func<Task<bool>> condition)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (!await condition())
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                throw new TimeoutException("condition never became true");
+            }
+
+            await Task.Delay(10);
+        }
+    }
+
     internal sealed class ManualTimeProvider : TimeProvider
     {
         private DateTimeOffset _now = new(2026, 9, 13, 0, 0, 0, TimeSpan.Zero);
@@ -165,19 +208,35 @@ public sealed class NetFtAddressTableTests
 
         public Dictionary<string, int> Reads { get; } = new(StringComparer.OrdinalIgnoreCase);
 
+        /// <summary>When set, every read waits for it before answering - a node slow to respond.</summary>
+        public Task? Gate { get; set; }
+
+        public int ReadCount(string nodeName)
+        {
+            lock (Reads)
+            {
+                return Reads.GetValueOrDefault(nodeName);
+            }
+        }
+
         public Task<IReadOnlyList<CsvOpenFile>> ReadCsvOpenFilesAsync(string nodeName, CancellationToken cancellationToken) =>
             throw new NotSupportedException("the address table never lists open files");
 
-        public Task<IReadOnlyList<string>> ReadNetFtAddressesAsync(string nodeName, CancellationToken cancellationToken)
+        public async Task<IReadOnlyList<string>> ReadNetFtAddressesAsync(string nodeName, CancellationToken cancellationToken)
         {
             lock (Reads)
             {
                 Reads[nodeName] = Reads.GetValueOrDefault(nodeName) + 1;
             }
 
+            if (Gate is { } gate)
+            {
+                await gate;
+            }
+
             return Failing.Contains(nodeName)
                 ? throw new TimeoutException($"{nodeName} did not answer")
-                : Task.FromResult<IReadOnlyList<string>>(Addresses.GetValueOrDefault(nodeName) ?? []);
+                : Addresses.GetValueOrDefault(nodeName) ?? [];
         }
     }
 
