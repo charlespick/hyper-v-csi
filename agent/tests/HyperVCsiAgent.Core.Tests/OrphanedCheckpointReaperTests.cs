@@ -548,6 +548,8 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
             return job;
         }
 
+        public Job? FindActive(string idempotencyKey, string operationType) => _inner.FindActive(idempotencyKey, operationType);
+
         public Job? Get(string id) => _inner.Get(id);
 
         public void Dispose() => _inner.Dispose();

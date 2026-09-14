@@ -141,6 +141,19 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
         }
     }
 
+    public Job? FindActive(string idempotencyKey, string operationType)
+    {
+        lock (_gate)
+        {
+            // The live instance, not a snapshot like Get's: the caller waits on
+            // its Status moving, which a copy taken now never would.
+            return _byKey.TryGetValue((operationType, idempotencyKey), out var job)
+                && job.Status is JobStatus.Pending or JobStatus.Running
+                    ? job
+                    : null;
+        }
+    }
+
     public Job? Get(string id)
     {
         var job = _byId.GetValueOrDefault(id);

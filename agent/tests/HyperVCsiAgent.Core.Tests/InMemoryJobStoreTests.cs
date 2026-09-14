@@ -24,6 +24,25 @@ public class InMemoryJobStoreTests
     }
 
     [Fact]
+    public async Task FindActive_ReturnsTheLiveJobOnlyWhilePendingOrRunning()
+    {
+        var store = new InMemoryJobStore();
+        var release = new TaskCompletionSource();
+
+        Assert.Null(store.FindActive("pvc-1", "CreateVolume"));
+
+        var job = store.GetOrCreate("pvc-1", "CreateVolume", ["vol-pvc-1"], async (_, _) => await release.Task);
+
+        Assert.Same(job, store.FindActive("pvc-1", "CreateVolume"));
+        Assert.Null(store.FindActive("pvc-1", "DeleteVolume"));
+
+        release.SetResult();
+        await WaitForTerminal(job);
+
+        Assert.Null(store.FindActive("pvc-1", "CreateVolume"));
+    }
+
+    [Fact]
     public async Task GetOrCreate_AfterFailure_StartsAFreshJob()
     {
         var store = new InMemoryJobStore();

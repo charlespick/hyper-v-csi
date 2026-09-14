@@ -299,6 +299,29 @@ public sealed class SnapshotService : ISnapshotService
                     _options.DiskOperationTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
             }
 
+            // A copy of this snapshot already in flight in this process is
+            // waited on and described, without the preconditions below. Those
+            // only decide whether a copy may start, and GetOrCreate would hand
+            // this same job back whatever they found. Running them anyway is
+            // not free: InspectSourceAsync's open-handle probe opens the source
+            // with no sharing, which for that instant refuses the copy's own
+            // opens of it - the copy starting to read, the checkpoint being
+            // taken, the merge after it. external-snapshotter polls this call
+            // for as long as the copy runs, so every poll would be another
+            // chance to land on one of those.
+            //
+            // Awaited directly rather than reached through GetOrCreate: a copy
+            // that finishes between this lookup and that call would have
+            // GetOrCreate start a fresh one with no precondition run at all.
+            if (_jobs.FindActive(snapshotId, CopySnapshot) is { } inFlight)
+            {
+                await AwaitCheckpointAsync(inFlight, snapshotId, snapshotPath, copyingPath, attempt.Token).ConfigureAwait(false);
+
+                return await DescribeAsync(
+                    snapshotId, sourceVolumeId, snapshotPath, copyingPath, sourcePath,
+                    _options.DiskOperationTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
+            }
+
             // Preconditions, in order, each with its own message. None of them
             // takes the checkpoint anymore: Decision 5 moved that into
             // RunCopyAsync, immediately before the copy actually starts, so
@@ -306,11 +329,13 @@ public sealed class SnapshotService : ISnapshotService
             // mode the old ordering existed to guard against is gone along
             // with the thing it was protecting against.
             //
-            // Re-run on every call rather than only on the first: the per-volume
-            // job queue does not span an agent restart, so a copy resumed after
-            // one cannot assume the volume is still in the state the original
-            // call found it in. A volume attached between an abandoned copy and
-            // its restart is the case that makes this matter.
+            // Re-run on every call that has no copy in flight to attach to,
+            // rather than only on the first: the per-volume job queue does not
+            // span an agent restart, so a copy resumed after one cannot assume
+            // the volume is still in the state the original call found it in.
+            // A volume attached between an abandoned copy and its restart is
+            // the case that makes this matter, and with the store gone along
+            // with that process, it always comes through here.
             var source = await InspectSourceAsync(
                 snapshotId, sourceVolumeId, snapshotName, sourcePath, attempt, cancellationToken).ConfigureAwait(false);
 
@@ -349,7 +374,10 @@ public sealed class SnapshotService : ISnapshotService
             // A copy that is Pending or Running comes back as the existing
             // job and this delegate is never invoked - nothing restarts, and
             // AwaitCheckpointAsync below reports whatever that job's own
-            // progress already is.
+            // progress already is. The FindActive check above answers most of
+            // those first; this still catches one enqueued since, such as by
+            // the reaper's ResumeCopy, which does not queue on this call's
+            // snapshot: target.
             //
             // A copy that Failed, or that the store has since evicted, or
             // that a restart erased along with the whole store, produces a
@@ -399,16 +427,17 @@ public sealed class SnapshotService : ISnapshotService
     /// Skipping straight to the enqueue, with none of <see cref="CreateAsync"/>'s
     /// own preconditions re-run, is deliberate too: those exist to decide
     /// whether a *new* copy may start, and this one already started once - if
-    /// a fresh CreateSnapshot for the same (volume, name) does arrive, it
-    /// still runs every precondition itself and then reaches this exact job
-    /// through <see cref="IJobStore.GetOrCreate"/> rather than a second one.
+    /// a fresh CreateSnapshot for the same (volume, name) does arrive while it
+    /// runs, that call finds this exact job through
+    /// <see cref="IJobStore.FindActive"/> and waits on it, skipping its own
+    /// preconditions for the same reason.
     /// <para>
     /// <c>sourceVolumeId</c> and <c>snapshotName</c> are the only two inputs
     /// <see cref="SnapshotNaming.ComposeId"/> takes, so the <c>snapshotId</c>
     /// computed here is identical to the one a live client's retry of the
     /// original CreateSnapshot would compute independently - which is what
-    /// lets that retry attach to this same job through GetOrCreate instead of
-    /// starting a second, parallel copy.
+    /// lets that retry attach to this same job instead of starting a second,
+    /// parallel copy.
     /// </para>
     /// </remarks>
     public Job ResumeCopy(string sourceVolumeId, string snapshotName, string nodeId)

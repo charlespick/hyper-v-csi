@@ -173,6 +173,37 @@ public sealed class SnapshotServiceTests : IDisposable
         await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
     }
 
+    [WindowsOnlyFact]
+    public async Task CreateAsync_WhileACopyIsInFlight_DoesNotInspectTheSourceAgain()
+    {
+        // The source inspection's open-handle probe opens the disk with no
+        // sharing at all, and a copy in flight opens that same disk itself - to
+        // start reading it, to take a checkpoint, to merge one away. The
+        // external-snapshotter polls this call for as long as the copy runs, so
+        // a poll that probed would keep landing on those opens. Held here by a
+        // reader that shares, so a probe that did run would find the disk held
+        // and go on to trace it, which is what the count sees.
+        var location = new FakeVhdxLocationService();
+        var harness = NewHarness(location: location);
+        WriteVolume("pvc-1", 4096);
+        using var reader = HoldOpenForReading(VolumePath("pvc-1"));
+        using var release = new SemaphoreSlim(0);
+        harness.Copier.DuringCopy = _ => release.WaitAsync();
+
+        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        await WaitForAsync(() => harness.Copier.Destinations.Count == 1);
+        Assert.Equal(1, location.LocateCalls);
+
+        var poll = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+
+        Assert.False(poll.ReadyToUse);
+        Assert.Equal(1, location.LocateCalls);
+        Assert.Single(harness.Store.Created);
+
+        release.Release();
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+    }
+
     [Fact]
     public async Task CreateAsync_AnAbandonedMarkerWithNoRunningCopy_IsDiscardedAndTheCopyRestarts()
     {
@@ -2147,6 +2178,8 @@ public sealed class SnapshotServiceTests : IDisposable
             return job;
         }
 
+        public Job? FindActive(string idempotencyKey, string operationType) => _inner.FindActive(idempotencyKey, operationType);
+
         public Job? Get(string id) => _inner.Get(id);
 
         public void Dispose() => _inner.Dispose();
@@ -2177,6 +2210,10 @@ public sealed class SnapshotServiceTests : IDisposable
             _byId[job.Id] = job;
             return job;
         }
+
+        // Every job this store hands out reads as Running, so every one is active.
+        public Job? FindActive(string idempotencyKey, string operationType) =>
+            _byId.Values.FirstOrDefault(job => job.IdempotencyKey == idempotencyKey && job.OperationType == operationType);
 
         public Job? Get(string id) => _byId.GetValueOrDefault(id);
     }
@@ -2407,8 +2444,16 @@ public sealed class SnapshotServiceTests : IDisposable
 
         public string? VmId { get; init; }
 
-        public Task<VhdxLocation?> LocateAsync(string path, CancellationToken cancellationToken) =>
-            Task.FromResult(VmId is null ? null : new VhdxLocation(Host, VmId));
+        private int _locateCalls;
+
+        /// <summary>How many times a source has been traced - once per inspection that found it held.</summary>
+        public int LocateCalls => Volatile.Read(ref _locateCalls);
+
+        public Task<VhdxLocation?> LocateAsync(string path, CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref _locateCalls);
+            return Task.FromResult(VmId is null ? null : new VhdxLocation(Host, VmId));
+        }
     }
 
     /// <summary>
