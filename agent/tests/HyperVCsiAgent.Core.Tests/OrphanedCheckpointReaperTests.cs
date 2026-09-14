@@ -505,10 +505,7 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
     /// </summary>
     private sealed class NeverCalledVhdxLocationService : IVhdxLocationService
     {
-        public Task<string> ResolveHostAsync(string path, CancellationToken cancellationToken) =>
-            throw new NotSupportedException("the reaper never traces a disk from its path");
-
-        public Task<string?> ResolveVmOnHostAsync(string hostName, string path, CancellationToken cancellationToken) =>
+        public Task<VhdxLocation?> LocateAsync(string path, CancellationToken cancellationToken) =>
             throw new NotSupportedException("the reaper never traces a disk from its path");
     }
 

@@ -9,6 +9,11 @@ public sealed class CsvFileOwnershipServiceTests
 {
     private const string Volume2 = @"C:\ClusterStorage\Volume2";
     private const string Pvc = @"C:\ClusterStorage\Volume2\hyperv-csi\volumes\pvc-1.vhdx";
+    private const string PvcRelative = @"hyperv-csi\volumes\pvc-1.vhdx";
+
+    private const string Dev01Address = "[fe80::5555:2b8c:de84:3bf7]";
+    private const string Dev02Address = "[fe80::1429:5bed:d08a:d5a8]";
+    private const string Dev03Address = "[fe80::3]";
 
     private readonly NetFtAddressTableTests.ManualTimeProvider _clock = new();
     private readonly FakeCluster _cluster = new();
@@ -17,89 +22,161 @@ public sealed class CsvFileOwnershipServiceTests
 
     public CsvFileOwnershipServiceTests()
     {
-        _cluster.Nodes = ["csidev01", "csidev02"];
+        // The cluster this was measured on, plus a third node: the shapes that
+        // need one - a VM and another reader, each on a node that is not the
+        // coordinator - cannot happen with two.
+        _cluster.Nodes = ["csidev01", "csidev02", "csidev03"];
         _probe.Addresses["csidev01"] = ["fe80::5555:2b8c:de84:3bf7"];
         _probe.Addresses["csidev02"] = ["fe80::1429:5bed:d08a:d5a8"];
+        _probe.Addresses["csidev03"] = ["fe80::3"];
         _cluster.Volumes.Enqueue([new ClusterSharedVolume(Volume2, "csidev02")]);
+        _cluster.Vms = [new("vm-1", "csidev01"), new("vm-2", "csidev02"), new("vm-3", "csidev03")];
     }
 
     [Fact]
-    public async Task ResolveHostAsync_NamesTheNodeTheCoordinatorListsTheFileOpenFrom()
+    public async Task LocateAsync_FindsTheVmOnTheNodeTheCoordinatorListsTheFileOpenFrom()
     {
         _probe.OpenFiles["csidev02"] =
         [
-            new(@"hyperv-csi\volumes\pvc-2.vhdx", "[fe80::1429:5bed:d08a:d5a8]"),
-            new(@"hyperv-csi\volumes\pvc-1.vhdx", "[fe80::5555:2b8c:de84:3bf7]"),
+            new(@"hyperv-csi\volumes\pvc-2.vhdx", Dev02Address),
+            new(PvcRelative, Dev01Address),
             // A running VM holds several handles on one disk; they all name the
-            // same client, and that is still one holder.
-            new(@"hyperv-csi\volumes\pvc-1.vhdx", "[fe80::5555:2b8c:de84:3bf7]"),
+            // same client, and that is still one node.
+            new(PvcRelative, Dev01Address),
         ];
+        _host.References.Add(("csidev01", "vm-1"));
 
-        Assert.Equal("csidev01", await NewService().ResolveHostAsync(Pvc, CancellationToken.None));
+        Assert.Equal(new VhdxLocation("csidev01", "vm-1"), await NewService().LocateAsync(Pvc, CancellationToken.None));
+
+        // Found on the listed node, so nothing else is asked - not even the
+        // coordinator.
+        Assert.Equal(["vm-1"], _host.Asked);
     }
 
     [Fact]
-    public async Task ResolveHostAsync_MatchesThePathWithoutRegardToCase()
+    public async Task LocateAsync_WhenTwoNodesHaveTheFileOpen_PicksTheOneWhoseVmReferencesIt()
     {
-        _probe.OpenFiles["csidev02"] = [new(@"HyperV-CSI\Volumes\PVC-1.VHDX", "[fe80::5555:2b8c:de84:3bf7]")];
+        // The shape that used to fail every CreateSnapshot replayed during a
+        // copy: the VM's node and this agent's own copy, reading the source
+        // from another node, both listed beside each other.
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address), new(PvcRelative, Dev03Address)];
+        _host.References.Add(("csidev01", "vm-1"));
 
-        Assert.Equal("csidev01", await NewService().ResolveHostAsync(Pvc, CancellationToken.None));
+        Assert.Equal(new VhdxLocation("csidev01", "vm-1"), await NewService().LocateAsync(Pvc, CancellationToken.None));
+        Assert.Equal(["vm-1", "vm-3"], _host.Asked);
     }
 
     [Fact]
-    public async Task ResolveHostAsync_AnswersTheCoordinatorWhenNothingOpenedTheFileThroughItsChannel()
+    public async Task LocateAsync_WhenTheOnlyListedNodeRunsNoVmReferencingIt_FallsBackToTheCoordinator()
     {
-        // The coordinator's blind spot: its own opens are local handles that
-        // never appear in this listing.
-        _probe.OpenFiles["csidev02"] = [new(@"hyperv-csi\volumes\pvc-2.vhdx", "[fe80::5555:2b8c:de84:3bf7]")];
+        // The VM runs on the coordinator, whose own opens never appear in its
+        // listing, so the only node listed is the other reader.
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev03Address)];
+        _host.References.Add(("csidev02", "vm-2"));
 
-        Assert.Equal("csidev02", await NewService().ResolveHostAsync(Pvc, CancellationToken.None));
+        Assert.Equal(new VhdxLocation("csidev02", "vm-2"), await NewService().LocateAsync(Pvc, CancellationToken.None));
+        Assert.Equal(["vm-3", "vm-2"], _host.Asked);
+    }
 
-        // Checked once more before being believed.
+    [Fact]
+    public async Task LocateAsync_WhenNothingIsListed_FindsTheVmOnTheCoordinator()
+    {
+        _probe.OpenFiles["csidev02"] = [new(@"hyperv-csi\volumes\pvc-2.vhdx", Dev01Address)];
+        _host.References.Add(("csidev02", "vm-2"));
+
+        Assert.Equal(new VhdxLocation("csidev02", "vm-2"), await NewService().LocateAsync(Pvc, CancellationToken.None));
+
+        // Only the coordinator's VMs are asked, and the empty listing was
+        // checked against a fresh reading of the coordinator before that.
+        Assert.Equal(["vm-2"], _host.Asked);
         Assert.Equal(2, _cluster.SharedVolumeReads);
     }
 
     [Fact]
-    public async Task ResolveHostAsync_FollowsCoordinationThatMovedSinceTheCachedReading()
+    public async Task LocateAsync_IsNullWhenNoCandidateNodesVmReferencesThePath_AndAsksNoOtherNode()
+    {
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address)];
+
+        Assert.Null(await NewService().LocateAsync(Pvc, CancellationToken.None));
+
+        // The listed node, then the coordinator - never csidev03, which neither
+        // lists the file nor coordinates its volume.
+        Assert.Equal(["vm-1", "vm-2"], _host.Asked);
+    }
+
+    [Fact]
+    public async Task LocateAsync_RefusesTwoVmsReferencingOnePath()
+    {
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address), new(PvcRelative, Dev03Address)];
+        _host.References.Add(("csidev01", "vm-1"));
+        _host.References.Add(("csidev03", "vm-3"));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => NewService().LocateAsync(Pvc, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task LocateAsync_SkipsAVmThatMigratedAwayWhileBeingChecked()
+    {
+        _cluster.Vms = [new("vm-1", "csidev01"), new("vm-4", "csidev01")];
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address)];
+        _host.Migrated.Add("vm-1");
+        _host.References.Add(("csidev01", "vm-4"));
+
+        Assert.Equal(new VhdxLocation("csidev01", "vm-4"), await NewService().LocateAsync(Pvc, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task LocateAsync_MatchesThePathWithoutRegardToCase()
+    {
+        _probe.OpenFiles["csidev02"] = [new(@"HyperV-CSI\Volumes\PVC-1.VHDX", Dev01Address)];
+        _host.References.Add(("csidev01", "vm-1"));
+
+        Assert.Equal(new VhdxLocation("csidev01", "vm-1"), await NewService().LocateAsync(Pvc, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task LocateAsync_FollowsCoordinationThatMovedSinceTheCachedReading()
     {
         // The cached reading still names csidev02, which no longer sees this
         // volume's opens; the fresh one names csidev01, which does.
         _cluster.Volumes.Enqueue([new ClusterSharedVolume(Volume2, "csidev01")]);
-        _probe.OpenFiles["csidev01"] = [new(@"hyperv-csi\volumes\pvc-1.vhdx", "[fe80::1429:5bed:d08a:d5a8]")];
+        _probe.OpenFiles["csidev01"] = [new(PvcRelative, Dev02Address)];
+        _host.References.Add(("csidev02", "vm-2"));
 
-        Assert.Equal("csidev02", await NewService().ResolveHostAsync(Pvc, CancellationToken.None));
+        Assert.Equal(new VhdxLocation("csidev02", "vm-2"), await NewService().LocateAsync(Pvc, CancellationToken.None));
         Assert.Equal(["csidev02", "csidev01"], _probe.OpenFileReads);
     }
 
     [Fact]
-    public async Task ResolveHostAsync_AsksTheCoordinatorAgainWhenItsListingFailsOnce()
+    public async Task LocateAsync_AsksTheCoordinatorAgainWhenItsListingFailsOnce()
     {
-        _probe.OpenFiles["csidev02"] = [new(@"hyperv-csi\volumes\pvc-1.vhdx", "[fe80::5555:2b8c:de84:3bf7]")];
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address)];
         _probe.FailOpenFileReads = 1;
+        _host.References.Add(("csidev01", "vm-1"));
 
-        Assert.Equal("csidev01", await NewService().ResolveHostAsync(Pvc, CancellationToken.None));
+        Assert.Equal(new VhdxLocation("csidev01", "vm-1"), await NewService().LocateAsync(Pvc, CancellationToken.None));
         Assert.Equal(["csidev02", "csidev02"], _probe.OpenFileReads);
     }
 
     [Fact]
-    public async Task ResolveHostAsync_ThrowsWhenTheCoordinatorCannotBeListedTwice()
+    public async Task LocateAsync_ThrowsWhenTheCoordinatorCannotBeListedTwice()
     {
         _probe.FailOpenFileReads = 2;
 
-        await Assert.ThrowsAsync<TimeoutException>(() => NewService().ResolveHostAsync(Pvc, CancellationToken.None));
+        await Assert.ThrowsAsync<TimeoutException>(() => NewService().LocateAsync(Pvc, CancellationToken.None));
     }
 
     [Fact]
-    public async Task ResolveHostAsync_RefusesAPathOnNoSharedVolume()
+    public async Task LocateAsync_RefusesAPathOnNoSharedVolume()
     {
         var failure = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => NewService().ResolveHostAsync(@"C:\ClusterStorage\Volume9\pvc-1.vhdx", CancellationToken.None));
+            () => NewService().LocateAsync(@"C:\ClusterStorage\Volume9\pvc-1.vhdx", CancellationToken.None));
 
         Assert.Contains("not on any Cluster Shared Volume", failure.Message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task ResolveHostAsync_PicksTheVolumeThePathIsActuallyOn_NotOneWhoseNameMerelyPrefixesIt()
+    public async Task LocateAsync_PicksTheVolumeThePathIsActuallyOn_NotOneWhoseNameMerelyPrefixesIt()
     {
         _cluster.Volumes.Clear();
         _cluster.Volumes.Enqueue(
@@ -107,90 +184,41 @@ public sealed class CsvFileOwnershipServiceTests
             new ClusterSharedVolume(@"C:\ClusterStorage\Volume1", "csidev01"),
             new ClusterSharedVolume(@"C:\ClusterStorage\Volume10", "csidev02"),
         ]);
-        _probe.OpenFiles["csidev02"] = [new("pvc-1.vhdx", "[fe80::5555:2b8c:de84:3bf7]")];
+        _probe.OpenFiles["csidev02"] = [new("pvc-1.vhdx", Dev01Address)];
+        _host.References.Add(("csidev01", "vm-1"));
 
-        Assert.Equal("csidev01", await NewService().ResolveHostAsync(@"C:\ClusterStorage\Volume10\pvc-1.vhdx", CancellationToken.None));
+        Assert.Equal(
+            new VhdxLocation("csidev01", "vm-1"),
+            await NewService().LocateAsync(@"C:\ClusterStorage\Volume10\pvc-1.vhdx", CancellationToken.None));
         Assert.Equal(["csidev02"], _probe.OpenFileReads);
     }
 
     [Fact]
-    public async Task ResolveHostAsync_RefusesAClientNoNodeCarries()
+    public async Task LocateAsync_RefusesAClientNoNodeCarries()
     {
-        _probe.OpenFiles["csidev02"] = [new(@"hyperv-csi\volumes\pvc-1.vhdx", "[fe80::dead:beef]")];
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, "[fe80::dead:beef]")];
 
         var failure = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => NewService().ResolveHostAsync(Pvc, CancellationToken.None));
+            () => NewService().LocateAsync(Pvc, CancellationToken.None));
 
         Assert.Contains("[fe80::dead:beef]", failure.Message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task ResolveHostAsync_RefusesAFileOpenFromTwoNodes()
-    {
-        _cluster.Nodes = ["csidev01", "csidev02", "csidev03"];
-        _probe.Addresses["csidev03"] = ["fe80::3"];
-        _probe.OpenFiles["csidev02"] =
-        [
-            new(@"hyperv-csi\volumes\pvc-1.vhdx", "[fe80::5555:2b8c:de84:3bf7]"),
-            new(@"hyperv-csi\volumes\pvc-1.vhdx", "[fe80::3]"),
-        ];
-
-        await Assert.ThrowsAsync<InvalidOperationException>(() => NewService().ResolveHostAsync(Pvc, CancellationToken.None));
-    }
-
-    [Fact]
-    public async Task ResolveHostAsync_ReusesTheVolumeReadingUntilItExpires()
+    public async Task LocateAsync_ReusesTheVolumeReadingUntilItExpires()
     {
         _cluster.Volumes.Enqueue([new ClusterSharedVolume(Volume2, "csidev02")]);
-        _probe.OpenFiles["csidev02"] = [new(@"hyperv-csi\volumes\pvc-1.vhdx", "[fe80::5555:2b8c:de84:3bf7]")];
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address)];
+        _host.References.Add(("csidev01", "vm-1"));
         var service = NewService();
 
-        await service.ResolveHostAsync(Pvc, CancellationToken.None);
-        await service.ResolveHostAsync(Pvc, CancellationToken.None);
+        await service.LocateAsync(Pvc, CancellationToken.None);
+        await service.LocateAsync(Pvc, CancellationToken.None);
         Assert.Equal(1, _cluster.SharedVolumeReads);
 
         _clock.Advance(CsvFileOwnershipService.SharedVolumeCacheTtl);
-        await service.ResolveHostAsync(Pvc, CancellationToken.None);
+        await service.LocateAsync(Pvc, CancellationToken.None);
         Assert.Equal(2, _cluster.SharedVolumeReads);
-    }
-
-    [Fact]
-    public async Task ResolveVmOnHostAsync_AsksOnlyTheVmsThatHostRuns()
-    {
-        _cluster.Vms = [new("vm-a", "csidev01"), new("vm-b", "csidev02"), new("vm-c", "CSIDEV02")];
-        _host.References.Add(("csidev02", "vm-c"));
-
-        Assert.Equal("vm-c", await NewService().ResolveVmOnHostAsync("csidev02", Pvc, CancellationToken.None));
-        Assert.Equal(["vm-b", "vm-c"], _host.Asked);
-    }
-
-    [Fact]
-    public async Task ResolveVmOnHostAsync_IsNullWhenNoVmOnTheHostReferencesThePath()
-    {
-        _cluster.Vms = [new("vm-a", "csidev01")];
-
-        Assert.Null(await NewService().ResolveVmOnHostAsync("csidev01", Pvc, CancellationToken.None));
-    }
-
-    [Fact]
-    public async Task ResolveVmOnHostAsync_SkipsAVmThatMigratedAwayWhileBeingChecked()
-    {
-        _cluster.Vms = [new("vm-a", "csidev01"), new("vm-b", "csidev01")];
-        _host.Migrated.Add("vm-a");
-        _host.References.Add(("csidev01", "vm-b"));
-
-        Assert.Equal("vm-b", await NewService().ResolveVmOnHostAsync("csidev01", Pvc, CancellationToken.None));
-    }
-
-    [Fact]
-    public async Task ResolveVmOnHostAsync_RefusesTwoVmsReferencingOnePath()
-    {
-        _cluster.Vms = [new("vm-a", "csidev01"), new("vm-b", "csidev01")];
-        _host.References.Add(("csidev01", "vm-a"));
-        _host.References.Add(("csidev01", "vm-b"));
-
-        await Assert.ThrowsAsync<InvalidOperationException>(
-            () => NewService().ResolveVmOnHostAsync("csidev01", Pvc, CancellationToken.None));
     }
 
     private CsvFileOwnershipService NewService() =>
@@ -273,6 +301,7 @@ public sealed class CsvFileOwnershipServiceTests
 
         public HashSet<string> Migrated { get; } = [];
 
+        /// <summary>Every VM asked, in the order it was asked.</summary>
         public List<string> Asked { get; } = [];
 
         public Task<bool> ReferencesDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken)

@@ -1230,13 +1230,13 @@ public sealed class SnapshotService : ISnapshotService
             return (OpenSourceLocally(snapshotId, sourceVolumeId, sourcePath), null);
         }
 
-        var (host, vmId) = await LocateHolderAsync(snapshotId, sourcePath, attempt.Token).ConfigureAwait(false);
-        if (vmId is null)
+        var location = await LocateHolderAsync(snapshotId, sourcePath, attempt.Token).ConfigureAwait(false);
+        if (location is null)
         {
             return (OpenSourceLocally(snapshotId, sourceVolumeId, sourcePath), null);
         }
 
-        var vm = new ClusteredVm(vmId, host);
+        var vm = new ClusteredVm(location.VmId, location.HostName);
         var elementName = CheckpointElementName(sourceVolumeId, snapshotName);
         VolumeAttachment attachment;
 
@@ -1341,7 +1341,7 @@ public sealed class SnapshotService : ISnapshotService
 
     /// <summary>
     /// Whether anything at all has <paramref name="path"/> open, readers
-    /// included - the premise <see cref="IVhdxLocationService.ResolveHostAsync"/>
+    /// included - the premise <see cref="IVhdxLocationService.LocateAsync"/>
     /// needs before its answer means anything.
     /// </summary>
     /// <remarks>
@@ -1373,17 +1373,23 @@ public sealed class SnapshotService : ISnapshotService
     }
 
     /// <summary>
-    /// The host holding <paramref name="sourcePath"/> open and the clustered VM
-    /// on it the source belongs to, or null for the VM when it belongs to none.
+    /// The clustered VM holding <paramref name="sourcePath"/> open and the node
+    /// it runs on, or null when the source belongs to no clustered VM that
+    /// could be holding it.
     /// </summary>
-    private async Task<(string Host, string? VmId)> LocateHolderAsync(
+    /// <remarks>
+    /// This agent's own copy of the source counts among the things that can
+    /// have it open - every CreateSnapshot replayed while that copy runs
+    /// probes the source again - which is exactly the second open
+    /// <see cref="IVhdxLocationService.LocateAsync"/> is built to see past
+    /// rather than refuse.
+    /// </remarks>
+    private async Task<VhdxLocation?> LocateHolderAsync(
         string snapshotId, string sourcePath, CancellationToken cancellationToken)
     {
         try
         {
-            var host = await _location.ResolveHostAsync(sourcePath, cancellationToken).ConfigureAwait(false);
-            var vmId = await _location.ResolveVmOnHostAsync(host, sourcePath, cancellationToken).ConfigureAwait(false);
-            return (host, vmId);
+            return await _location.LocateAsync(sourcePath, cancellationToken).ConfigureAwait(false);
         }
         catch (InvalidOperationException ex)
         {

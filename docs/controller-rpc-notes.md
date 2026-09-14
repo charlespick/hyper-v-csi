@@ -454,13 +454,17 @@ not carry, unlike `ControllerPublishVolume`/`UnpublishVolume`'s node ID: the
 host to send the path-only CIM calls to, and the VM whose `vm:` target the
 resize has to hold (see design.md's "Snapshots and VM serialization"). The
 agent works both out from the path, with no Kubernetes lookup and no node ID:
-the VHDX's CSV coordinator lists which node has the file open through the CSV
-metadata channel, that node's NetFT address maps it to a host name, and the
-clustered VMs on that one host are asked which of them references the disk —
-[docs/csv-file-open-ownership.md](csv-file-open-ownership.md) has the
-mechanism and what was measured. An empty listing means the coordinator holds
-the file itself, which is only unambiguous because the local read has already
-proven the file is open somewhere.
+the VHDX's CSV coordinator lists which nodes have the file open through the
+CSV metadata channel, each node's NetFT address maps it to a host name, and
+only the clustered VMs on those nodes are asked which of them references the
+disk — [docs/csv-file-open-ownership.md](csv-file-open-ownership.md) has the
+mechanism and what was measured. The listing usually names one node, and two
+when something besides the VM is reading the file from another node (this
+agent's own snapshot copy, most often); a node counts only if one of its VMs
+references the disk. The coordinator is checked last, and only when no listed
+node has such a VM: its own opens never appear in its listing, so a VM running
+on it shows up as an empty listing, or as one naming only the other reader.
+Neither outcome needs every VM in the cluster asked.
 
 Because the VM is only known once that trace has run, and a job's targets are
 fixed when it is enqueued, the ExpandVolume job holds only `expand:<volumeId>`:

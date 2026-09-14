@@ -596,8 +596,8 @@ public sealed class VhdxService : IVhdxService, IDisposable
                 _concurrency.Release();
             }
 
-            var (_, vmId) = await LocateHolderAsync(volumeId, path, attempt.Token).ConfigureAwait(false);
-            return vmId;
+            var location = await LocateHolderAsync(volumeId, path, attempt.Token).ConfigureAwait(false);
+            return location?.VmId;
         }
         catch (OperationCanceledException) when (attempt.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
         {
@@ -762,19 +762,21 @@ public sealed class VhdxService : IVhdxService, IDisposable
     private async Task<ExpandVolumeResult> ExpandAttachedAsync(
         string volumeId, string path, long newSizeBytes, string? heldVmId, CancellationTokenSource attempt)
     {
-        var (host, vmId) = await LocateHolderAsync(volumeId, path, attempt.Token).ConfigureAwait(false);
+        var location = await LocateHolderAsync(volumeId, path, attempt.Token).ConfigureAwait(false);
 
-        if (vmId is null)
+        if (location is null)
         {
-            // Open on a host where no clustered VM references it. A genuine
-            // inconsistency - an unmanaged handle on the CSV, most plausibly -
-            // not a transient state a retry fixes on its own, so it is
-            // reported rather than guessed past.
+            // Open, but no clustered VM on any node that could be holding it
+            // references it. A genuine inconsistency - an unmanaged handle on
+            // the CSV, most plausibly - not a transient state a retry fixes on
+            // its own, so it is reported rather than guessed past.
             throw new JobFailureException(
                 AgentErrorCodes.Internal,
-                $"volume {volumeId} at {path} is open on {host}, but no clustered VM there has it attached; " +
-                "check for an unmanaged handle on the CSV");
+                $"volume {volumeId} at {path} is open, but no clustered VM on a node that could be holding it has " +
+                "it attached; check for an unmanaged handle on the CSV");
         }
+
+        var (host, vmId) = (location.HostName, location.VmId);
 
         if (heldVmId is null || JobTargets.Vm(heldVmId) != JobTargets.Vm(vmId))
         {
@@ -814,19 +816,17 @@ public sealed class VhdxService : IVhdxService, IDisposable
     }
 
     /// <summary>
-    /// The host holding <paramref name="path"/> open and the clustered VM on
-    /// it the disk belongs to, or null for the VM when it belongs to none. For
-    /// a disk the caller has just failed to read locally - the premise
-    /// <see cref="IVhdxLocationService.ResolveHostAsync"/> needs.
+    /// The clustered VM holding <paramref name="path"/> open and the node it
+    /// runs on, or null when no clustered VM that could be holding it
+    /// references it. For a disk the caller has just failed to read locally -
+    /// the premise <see cref="IVhdxLocationService.LocateAsync"/> needs.
     /// </summary>
-    private async Task<(string Host, string? VmId)> LocateHolderAsync(
+    private async Task<VhdxLocation?> LocateHolderAsync(
         string volumeId, string path, CancellationToken cancellationToken)
     {
         try
         {
-            var host = await _location.ResolveHostAsync(path, cancellationToken).ConfigureAwait(false);
-            var vmId = await _location.ResolveVmOnHostAsync(host, path, cancellationToken).ConfigureAwait(false);
-            return (host, vmId);
+            return await _location.LocateAsync(path, cancellationToken).ConfigureAwait(false);
         }
         catch (InvalidOperationException ex)
         {
@@ -838,29 +838,24 @@ public sealed class VhdxService : IVhdxService, IDisposable
     }
 
     /// <summary>
-    /// Reads a disk a running VM has open through the host holding it, for a
-    /// CreateVolume replay - which needs only the host, not the VM, since
-    /// reading changes nothing on it.
+    /// Reads a disk a running VM has open through the host that VM runs on, for
+    /// a CreateVolume replay. Only a host with a VM confirmed to reference the
+    /// disk is asked: any other node that merely has the file open cannot read
+    /// it past the VM's hold any better than this one just failed to.
     /// </summary>
     private async Task<HostDiskInfo> ReadThroughHolderAsync(
         string volumeName, string path, CancellationToken cancellationToken)
     {
-        string host;
-        try
-        {
-            host = await _location.ResolveHostAsync(path, cancellationToken).ConfigureAwait(false);
-        }
-        catch (InvalidOperationException ex)
-        {
-            throw new JobFailureException(
+        var location = await LocateHolderAsync(volumeName, path, cancellationToken).ConfigureAwait(false)
+            ?? throw new JobFailureException(
                 AgentErrorCodes.Internal,
-                $"volume {volumeName} at {path} is open by something this agent could not trace: {ex.Message}",
-                ex);
-        }
+                $"volume {volumeName} at {path} is open, but no clustered VM on a node that could be holding it has " +
+                "it attached, so there is no host to read it through; check for an unmanaged handle on the CSV");
 
         _logger.LogInformation(
-            "CreateVolume {VolumeName}: {Path} is open on {Host}; reading it through that host", volumeName, path, host);
-        return await _host.GetDiskInfoAsync(host, path, cancellationToken).ConfigureAwait(false);
+            "CreateVolume {VolumeName}: {Path} is open by {VmId} on {Host}; reading it through that host",
+            volumeName, path, location.VmId, location.HostName);
+        return await _host.GetDiskInfoAsync(location.HostName, path, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task DeleteAsync(string volumeId, CancellationToken cancellationToken)

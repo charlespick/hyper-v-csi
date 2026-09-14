@@ -2395,10 +2395,10 @@ public sealed class SnapshotServiceTests : IDisposable
 
     /// <summary>
     /// Stands in for tracing a source something has open. The default answers
-    /// "open on host-1, and no clustered VM there references it" - which is
-    /// also the true answer for the one holder an unattached test does
-    /// produce: this service's own copy, still reading a source that a
-    /// replayed CreateSnapshot inspects again.
+    /// "no clustered VM that could be holding it references it" - which is also
+    /// the true answer for the one holder an unattached test does produce:
+    /// this service's own copy, still reading a source that a replayed
+    /// CreateSnapshot inspects again.
     /// </summary>
     private sealed class FakeVhdxLocationService : IVhdxLocationService
     {
@@ -2406,10 +2406,8 @@ public sealed class SnapshotServiceTests : IDisposable
 
         public string? VmId { get; init; }
 
-        public Task<string> ResolveHostAsync(string path, CancellationToken cancellationToken) => Task.FromResult(Host);
-
-        public Task<string?> ResolveVmOnHostAsync(string hostName, string path, CancellationToken cancellationToken) =>
-            Task.FromResult(VmId);
+        public Task<VhdxLocation?> LocateAsync(string path, CancellationToken cancellationToken) =>
+            Task.FromResult(VmId is null ? null : new VhdxLocation(Host, VmId));
     }
 
     /// <summary>

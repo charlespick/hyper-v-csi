@@ -188,10 +188,8 @@ public sealed class HostOperationSlotsTests : IDisposable
 
         public required string VmId { get; init; }
 
-        public Task<string> ResolveHostAsync(string path, CancellationToken cancellationToken) => Task.FromResult(Host);
-
-        public Task<string?> ResolveVmOnHostAsync(string hostName, string path, CancellationToken cancellationToken) =>
-            Task.FromResult<string?>(VmId);
+        public Task<VhdxLocation?> LocateAsync(string path, CancellationToken cancellationToken) =>
+            Task.FromResult<VhdxLocation?>(new VhdxLocation(Host, VmId));
     }
 
     private sealed class NeverCalledVirtualDiskManager : IVirtualDiskManager

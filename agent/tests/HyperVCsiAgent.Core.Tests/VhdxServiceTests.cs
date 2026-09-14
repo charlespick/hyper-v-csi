@@ -197,7 +197,7 @@ public sealed class VhdxServiceTests : IDisposable
         // asked for, so a replay reporting the request on trust would show.
         var disks = new FakeVirtualDiskManager { RoundUpTo = 4096 };
         var host = new FakeHostClient { SizeOnHost = 4096 };
-        using var service = NewService(disks, location: new FakeVhdxLocationService(), host: host);
+        using var service = NewService(disks, location: new FakeVhdxLocationService { VmIds = ["vm-1"] }, host: host);
 
         await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
         disks.Created.Clear();
@@ -391,6 +391,24 @@ public sealed class VhdxServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateAsync_WhenTheExistingDiskIsOpenByNoClusteredVm_FailsAsInternal()
+    {
+        // Open, but by no clustered VM on any node that could be holding it -
+        // so no host is known to be able to read it past that hold, and asking
+        // one anyway would only repeat the local failure somewhere else.
+        var disks = new FakeVirtualDiskManager();
+        using var service = NewService(disks, location: new FakeVhdxLocationService(), host: new NeverCalledHostClient());
+
+        await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
+        disks.VhdxInUse = true;
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => service.CreateAsync("pvc-1", 1024, null, CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
+    }
+
+    [Fact]
     public async Task CreateAsync_FromASnapshot_WhenTheExistingDiskIsAttachedToARunningVm_AnswersWithWhatTheHostHoldingItReads()
     {
         // Same idempotency-check failure as the empty-create case, on the
@@ -401,7 +419,8 @@ public sealed class VhdxServiceTests : IDisposable
         var copier = new FakeDiskCopier();
         var host = new FakeHostClient { SizeOnHost = 8192 };
         WriteSnapshot("pvc-1~snap-a", 4096);
-        using var service = NewService(disks, location: new FakeVhdxLocationService(), host: host, copier: copier);
+        using var service = NewService(
+            disks, location: new FakeVhdxLocationService { VmIds = ["vm-1"] }, host: host, copier: copier);
 
         await service.CreateAsync("pvc-2", 4096, "pvc-1~snap-a", CancellationToken.None);
         copier.Destinations.Clear();
@@ -1598,31 +1617,33 @@ public sealed class VhdxServiceTests : IDisposable
     }
 
     /// <summary>
-    /// Stands in for tracing a disk something has open: always to
-    /// <see cref="Host"/>, and to the VMs in <see cref="VmIds"/> one lookup at
-    /// a time, the last repeating - so two entries are the disk changing hands
-    /// between ExpandAsync's own trace and the resize job's.
+    /// Stands in for tracing a disk something has open: to the VMs in
+    /// <see cref="VmIds"/> on <see cref="Host"/>, one lookup at a time, the last
+    /// repeating - so two entries are the disk changing hands between
+    /// ExpandAsync's own trace and the resize job's. A null entry is no
+    /// clustered VM holding it.
     /// </summary>
     private sealed class FakeVhdxLocationService : IVhdxLocationService
     {
-        private int _vmLookups;
+        private int _lookups;
 
         public string Host { get; init; } = "host-a";
 
         public IReadOnlyList<string?> VmIds { get; init; } = [null];
 
-        /// <summary>Fails the trace, the way an open that cannot be pinned to one host does.</summary>
+        /// <summary>Fails the trace, the way a path on no Cluster Shared Volume does.</summary>
         public bool Untraceable { get; init; }
 
-        public Task<string> ResolveHostAsync(string path, CancellationToken cancellationToken) =>
-            Untraceable
-                ? throw new InvalidOperationException($"{path} is open from more than one node at once")
-                : Task.FromResult(Host);
-
-        public Task<string?> ResolveVmOnHostAsync(string hostName, string path, CancellationToken cancellationToken)
+        public Task<VhdxLocation?> LocateAsync(string path, CancellationToken cancellationToken)
         {
-            var lookup = Interlocked.Increment(ref _vmLookups) - 1;
-            return Task.FromResult(VmIds[Math.Min(lookup, VmIds.Count - 1)]);
+            if (Untraceable)
+            {
+                throw new InvalidOperationException($"{path} is not on any Cluster Shared Volume");
+            }
+
+            var lookup = Interlocked.Increment(ref _lookups) - 1;
+            var vmId = VmIds[Math.Min(lookup, VmIds.Count - 1)];
+            return Task.FromResult(vmId is null ? null : new VhdxLocation(Host, vmId));
         }
     }
 
@@ -1707,10 +1728,7 @@ public sealed class VhdxServiceTests : IDisposable
     /// </summary>
     private sealed class NeverCalledVhdxLocationService : IVhdxLocationService
     {
-        public Task<string> ResolveHostAsync(string path, CancellationToken cancellationToken) =>
-            throw new InvalidOperationException("nothing has the disk open in this test, so nothing should trace it");
-
-        public Task<string?> ResolveVmOnHostAsync(string hostName, string path, CancellationToken cancellationToken) =>
+        public Task<VhdxLocation?> LocateAsync(string path, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("nothing has the disk open in this test, so nothing should trace it");
     }
 

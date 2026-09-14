@@ -9,15 +9,17 @@ namespace HyperVCsiAgent.Service.HostControl;
 /// cluster before any of this was written.
 /// </summary>
 /// <remarks>
-/// A host takes three reads: the path's volume and that volume's coordinator
-/// (<see cref="IClusterService.ListSharedVolumesAsync"/>, cached for
-/// <see cref="SharedVolumeCacheTtl"/>), the coordinator's listing of files
+/// Candidate nodes take three reads: the path's volume and that volume's
+/// coordinator (<see cref="IClusterService.ListSharedVolumesAsync"/>, cached
+/// for <see cref="SharedVolumeCacheTtl"/>), the coordinator's listing of files
 /// other nodes have open through the CSV metadata channel
 /// (<see cref="ICsvNodeProbe.ReadCsvOpenFilesAsync"/>), and the NetFT address
 /// each matching row names, mapped back to a node (<see cref="NetFtAddressTable"/>).
-/// A VM, once the host is known, takes the VMs the cluster says that host runs,
-/// each asked whether its storage references the path: a walk of one host,
-/// never of the cluster.
+/// The VM then comes from asking only the VMs the cluster says those
+/// candidates run whether their storage references the path - usually one
+/// node's worth, two at most in practice, and the coordinator's only as a last
+/// resort. Never a walk of every VM in the cluster, which is what this whole
+/// service exists to avoid.
 /// </remarks>
 public sealed class CsvFileOwnershipService : IVhdxLocationService
 {
@@ -26,8 +28,8 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
     /// Seconds, the same order as MsClusterService's own resource-name cache:
     /// coordination fails over and rebalances on its own. A stale coordinator
     /// is not silently wrong here - the node asked lists nothing for the
-    /// volume, which <see cref="ResolveHostAsync"/> rechecks before believing -
-    /// but each one costs a second listing.
+    /// volume, which <see cref="LocateAsync"/> rechecks before believing - but
+    /// each one costs a second listing.
     /// </summary>
     public static readonly TimeSpan SharedVolumeCacheTtl = TimeSpan.FromSeconds(5);
 
@@ -58,7 +60,7 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
         _logger = logger;
     }
 
-    public async Task<string> ResolveHostAsync(string path, CancellationToken cancellationToken)
+    public async Task<VhdxLocation?> LocateAsync(string path, CancellationToken cancellationToken)
     {
         var fullPath = Path.GetFullPath(path);
 
@@ -89,75 +91,83 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
             volume = fresh;
         }
 
-        switch (holders!.Count)
+        var vms = await _cluster.ListVmsAsync(cancellationToken).ConfigureAwait(false);
+
+        // The listed nodes first. More than one is not a contradiction to refuse:
+        // anything else reading the file from another node - this agent's own
+        // snapshot copy, most often - is listed right beside the VM, and the
+        // node that counts is the one running a VM that references the path.
+        var matches = await FindReferencingVmsAsync(
+            vms, holders!.Order(StringComparer.OrdinalIgnoreCase), fullPath, cancellationToken).ConfigureAwait(false);
+
+        if (matches.Count == 0 && !holders!.Contains(volume.CoordinatorNode))
         {
-            case 0:
-                // The coordinator's blind spot, and the one thing an empty
-                // listing can mean for a file the caller already knows is
-                // open: an open made on the coordinator itself is a local
-                // handle, which never passes through the channel this lists.
-                _logger.LogDebug(
-                    "{Path} is open by nothing that reached it through {Volume}'s CSV channel, so its coordinator {Coordinator} holds it",
-                    fullPath, volume.Path, volume.CoordinatorNode);
-                return volume.CoordinatorNode;
-
-            case 1:
-                var host = holders.Single();
-                _logger.LogDebug("{Path} is open on {Host}, per {Coordinator}'s CSV open files", fullPath, host, volume.CoordinatorNode);
-                return host;
-
-            default:
-                throw new InvalidOperationException(
-                    $"{path} is open from more than one node at once " +
-                    $"({string.Join(", ", holders.Order(StringComparer.OrdinalIgnoreCase))}), so no one of them is the node holding it");
-        }
-    }
-
-    public async Task<string?> ResolveVmOnHostAsync(string hostName, string path, CancellationToken cancellationToken)
-    {
-        var fullPath = Path.GetFullPath(path);
-
-        // Only the VMs the cluster database says this host runs - the VMs this
-        // driver manages at all, the same scoping ListOwnedCheckpointsAsync's
-        // own remarks give for why VM discovery belongs to IClusterService.
-        var candidates = (await _cluster.ListVmsAsync(cancellationToken).ConfigureAwait(false))
-            .Where(vm => string.Equals(vm.OwningHost, hostName, StringComparison.OrdinalIgnoreCase))
-            .ToList();
-
-        var matches = new List<string>();
-        foreach (var vm in candidates)
-        {
-            try
-            {
-                if (await _host.ReferencesDiskAsync(hostName, vm.VmId, fullPath, cancellationToken).ConfigureAwait(false))
-                {
-                    matches.Add(vm.VmId);
-                }
-            }
-            catch (VmNotOnHostException)
-            {
-                // Migrated off this host since the listing above. Wherever it
-                // went, it is not what has this file open on this host.
-                _logger.LogDebug("{VmId} left {HostName} while it was being checked for {Path}", vm.VmId, hostName, fullPath);
-            }
+            // The last resort, and the only one: the coordinator's own opens are
+            // local handles that never pass through the channel the listing
+            // reads, so a VM running on the coordinator shows up as nothing at
+            // all - or as only whatever else happens to be reading the file
+            // from another node.
+            _logger.LogDebug(
+                "no VM on the {Count} nodes listing {Path} open references it; checking its coordinator {Coordinator}",
+                holders.Count, fullPath, volume.CoordinatorNode);
+            matches = await FindReferencingVmsAsync(
+                vms, [volume.CoordinatorNode], fullPath, cancellationToken).ConfigureAwait(false);
         }
 
         switch (matches.Count)
         {
             case 0:
                 _logger.LogDebug(
-                    "none of the {Count} clustered VMs on {HostName} references {Path}", candidates.Count, hostName, fullPath);
+                    "{Path} is open, but no clustered VM on {Candidates} or its coordinator {Coordinator} references it",
+                    fullPath, holders, volume.CoordinatorNode);
                 return null;
 
             case 1:
-                _logger.LogDebug("{Path} belongs to {VmId} on {HostName}", fullPath, matches[0], hostName);
+                _logger.LogDebug(
+                    "{Path} belongs to {VmId} on {HostName}, per {Coordinator}'s CSV open files",
+                    fullPath, matches[0].VmId, matches[0].HostName, volume.CoordinatorNode);
                 return matches[0];
 
             default:
                 throw new InvalidOperationException(
-                    $"{path} is referenced by more than one VM on {hostName} ({string.Join(", ", matches)}), " +
+                    $"{path} is referenced by more than one VM " +
+                    $"({string.Join(", ", matches.Select(match => $"{match.VmId} on {match.HostName}"))}), " +
                     "so no one of them is the VM holding it");
         }
+    }
+
+    /// <summary>
+    /// Every VM on <paramref name="hostNames"/> whose storage references
+    /// <paramref name="fullPath"/>, asking only the VMs the cluster database
+    /// says those nodes run - the VMs this driver manages at all, the same
+    /// scoping ListOwnedCheckpointsAsync's own remarks give for why VM
+    /// discovery belongs to IClusterService.
+    /// </summary>
+    private async Task<List<VhdxLocation>> FindReferencingVmsAsync(
+        IReadOnlyList<ClusteredVm> vms, IEnumerable<string> hostNames, string fullPath, CancellationToken cancellationToken)
+    {
+        var matches = new List<VhdxLocation>();
+        foreach (var hostName in hostNames)
+        {
+            foreach (var vm in vms.Where(vm => string.Equals(vm.OwningHost, hostName, StringComparison.OrdinalIgnoreCase)))
+            {
+                try
+                {
+                    if (await _host.ReferencesDiskAsync(hostName, vm.VmId, fullPath, cancellationToken).ConfigureAwait(false))
+                    {
+                        matches.Add(new VhdxLocation(hostName, vm.VmId));
+                    }
+                }
+                catch (VmNotOnHostException)
+                {
+                    // Migrated off this node since the listing above. Wherever it
+                    // went, it is not what has this file open here.
+                    _logger.LogDebug("{VmId} left {HostName} while it was being checked for {Path}", vm.VmId, hostName, fullPath);
+                }
+            }
+        }
+
+        return matches;
     }
 
     /// <summary>
