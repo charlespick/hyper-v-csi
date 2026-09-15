@@ -402,6 +402,35 @@ public sealed class SnapshotServiceTests : IDisposable
     }
 
     [WindowsOnlyFact]
+    public async Task CreateAsync_WhenTheHolderSizeReadNeverAnswers_ReportsTheSizeAsUnknownInsteadOfTimingOut()
+    {
+        // A size is worth a bounded wait, not the call's whole budget: a host
+        // that does not answer must leave the poll answering with an unknown
+        // size, not run it into the call's own timeout and fail it. This host
+        // ignores cancellation as well, the way a CIM call stuck in a provider
+        // can.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient { DiskInfoNeverAnswers = true };
+        var harness = NewHarness(
+            cluster: cluster, location: TracedToVm1(), host: host, hostOperationTimeout: TimeSpan.FromMilliseconds(300));
+        WriteAttachedVolume("pvc-1", 4096);
+        harness.Disks.RefusedPaths.Add(VolumePath("pvc-1"));
+        using var release = new SemaphoreSlim(0);
+        harness.Copier.DuringCopy = _ => release.WaitAsync();
+
+        var creating = harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        Assert.Same(creating, await Task.WhenAny(creating, Task.Delay(TimeSpan.FromSeconds(10))));
+        var result = await creating;
+
+        Assert.False(result.ReadyToUse);
+        Assert.Equal(0, result.SizeBytes);
+        Assert.Contains("host-1", host.DiskInfoHosts);
+
+        release.Release();
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+    }
+
+    [WindowsOnlyFact]
     public async Task CreateAsync_CreationTimeComesFromTheMarkerAndSurvivesThePublish()
     {
         // external-snapshotter records what is returned here, so it must not
@@ -2043,7 +2072,8 @@ public sealed class SnapshotServiceTests : IDisposable
         TimeSpan? snapshotCopySlotWaitTimeout = null,
         TimeSpan? checkpointMergeTimeout = null,
         int maxConcurrentHostOperations = 4,
-        HostOperationSlots? hostSlots = null)
+        HostOperationSlots? hostSlots = null,
+        TimeSpan? hostOperationTimeout = null)
     {
         var disks = new FakeVirtualDiskManager();
         var copier = new FakeDiskCopier();
@@ -2088,6 +2118,7 @@ public sealed class SnapshotServiceTests : IDisposable
                 SnapshotCopySlotWaitTimeout = snapshotCopySlotWaitTimeout ?? TimeSpan.FromSeconds(2),
                 CheckpointMergeTimeout = checkpointMergeTimeout ?? TimeSpan.FromSeconds(2),
                 MaxConcurrentHostOperations = maxConcurrentHostOperations,
+                HostOperationTimeout = hostOperationTimeout ?? TimeSpan.FromMinutes(2),
             }),
             NullLogger<SnapshotService>.Instance);
 
@@ -2605,13 +2636,21 @@ public sealed class SnapshotServiceTests : IDisposable
         /// </summary>
         public bool FailChainCollapsedChecks { get; set; }
 
-        /// <summary>The virtual size GetDiskInfoAsync reports, as the VM's own host reads it.</summary>
-        public long DiskInfoVirtualSizeBytes { get; set; }
+        /// <summary>
+        /// The virtual size GetDiskInfoAsync reports, as the VM's own host reads
+        /// it. Left null, with neither of the two below set, GetDiskInfoAsync
+        /// throws NotSupportedException: only a size read this node was refused
+        /// has any business going to the host, so a test opts in to that.
+        /// </summary>
+        public long? DiskInfoVirtualSizeBytes { get; set; }
 
         /// <summary>Makes GetDiskInfoAsync throw, as a host that could not answer does.</summary>
         public bool FailDiskInfo { get; set; }
 
-        /// <summary>Every host GetDiskInfoAsync was asked on.</summary>
+        /// <summary>Makes GetDiskInfoAsync never complete, token or not, as a CIM call stuck in the provider does.</summary>
+        public bool DiskInfoNeverAnswers { get; set; }
+
+        /// <summary>Every host GetDiskInfoAsync was asked on, including the calls it refused.</summary>
         public List<string> DiskInfoHosts { get; } = [];
 
         public Task<VolumeAttachment> ClassifyAttachmentAsync(
@@ -2734,9 +2773,21 @@ public sealed class SnapshotServiceTests : IDisposable
                 DiskInfoHosts.Add(hostName);
             }
 
-            return FailDiskInfo
-                ? throw new InvalidOperationException("the host could not say")
-                : Task.FromResult(new HostDiskInfo(DiskInfoVirtualSizeBytes, Guid.NewGuid()));
+            if (DiskInfoNeverAnswers)
+            {
+                return new TaskCompletionSource<HostDiskInfo>().Task;
+            }
+
+            if (FailDiskInfo)
+            {
+                throw new InvalidOperationException("the host could not say");
+            }
+
+            return DiskInfoVirtualSizeBytes is { } size
+                ? Task.FromResult(new HostDiskInfo(size, Guid.NewGuid()))
+                : throw new NotSupportedException(
+                    "SnapshotService measures an attached source's allocated bytes from the CSV file directly; " +
+                    "only a virtual size read this node was refused goes through the host");
         }
 
         public Task<bool> ReferencesDiskAsync(

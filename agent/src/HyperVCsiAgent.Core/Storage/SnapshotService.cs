@@ -2138,51 +2138,98 @@ public sealed class SnapshotService : ISnapshotService
     /// unknown. The VM's own host answered in every phase.
     /// <para>
     /// Only a refusal goes to the holder: anything else stopping the local read
-    /// says nothing about whether another host could answer. Tracing opens
-    /// nothing, so unlike the open-handle probe <see cref="CreateAsync"/> skips
-    /// while a copy is in flight, it cannot collide with that copy or its
-    /// merge. Like <see cref="ReadVirtualSizeAsync"/>, this never fails the
-    /// caller.
+    /// says nothing about whether another host could answer.
+    /// </para>
+    /// <para>
+    /// Finding the holder opens nothing, but the read through it does reach the
+    /// file. vmms on the VM's own host answers it, during the merge when that
+    /// is where the poll lands, and outside the <c>vm:</c> target the copy job
+    /// doing that merge holds. That is judged safe on what was measured, not
+    /// proven. On a VM's own host this read succeeds against a disk that a
+    /// plain open of the same file is refused on, which is consistent with
+    /// vmms answering from the disk it already has open rather than opening
+    /// the file alongside it, the way the open-handle probe
+    /// <see cref="CreateAsync"/> skips during a copy does. And a snapshot
+    /// polled through its whole merge on the cluster, reading through the
+    /// holder on seven of those polls, merged and published normally.
+    /// </para>
+    /// <para>
+    /// A size is worth a bounded wait, not the call's whole budget: the
+    /// fallback gets at most <see cref="AgentOptions.HostOperationTimeout"/>,
+    /// and an unknown size when that runs out, rather than running the call
+    /// into its own timeout, which fails it. The bound abandons the wait
+    /// instead of relying on cancellation, since a token does nothing to a CIM
+    /// call already blocked in an RPC (see <c>CimDeadline</c>), so the read may
+    /// finish, and release its host slot, after this has answered. Like
+    /// <see cref="ReadVirtualSizeAsync"/>, this never fails the caller.
     /// </para>
     /// </remarks>
     private async Task<long> ReadSourceVirtualSizeAsync(
         string sourcePath, TimeSpan remainingBudget, CancellationToken cancellationToken)
     {
+        var elapsed = Stopwatch.StartNew();
         try
         {
             return await _diskManager.GetVirtualSizeAsync(sourcePath, remainingBudget, cancellationToken).ConfigureAwait(false);
         }
         catch (VhdxInUseException refused)
         {
-            VhdxLocation? holder;
+            var budget = TimeSpan.FromTicks(
+                Math.Min((remainingBudget - elapsed.Elapsed).Ticks, _options.HostOperationTimeout.Ticks));
+            if (budget <= TimeSpan.Zero)
+            {
+                _logger.LogWarning(refused,
+                    "could not read the virtual size of {Path}, and there is no time left to read it through the host " +
+                    "holding it; reporting it as unknown",
+                    sourcePath);
+                return 0;
+            }
+
+            var bound = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            bound.CancelAfter(budget);
+
+            // Taken before the read starts: a read that completes synchronously
+            // disposes of the source in the finally below before this method
+            // would otherwise get to ask it for its token.
+            var boundToken = bound.Token;
+            var read = ReadSizeThroughHolderAsync(sourcePath, boundToken);
             try
             {
-                holder = await _location.LocateAsync(sourcePath, cancellationToken).ConfigureAwait(false);
-                if (holder is not null)
+                if (await read.WaitAsync(boundToken).ConfigureAwait(false) is { } size)
                 {
-                    _logger.LogDebug(
-                        "{Path} is open by {VmId} on {Host}; reading its virtual size through that host",
-                        sourcePath, holder.VmId, holder.HostName);
-
-                    // One short vmms read, bounded by the same per-host cap as
-                    // every other (issue #14's D4).
-                    await _hostSlots.WaitAsync(holder.HostName, cancellationToken).ConfigureAwait(false);
-                    try
-                    {
-                        var info = await _host.GetDiskInfoAsync(holder.HostName, sourcePath, cancellationToken).ConfigureAwait(false);
-                        return info.VirtualSizeBytes;
-                    }
-                    finally
-                    {
-                        _hostSlots.Release(holder.HostName);
-                    }
+                    return size;
                 }
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                _logger.LogWarning(
+                    "the host holding {Path} did not answer its virtual size within {Budget}; reporting it as unknown",
+                    sourcePath, budget);
+                return 0;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 _logger.LogWarning(ex,
                     "could not read the virtual size of {Path} through the host holding it; reporting it as unknown", sourcePath);
                 return 0;
+            }
+            finally
+            {
+                // The read can outlive the wait above and keeps a registration on
+                // the token until it ends, so the source is disposed of only
+                // then - straight away, for a read already over. Its outcome is
+                // observed at the same point, so an abandoned read that later
+                // fails is not reported as an unobserved task exception.
+                _ = read.ContinueWith(
+                    static (finished, state) =>
+                    {
+                        _ = finished.Exception;
+                        ((CancellationTokenSource)state!).Dispose();
+                    },
+                    bound,
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
             }
 
             _logger.LogWarning(refused,
@@ -2194,6 +2241,35 @@ public sealed class SnapshotService : ISnapshotService
         {
             _logger.LogWarning(ex, "could not read the virtual size of {Path}; reporting it as unknown", sourcePath);
             return 0;
+        }
+    }
+
+    /// <summary>
+    /// <paramref name="sourcePath"/>'s virtual size as the host of the VM
+    /// holding it reads it, or null when no clustered VM holds it.
+    /// </summary>
+    private async Task<long?> ReadSizeThroughHolderAsync(string sourcePath, CancellationToken cancellationToken)
+    {
+        if (await _location.LocateAsync(sourcePath, cancellationToken).ConfigureAwait(false) is not { } holder)
+        {
+            return null;
+        }
+
+        _logger.LogDebug(
+            "{Path} is open by {VmId} on {Host}; reading its virtual size through that host",
+            sourcePath, holder.VmId, holder.HostName);
+
+        // One short vmms read, bounded by the same per-host cap as every other
+        // (issue #14's D4).
+        await _hostSlots.WaitAsync(holder.HostName, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var info = await _host.GetDiskInfoAsync(holder.HostName, sourcePath, cancellationToken).ConfigureAwait(false);
+            return info.VirtualSizeBytes;
+        }
+        finally
+        {
+            _hostSlots.Release(holder.HostName);
         }
     }
 
