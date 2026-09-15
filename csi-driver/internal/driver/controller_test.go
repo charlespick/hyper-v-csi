@@ -1216,7 +1216,10 @@ func TestControllerExpandVolumeReturnsTheNewCapacityAndAsksForANodeExpansion(t *
 	}
 }
 
-func TestControllerExpandVolumeEnqueuesUnderTheVolumeIDAsIdempotencyKey(t *testing.T) {
+func TestControllerExpandVolumeEnqueuesUnderTheVolumeIDAndSizeAsIdempotencyKey(t *testing.T) {
+	// The size is part of the key so that a larger request made while a smaller
+	// expansion is still running gets a job of its own, rather than the smaller
+	// one's result.
 	agent := newFakeAgent(t, expanded(4*gibibyte, false))
 	server := newControllerServer(agent)
 
@@ -1229,8 +1232,8 @@ func TestControllerExpandVolumeEnqueuesUnderTheVolumeIDAsIdempotencyKey(t *testi
 	if enqueued.OperationType != operationExpandVolume {
 		t.Errorf("operationType = %q, want %q", enqueued.OperationType, operationExpandVolume)
 	}
-	if enqueued.IdempotencyKey != "pvc-1" {
-		t.Errorf("idempotencyKey = %q, want the volume ID", enqueued.IdempotencyKey)
+	if want := fmt.Sprintf("pvc-1@%d", 4*gibibyte); enqueued.IdempotencyKey != want {
+		t.Errorf("idempotencyKey = %q, want %q, the volume ID and requested size", enqueued.IdempotencyKey, want)
 	}
 	if enqueued.Payload.VolumeID != "pvc-1" || enqueued.Payload.SizeBytes != 4*gibibyte {
 		t.Errorf("payload = %+v, want volumeId pvc-1 and sizeBytes %d", enqueued.Payload, 4*gibibyte)

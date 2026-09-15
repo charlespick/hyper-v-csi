@@ -355,6 +355,53 @@ public sealed class SnapshotServiceTests : IDisposable
     }
 
     [WindowsOnlyFact]
+    public async Task CreateAsync_WhenAnAttachedSourceRefusesTheLocalSizeRead_ReadsItThroughTheHostHoldingIt()
+    {
+        // An attached source refuses a read from any node but its VM's own for
+        // most of a snapshot - the whole merge after the copy included - and
+        // every poll in that window used to report the size as unknown.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient { DiskInfoVirtualSizeBytes = 4096 };
+        var harness = NewHarness(cluster: cluster, location: TracedToVm1(), host: host);
+        WriteAttachedVolume("pvc-1", 4096);
+        harness.Disks.RefusedPaths.Add(VolumePath("pvc-1"));
+        using var release = new SemaphoreSlim(0);
+        harness.Copier.DuringCopy = _ => release.WaitAsync();
+
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+
+        Assert.False(result.ReadyToUse);
+        Assert.Equal(4096, result.SizeBytes);
+        Assert.Contains("host-1", host.DiskInfoHosts);
+
+        release.Release();
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_WhenNeitherTheLocalNorTheHolderSizeReadAnswers_ReportsTheSizeAsUnknown()
+    {
+        // The through-the-holder read is a better answer where there is one,
+        // not a new way to fail the call.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient { FailDiskInfo = true };
+        var harness = NewHarness(cluster: cluster, location: TracedToVm1(), host: host);
+        WriteAttachedVolume("pvc-1", 4096);
+        harness.Disks.RefusedPaths.Add(VolumePath("pvc-1"));
+        using var release = new SemaphoreSlim(0);
+        harness.Copier.DuringCopy = _ => release.WaitAsync();
+
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+
+        Assert.False(result.ReadyToUse);
+        Assert.Equal(0, result.SizeBytes);
+        Assert.Contains("host-1", host.DiskInfoHosts);
+
+        release.Release();
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+    }
+
+    [WindowsOnlyFact]
     public async Task CreateAsync_CreationTimeComesFromTheMarkerAndSurvivesThePublish()
     {
         // external-snapshotter records what is returned here, so it must not
@@ -2229,6 +2276,9 @@ public sealed class SnapshotServiceTests : IDisposable
     {
         public bool FailSizeReads { get; set; }
 
+        /// <summary>Paths whose size read is refused the way a disk held open by another node's VM refuses one.</summary>
+        public HashSet<string> RefusedPaths { get; } = new(StringComparer.OrdinalIgnoreCase);
+
         public static string Contents(long virtualSizeBytes) => $"fake vhdx virtualSize={virtualSizeBytes}";
 
         public Task CreateDynamicVhdxAsync(string path, long maxInternalSizeBytes, TimeSpan remainingBudget, CancellationToken cancellationToken) =>
@@ -2245,6 +2295,11 @@ public sealed class SnapshotServiceTests : IDisposable
             if (FailSizeReads)
             {
                 throw new InvalidOperationException("CIM would not say");
+            }
+
+            if (RefusedPaths.Contains(path))
+            {
+                throw new VhdxInUseException(path, new IOException("The process cannot access the file because it is being used by another process."));
             }
 
             var contents = File.ReadAllText(path);
@@ -2550,6 +2605,15 @@ public sealed class SnapshotServiceTests : IDisposable
         /// </summary>
         public bool FailChainCollapsedChecks { get; set; }
 
+        /// <summary>The virtual size GetDiskInfoAsync reports, as the VM's own host reads it.</summary>
+        public long DiskInfoVirtualSizeBytes { get; set; }
+
+        /// <summary>Makes GetDiskInfoAsync throw, as a host that could not answer does.</summary>
+        public bool FailDiskInfo { get; set; }
+
+        /// <summary>Every host GetDiskInfoAsync was asked on.</summary>
+        public List<string> DiskInfoHosts { get; } = [];
+
         public Task<VolumeAttachment> ClassifyAttachmentAsync(
             string hostName, string vmId, string vhdxPath, string thisSnapshotElementName, CancellationToken cancellationToken)
         {
@@ -2663,9 +2727,17 @@ public sealed class SnapshotServiceTests : IDisposable
             return Task.FromResult(!ChainStaysUncollapsed && _checkpointsByElementName.Count == 0);
         }
 
-        public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken) =>
-            throw new NotSupportedException(
-                "SnapshotService measures an attached source's allocated bytes from the CSV file directly, not through the host");
+        public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken)
+        {
+            lock (DiskInfoHosts)
+            {
+                DiskInfoHosts.Add(hostName);
+            }
+
+            return FailDiskInfo
+                ? throw new InvalidOperationException("the host could not say")
+                : Task.FromResult(new HostDiskInfo(DiskInfoVirtualSizeBytes, Guid.NewGuid()));
+        }
 
         public Task<bool> ReferencesDiskAsync(
             string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken) =>

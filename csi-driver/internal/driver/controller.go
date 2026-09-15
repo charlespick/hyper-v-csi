@@ -772,11 +772,15 @@ type expandVolumeResult struct {
 	AlreadyLargeEnough bool `json:"alreadyLargeEnough"`
 }
 
-// ControllerExpandVolume grows the VHDX. Idempotency key: volume ID.
+// ControllerExpandVolume grows the VHDX. Idempotency key: volume ID and the
+// requested size, as "<volumeId>@<sizeBytes>".
 //
-// The volume is also the target, as it is for create and delete: what must not
-// interleave is two operations on one disk, and an expand racing a delete of
-// the same volume is exactly the pair that ordering exists to separate.
+// The size is in the key because the agent hands back any job for the same key
+// that is still running. Keyed on the volume alone, a resize to a larger size -
+// a PVC edited again before the first expansion finished - would come back as
+// the smaller job still in flight, and fail below as "expanded below the
+// requested". A retry at the same size still attaches to its own job, and the
+// agent runs expansions of one volume one at a time regardless of key.
 //
 // This is only half of an expansion. The VHDX gets bigger here; the filesystem
 // inside it does not, which is why the response sets node_expansion_required
@@ -811,7 +815,8 @@ func (s *controllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 
 	// No node hint: the agent resolves where an attached disk is open from the
 	// VHDX path itself.
-	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetVolumeId(), operationExpandVolume, expandVolumePayload{
+	key := fmt.Sprintf("%s@%d", req.GetVolumeId(), sizeBytes)
+	job, err := s.driver.Agent.EnqueueJob(ctx, key, operationExpandVolume, expandVolumePayload{
 		VolumeID:  req.GetVolumeId(),
 		SizeBytes: sizeBytes,
 	})

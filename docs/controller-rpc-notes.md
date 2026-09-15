@@ -476,6 +476,14 @@ waits on the same queued job rather than starting another. `ExpandDisk`
 traces the disk again when it runs, and refuses with ABORTED to grow it
 through any VM but the one it holds.
 
+The controller keys the job on the volume ID and the requested size
+(`<volumeId>@<sizeBytes>`), not the volume alone. The agent hands back any job
+for the same key that is still running, so keyed on the volume, a larger
+request made while a smaller expansion was still in flight — a PVC edited again
+before the first resize finished — would get the smaller job's result and fail
+as expanded below the requested size. With the size in the key it gets a job of
+its own, which `expand:` queues behind the first.
+
 **`external-resizer` is deployed, and `allowVolumeExpansion` defaults to
 true.** Without the sidecar this RPC has no caller — the same relationship
 `external-attacher` has to `ControllerPublishVolume` — and without the

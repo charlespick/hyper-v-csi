@@ -1895,10 +1895,11 @@ public sealed class SnapshotService : ISnapshotService
                 readyToUse ? snapshotPath : copyingPath, knownToExist: readyToUse, cancellationToken)
             .ConfigureAwait(false);
 
-        var sizeFrom = readyToUse ? snapshotPath : sourcePath;
-        var sizeBytes = sizeFrom is null
-            ? 0
-            : await ReadVirtualSizeAsync(sizeFrom, remainingBudget, cancellationToken).ConfigureAwait(false);
+        var sizeBytes = readyToUse
+            ? await ReadVirtualSizeAsync(snapshotPath, remainingBudget, cancellationToken).ConfigureAwait(false)
+            : sourcePath is null
+                ? 0
+                : await ReadSourceVirtualSizeAsync(sourcePath, remainingBudget, cancellationToken).ConfigureAwait(false);
 
         return new SnapshotResult(snapshotId, sourceVolumeId, sizeBytes, creationTime, readyToUse);
     }
@@ -2118,6 +2119,80 @@ public sealed class SnapshotService : ISnapshotService
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogWarning(ex, "could not read the virtual size of {Path}; reporting it as unknown", path);
+            return 0;
+        }
+    }
+
+    /// <summary>
+    /// <see cref="ReadVirtualSizeAsync"/> for the source of a snapshot still
+    /// being taken, read through the host of the VM holding it when this node
+    /// is refused.
+    /// </summary>
+    /// <remarks>
+    /// An attached source refuses a read from every node but its VM's own for
+    /// most of a snapshot. Sampled across one on a live cluster, a read from
+    /// another node was refused while the VM ran on the disk, answered while
+    /// the checkpoint stood, and was refused again once the merge after the
+    /// copy began writing back into it. That merge is the tail of every
+    /// attached snapshot, so every poll during it reported the size as
+    /// unknown. The VM's own host answered in every phase.
+    /// <para>
+    /// Only a refusal goes to the holder: anything else stopping the local read
+    /// says nothing about whether another host could answer. Tracing opens
+    /// nothing, so unlike the open-handle probe <see cref="CreateAsync"/> skips
+    /// while a copy is in flight, it cannot collide with that copy or its
+    /// merge. Like <see cref="ReadVirtualSizeAsync"/>, this never fails the
+    /// caller.
+    /// </para>
+    /// </remarks>
+    private async Task<long> ReadSourceVirtualSizeAsync(
+        string sourcePath, TimeSpan remainingBudget, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await _diskManager.GetVirtualSizeAsync(sourcePath, remainingBudget, cancellationToken).ConfigureAwait(false);
+        }
+        catch (VhdxInUseException refused)
+        {
+            VhdxLocation? holder;
+            try
+            {
+                holder = await _location.LocateAsync(sourcePath, cancellationToken).ConfigureAwait(false);
+                if (holder is not null)
+                {
+                    _logger.LogDebug(
+                        "{Path} is open by {VmId} on {Host}; reading its virtual size through that host",
+                        sourcePath, holder.VmId, holder.HostName);
+
+                    // One short vmms read, bounded by the same per-host cap as
+                    // every other (issue #14's D4).
+                    await _hostSlots.WaitAsync(holder.HostName, cancellationToken).ConfigureAwait(false);
+                    try
+                    {
+                        var info = await _host.GetDiskInfoAsync(holder.HostName, sourcePath, cancellationToken).ConfigureAwait(false);
+                        return info.VirtualSizeBytes;
+                    }
+                    finally
+                    {
+                        _hostSlots.Release(holder.HostName);
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogWarning(ex,
+                    "could not read the virtual size of {Path} through the host holding it; reporting it as unknown", sourcePath);
+                return 0;
+            }
+
+            _logger.LogWarning(refused,
+                "could not read the virtual size of {Path}, and no clustered VM holds it to read it through; reporting it as unknown",
+                sourcePath);
+            return 0;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "could not read the virtual size of {Path}; reporting it as unknown", sourcePath);
             return 0;
         }
     }
