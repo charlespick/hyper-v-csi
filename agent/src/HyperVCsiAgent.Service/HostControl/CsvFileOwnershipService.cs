@@ -1,5 +1,7 @@
 using HyperVCsiAgent.Core.Cluster;
+using HyperVCsiAgent.Core.Configuration;
 using HyperVCsiAgent.Core.HostControl;
+using Microsoft.Extensions.Options;
 
 namespace HyperVCsiAgent.Service.HostControl;
 
@@ -15,11 +17,20 @@ namespace HyperVCsiAgent.Service.HostControl;
 /// other nodes have open through the CSV metadata channel
 /// (<see cref="ICsvNodeProbe.ReadCsvOpenFilesAsync"/>), and the NetFT address
 /// each matching row names, mapped back to a node (<see cref="NetFtAddressTable"/>).
-/// The VM then comes from asking only the VMs the cluster says those
-/// candidates run whether their storage references the path - usually one
-/// node's worth, two at most in practice, and the coordinator's only as a last
-/// resort. Never a walk of every VM in the cluster, which is what this whole
-/// service exists to avoid.
+/// <para>
+/// What happens next depends on the question. For the file's own properties
+/// (<see cref="ReadThroughHolderAsync"/>) the candidates are simply asked to
+/// read it, in order, and the first that can is the holder - no VM is looked
+/// up at all. For the VM (<see cref="LocateAsync"/>) each candidate host is
+/// asked, in one host-scoped read, which of the VMs the cluster says it runs
+/// have the path among their disks - usually one node's worth, two at most in
+/// practice, and the coordinator's only as a last resort. Never a walk of
+/// every VM in the cluster, which is what this whole service exists to avoid,
+/// and never a round trip per VM either: matched from configuration - the
+/// ordinary case - a host running a hundred VMs costs the same one call as a
+/// host running one. Only the differencing walk, reached once nothing
+/// references the path directly, still reads per disk.
+/// </para>
 /// </remarks>
 public sealed class CsvFileOwnershipService : IVhdxLocationService
 {
@@ -38,15 +49,16 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
 
     /// <summary>
     /// The per-host cap every other vmms call in this agent takes - issue #14's
-    /// D4. Tracing asks each candidate VM's host in turn, and a burst of
-    /// snapshots or expands traces many disks at once; left unbounded, those
-    /// reads would stack up against a host's vmms beside the attaches and
-    /// checkpoints the cap exists to protect.
+    /// D4. Tracing asks each candidate host in turn, and a burst of snapshots
+    /// or expands traces many disks at once; left unbounded, those reads would
+    /// stack up against a host's vmms beside the attaches and checkpoints the
+    /// cap exists to protect.
     /// </summary>
     private readonly HostOperationSlots _hostSlots;
 
     private readonly ICsvNodeProbe _probe;
     private readonly NetFtAddressTable _addresses;
+    private readonly AgentOptions _options;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<CsvFileOwnershipService> _logger;
 
@@ -60,6 +72,7 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
         HostOperationSlots hostSlots,
         ICsvNodeProbe probe,
         NetFtAddressTable addresses,
+        IOptions<AgentOptions> options,
         TimeProvider timeProvider,
         ILogger<CsvFileOwnershipService> logger)
     {
@@ -68,6 +81,7 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
         _hostSlots = hostSlots;
         _probe = probe;
         _addresses = addresses;
+        _options = options.Value;
         _timeProvider = timeProvider;
         _logger = logger;
     }
@@ -75,7 +89,111 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
     public async Task<VhdxLocation?> LocateAsync(string path, CancellationToken cancellationToken)
     {
         var fullPath = Path.GetFullPath(path);
+        var (volume, holders, stages) = await FindCandidatesAsync(path, fullPath, cancellationToken).ConfigureAwait(false);
 
+        var vms = await _cluster.ListVmsAsync(cancellationToken).ConfigureAwait(false);
+
+        // Configuration alone first, across every stage, and differencing chains
+        // only once that has found nothing. A disk attached to its VM as itself
+        // is the ordinary case, answered in one read per host - and walking
+        // chains first would make every VM on a candidate node pay a read per
+        // disk per hop before the one that simply lists the path is reached.
+        var failures = new List<string>();
+        foreach (var includeDifferencingChains in new[] { false, true })
+        {
+            failures.Clear();
+            foreach (var stage in stages)
+            {
+                var matches = await FindReferencingVmsAsync(
+                    vms, stage, fullPath, includeDifferencingChains, failures, cancellationToken).ConfigureAwait(false);
+
+                switch (matches.Count)
+                {
+                    case 0:
+                        continue;
+
+                    case 1:
+                        _logger.LogDebug(
+                            "{Path} belongs to {VmId} on {HostName}, per {Coordinator}'s CSV open files",
+                            fullPath, matches[0].VmId, matches[0].HostName, volume.CoordinatorNode);
+                        return matches[0];
+
+                    default:
+                        throw new InvalidOperationException(
+                            $"{path} is referenced by more than one VM " +
+                            $"({string.Join(", ", matches.Select(match => $"{match.VmId} on {match.HostName}"))}), " +
+                            "so no one of them is the VM holding it");
+                }
+            }
+        }
+
+        if (failures.Count > 0)
+        {
+            // Nothing matched, but not everything could be asked, and null would
+            // claim more than is known: callers read it as "no clustered VM holds
+            // this file".
+            throw new InvalidOperationException(
+                $"{path} is open, and no clustered VM on a node that could be holding it was found to reference it, " +
+                $"but not all of those VMs could be checked: {string.Join("; ", failures)}");
+        }
+
+        _logger.LogDebug(
+            "{Path} is open, but no clustered VM on {Candidates} or its coordinator {Coordinator} references it",
+            fullPath, holders, volume.CoordinatorNode);
+        return null;
+    }
+
+    public async Task<HeldDiskInfo> ReadThroughHolderAsync(string path, CancellationToken cancellationToken)
+    {
+        var fullPath = Path.GetFullPath(path);
+        var (volume, _, stages) = await FindCandidatesAsync(path, fullPath, cancellationToken).ConfigureAwait(false);
+
+        // The same order LocateAsync asks in, for the same reasons: the listed
+        // nodes, then the coordinator, whose own opens the listing never shows.
+        // A node that cannot read the file past its holder refuses the read
+        // the same way the caller's own was refused, so each refusal only
+        // moves on to the next candidate - the usual cost is one read, and
+        // the worst one per candidate node.
+        var refusals = new List<string>();
+        foreach (var hostName in stages.SelectMany(stage => stage))
+        {
+            if (!await TryTakeHostSlotAsync(hostName, cancellationToken).ConfigureAwait(false))
+            {
+                refusals.Add($"{hostName}: {SlotWaitTimedOut(hostName)}");
+                continue;
+            }
+
+            try
+            {
+                var info = await _host.GetDiskInfoAsync(hostName, path, cancellationToken).ConfigureAwait(false);
+                _logger.LogDebug(
+                    "{Path} read through {HostName}, per {Coordinator}'s CSV open files", fullPath, hostName, volume.CoordinatorNode);
+                return new HeldDiskInfo(hostName, info);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogDebug(ex, "{HostName} could not read {Path}; asking the next node that could be holding it", hostName, fullPath);
+                refusals.Add($"{hostName}: {ex.Message}");
+            }
+            finally
+            {
+                _hostSlots.Release(hostName);
+            }
+        }
+
+        throw new InvalidOperationException(
+            $"{path} is open, but no node that could be holding it could read it: {string.Join("; ", refusals)}");
+    }
+
+    /// <summary>
+    /// The nodes that could be holding <paramref name="fullPath"/> open, in the
+    /// stages they are asked in: the nodes its CSV coordinator lists it open
+    /// from, and then the coordinator itself when it is not already one of
+    /// those.
+    /// </summary>
+    private async Task<(ClusterSharedVolume Volume, IReadOnlySet<string> Holders, string[][] Stages)> FindCandidatesAsync(
+        string path, string fullPath, CancellationToken cancellationToken)
+    {
         var volume = await FindVolumeAsync(fullPath, forceRefresh: false, cancellationToken).ConfigureAwait(false)
             ?? await FindVolumeAsync(fullPath, forceRefresh: true, cancellationToken).ConfigureAwait(false)
             ?? throw new InvalidOperationException(NotOnSharedVolume(path));
@@ -117,56 +235,7 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
             stages.Add([volume.CoordinatorNode]);
         }
 
-        var vms = await _cluster.ListVmsAsync(cancellationToken).ConfigureAwait(false);
-
-        // Configuration alone first, across every stage, and differencing chains
-        // only once that has found nothing. A disk attached to its VM as itself
-        // is the ordinary case, answered in a few reads per VM - and walking
-        // chains first would make every VM on a candidate node pay a read per
-        // disk per hop before the one that simply lists the path is reached.
-        var failures = new List<string>();
-        foreach (var includeDifferencingChains in new[] { false, true })
-        {
-            failures.Clear();
-            foreach (var stage in stages)
-            {
-                var matches = await FindReferencingVmsAsync(
-                    vms, stage, fullPath, includeDifferencingChains, failures, cancellationToken).ConfigureAwait(false);
-
-                switch (matches.Count)
-                {
-                    case 0:
-                        continue;
-
-                    case 1:
-                        _logger.LogDebug(
-                            "{Path} belongs to {VmId} on {HostName}, per {Coordinator}'s CSV open files",
-                            fullPath, matches[0].VmId, matches[0].HostName, volume.CoordinatorNode);
-                        return matches[0];
-
-                    default:
-                        throw new InvalidOperationException(
-                            $"{path} is referenced by more than one VM " +
-                            $"({string.Join(", ", matches.Select(match => $"{match.VmId} on {match.HostName}"))}), " +
-                            "so no one of them is the VM holding it");
-                }
-            }
-        }
-
-        if (failures.Count > 0)
-        {
-            // Nothing matched, but not everything could be asked, and null would
-            // claim more than is known: callers read it as "no clustered VM holds
-            // this file".
-            throw new InvalidOperationException(
-                $"{path} is open, and no clustered VM on a node that could be holding it was found to reference it, " +
-                $"but {failures.Count} of those VMs could not be checked: {string.Join("; ", failures)}");
-        }
-
-        _logger.LogDebug(
-            "{Path} is open, but no clustered VM on {Candidates} or its coordinator {Coordinator} references it",
-            fullPath, holders, volume.CoordinatorNode);
-        return null;
+        return (volume, holders!, stages.ToArray());
     }
 
     /// <summary>
@@ -177,10 +246,21 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
     /// discovery belongs to IClusterService.
     /// </summary>
     /// <remarks>
-    /// A VM that cannot be checked - one whose configuration or some unrelated
-    /// disk of which cannot be read - is recorded in
+    /// One call per host, whatever the number of VMs on it - see
+    /// <see cref="IHyperVHostClient.FindDiskReferencesAsync"/>. Every VM on
+    /// the host is still answered for, not just the first to match: two VMs
+    /// referencing one path - a differencing base shared by two VMs' children -
+    /// is a refusal the caller has to be able to see, and with one read per
+    /// host, seeing it costs nothing extra.
+    /// <para>
+    /// Whatever cannot be checked - a VM whose differencing chains cannot be
+    /// walked, or a host that cannot be asked at all - is recorded in
     /// <paramref name="failures"/> and passed over rather than allowed to stop
     /// the rest: it says nothing about whether another VM references the path.
+    /// A VM the cluster lists on a host that no longer has it has migrated
+    /// since the listing, and wherever it went, it is not what has this file
+    /// open here; the host simply does not answer for it.
+    /// </para>
     /// </remarks>
     private async Task<List<VhdxLocation>> FindReferencingVmsAsync(
         IReadOnlyList<ClusteredVm> vms,
@@ -193,50 +273,94 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
         var matches = new List<VhdxLocation>();
         foreach (var hostName in hostNames)
         {
-            foreach (var vm in vms.Where(vm => string.Equals(vm.OwningHost, hostName, StringComparison.OrdinalIgnoreCase)))
+            var vmIds = vms
+                .Where(vm => string.Equals(vm.OwningHost, hostName, StringComparison.OrdinalIgnoreCase))
+                .Select(vm => vm.VmId)
+                .ToArray();
+            if (vmIds.Length == 0)
             {
-                try
-                {
-                    // Taken and released around each VM's one call, never held
-                    // across the whole walk: no caller of this service holds a
-                    // host slot while it traces, and holding one here for every
-                    // VM on a node would starve that node's attaches for the
-                    // length of the walk.
-                    await _hostSlots.WaitAsync(hostName, cancellationToken).ConfigureAwait(false);
-                    bool references;
-                    try
-                    {
-                        references = await _host.ReferencesDiskAsync(
-                            hostName, vm.VmId, fullPath, includeDifferencingChains, cancellationToken).ConfigureAwait(false);
-                    }
-                    finally
-                    {
-                        _hostSlots.Release(hostName);
-                    }
+                continue;
+            }
 
-                    if (references)
-                    {
-                        matches.Add(new VhdxLocation(hostName, vm.VmId));
-                    }
-                }
-                catch (VmNotOnHostException)
-                {
-                    // Migrated off this node since the listing above. Wherever it
-                    // went, it is not what has this file open here.
-                    _logger.LogDebug("{VmId} left {HostName} while it was being checked for {Path}", vm.VmId, hostName, fullPath);
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    _logger.LogWarning(ex,
-                        "could not tell whether {VmId} on {HostName} references {Path}; carrying on with the others",
-                        vm.VmId, hostName, fullPath);
-                    failures.Add($"{vm.VmId} on {hostName}: {ex.Message}");
-                }
+            // Taken and released around each host's one call, never held
+            // across the stages: no caller of this service holds a host slot
+            // while it traces, and holding one across every candidate would
+            // starve those nodes' attaches for the length of the trace. One
+            // slot for the call, not the cap: in the differencing pass that
+            // call is a whole host's chain walk, but it still leaves the
+            // host's other slots to its attaches.
+            if (!await TryTakeHostSlotAsync(hostName, cancellationToken).ConfigureAwait(false))
+            {
+                _logger.LogWarning(
+                    "could not ask {HostName} whether its VMs reference {Path}: {Reason}; carrying on with the others",
+                    hostName, fullPath, SlotWaitTimedOut(hostName));
+                failures.Add($"the VMs on {hostName} ({string.Join(", ", vmIds)}): {SlotWaitTimedOut(hostName)}");
+                continue;
+            }
+
+            DiskReferences references;
+            try
+            {
+                references = await _host.FindDiskReferencesAsync(
+                    hostName, vmIds, fullPath, includeDifferencingChains, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogWarning(ex,
+                    "could not ask {HostName} whether its VMs reference {Path}; carrying on with the others", hostName, fullPath);
+                failures.Add($"the VMs on {hostName} ({string.Join(", ", vmIds)}): {ex.Message}");
+                continue;
+            }
+            finally
+            {
+                _hostSlots.Release(hostName);
+            }
+
+            matches.AddRange(references.VmIds.Select(vmId => new VhdxLocation(hostName, vmId)));
+            foreach (var unresolved in references.Unresolved)
+            {
+                _logger.LogWarning(
+                    "could not tell whether {VmId} on {HostName} references {Path}: {Reason}; carrying on with the others",
+                    unresolved.VmId, hostName, fullPath, unresolved.Reason);
+                failures.Add($"{unresolved.VmId} on {hostName}: {unresolved.Reason}");
             }
         }
 
         return matches;
     }
+
+    /// <summary>
+    /// Takes a slot on <paramref name="hostName"/>'s share of
+    /// <see cref="HostOperationSlots"/>, waiting at most
+    /// <see cref="AgentOptions.HostOperationTimeout"/> - false when that ran
+    /// out first.
+    /// </summary>
+    /// <remarks>
+    /// Bounded the way every other taker of the cap bounds it, and for the same
+    /// reason: with a merge or a run of attaches holding all of a host's slots,
+    /// an unbounded wait would sit out the caller's whole budget and surface as
+    /// a timeout naming nothing. A caller that cannot get a slot here records
+    /// that host as one it could not ask, naming what it queued for, and moves
+    /// on to the rest.
+    /// </remarks>
+    private async Task<bool> TryTakeHostSlotAsync(string hostName, CancellationToken cancellationToken)
+    {
+        using var bound = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        bound.CancelAfter(_options.HostOperationTimeout);
+        try
+        {
+            await _hostSlots.WaitAsync(hostName, bound.Token).ConfigureAwait(false);
+            return true;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return false;
+        }
+    }
+
+    private string SlotWaitTimedOut(string hostName) =>
+        $"timed out after {_options.HostOperationTimeout} waiting for one of " +
+        $"{_options.MaxConcurrentHostOperations} operation slots on {hostName}";
 
     /// <summary>
     /// The distinct nodes the coordinator lists as having <paramref name="fullPath"/>

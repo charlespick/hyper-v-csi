@@ -872,24 +872,33 @@ public sealed class VhdxService : IVhdxService, IDisposable
     }
 
     /// <summary>
-    /// Reads a disk a running VM has open through the host that VM runs on, for
-    /// a CreateVolume replay. Only a host with a VM confirmed to reference the
-    /// disk is asked: any other node that merely has the file open cannot read
-    /// it past the VM's hold any better than this one just failed to.
+    /// Reads a disk a running VM has open through the host holding it, for a
+    /// CreateVolume replay. Only the file's own properties are wanted, so no VM
+    /// is looked up: <see cref="IVhdxLocationService.ReadThroughHolderAsync"/>
+    /// asks the nodes that could be holding it until one can read it. This is
+    /// the replay storm's path - a provisioner restart replays every bound PVC
+    /// at once - so it must not pay for a VM it never uses.
     /// </summary>
     private async Task<HostDiskInfo> ReadThroughHolderAsync(
         string volumeName, string path, CancellationToken cancellationToken)
     {
-        var location = await LocateHolderAsync(volumeName, path, cancellationToken).ConfigureAwait(false)
-            ?? throw new JobFailureException(
+        HeldDiskInfo held;
+        try
+        {
+            held = await _location.ReadThroughHolderAsync(path, cancellationToken).ConfigureAwait(false);
+        }
+        catch (InvalidOperationException ex)
+        {
+            throw new JobFailureException(
                 AgentErrorCodes.Internal,
-                $"volume {volumeName} at {path} is open, but no clustered VM on a node that could be holding it has " +
-                "it attached, so there is no host to read it through; check for an unmanaged handle on the CSV");
+                $"volume {volumeName} at {path} is open, but could not be read through any node that could be holding " +
+                $"it; check for an unmanaged handle on the CSV: {ex.Message}",
+                ex);
+        }
 
         _logger.LogInformation(
-            "CreateVolume {VolumeName}: {Path} is open by {VmId} on {Host}; reading it through that host",
-            volumeName, path, location.VmId, location.HostName);
-        return await _host.GetDiskInfoAsync(location.HostName, path, cancellationToken).ConfigureAwait(false);
+            "CreateVolume {VolumeName}: {Path} is held open; read it through {Host}", volumeName, path, held.HostName);
+        return held.Info;
     }
 
     public async Task DeleteAsync(string volumeId, CancellationToken cancellationToken)

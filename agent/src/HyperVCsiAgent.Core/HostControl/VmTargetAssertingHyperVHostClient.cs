@@ -23,7 +23,7 @@ namespace HyperVCsiAgent.Core.HostControl;
 /// <para>
 /// Read-only calls are deliberately exempt: <see cref="FindAttachedDiskAsync"/>,
 /// <see cref="IsDiskAttachedAsync"/>, <see cref="FindFreeSlotAsync"/>,
-/// <see cref="ReferencesDiskAsync"/>, <see cref="GetDiskInfoAsync"/>,
+/// <see cref="FindDiskReferencesAsync"/>, <see cref="GetDiskInfoAsync"/>,
 /// <see cref="ClassifyAttachmentAsync"/>,
 /// <see cref="FindOwnedCheckpointAsync"/>, <see cref="CanCheckpointAsync"/>,
 /// <see cref="IsChainCollapsedAsync"/> and
@@ -62,9 +62,13 @@ public sealed class VmTargetAssertingHyperVHostClient(IHyperVHostClient inner) :
         return inner.DetachDiskAsync(hostName, vmId, vhdxPath, cancellationToken);
     }
 
-    public Task<bool> ReferencesDiskAsync(
-        string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken) =>
-        inner.ReferencesDiskAsync(hostName, vmId, vhdxPath, includeDifferencingChains, cancellationToken);
+    public Task<DiskReferences> FindDiskReferencesAsync(
+        string hostName,
+        IReadOnlyCollection<string> vmIds,
+        string vhdxPath,
+        bool includeDifferencingChains,
+        CancellationToken cancellationToken) =>
+        inner.FindDiskReferencesAsync(hostName, vmIds, vhdxPath, includeDifferencingChains, cancellationToken);
 
     public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken) =>
         inner.GetDiskInfoAsync(hostName, vhdxPath, cancellationToken);

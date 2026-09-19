@@ -2141,8 +2141,11 @@ public sealed class SnapshotService : ISnapshotService
     /// says nothing about whether another host could answer.
     /// </para>
     /// <para>
-    /// Finding the holder opens nothing, but the read through it does reach the
-    /// file. vmms on the VM's own host answers it, during the merge when that
+    /// The holder is found by trying the read on each node that could be
+    /// holding the file, in turn, until one answers - and that read does reach
+    /// the file. A node that does not hold it refuses, or, while a checkpoint
+    /// stands, answers the same size the holder would. vmms on the VM's own
+    /// host answers it in every phase, during the merge when that
     /// is where the poll lands, and outside the <c>vm:</c> target the copy job
     /// doing that merge holds. That is judged safe on what was measured, not
     /// proven. On a VM's own host this read succeeds against a disk that a
@@ -2195,10 +2198,7 @@ public sealed class SnapshotService : ISnapshotService
             var read = ReadSizeThroughHolderAsync(sourcePath, boundToken);
             try
             {
-                if (await read.WaitAsync(boundToken).ConfigureAwait(false) is { } size)
-                {
-                    return size;
-                }
+                return await read.WaitAsync(boundToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
             {
@@ -2231,11 +2231,6 @@ public sealed class SnapshotService : ISnapshotService
                     TaskContinuationOptions.ExecuteSynchronously,
                     TaskScheduler.Default);
             }
-
-            _logger.LogWarning(refused,
-                "could not read the virtual size of {Path}, and no clustered VM holds it to read it through; reporting it as unknown",
-                sourcePath);
-            return 0;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -2245,32 +2240,22 @@ public sealed class SnapshotService : ISnapshotService
     }
 
     /// <summary>
-    /// <paramref name="sourcePath"/>'s virtual size as the host of the VM
-    /// holding it reads it, or null when no clustered VM holds it.
+    /// <paramref name="sourcePath"/>'s virtual size as the host holding it
+    /// reads it.
     /// </summary>
-    private async Task<long?> ReadSizeThroughHolderAsync(string sourcePath, CancellationToken cancellationToken)
+    /// <remarks>
+    /// Only the size is wanted, so no VM is looked up - see
+    /// <see cref="IVhdxLocationService.ReadThroughHolderAsync"/>. external-snapshotter
+    /// polls CreateSnapshot for the whole of a copy and its merge, and each
+    /// poll that lands here would otherwise pay for naming a VM it never uses.
+    /// The read takes its host slot inside that call, under the same per-host
+    /// cap as every other vmms call (issue #14's D4).
+    /// </remarks>
+    private async Task<long> ReadSizeThroughHolderAsync(string sourcePath, CancellationToken cancellationToken)
     {
-        if (await _location.LocateAsync(sourcePath, cancellationToken).ConfigureAwait(false) is not { } holder)
-        {
-            return null;
-        }
-
-        _logger.LogDebug(
-            "{Path} is open by {VmId} on {Host}; reading its virtual size through that host",
-            sourcePath, holder.VmId, holder.HostName);
-
-        // One short vmms read, bounded by the same per-host cap as every other
-        // (issue #14's D4).
-        await _hostSlots.WaitAsync(holder.HostName, cancellationToken).ConfigureAwait(false);
-        try
-        {
-            var info = await _host.GetDiskInfoAsync(holder.HostName, sourcePath, cancellationToken).ConfigureAwait(false);
-            return info.VirtualSizeBytes;
-        }
-        finally
-        {
-            _hostSlots.Release(holder.HostName);
-        }
+        var held = await _location.ReadThroughHolderAsync(sourcePath, cancellationToken).ConfigureAwait(false);
+        _logger.LogDebug("{Path} is held open; read its virtual size through {Host}", sourcePath, held.HostName);
+        return held.Info.VirtualSizeBytes;
     }
 
     /// <summary>

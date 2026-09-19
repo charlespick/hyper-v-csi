@@ -190,6 +190,9 @@ public sealed class HostOperationSlotsTests : IDisposable
 
         public Task<VhdxLocation?> LocateAsync(string path, CancellationToken cancellationToken) =>
             Task.FromResult<VhdxLocation?>(new VhdxLocation(Host, VmId));
+
+        public Task<HeldDiskInfo> ReadThroughHolderAsync(string path, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException($"{path} could not be read through {Host}");
     }
 
     private sealed class NeverCalledVirtualDiskManager : IVirtualDiskManager
@@ -280,8 +283,9 @@ public sealed class HostOperationSlotsTests : IDisposable
         public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
-        public Task<bool> ReferencesDiskAsync(
-            string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken) =>
+        public Task<DiskReferences> FindDiskReferencesAsync(
+            string hostName, IReadOnlyCollection<string> vmIds, string vhdxPath, bool includeDifferencingChains,
+            CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
         public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken) =>

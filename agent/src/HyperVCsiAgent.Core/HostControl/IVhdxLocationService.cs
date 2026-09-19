@@ -42,8 +42,40 @@ public interface IVhdxLocationService
     /// <exception cref="InvalidOperationException">
     /// The path is not on a Cluster Shared Volume, the open-file listing names a
     /// client no cluster node's address matches, more than one VM references
-    /// the path, or a VM's differencing chain could not be walked far enough to
-    /// tell. Each is refused rather than guessed past.
+    /// the path, or - with no VM found to reference it - a VM's differencing
+    /// chain could not be walked far enough to tell, or a candidate node could
+    /// not be asked at all, whether it failed or none of its host operation
+    /// slots came free in time. Each is refused rather than guessed past.
     /// </exception>
     Task<VhdxLocation?> LocateAsync(string path, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Reads <paramref name="path"/>'s virtual size and identity through the
+    /// host whose vmms can read it past whatever holds it open - the question a
+    /// caller asks when all it wants is the file's own properties, and no VM
+    /// has to be named to answer it.
+    /// </summary>
+    /// <remarks>
+    /// Only meaningful under the same premise as <see cref="LocateAsync"/>: the
+    /// caller's own read of the file was just refused.
+    /// <para>
+    /// Never asks which VM holds the file, so none of the per-host VM matching
+    /// <see cref="LocateAsync"/> does is paid for here. The same candidate
+    /// nodes, in the same order, are each asked for the read instead, and the
+    /// first to answer is used: measured, the same path-only read from a node
+    /// that merely has the file open, or none at all, is refused exactly as the
+    /// caller's own was, so a node that answers needs nothing further to be
+    /// believed. It is usually the holder, though not always - while a
+    /// checkpoint stands, any node can read the base - but whatever answers,
+    /// the size and identity are the file's own, not the host's. Usually one
+    /// read, and at most one per candidate node - the listed nodes and the
+    /// coordinator.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">
+    /// The path is not on a Cluster Shared Volume, the open-file listing names a
+    /// client no cluster node's address matches, or no candidate node could
+    /// read the file - each node's own refusal is named.
+    /// </exception>
+    Task<HeldDiskInfo> ReadThroughHolderAsync(string path, CancellationToken cancellationToken);
 }

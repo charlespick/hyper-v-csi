@@ -197,7 +197,8 @@ public sealed class VhdxServiceTests : IDisposable
         // asked for, so a replay reporting the request on trust would show.
         var disks = new FakeVirtualDiskManager { RoundUpTo = 4096 };
         var host = new FakeHostClient { SizeOnHost = 4096 };
-        using var service = NewService(disks, location: new FakeVhdxLocationService { VmIds = ["vm-1"] }, host: host);
+        var location = new FakeVhdxLocationService { VmIds = ["vm-1"] };
+        using var service = NewService(disks, location: location, host: host);
 
         await service.CreateAsync("pvc-1", 1024, null, CancellationToken.None);
         disks.Created.Clear();
@@ -210,6 +211,11 @@ public sealed class VhdxServiceTests : IDisposable
         Assert.Equal(host.DiskIdOnHost, replay.DiskId);
         Assert.Equal("host-a", host.ReadOnHost);
         Assert.Empty(disks.Created);
+
+        // The replay storm's path (issue #35): the file's own size and
+        // identity are all it wants, so no VM is ever looked up for it.
+        Assert.Equal(1, location.ReadThroughCalls);
+        Assert.Equal(0, location.LocateCalls);
     }
 
     [WindowsOnlyFact]
@@ -1489,6 +1495,13 @@ public sealed class VhdxServiceTests : IDisposable
             jobs = store;
         }
 
+        // A read through the holder lands on this test's host, the way the
+        // real service sends it to the node it found.
+        if (location is FakeVhdxLocationService fakeLocation)
+        {
+            fakeLocation.Reader ??= host;
+        }
+
         return new VhdxService(
             disks,
             // Defaults to something that throws if ever called: restore is the
@@ -1807,6 +1820,41 @@ public sealed class VhdxServiceTests : IDisposable
             var vmId = VmIds[Math.Min(lookup, VmIds.Count - 1)];
             return Task.FromResult(vmId is null ? null : new VhdxLocation(Host, vmId));
         }
+
+        /// <summary>How many times the disk has been traced to a VM.</summary>
+        public int LocateCalls => Volatile.Read(ref _lookups);
+
+        private int _readThroughCalls;
+
+        /// <summary>How many times the disk has been read through the node holding it.</summary>
+        public int ReadThroughCalls => Volatile.Read(ref _readThroughCalls);
+
+        /// <summary>
+        /// What a read through the holder is sent to - the test's own host
+        /// client, wired in by NewService, so its answers are the ones that land.
+        /// </summary>
+        public IHyperVHostClient? Reader { get; set; }
+
+        /// <summary>
+        /// The real service's contract in miniature: held when the current
+        /// trace would name a VM, and read on <see cref="Host"/>; refused, the
+        /// one way the contract names, otherwise.
+        /// </summary>
+        public async Task<HeldDiskInfo> ReadThroughHolderAsync(string path, CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref _readThroughCalls);
+            if (Untraceable)
+            {
+                throw new InvalidOperationException($"{path} is not on any Cluster Shared Volume");
+            }
+
+            if (VmIds[Math.Min(Volatile.Read(ref _lookups), VmIds.Count - 1)] is null || Reader is null)
+            {
+                throw new InvalidOperationException($"{path} is open, but no node that could be holding it could read it");
+            }
+
+            return new HeldDiskInfo(Host, await Reader.GetDiskInfoAsync(Host, path, cancellationToken).ConfigureAwait(false));
+        }
     }
 
     /// <summary>
@@ -1839,8 +1887,9 @@ public sealed class VhdxServiceTests : IDisposable
             return Task.FromResult(newSizeBytes);
         }
 
-        public Task<bool> ReferencesDiskAsync(
-            string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken) =>
+        public Task<DiskReferences> FindDiskReferencesAsync(
+            string hostName, IReadOnlyCollection<string> vmIds, string vhdxPath, bool includeDifferencingChains,
+            CancellationToken cancellationToken) =>
             throw new NotSupportedException("VhdxService learns the VM from IVhdxLocationService, never VM by VM");
 
         public Task<AttachedDisk?> FindAttachedDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
@@ -1893,6 +1942,9 @@ public sealed class VhdxServiceTests : IDisposable
     {
         public Task<VhdxLocation?> LocateAsync(string path, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("nothing has the disk open in this test, so nothing should trace it");
+
+        public Task<HeldDiskInfo> ReadThroughHolderAsync(string path, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("nothing has the disk open in this test, so nothing should read through a holder");
     }
 
     /// <summary>NeverCalledVhdxLocationService's counterpart for IHyperVHostClient.</summary>
@@ -1913,8 +1965,9 @@ public sealed class VhdxServiceTests : IDisposable
         public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
 
-        public Task<bool> ReferencesDiskAsync(
-            string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken) =>
+        public Task<DiskReferences> FindDiskReferencesAsync(
+            string hostName, IReadOnlyCollection<string> vmIds, string vhdxPath, bool includeDifferencingChains,
+            CancellationToken cancellationToken) =>
             throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
 
         public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken) =>

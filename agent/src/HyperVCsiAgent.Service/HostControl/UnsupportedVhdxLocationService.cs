@@ -11,7 +11,12 @@ namespace HyperVCsiAgent.Service.HostControl;
 public sealed class UnsupportedVhdxLocationService : IVhdxLocationService
 {
     public Task<VhdxLocation?> LocateAsync(string path, CancellationToken cancellationToken) =>
-        throw new PlatformNotSupportedException(
-            "Locating an open VHDX requires Windows Failover Clustering; this agent is running on " +
+        throw Unsupported();
+
+    public Task<HeldDiskInfo> ReadThroughHolderAsync(string path, CancellationToken cancellationToken) =>
+        throw Unsupported();
+
+    private static PlatformNotSupportedException Unsupported() =>
+        new("Locating an open VHDX requires Windows Failover Clustering; this agent is running on " +
             $"{Environment.OSVersion.Platform}");
 }

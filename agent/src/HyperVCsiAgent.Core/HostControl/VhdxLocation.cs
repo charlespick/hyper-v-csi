@@ -6,9 +6,9 @@ namespace HyperVCsiAgent.Core.HostControl;
 /// while it is held open.
 /// </summary>
 /// <remarks>
-/// Always both halves or nothing. A host is only worth sending a path-only CIM
-/// call to once a VM registered there has been confirmed to reference the path;
-/// a node that merely has the file open - another reader, this agent's own copy -
-/// cannot answer for it any better than the node the caller is already on.
+/// Always both halves or nothing. A caller that needs only the host - to send
+/// it a path-only CIM call - asks
+/// <see cref="IVhdxLocationService.ReadThroughHolderAsync"/> instead, which
+/// never pays for naming the VM.
 /// </remarks>
 public sealed record VhdxLocation(string HostName, string VmId);

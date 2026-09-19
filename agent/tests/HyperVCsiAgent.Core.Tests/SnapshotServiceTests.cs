@@ -362,7 +362,8 @@ public sealed class SnapshotServiceTests : IDisposable
         // every poll in that window used to report the size as unknown.
         var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
         var host = new FakeHostClient { DiskInfoVirtualSizeBytes = 4096 };
-        var harness = NewHarness(cluster: cluster, location: TracedToVm1(), host: host);
+        var location = TracedToVm1();
+        var harness = NewHarness(cluster: cluster, location: location, host: host);
         WriteAttachedVolume("pvc-1", 4096);
         harness.Disks.RefusedPaths.Add(VolumePath("pvc-1"));
         using var release = new SemaphoreSlim(0);
@@ -373,6 +374,11 @@ public sealed class SnapshotServiceTests : IDisposable
         Assert.False(result.ReadyToUse);
         Assert.Equal(4096, result.SizeBytes);
         Assert.Contains("host-1", host.DiskInfoHosts);
+
+        // Traced once to find the VM to checkpoint; the size read after it
+        // only wants the file's own size, so it names no VM (issue #35).
+        Assert.Equal(1, location.LocateCalls);
+        Assert.Equal(1, location.ReadThroughCalls);
 
         release.Release();
         await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
@@ -2082,6 +2088,14 @@ public sealed class SnapshotServiceTests : IDisposable
         {
             MaxConcurrentSnapshotCopies = maxConcurrentSnapshotCopies,
         }));
+
+        // A read through the holder lands on this harness's host, the way the
+        // real service sends it to the host it found.
+        if (location is FakeVhdxLocationService fakeLocation)
+        {
+            fakeLocation.Reader ??= host;
+        }
+
         // Shared with the caller when one is passed in - the point of
         // HostOperationSlots (issue #14's D4) is that it is the one cap two
         // different services contend for, not a fresh one per harness.
@@ -2482,8 +2496,9 @@ public sealed class SnapshotServiceTests : IDisposable
         public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
             throw Unexpected();
 
-        public Task<bool> ReferencesDiskAsync(
-            string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken) =>
+        public Task<DiskReferences> FindDiskReferencesAsync(
+            string hostName, IReadOnlyCollection<string> vmIds, string vhdxPath, bool includeDifferencingChains,
+            CancellationToken cancellationToken) =>
             throw Unexpected();
 
         public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken) =>
@@ -2535,10 +2550,44 @@ public sealed class SnapshotServiceTests : IDisposable
         /// <summary>How many times a source has been traced - once per inspection that found it held.</summary>
         public int LocateCalls => Volatile.Read(ref _locateCalls);
 
+        private int _readThroughCalls;
+
+        /// <summary>How many times a source's size has been read through the node holding it.</summary>
+        public int ReadThroughCalls => Volatile.Read(ref _readThroughCalls);
+
+        /// <summary>
+        /// What a read through the holder is sent to - the harness's own host
+        /// client, so its answers, refusals and hangs are the ones that land.
+        /// </summary>
+        public IHyperVHostClient? Reader { get; set; }
+
         public Task<VhdxLocation?> LocateAsync(string path, CancellationToken cancellationToken)
         {
             Interlocked.Increment(ref _locateCalls);
             return Task.FromResult(VmId is null ? null : new VhdxLocation(Host, VmId));
+        }
+
+        /// <summary>
+        /// The real service's contract in miniature: the node holding the file
+        /// is asked, and any refusal - including there being no holder at all -
+        /// comes back as the one exception type the contract names.
+        /// </summary>
+        public async Task<HeldDiskInfo> ReadThroughHolderAsync(string path, CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref _readThroughCalls);
+            if (VmId is null || Reader is null)
+            {
+                throw new InvalidOperationException($"{path} is open, but no node that could be holding it could read it");
+            }
+
+            try
+            {
+                return new HeldDiskInfo(Host, await Reader.GetDiskInfoAsync(Host, path, cancellationToken).ConfigureAwait(false));
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException and not InvalidOperationException)
+            {
+                throw new InvalidOperationException($"{Host}: {ex.Message}", ex);
+            }
         }
     }
 
@@ -2790,8 +2839,9 @@ public sealed class SnapshotServiceTests : IDisposable
                     "only a virtual size read this node was refused goes through the host");
         }
 
-        public Task<bool> ReferencesDiskAsync(
-            string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken) =>
+        public Task<DiskReferences> FindDiskReferencesAsync(
+            string hostName, IReadOnlyCollection<string> vmIds, string vhdxPath, bool includeDifferencingChains,
+            CancellationToken cancellationToken) =>
             throw new NotSupportedException("SnapshotService learns the VM from IVhdxLocationService, never VM by VM");
 
         public Task<AttachedDisk?> FindAttachedDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>

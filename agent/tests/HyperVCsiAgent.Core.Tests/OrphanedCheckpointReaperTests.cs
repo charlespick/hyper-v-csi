@@ -507,6 +507,9 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
     {
         public Task<VhdxLocation?> LocateAsync(string path, CancellationToken cancellationToken) =>
             throw new NotSupportedException("the reaper never traces a disk from its path");
+
+        public Task<HeldDiskInfo> ReadThroughHolderAsync(string path, CancellationToken cancellationToken) =>
+            throw new NotSupportedException("the reaper never reads a disk through its holder");
     }
 
     /// <summary>
@@ -742,8 +745,9 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
         public Task<bool> IsChainCollapsedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
             Task.FromResult(!_byHost.TryGetValue(hostName, out var entries) || entries.Count == 0);
 
-        public Task<bool> ReferencesDiskAsync(
-            string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken) =>
+        public Task<DiskReferences> FindDiskReferencesAsync(
+            string hostName, IReadOnlyCollection<string> vmIds, string vhdxPath, bool includeDifferencingChains,
+            CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
         public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken) =>

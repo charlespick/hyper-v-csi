@@ -51,27 +51,34 @@ public interface IHyperVHostClient
     Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Whether <paramref name="vhdxPath"/> is part of the VM's current storage:
-    /// referenced directly, or - with <paramref name="includeDifferencingChains"/>
-    /// - as the base of a differencing chain one of its disks is built on.
-    /// Unlike <see cref="IsDiskAttachedAsync"/>, a checkpoint standing over the
-    /// disk is an ordinary "yes" here rather than a refusal - this answers which
-    /// VM a disk belongs to, not whether an operation on it is safe to start.
+    /// Which of <paramref name="vmIds"/> have <paramref name="vhdxPath"/> as
+    /// part of their current storage on this host: referenced directly, or -
+    /// with <paramref name="includeDifferencingChains"/> - as the base of a
+    /// differencing chain one of their disks is built on. Unlike
+    /// <see cref="IsDiskAttachedAsync"/>, a checkpoint standing over the disk
+    /// is an ordinary "yes" here rather than a refusal - this answers which VM
+    /// a disk belongs to, not whether an operation on it is safe to start.
     /// </summary>
+    /// <remarks>
+    /// Answered for the whole host at once rather than VM by VM: every VM's
+    /// active disks come back from one host-scoped enumeration and are matched
+    /// in memory, so without <paramref name="includeDifferencingChains"/>,
+    /// asking about a host running a hundred VMs costs the same round trips as
+    /// asking about one running a single VM. A VM in
+    /// <paramref name="vmIds"/> that is not registered on the host - migrated
+    /// away since the caller listed it - is simply not among the answers.
+    /// </remarks>
     /// <param name="includeDifferencingChains">
-    /// False answers from the VM's configuration alone. True also walks every
-    /// other disk's chain, one read per disk per hop - worth paying only once
-    /// no VM has been found referencing the path directly.
+    /// False answers from configuration alone. True also walks every other
+    /// disk's chain, one read per disk per hop - worth paying only once no VM
+    /// has been found referencing the path directly.
     /// </param>
-    /// <exception cref="VmNotOnHostException">The VM is not registered on this host.</exception>
-    /// <exception cref="InvalidOperationException">
-    /// No disk was found referencing <paramref name="vhdxPath"/>, and at least
-    /// one of the VM's differencing chains could not be walked far enough to
-    /// tell. A chain that cannot be walked never hides another disk that does
-    /// reference the path.
-    /// </exception>
-    Task<bool> ReferencesDiskAsync(
-        string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken);
+    Task<DiskReferences> FindDiskReferencesAsync(
+        string hostName,
+        IReadOnlyCollection<string> vmIds,
+        string vhdxPath,
+        bool includeDifferencingChains,
+        CancellationToken cancellationToken);
 
     /// <summary>
     /// Reads a VHDX's current virtual size and identity through the host that

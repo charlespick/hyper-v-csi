@@ -8,8 +8,8 @@ namespace HyperVCsiAgent.Core.HostControl;
 /// The single cap on concurrent operations against any one Hyper-V host,
 /// shared by every caller that issues one: <see cref="AttachService"/>'s
 /// attach and detach, <see cref="Storage.SnapshotService"/>'s checkpoint
-/// take, classify, find and destroy, and the per-VM reads
-/// <see cref="IVhdxLocationService"/> makes to trace a disk to its VM.
+/// take, classify, find and destroy, and the per-host reads
+/// <see cref="IVhdxLocationService"/> makes to trace a disk to its holder.
 /// </summary>
 /// <remarks>
 /// One shared instance rather than one per caller - issue #14's D4. Checkpoint

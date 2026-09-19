@@ -21,9 +21,13 @@ public sealed class CsvFileOwnershipServiceTests
     private readonly FakeCluster _cluster = new();
     private readonly FakeProbe _probe = new();
     private readonly FakeHost _host = new();
+    private readonly AgentOptions _options = new() { MaxConcurrentHostOperations = 4 };
+    private readonly HostOperationSlots _slots;
 
     public CsvFileOwnershipServiceTests()
     {
+        _slots = new HostOperationSlots(Options.Create(_options));
+
         // The cluster this was measured on, plus a third node: the shapes that
         // need one - a VM and another reader, each on a node that is not the
         // coordinator - cannot happen with two.
@@ -275,13 +279,226 @@ public sealed class CsvFileOwnershipServiceTests
         Assert.Equal(2, _cluster.SharedVolumeReads);
     }
 
+    [Fact]
+    public async Task LocateAsync_AsksADenseHostOnce_HoweverManyVmsItRuns()
+    {
+        // Issue #35: the scale this driver targets puts a hundred VMs or more on
+        // a host, and asking them one at a time cost three round trips each on
+        // every trace. One call per host, however many VMs it runs, and every
+        // one of them still answered for.
+        _cluster.Vms = Enumerable.Range(1, 100)
+            .Select(n => new ClusteredVm($"vm-dense-{n}", "csidev01"))
+            .Append(new ClusteredVm("vm-2", "csidev02"))
+            .ToArray();
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address)];
+        _host.References.Add(("csidev01", "vm-dense-1"));
+
+        Assert.Equal(new VhdxLocation("csidev01", "vm-dense-1"), await NewService().LocateAsync(Pvc, CancellationToken.None));
+        Assert.Equal(["csidev01"], _host.ReferenceCalls);
+        Assert.Equal(100, _host.Asked.Count);
+        Assert.Empty(_host.AskedForChains);
+    }
+
+    [Fact]
+    public async Task LocateAsync_WalkingChains_AsksEachCandidateHostOnceMore_AndNoMore()
+    {
+        // The worst ordinary case: nothing references the path directly, so
+        // both passes run across both stages - four calls, not four per VM.
+        _cluster.Vms = Enumerable.Range(1, 50)
+            .Select(n => new ClusteredVm($"vm-a-{n}", "csidev01"))
+            .Concat(Enumerable.Range(1, 50).Select(n => new ClusteredVm($"vm-b-{n}", "csidev02")))
+            .ToArray();
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address)];
+        _host.ChainReferences.Add(("csidev02", "vm-b-7"));
+
+        Assert.Equal(new VhdxLocation("csidev02", "vm-b-7"), await NewService().LocateAsync(Pvc, CancellationToken.None));
+        Assert.Equal(["csidev01", "csidev02", "csidev01", "csidev02"], _host.ReferenceCalls);
+    }
+
+    [Fact]
+    public async Task LocateAsync_RefusesTwoVmsOnOneHostReferencingOnePath()
+    {
+        // A differencing base shared by two VMs' children, both on one node:
+        // answering for the whole host at once still sees both, and neither is
+        // the one VM holding it.
+        _cluster.Vms = [new("vm-1", "csidev01"), new("vm-4", "csidev01"), new("vm-2", "csidev02")];
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address)];
+        _host.References.Add(("csidev01", "vm-1"));
+        _host.References.Add(("csidev01", "vm-4"));
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => NewService().LocateAsync(Pvc, CancellationToken.None));
+
+        Assert.Contains("vm-1 on csidev01", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("vm-4 on csidev01", failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task LocateAsync_AHostThatCannotBeAsked_DoesNotHideAnotherThatHoldsThePath()
+    {
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address), new(PvcRelative, Dev03Address)];
+        _host.Unreachable.Add("csidev01");
+        _host.References.Add(("csidev03", "vm-3"));
+
+        Assert.Equal(new VhdxLocation("csidev03", "vm-3"), await NewService().LocateAsync(Pvc, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task LocateAsync_RefusesRatherThanAnswerNoneWhenAHostCouldNotBeAsked()
+    {
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address)];
+        _host.Unreachable.Add("csidev01");
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => NewService().LocateAsync(Pvc, CancellationToken.None));
+
+        Assert.Contains("the VMs on csidev01 (vm-1)", failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task LocateAsync_BoundsTheWaitForAHostSlot_AndNamesWhatItQueuedFor()
+    {
+        // Every slot on the listed node taken - a merge, a run of attaches -
+        // and held for longer than a host operation may take. The trace stops
+        // waiting on that node, says so, and refuses rather than answering
+        // "no VM holds it" for a node it never asked.
+        _options.HostOperationTimeout = TimeSpan.FromMilliseconds(100);
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address)];
+        for (var slot = 0; slot < _options.MaxConcurrentHostOperations; slot++)
+        {
+            await _slots.WaitAsync("csidev01", CancellationToken.None);
+        }
+
+        var locating = NewService().LocateAsync(Pvc, CancellationToken.None);
+        Assert.Same(locating, await Task.WhenAny(locating, Task.Delay(TimeSpan.FromSeconds(10))));
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(() => locating);
+
+        Assert.Contains("waiting for one of 4 operation slots on csidev01", failure.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("csidev01", _host.ReferenceCalls);
+    }
+
+    [Fact]
+    public async Task ReadThroughHolderAsync_ReadsThroughTheListedNode_WithoutLookingUpAnyVm()
+    {
+        // Issue #35: a CreateVolume replay and a snapshot size poll want the
+        // file's own properties, not its VM, and are the two callers that run
+        // hottest - so neither pays for a VM lookup.
+        var info = new HostDiskInfo(4096, Guid.NewGuid());
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address)];
+        _host.Readable["csidev01"] = info;
+
+        Assert.Equal(new HeldDiskInfo("csidev01", info), await NewService().ReadThroughHolderAsync(Pvc, CancellationToken.None));
+        Assert.Equal(["csidev01"], _host.DiskInfoCalls);
+        Assert.Empty(_host.ReferenceCalls);
+        Assert.Equal(0, _cluster.VmListings);
+    }
+
+    [Fact]
+    public async Task ReadThroughHolderAsync_WhenTheListedNodeIsOnlyAnotherReader_FallsBackToTheCoordinator()
+    {
+        // The VM runs on the coordinator, whose own opens never appear in its
+        // listing, so the only node listed is another reader - which refuses
+        // the read, the way any node but the holder does.
+        var info = new HostDiskInfo(4096, Guid.NewGuid());
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev03Address)];
+        _host.Readable["csidev02"] = info;
+
+        Assert.Equal(new HeldDiskInfo("csidev02", info), await NewService().ReadThroughHolderAsync(Pvc, CancellationToken.None));
+        Assert.Equal(["csidev03", "csidev02"], _host.DiskInfoCalls);
+    }
+
+    [Fact]
+    public async Task ReadThroughHolderAsync_WhenTwoNodesHaveTheFileOpen_AnswersFromTheOneThatCanRead()
+    {
+        // The VM's node and this agent's own copy on another node, listed side
+        // by side: whichever comes first in order is asked first, and the
+        // other reader's refusal only moves on to the next.
+        var info = new HostDiskInfo(4096, Guid.NewGuid());
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev03Address), new(PvcRelative, Dev01Address)];
+        _host.Readable["csidev03"] = info;
+
+        Assert.Equal(new HeldDiskInfo("csidev03", info), await NewService().ReadThroughHolderAsync(Pvc, CancellationToken.None));
+        Assert.Equal(["csidev01", "csidev03"], _host.DiskInfoCalls);
+    }
+
+    [Fact]
+    public async Task ReadThroughHolderAsync_WhenNoCandidateCanReadIt_RefusesNamingEachNodesRefusal()
+    {
+        // An unmanaged handle, most plausibly: open, but not through anything
+        // any candidate's vmms can read past. The listed node and the
+        // coordinator are asked, never a node that is neither.
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address)];
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => NewService().ReadThroughHolderAsync(Pvc, CancellationToken.None));
+
+        Assert.Contains("csidev01: GetVirtualHardDiskSettingData", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("csidev02: GetVirtualHardDiskSettingData", failure.Message, StringComparison.Ordinal);
+        Assert.Equal(["csidev01", "csidev02"], _host.DiskInfoCalls);
+    }
+
+    [Fact]
+    public async Task ReadThroughHolderAsync_BoundsTheWaitForAHostSlot_AndMovesOn()
+    {
+        _options.HostOperationTimeout = TimeSpan.FromMilliseconds(100);
+        var info = new HostDiskInfo(4096, Guid.NewGuid());
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address)];
+        _host.Readable["csidev02"] = info;
+        for (var slot = 0; slot < _options.MaxConcurrentHostOperations; slot++)
+        {
+            await _slots.WaitAsync("csidev01", CancellationToken.None);
+        }
+
+        var reading = NewService().ReadThroughHolderAsync(Pvc, CancellationToken.None);
+        Assert.Same(reading, await Task.WhenAny(reading, Task.Delay(TimeSpan.FromSeconds(10))));
+
+        Assert.Equal(new HeldDiskInfo("csidev02", info), await reading);
+        Assert.Equal(["csidev02"], _host.DiskInfoCalls);
+    }
+
+    [Fact]
+    public async Task ReadThroughHolderAsync_ReleasesEveryHostSlotItTakes()
+    {
+        _options.MaxConcurrentHostOperations = 1;
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address)];
+        _host.Readable["csidev02"] = new HostDiskInfo(4096, Guid.NewGuid());
+        var slots = new HostOperationSlots(Options.Create(_options));
+        var service = new CsvFileOwnershipService(
+            _cluster,
+            _host,
+            slots,
+            _probe,
+            new NetFtAddressTable(_cluster, _probe, _clock, NullLogger<NetFtAddressTable>.Instance),
+            Options.Create(_options),
+            _clock,
+            NullLogger<CsvFileOwnershipService>.Instance);
+
+        await service.ReadThroughHolderAsync(Pvc, CancellationToken.None);
+
+        // csidev01 refused and csidev02 answered; both slots are free again.
+        using var bounded = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        await slots.WaitAsync("csidev01", bounded.Token);
+        await slots.WaitAsync("csidev02", bounded.Token);
+    }
+
+    [Fact]
+    public async Task ReadThroughHolderAsync_RefusesAPathOnNoSharedVolume()
+    {
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => NewService().ReadThroughHolderAsync(@"C:\ClusterStorage\Volume9\pvc-1.vhdx", CancellationToken.None));
+
+        Assert.Contains("not on any Cluster Shared Volume", failure.Message, StringComparison.Ordinal);
+        Assert.Empty(_host.DiskInfoCalls);
+    }
+
     private CsvFileOwnershipService NewService() =>
         new(
             _cluster,
             _host,
-            new HostOperationSlots(Options.Create(new AgentOptions { MaxConcurrentHostOperations = 4 })),
+            _slots,
             _probe,
             new NetFtAddressTable(_cluster, _probe, _clock, NullLogger<NetFtAddressTable>.Instance),
+            Options.Create(_options),
             _clock,
             NullLogger<CsvFileOwnershipService>.Instance);
 
@@ -309,8 +526,13 @@ public sealed class CsvFileOwnershipServiceTests
         public Task<IReadOnlyList<string>> ListNodesAsync(CancellationToken cancellationToken) =>
             Task.FromResult<IReadOnlyList<string>>(Nodes);
 
-        public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) =>
-            Task.FromResult<IReadOnlyList<ClusteredVm>>(Vms);
+        public int VmListings { get; private set; }
+
+        public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken)
+        {
+            VmListings++;
+            return Task.FromResult<IReadOnlyList<ClusteredVm>>(Vms);
+        }
 
         public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
@@ -358,35 +580,62 @@ public sealed class CsvFileOwnershipServiceTests
         /// <summary>VMs a checkpoint has re-pointed at a differencing disk built on the path.</summary>
         public HashSet<(string Host, string VmId)> ChainReferences { get; } = [];
 
+        /// <summary>VMs the cluster still lists on a host that no longer has them registered.</summary>
         public HashSet<string> Migrated { get; } = [];
 
-        /// <summary>VMs with something - their configuration, or an unrelated disk - that cannot be read.</summary>
+        /// <summary>VMs with an unrelated disk whose differencing chain cannot be walked.</summary>
         public HashSet<string> Unreadable { get; } = [];
 
-        /// <summary>Every VM asked from configuration alone, in the order it was asked.</summary>
+        /// <summary>Hosts that cannot be asked at all.</summary>
+        public HashSet<string> Unreachable { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// The hosts whose vmms can read the path past whatever holds it, and
+        /// what they read. Every other host refuses, the way a node that is not
+        /// the holder is measured to.
+        /// </summary>
+        public Dictionary<string, HostDiskInfo> Readable { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Every VM asked about from configuration alone, in the order it was asked.</summary>
         public List<string> Asked { get; } = [];
 
-        /// <summary>Every VM asked with its differencing chains walked, in the order it was asked.</summary>
+        /// <summary>Every VM asked about with differencing chains walked, in the order it was asked.</summary>
         public List<string> AskedForChains { get; } = [];
 
-        public Task<bool> ReferencesDiskAsync(
-            string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken)
+        /// <summary>
+        /// Every host asked which of its VMs reference the path, one entry per
+        /// call - the round trips a locate costs, whatever the VM count.
+        /// </summary>
+        public List<string> ReferenceCalls { get; } = [];
+
+        /// <summary>Every host asked to read the path, in the order it was asked.</summary>
+        public List<string> DiskInfoCalls { get; } = [];
+
+        public Task<DiskReferences> FindDiskReferencesAsync(
+            string hostName, IReadOnlyCollection<string> vmIds, string vhdxPath, bool includeDifferencingChains,
+            CancellationToken cancellationToken)
         {
-            (includeDifferencingChains ? AskedForChains : Asked).Add(vmId);
+            ReferenceCalls.Add(hostName);
+            (includeDifferencingChains ? AskedForChains : Asked).AddRange(vmIds);
 
-            if (Migrated.Contains(vmId))
+            if (Unreachable.Contains(hostName))
             {
-                throw new VmNotOnHostException(hostName, vmId);
+                throw new TimeoutException($"{hostName} did not answer");
             }
 
-            if (Unreadable.Contains(vmId))
-            {
-                throw new InvalidOperationException($"a disk on {vmId} could not be read");
-            }
+            var registered = vmIds.Where(vmId => !Migrated.Contains(vmId)).ToList();
+            var references = registered
+                .Where(vmId => References.Contains((hostName, vmId))
+                    || (includeDifferencingChains && ChainReferences.Contains((hostName, vmId))))
+                .ToList();
+            var unresolved = includeDifferencingChains
+                ? registered
+                    .Where(vmId => Unreadable.Contains(vmId) && !references.Contains(vmId))
+                    .Select(vmId => new UnresolvedDiskReference(vmId, $"a disk on {vmId} could not be read"))
+                    .ToList()
+                : [];
 
-            return Task.FromResult(
-                References.Contains((hostName, vmId))
-                || (includeDifferencingChains && ChainReferences.Contains((hostName, vmId))));
+            return Task.FromResult(new DiskReferences(references, unresolved));
         }
 
         public Task<AttachedDisk?> FindAttachedDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
@@ -404,8 +653,14 @@ public sealed class CsvFileOwnershipServiceTests
         public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
-        public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken) =>
-            throw new NotSupportedException();
+        public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken)
+        {
+            DiskInfoCalls.Add(hostName);
+            return Readable.TryGetValue(hostName, out var info)
+                ? Task.FromResult(info)
+                : throw new InvalidOperationException(
+                    $"GetVirtualHardDiskSettingData for {vhdxPath} failed on {hostName}: the file is being used by another process");
+        }
 
         public Task<long> ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
             throw new NotSupportedException();

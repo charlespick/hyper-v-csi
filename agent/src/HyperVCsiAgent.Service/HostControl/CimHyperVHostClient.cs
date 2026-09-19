@@ -47,6 +47,13 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     private const string VirtualHardDiskSubType = "Microsoft:Hyper-V:Virtual Hard Disk";
 
     /// <summary>
+    /// <c>Msvm_VirtualSystemSettingData.VirtualSystemType</c> of a VM's active
+    /// configuration, as opposed to a checkpoint's or a planned VM's. Read off
+    /// a live host.
+    /// </summary>
+    private const string RealizedVirtualSystemType = "Microsoft:Hyper-V:System:Realized";
+
+    /// <summary>
     /// Addresses per synthetic SCSI controller. Hyper-V's own limit; a VM with
     /// four controllers therefore tops out at 256 disks, minus whatever it boots
     /// from.
@@ -359,18 +366,22 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             _logger.LogInformation("detached {VhdxPath} from {VmId} on {HostName}", vhdxPath, vmId, hostName);
         }, cancellationToken);
 
-    public Task<bool> ReferencesDiskAsync(
-        string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken) =>
+    public Task<DiskReferences> FindDiskReferencesAsync(
+        string hostName,
+        IReadOnlyCollection<string> vmIds,
+        string vhdxPath,
+        bool includeDifferencingChains,
+        CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
             _logger.LogDebug(
-                "checking whether {VmId} on {HostName} references {VhdxPath} (differencing chains: {IncludeChains})",
-                vmId, hostName, vhdxPath, includeDifferencingChains);
+                "checking whether any of {VmCount} VMs on {HostName} reference {VhdxPath} (differencing chains: {IncludeChains})",
+                vmIds.Count, hostName, vhdxPath, includeDifferencingChains);
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
-            using var settings = GetActiveSettings(session, hostName, vmId, deadline, cancellationToken);
-            return ReferencesDisk(
-                session, settings, vmId, vhdxPath, includeDifferencingChains, deadline, cancellationToken, _logger);
+            var disks = ReadActiveDisks(session, vmIds, deadline, cancellationToken);
+            return FindDiskReferences(
+                session, disks, vhdxPath, includeDifferencingChains, _hostOperationTimeout, cancellationToken, _logger);
         }, cancellationToken);
 
     public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken) =>
@@ -742,99 +753,221 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     }
 
     /// <summary>
-    /// <see cref="ReferencesDiskAsync"/>'s traversal - the walk
+    /// The virtual hard disks in the active configuration of each of
+    /// <paramref name="vmIds"/> registered on this host, keyed by VM ID as the
+    /// caller spelled it - two host-scoped enumerations, however many VMs the
+    /// host runs.
+    /// </summary>
+    /// <remarks>
+    /// Replaces a lookup per VM - the VM, its active settings, then those
+    /// settings' disks, three round trips each - with two queries matched in
+    /// memory, the bulk shape MsClusterService.ListVmsAsync takes for the same
+    /// reason. Measured against a real host: about 230ms for one VM the old
+    /// way, about 50ms for every VM on the host this way.
+    /// <para>
+    /// Both ends are joined through <c>InstanceID</c>, which Hyper-V writes as
+    /// <c>Microsoft:&lt;GUID&gt;</c> on a VM's settings and
+    /// <c>Microsoft:&lt;GUID&gt;\&lt;device-specific data&gt;</c> on each of
+    /// its resources, the GUID being the VM's - read off a live host, as
+    /// documented for Msvm_StorageAllocationSettingData. Only settings whose
+    /// <c>VirtualSystemType</c> is the realized type are taken as a VM's
+    /// active configuration, which leaves out the planned VM a live migration
+    /// stages on its destination - that one is not running here yet - and the
+    /// <c>Microsoft:Definition\...</c> capability templates, whose prefix is no
+    /// GUID at all. A checkpoint's own copy of the disks is left out too, as
+    /// long as it is keyed by the checkpoint's own GUID; that is what key
+    /// uniqueness implies - its device-specific suffix is the VM's own, so
+    /// its prefix has to differ - but unlike the rest, it has not been read
+    /// off a host. Were it keyed by the VM's GUID instead, it would only ever
+    /// name that VM as referencing the base it was taken over, which is the
+    /// VM the differencing walk would have found anyway.
+    /// </para>
+    /// </remarks>
+    private static Dictionary<string, List<string>> ReadActiveDisks(
+        CimSession session,
+        IReadOnlyCollection<string> vmIds,
+        CimDeadline deadline,
+        CancellationToken cancellationToken)
+    {
+        var wanted = new HashSet<string>(vmIds, StringComparer.OrdinalIgnoreCase);
+        var disks = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var settings in session.QueryInstances(
+            NamespaceName,
+            "WQL",
+            $"SELECT InstanceID FROM Msvm_VirtualSystemSettingData WHERE VirtualSystemType = '{RealizedVirtualSystemType}'",
+            deadline.Options("listing the active settings of every VM", cancellationToken)))
+        {
+            using (settings)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (OwningVmOf(settings) is { } vmId && wanted.TryGetValue(vmId, out var asAsked))
+                {
+                    disks.TryAdd(asAsked, []);
+                }
+            }
+        }
+
+        if (disks.Count == 0)
+        {
+            return disks;
+        }
+
+        foreach (var disk in session.QueryInstances(
+            NamespaceName,
+            "WQL",
+            $"SELECT InstanceID, HostResource FROM Msvm_StorageAllocationSettingData WHERE ResourceSubType = '{VirtualHardDiskSubType}'",
+            deadline.Options("listing the virtual hard disks of every VM", cancellationToken)))
+        {
+            using (disk)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (OwningVmOf(disk) is { } vmId
+                    && disks.TryGetValue(vmId, out var paths)
+                    && disk.CimInstanceProperties["HostResource"]?.Value is string[] { Length: > 0 } hostResource)
+                {
+                    paths.Add(hostResource[0]);
+                }
+            }
+        }
+
+        return disks;
+    }
+
+    /// <summary>
+    /// The VM GUID an <c>InstanceID</c> of the form
+    /// <c>Microsoft:&lt;GUID&gt;</c> or <c>Microsoft:&lt;GUID&gt;\...</c> is
+    /// keyed by, or null for any other form.
+    /// </summary>
+    private static string? OwningVmOf(CimInstance instance)
+    {
+        const string Prefix = "Microsoft:";
+        if (instance.CimInstanceProperties["InstanceID"]?.Value is not string instanceId
+            || !instanceId.StartsWith(Prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var owner = instanceId[Prefix.Length..];
+        var end = owner.IndexOf('\\', StringComparison.Ordinal);
+        owner = end < 0 ? owner : owner[..end];
+        return WqlNames.IsVmId(owner) ? owner : null;
+    }
+
+    /// <summary>
+    /// <see cref="FindDiskReferencesAsync"/>'s matching over
+    /// <see cref="ReadActiveDisks"/>' answer - the walk
     /// <see cref="IsChainCollapsed"/> does, asking the other question: whether
-    /// anything on this VM is <paramref name="vhdxPath"/> or is built on it.
+    /// anything on each VM is <paramref name="vhdxPath"/> or is built on it.
     /// </summary>
     /// <remarks>
     /// Its own copy, following this file's rule that walks differing in when
     /// they throw are not shared. This one sits between the two existing
     /// postures: a checkpoint over the disk is an answer, not a refusal - the
     /// caller wants to know which VM owns the disk, not whether it is safe to
-    /// touch - but a chain it cannot walk to the end is still refused rather
+    /// touch - but a chain it cannot walk to the end is still reported rather
     /// than read as "not this VM", because the caller is choosing which VM
     /// to act on and a wrong "no" sends it to act on none.
     /// <para>
-    /// Refused only once every other chain has been walked, though. A disk
-    /// whose setting data cannot be read - one whose file is gone, most
-    /// plausibly - says nothing about whether a different disk on the same VM
-    /// is built on the path, so it is set aside rather than allowed to stop
-    /// the walk.
+    /// Reported only once every other chain on that VM has been walked,
+    /// though, and never allowed to stop the other VMs being answered for. A
+    /// disk whose setting data cannot be read - one whose file is gone, most
+    /// plausibly - says nothing about whether a different disk is built on
+    /// the path, so it is set aside rather than allowed to stop the walk.
+    /// </para>
+    /// <para>
+    /// Each VM's chains get a <paramref name="budgetPerVm"/> of their own
+    /// rather than sharing one across the host, the budget each VM had when it
+    /// was asked about alone. The walk is a read per disk per hop, so its cost
+    /// does grow with the VMs on the host, unlike the configuration match; one
+    /// shared budget would let a dense host run out part way and take the VMs
+    /// already found down with it. A VM whose own budget runs out is reported
+    /// as unresolved, the same as a chain that cannot be walked.
     /// </para>
     /// </remarks>
-    private static bool ReferencesDisk(
+    private static DiskReferences FindDiskReferences(
         CimSession session,
-        CimInstance settings,
-        string vmId,
+        Dictionary<string, List<string>> disks,
         string vhdxPath,
         bool includeDifferencingChains,
-        CimDeadline deadline,
+        TimeSpan budgetPerVm,
         CancellationToken cancellationToken,
         ILogger logger)
     {
-        var otherDisks = new List<string>();
-
-        foreach (var disk in DeviceSettings(session, settings, "Msvm_StorageAllocationSettingData", deadline, cancellationToken))
+        var references = new List<string>();
+        var unresolved = new List<UnresolvedDiskReference>();
+        CimInstance? imageService = null;
+        try
         {
-            using (disk)
+            foreach (var (vmId, paths) in disks)
             {
-                if ((disk.CimInstanceProperties["ResourceSubType"]?.Value as string) != VirtualHardDiskSubType)
+                if (paths.Any(path => SamePath(path, vhdxPath)))
+                {
+                    references.Add(vmId);
+                    continue;
+                }
+
+                if (!includeDifferencingChains || paths.Count == 0)
                 {
                     continue;
                 }
 
-                if (disk.CimInstanceProperties["HostResource"]?.Value is not string[] { Length: > 0 } hostResource)
+                var deadline = CimDeadline.After(budgetPerVm);
+                imageService ??= GetImageManagementService(session, deadline, cancellationToken);
+
+                var chainFailures = new List<string>();
+                var builtOn = false;
+                foreach (var attached in paths)
                 {
-                    continue;
+                    try
+                    {
+                        if (IsBuiltOn(session, imageService, attached, vhdxPath, deadline, cancellationToken))
+                        {
+                            builtOn = true;
+                            break;
+                        }
+                    }
+                    catch (Exception ex) when (ex is InvalidOperationException or CimException)
+                    {
+                        logger.LogDebug(ex,
+                            "could not walk {Attached}'s differencing chain on {VmId}; carrying on with its other disks", attached, vmId);
+                        chainFailures.Add($"{attached}: {ex.Message}");
+                    }
+                    catch (TimeoutException ex)
+                    {
+                        // This VM's own budget is spent, so every chain still
+                        // to walk on it would fail the same way - but the VMs
+                        // after it each start a budget of their own.
+                        logger.LogDebug(ex, "ran out of time walking {VmId}'s differencing chains at {Attached}", vmId, attached);
+                        chainFailures.Add($"{attached} and any after it: {ex.Message}");
+                        break;
+                    }
                 }
 
-                if (SamePath(hostResource[0], vhdxPath))
+                if (builtOn)
                 {
-                    return true;
+                    references.Add(vmId);
                 }
-
-                otherDisks.Add(hostResource[0]);
-            }
-        }
-
-        if (!includeDifferencingChains || otherDisks.Count == 0)
-        {
-            return false;
-        }
-
-        using var imageService = GetImageManagementService(session, deadline, cancellationToken);
-
-        var unresolved = new List<string>();
-        foreach (var attached in otherDisks)
-        {
-            try
-            {
-                if (IsBuiltOn(session, imageService, attached, vhdxPath, deadline, cancellationToken))
+                else if (chainFailures.Count > 0)
                 {
-                    return true;
+                    unresolved.Add(new UnresolvedDiskReference(
+                        vmId,
+                        $"no disk on it was found to be {vhdxPath} or built on it, but {chainFailures.Count} of its " +
+                        $"differencing chains could not be walked to tell: {string.Join("; ", chainFailures)}"));
                 }
             }
-            catch (Exception ex) when (ex is InvalidOperationException or CimException)
-            {
-                logger.LogDebug(ex,
-                    "could not walk {Attached}'s differencing chain on {VmId}; carrying on with its other disks", attached, vmId);
-                unresolved.Add($"{attached}: {ex.Message}");
-            }
         }
-
-        if (unresolved.Count > 0)
+        finally
         {
-            throw new InvalidOperationException(
-                $"no disk on {vmId} was found to be {vhdxPath} or built on it, but {unresolved.Count} of its " +
-                $"differencing chains could not be walked to tell: {string.Join("; ", unresolved)}");
+            imageService?.Dispose();
         }
 
-        return false;
+        return new DiskReferences(references, unresolved);
     }
 
     /// <summary>
     /// Whether <paramref name="attached"/>'s differencing chain reaches
-    /// <paramref name="vhdxPath"/> - <see cref="ReferencesDisk"/>'s walk of one
+    /// <paramref name="vhdxPath"/> - <see cref="FindDiskReferences"/>'s walk of one
     /// disk.
     /// </summary>
     /// <exception cref="InvalidOperationException">

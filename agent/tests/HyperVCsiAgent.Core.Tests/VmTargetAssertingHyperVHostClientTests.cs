@@ -136,18 +136,18 @@ public class VmTargetAssertingHyperVHostClientTests
         var client = new VmTargetAssertingHyperVHostClient(inner);
 
         var attached = await client.FindAttachedDiskAsync("hv-01", VmId, @"C:\path.vhdx", CancellationToken.None);
-        await client.ReferencesDiskAsync("hv-01", VmId, @"C:\path.vhdx", includeDifferencingChains: true, CancellationToken.None);
+        await client.FindDiskReferencesAsync("hv-01", [VmId], @"C:\path.vhdx", includeDifferencingChains: true, CancellationToken.None);
         await client.GetDiskInfoAsync("hv-01", @"C:\path.vhdx", CancellationToken.None);
 
         Assert.Null(attached);
         Assert.Equal(("hv-01", VmId, @"C:\path.vhdx"), inner.LastFindAttached);
-        Assert.Equal(("hv-01", VmId, @"C:\path.vhdx"), inner.LastReferencesDisk);
+        Assert.Equal(("hv-01", VmId, @"C:\path.vhdx"), inner.LastFindDiskReferences);
         Assert.Equal(("hv-01", @"C:\path.vhdx"), inner.LastGetDiskInfo);
     }
 
     private sealed class RecordingHostClient : IHyperVHostClient
     {
-        public (string HostName, string VmId, string VhdxPath)? LastReferencesDisk { get; private set; }
+        public (string HostName, string VmId, string VhdxPath)? LastFindDiskReferences { get; private set; }
 
         public (string HostName, string VhdxPath)? LastGetDiskInfo { get; private set; }
 
@@ -187,11 +187,12 @@ public class VmTargetAssertingHyperVHostClientTests
             return Task.CompletedTask;
         }
 
-        public Task<bool> ReferencesDiskAsync(
-            string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken)
+        public Task<DiskReferences> FindDiskReferencesAsync(
+            string hostName, IReadOnlyCollection<string> vmIds, string vhdxPath, bool includeDifferencingChains,
+            CancellationToken cancellationToken)
         {
-            LastReferencesDisk = (hostName, vmId, vhdxPath);
-            return Task.FromResult(true);
+            LastFindDiskReferences = (hostName, Assert.Single(vmIds), vhdxPath);
+            return Task.FromResult(new DiskReferences([], []));
         }
 
         public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken)
