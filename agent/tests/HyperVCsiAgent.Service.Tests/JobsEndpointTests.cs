@@ -68,7 +68,10 @@ public sealed class JobsEndpointTests : IDisposable
 
         Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
         using var body = await ReadJsonAsync(response);
-        Assert.Equal($"/v1/jobs/{body.RootElement.GetProperty("id").GetString()}", response.Headers.Location?.ToString());
+        var id = body.RootElement.GetProperty("id").GetString();
+        Assert.Equal($"/v1/jobs/{id}", response.Headers.Location?.ToString());
+
+        (await WaitForCompletionAsync(client, id)).Dispose();
     }
 
     [Fact]
@@ -160,9 +163,12 @@ public sealed class JobsEndpointTests : IDisposable
         using var created = await ReadJsonAsync(await client.PostAsJsonAsync("/v1/jobs", CreateVolumeRequest("pvc-1", 4096)));
         using var deleted = await ReadJsonAsync(await client.PostAsJsonAsync("/v1/jobs", DeleteVolumeRequest("pvc-1")));
 
-        Assert.NotEqual(
-            created.RootElement.GetProperty("id").GetString(),
-            deleted.RootElement.GetProperty("id").GetString());
+        var createdId = created.RootElement.GetProperty("id").GetString();
+        var deletedId = deleted.RootElement.GetProperty("id").GetString();
+        Assert.NotEqual(createdId, deletedId);
+
+        (await WaitForCompletionAsync(client, createdId)).Dispose();
+        (await WaitForCompletionAsync(client, deletedId)).Dispose();
     }
 
     [Theory]
@@ -429,8 +435,17 @@ public sealed class JobsEndpointTests : IDisposable
         Assert.Equal(HttpStatusCode.Accepted, accepted.StatusCode);
 
         using var enqueued = await ReadJsonAsync(accepted);
-        var id = enqueued.RootElement.GetProperty("id").GetString();
+        return await WaitForCompletionAsync(client, enqueued.RootElement.GetProperty("id").GetString());
+    }
 
+    /// <summary>
+    /// Polls a job until it is terminal. Every test that enqueues a job has to
+    /// wait for it: the store's shutdown cancels running jobs but does not
+    /// wait for them, so a job left running can still hold a VHDX open in the
+    /// directory <see cref="Dispose"/> deletes.
+    /// </summary>
+    private static async Task<JsonDocument> WaitForCompletionAsync(HttpClient client, string? id)
+    {
         var deadline = DateTime.UtcNow.AddSeconds(5);
         while (true)
         {
