@@ -259,6 +259,24 @@ node:
   # absent and the node plugin refuses to start.
   kvpPoolDir: /var/lib/hyperv
 
+  # Migration escape hatch for upgrading from a release candidate installed
+  # before NodeStageVolume verified the resolved disk's own identity (see
+  # PR #33 and its review comments, github issue #30): a PV created back then
+  # has no diskId in its volume_context, and kubelet replays that same,
+  # disk-ID-less context on every restage, so by default such a PV now fails
+  # NodeStageVolume with InvalidArgument.
+  #
+  # Setting this to true is an explicit acknowledgment that some PVs on this
+  # cluster predate the disk ID check: NodeStageVolume then falls back to
+  # trusting vmbusdisk.Resolve's controller/LUN slot alone for a volume whose
+  # volume_context has no diskId - the same, slightly less safe mode this
+  # driver ran in before the check existed, and no safer than a coordinate
+  # ever was. A PV whose volume_context does carry a diskId is still verified
+  # against it either way; this only relaxes the requirement that the field
+  # be present at all. Recreate every affected PV against a volume_context
+  # that carries a diskId, then turn this back off.
+  unsafeAllowMissingDiskId: false
+
   resources:
     requests:
       cpu: 10m

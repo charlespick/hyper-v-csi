@@ -159,6 +159,18 @@ measured against a real Hyper-V host and guest (three VHDXes attached to
 `Get-VHD -Path ... | Select DiskIdentifier` on the owning host,
 `CSIDEV01`), not derived from the SCSI or MS-VHDX specs alone.
 
+A PV created before this check existed has no `diskId` in its
+`volume_context`, and `external-provisioner` keeps replaying that same,
+disk-ID-less context on every later `NodeStageVolume` — so by default such
+a PV now fails to stage with `InvalidArgument`. The Helm chart's
+`node.unsafeAllowMissingDiskId` (`--allow-missing-disk-id`) is a migration
+escape hatch for exactly that PV: set, `NodeStageVolume` accepts a missing
+`diskId` and falls back to `vmbusdisk.Resolve`'s coordinate alone for that
+one volume, same as before this check existed. A `volume_context` that does
+carry a `diskId` is still verified against it regardless of the flag. Off
+by default; turn it back off once every such PV has been recreated with a
+`volume_context` that carries a `diskId`.
+
 `vmbusdisk.Resolve` is what turns that pair into a device path, and it
 walks a fixed chain: the VMBus channel directory at
 `/sys/bus/vmbus/devices/<controllerID>` has a single `host<N>` child — the

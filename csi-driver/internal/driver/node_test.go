@@ -319,6 +319,63 @@ func TestNodeStageVolumeRejectsMissingDiskID(t *testing.T) {
 	}
 }
 
+func TestNodeStageVolumeAllowsMissingDiskIDWhenConfigured(t *testing.T) {
+	// The migration escape hatch: a PV from before resolve github issue 30's
+	// disk ID check replays a volume_context with no diskId. With
+	// AllowMissingDiskID set, that no longer rejects the request - it falls
+	// back to trusting vmbusdisk.Resolve's controller/LUN slot alone, the
+	// same as before the check existed, with no VPD page 0x83 needed at all.
+	s, fakeMounter, sysRoot := newTestNodeServer(t)
+	s.driver.AllowMissingDiskID = true
+	putDevice(t, sysRoot, testControllerID, 3, 7, "sdb") // no matching putVpd
+	target := filepath.Join(t.TempDir(), "globalmount")
+	if err := os.MkdirAll(target, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := s.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+		VolumeId:          "vol-1",
+		StagingTargetPath: target,
+		VolumeCapability:  mountVolumeCapability("", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
+		PublishContext:    publishContext(testControllerID, 7),
+	})
+	if err != nil {
+		t.Fatalf("NodeStageVolume: %v", err)
+	}
+
+	mountPoints, listErr := fakeMounter.List()
+	if listErr != nil {
+		t.Fatalf("List: %v", listErr)
+	}
+	if len(mountPoints) != 1 {
+		t.Fatalf("got %d mount points, want 1: %+v", len(mountPoints), mountPoints)
+	}
+}
+
+func TestNodeStageVolumeStillVerifiesADiskIDWhenConfiguredToAllowMissingOnes(t *testing.T) {
+	// AllowMissingDiskID only relaxes the requirement that the field be
+	// present; a volume_context that does carry a diskId is still checked
+	// against the resolved device, same as when the flag is off.
+	s, _, sysRoot := newTestNodeServer(t)
+	s.driver.AllowMissingDiskID = true
+	putDeviceWithIdentity(t, sysRoot, testControllerID, 3, 7, "sdb", otherDiskIDVpdBytes)
+	target := filepath.Join(t.TempDir(), "globalmount")
+	if err := os.MkdirAll(target, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := s.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+		VolumeId:          "vol-1",
+		StagingTargetPath: target,
+		VolumeCapability:  mountVolumeCapability("", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
+		PublishContext:    publishContext(testControllerID, 7),
+		VolumeContext:     volumeContext(testDiskID),
+	})
+	if got := grpcCode(t, err); got != codes.Internal {
+		t.Errorf("code = %s, want Internal", got)
+	}
+}
+
 func TestNodeStageVolumeRejectsAMalformedDiskID(t *testing.T) {
 	s, _, _ := newTestNodeServer(t)
 	_, err := s.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{

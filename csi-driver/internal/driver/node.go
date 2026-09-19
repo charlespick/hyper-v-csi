@@ -199,10 +199,18 @@ func (s *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolu
 	// this volume before ever formatting it, rather than trusting the slot.
 	diskID := req.GetVolumeContext()[volumeContextDiskID]
 	if diskID == "" {
-		klog.V(2).InfoS("NodeStageVolume: rejected, missing volume context disk id", "volumeId", volumeID, "target", target)
-		return nil, status.Errorf(codes.InvalidArgument, "volume context %q is required", volumeContextDiskID)
-	}
-	if _, err := guidnorm.Normalize(diskID); err != nil {
+		if !s.driver.AllowMissingDiskID {
+			klog.V(2).InfoS("NodeStageVolume: rejected, missing volume context disk id", "volumeId", volumeID, "target", target)
+			return nil, status.Errorf(codes.InvalidArgument, "volume context %q is required", volumeContextDiskID)
+		}
+		// --allow-missing-disk-id: an operator's explicit acknowledgment that
+		// this PV predates the disk ID check and is running with it disabled
+		// until replaced. stageVolume skips diskidentity.Verify entirely below
+		// rather than trusting a zero-value diskID against it.
+		klog.Warningf(
+			"NodeStageVolume: volume %s has no volume context %q; staging it without verifying the resolved disk's identity because --allow-missing-disk-id is set",
+			volumeID, volumeContextDiskID)
+	} else if _, err := guidnorm.Normalize(diskID); err != nil {
 		klog.V(2).InfoS("NodeStageVolume: rejected, invalid volume context disk id",
 			"volumeId", volumeID, "target", target, "diskId", diskID, "err", err)
 		return nil, status.Errorf(codes.InvalidArgument,
@@ -315,9 +323,16 @@ func (s *nodeServer) stageVolume(controllerID string, lun int32, diskID, target,
 	// read, so this costs nothing worth measuring next to the poll above it.
 	// Both a mismatch and an unreadable page fail closed: guessing which
 	// disk this is risks silently formatting the wrong one.
-	if err := diskidentity.Verify(s.sysRoot, devicePath, diskID); err != nil {
-		return status.Errorf(codes.Internal,
-			"confirming %s is volume %s's own disk before mounting it: %v", devicePath, diskID, err)
+	//
+	// diskID is only ever empty here when NodeStageVolume let it through
+	// under --allow-missing-disk-id, in which case there is nothing to check
+	// devicePath against and this falls back to trusting the controller/LUN
+	// slot alone, same as before resolve github issue 30.
+	if diskID != "" {
+		if err := diskidentity.Verify(s.sysRoot, devicePath, diskID); err != nil {
+			return status.Errorf(codes.Internal,
+				"confirming %s is volume %s's own disk before mounting it: %v", devicePath, diskID, err)
+		}
 	}
 
 	alreadyMounted, err := s.alreadyMountedCompatibly(target, "staging target", readOnly, devicePath)

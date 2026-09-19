@@ -39,6 +39,16 @@ func main() {
 			"directory holding the Hyper-V key-value pool files hv_kvp_daemon maintains")
 		agentAddress = flag.String("agent-address", "", "hyperv-csi-agent base URL (required in controller mode)")
 
+		// Off by default, and deliberately so - see Driver.AllowMissingDiskID.
+		// This exists to let a PV created before resolve github issue 30's
+		// disk ID check shipped keep staging across an upgrade (kubelet
+		// replays its persisted, disk-ID-less volume_context), rather than
+		// failing NodeStageVolume with InvalidArgument, until the PV is
+		// replaced by one whose volume_context carries the disk ID. Node
+		// mode only.
+		allowMissingDiskID = flag.Bool("allow-missing-disk-id", false,
+			"stage a volume whose volume context has no disk id by trusting the controller/LUN slot alone, skipping the check that the resolved disk is actually this volume's own VHDX. Migration escape hatch for PVs created before that check existed; leave this off once every PV has been replaced. Node mode only")
+
 		agentClientCert = flag.String("agent-client-cert", "",
 			"PEM client certificate presented to the agent, whose fingerprint the agent pins (required in controller mode)")
 		agentClientKey = flag.String("agent-client-key", "",
@@ -77,6 +87,9 @@ func main() {
 	case "controller":
 		if *agentAddress == "" {
 			klog.Fatal("--agent-address is required in controller mode")
+		}
+		if *allowMissingDiskID {
+			klog.Fatal("--allow-missing-disk-id is a node-mode flag; the controller server does not run NodeStageVolume")
 		}
 	case "node":
 		if *nodeFencing {
@@ -120,7 +133,7 @@ func main() {
 		}
 	}
 
-	d := driver.New(*nodeID, agent)
+	d := driver.New(*nodeID, agent, *allowMissingDiskID)
 
 	// Kubelet stops the container with SIGTERM. Established here rather than
 	// just before Serve because the node-fencing controller below shares it:

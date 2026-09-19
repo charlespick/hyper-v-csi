@@ -30,10 +30,21 @@ var Version = "dev"
 type Driver struct {
 	NodeID string
 	Agent  *agentclient.Client
+
+	// AllowMissingDiskID relaxes NodeStageVolume's requirement that
+	// volume_context carry volumeContextDiskID, and skips diskidentity.Verify
+	// when it is absent, falling back to trusting vmbusdisk.Resolve's
+	// controller/LUN slot alone - the pre-#30 behavior. It exists only to let
+	// a PV created before this check shipped keep staging across an upgrade,
+	// until it is replaced by one whose volume_context carries the disk ID.
+	// Off by default: NodeStageVolume then fails closed with InvalidArgument
+	// on a volume_context with no disk ID, which is what forces that
+	// replacement to happen rather than being silently skippable forever.
+	AllowMissingDiskID bool
 }
 
-func New(nodeID string, agent *agentclient.Client) *Driver {
-	return &Driver{NodeID: nodeID, Agent: agent}
+func New(nodeID string, agent *agentclient.Client, allowMissingDiskID bool) *Driver {
+	return &Driver{NodeID: nodeID, Agent: agent, AllowMissingDiskID: allowMissingDiskID}
 }
 
 func (d *Driver) IdentityServer() csi.IdentityServer {

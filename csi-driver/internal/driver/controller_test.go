@@ -2010,7 +2010,7 @@ func attached(controllerID string, lun int) agentclient.Job {
 }
 
 func newControllerServer(agent *fakeAgent) *controllerServer {
-	return &controllerServer{driver: New("", agentclient.New(agent.URL))}
+	return &controllerServer{driver: New("", agentclient.New(agent.URL), false)}
 }
 
 func createVolumeRequest(name string, requiredBytes, limitBytes int64) *csi.CreateVolumeRequest {
