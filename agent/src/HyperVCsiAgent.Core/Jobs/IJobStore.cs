@@ -41,5 +41,18 @@ public interface IJobStore
     Job GetOrCreate(
         string idempotencyKey, string operationType, IReadOnlyCollection<string> targets, Func<Job, CancellationToken, Task> run);
 
+    /// <summary>
+    /// The job GetOrCreate would hand back for (operationType, idempotencyKey)
+    /// right now - the live instance, Pending or Running - or null where it would
+    /// start a fresh one. For a caller whose work ahead of GetOrCreate only
+    /// matters when a fresh job is about to start.
+    ///
+    /// The answer can go stale as soon as it is given: a job found here may
+    /// finish straight afterwards. Wait on the instance returned rather than
+    /// calling GetOrCreate to reach it, which in that moment would start a fresh
+    /// job with that caller's work skipped.
+    /// </summary>
+    Job? FindActive(string idempotencyKey, string operationType);
+
     Job? Get(string id);
 }

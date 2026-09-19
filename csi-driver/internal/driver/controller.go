@@ -114,6 +114,15 @@ type createVolumeResult struct {
 	// already on the CSV, which is the difference between our own bug and a
 	// genuine name collision when the size doesn't fit the request.
 	AlreadyPresent bool `json:"alreadyPresent"`
+	// DiskID is the VHDX's VirtualDiskId (Hyper-V's DiskIdentifier), read
+	// fresh off the file the agent just created or confirmed. It travels to
+	// NodeStageVolume via volume_context (volumeContextDiskID), not the
+	// publish context attach returns, because this is a once-at-creation
+	// value and the VHDX is guaranteed readable right here - see resolve
+	// github issue 30 and docs/node-identity-and-attach.md for why
+	// NodeStageVolume cannot trust the controller/LUN slot it resolves a
+	// device from without checking this against it.
+	DiskID string `json:"diskId"`
 }
 
 // CreateVolume provisions a new VHDX on the CSV. Idempotency key: volume name.
@@ -180,6 +189,14 @@ func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	if result.VolumeID == "" {
 		err := status.Errorf(codes.Internal, "agent returned no volume id for %s", req.GetName())
 		klog.ErrorS(err, "CreateVolume: agent returned no volume id", "name", req.GetName())
+		return nil, err
+	}
+	if result.DiskID == "" {
+		// Without it NodeStageVolume has nothing to verify the disk it
+		// resolves by controller/LUN against, which is the whole point of
+		// this field - see createVolumeResult.DiskID.
+		err := status.Errorf(codes.Internal, "agent returned no disk id for %s", req.GetName())
+		klog.ErrorS(err, "CreateVolume: agent returned no disk id", "name", req.GetName())
 		return nil, err
 	}
 
@@ -254,6 +271,11 @@ func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 			// name-to-ID mapping that would be lost on an agent restart.
 			VolumeId:      result.VolumeID,
 			CapacityBytes: result.ActualSizeBytes,
+			// external-provisioner persists volume_context onto the PV and
+			// hands it back on every later NodeStageVolume for this volume -
+			// the one channel that reaches the node with a value read at
+			// creation time, before anything else has ever touched the VHDX.
+			VolumeContext: map[string]string{volumeContextDiskID: result.DiskID},
 			// CSI requires a restored volume to report where it came from;
 			// external-provisioner records this on the PV. Nil for an empty
 			// create, exactly mirroring the request.
@@ -449,6 +471,17 @@ const (
 	publishContextLun        = "lun"
 	publishContextVhdxPath   = "vhdxPath"
 )
+
+// volumeContextDiskID is the volume_context key CreateVolume sets to the
+// VHDX's VirtualDiskId (createVolumeResult.DiskID). Unlike the publish
+// context keys above, this travels through CreateVolumeResponse rather than
+// ControllerPublishVolumeResponse: external-provisioner persists
+// volume_context onto the PV once, at creation, and hands it back on every
+// NodeStageVolume for the volume's lifetime, which is what lets the node
+// verify the device vmbusdisk.Resolve finds by controller/LUN actually is
+// this volume before ever formatting it - see
+// docs/node-identity-and-attach.md and package diskidentity.
+const volumeContextDiskID = "diskId"
 
 // ControllerPublishVolume attaches a VHDX to the node VM by resolving its
 // owning host via cluster APIs, then attaching through that host.
@@ -728,15 +761,6 @@ func unsupportedCapability(capability *csi.VolumeCapability) string {
 type expandVolumePayload struct {
 	VolumeID  string `json:"volumeId"`
 	SizeBytes int64  `json:"sizeBytes"`
-	// NodeID is the CSI node ID of the VM currently holding this volume
-	// attached, when one does - empty otherwise, which covers the common case
-	// of an unattached or not-yet-attached volume. CSI's own request carries
-	// nothing like it, unlike ControllerPublishVolume/UnpublishVolume's, so
-	// this driver finds it itself via findAttachedNode before enqueueing. The
-	// agent's own local read already handles the unattached case without it;
-	// this only matters when a running VM has the disk open, which is exactly
-	// the case ONLINE expansion exists to grow.
-	NodeID string `json:"nodeId,omitempty"`
 }
 
 type expandVolumeResult struct {
@@ -748,11 +772,15 @@ type expandVolumeResult struct {
 	AlreadyLargeEnough bool `json:"alreadyLargeEnough"`
 }
 
-// ControllerExpandVolume grows the VHDX. Idempotency key: volume ID.
+// ControllerExpandVolume grows the VHDX. Idempotency key: volume ID and the
+// requested size, as "<volumeId>@<sizeBytes>".
 //
-// The volume is also the target, as it is for create and delete: what must not
-// interleave is two operations on one disk, and an expand racing a delete of
-// the same volume is exactly the pair that ordering exists to separate.
+// The size is in the key because the agent hands back any job for the same key
+// that is still running. Keyed on the volume alone, a resize to a larger size -
+// a PVC edited again before the first expansion finished - would come back as
+// the smaller job still in flight, and fail below as "expanded below the
+// requested". A retry at the same size still attaches to its own job, and the
+// agent runs expansions of one volume one at a time regardless of key.
 //
 // This is only half of an expansion. The VHDX gets bigger here; the filesystem
 // inside it does not, which is why the response sets node_expansion_required
@@ -785,23 +813,12 @@ func (s *controllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 		return nil, err
 	}
 
-	// Errors here fail the RPC rather than degrading to "no hint": Kubernetes
-	// is the only place that knows which node has this volume attached, so an
-	// API server this driver cannot reach is indistinguishable from "nothing
-	// attached" if silently swallowed - and reporting the volume falsely
-	// unattached is exactly the state that sends the agent's own local read
-	// into a sharing violation it has no hint left to recover from. CSI
-	// retries this RPC, so failing loudly on a transient API server blip costs
-	// a retry, not correctness.
-	nodeID, err := findAttachedNode(ctx, s.driver.KubeClient, req.GetVolumeId())
-	if err != nil {
-		return nil, findAttachedNodeFailed(ctx, err, "finding which node has %s attached", req.GetVolumeId())
-	}
-
-	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetVolumeId(), operationExpandVolume, expandVolumePayload{
+	// No node hint: the agent resolves where an attached disk is open from the
+	// VHDX path itself.
+	key := fmt.Sprintf("%s@%d", req.GetVolumeId(), sizeBytes)
+	job, err := s.driver.Agent.EnqueueJob(ctx, key, operationExpandVolume, expandVolumePayload{
 		VolumeID:  req.GetVolumeId(),
 		SizeBytes: sizeBytes,
-		NodeID:    nodeID,
 	})
 	if err != nil {
 		return nil, enqueueFailed(ctx, err, "enqueueing ControllerExpandVolume for %s", req.GetVolumeId())
@@ -878,11 +895,6 @@ func pickExpandSize(capacityRange *csi.CapacityRange) (int64, error) {
 type createSnapshotPayload struct {
 	SourceVolumeID string `json:"sourceVolumeId"`
 	SnapshotName   string `json:"snapshotName"`
-	// NodeID is the CSI node ID of the VM currently holding the source volume
-	// attached, when one exists - found via findAttachedNode the same way
-	// expandVolumePayload.NodeID is, since CSI's own request carries neither.
-	// Empty for an unattached source.
-	NodeID string `json:"nodeId,omitempty"`
 }
 
 // snapshotResult is the agent's description of one snapshot, matching
@@ -978,27 +990,15 @@ func (s *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 	// on them would look like support for them; dropping them here keeps the gap
 	// where it already is, and honest.
 
-	// CreateSnapshotRequest carries no node hint, unlike ControllerPublish/
-	// UnpublishVolume's own — the same gap ControllerExpandVolume has, and the
-	// same fix: ask Kubernetes which node the VolumeAttachment API says has
-	// this volume, so the agent can freeze it through a checkpoint if it's
-	// attached. An empty result is not an error - most snapshots are of
-	// unattached volumes, and the agent's own local read already handles that
-	// case without any hint at all.
-	nodeID, err := findAttachedNode(ctx, s.driver.KubeClient, req.GetSourceVolumeId())
-	if err != nil {
-		return nil, findAttachedNodeFailed(ctx, err, "finding which node has %s attached", req.GetSourceVolumeId())
-	}
-
 	// The snapshot name is the idempotency key (docs/rpc-surface-overview.md),
 	// so a retry from external-snapshotter for the same VolumeSnapshot
 	// re-attaches to the job in flight instead of starting a second copy of the
-	// same disk.
+	// same disk. No node hint: the agent resolves where an attached source is
+	// open from the VHDX path itself.
 	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetName(), operationCreateSnapshot,
 		createSnapshotPayload{
 			SourceVolumeID: req.GetSourceVolumeId(),
 			SnapshotName:   req.GetName(),
-			NodeID:         nodeID,
 		})
 	if err != nil {
 		return nil, enqueueFailed(ctx, err,

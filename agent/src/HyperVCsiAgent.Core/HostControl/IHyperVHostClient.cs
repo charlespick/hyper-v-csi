@@ -51,16 +51,38 @@ public interface IHyperVHostClient
     Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Reads a VHDX's current virtual size through the host running the VM
-    /// it's attached to, rather than opening the file locally - the local open
-    /// is exactly what the running VM's own exclusive hold on the file defeats,
-    /// per <see cref="Storage.VhdxInUseException"/>. <paramref name="vmId"/>
-    /// names nothing the underlying call needs - it operates on the path alone
-    /// - and is carried through only so a failure can be logged against the VM
-    /// it concerns, the same reason every other method on this interface takes
-    /// it.
+    /// Whether <paramref name="vhdxPath"/> is part of the VM's current storage:
+    /// referenced directly, or - with <paramref name="includeDifferencingChains"/>
+    /// - as the base of a differencing chain one of its disks is built on.
+    /// Unlike <see cref="IsDiskAttachedAsync"/>, a checkpoint standing over the
+    /// disk is an ordinary "yes" here rather than a refusal - this answers which
+    /// VM a disk belongs to, not whether an operation on it is safe to start.
     /// </summary>
-    Task<long> GetDiskSizeAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken);
+    /// <param name="includeDifferencingChains">
+    /// False answers from the VM's configuration alone. True also walks every
+    /// other disk's chain, one read per disk per hop - worth paying only once
+    /// no VM has been found referencing the path directly.
+    /// </param>
+    /// <exception cref="VmNotOnHostException">The VM is not registered on this host.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// No disk was found referencing <paramref name="vhdxPath"/>, and at least
+    /// one of the VM's differencing chains could not be walked far enough to
+    /// tell. A chain that cannot be walked never hides another disk that does
+    /// reference the path.
+    /// </exception>
+    Task<bool> ReferencesDiskAsync(
+        string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Reads a VHDX's current virtual size and identity through the host that
+    /// has it open, rather than opening the file locally - the local open is
+    /// exactly what a running VM's own exclusive hold on the file defeats, per
+    /// <see cref="Storage.VhdxInUseException"/>. Path-only: measured, the same
+    /// call issued from any other host fails with that same "used by another
+    /// process", while the holder answers it immediately, so the host is the
+    /// whole of what has to be right.
+    /// </summary>
+    Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken);
 
     /// <summary>
     /// Grows a VHDX through the host running the VM it's attached to, and
@@ -69,7 +91,9 @@ public interface IHyperVHostClient
     /// entire basis for CSI's ONLINE expansion claim - but only when asked from
     /// the host actually running the VM; the same call issued from a peer host
     /// collides with that VM's exclusive hold on the file, exactly as
-    /// <see cref="GetDiskSizeAsync"/> does.
+    /// <see cref="GetDiskInfoAsync"/> does. The underlying call is path-only
+    /// too; <paramref name="vmId"/> is carried so issue #14's D10 check can
+    /// hold the caller to having serialized on the VM it is growing a disk of.
     /// </summary>
     Task<long> ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken);
 

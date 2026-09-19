@@ -133,6 +133,16 @@ public class AgentOptionsValidationTests
     }
 
     [Fact]
+    public void Validate_NonPositiveExpandDiskWaitTimeout_IsRejected()
+    {
+        var options = NewOptions();
+        options.ExpandDiskWaitTimeout = TimeSpan.Zero;
+
+        var failure = Assert.Throws<InvalidOperationException>(options.Validate);
+        Assert.Contains(nameof(AgentOptions.ExpandDiskWaitTimeout), failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Validate_NonPositiveSnapshotCopySlotWaitTimeout_IsRejected()
     {
         var options = NewOptions();

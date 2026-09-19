@@ -118,13 +118,17 @@ keeps.
 
 ## CreateVolume
 
-StorageClass `parameters` are ignored rather than consumed or rejected,
-and `volume_context` is left empty — tracked in
-[#23](https://github.com/charlespick/hyper-v-csi/issues/23). Cloning a
-volume from another volume (`VolumeContentSource_Volume`) returns
-`Unimplemented` — `CLONE_VOLUME` is not advertised — but restoring from a
-snapshot (`VolumeContentSource_Snapshot`) is implemented and goes through
-the same RPC.
+StorageClass `parameters` are ignored rather than consumed or rejected —
+tracked in [#23](https://github.com/charlespick/hyper-v-csi/issues/23).
+`volume_context` is no longer empty, though: it carries one entry,
+`diskId` — the VHDX's own `VirtualDiskId`, read off the file at creation
+time — which `NodeStageVolume` checks the resolved device against before
+ever formatting it. See "Publish context locates; volume_context
+verifies" in docs/node-identity-and-attach.md. Cloning a volume from
+another volume (`VolumeContentSource_Volume`) returns `Unimplemented` —
+`CLONE_VOLUME` is not advertised — but restoring from a snapshot
+(`VolumeContentSource_Snapshot`) is implemented and goes through the same
+RPC.
 
 ## DeleteVolume
 
@@ -425,44 +429,60 @@ bookkeeping — see [Host CIM calls are bounded per
 call](host-cim-and-timeouts.md#host-cim-calls-are-bounded-per-call) for how
 that wait is timed out.
 
-**The agent's idempotency check opens the VHDX directly, which fails on an
-attached, running disk — the fallback is why this RPC talks to
-Kubernetes.** `VhdxService.ExpandAsync`'s read-before-write check
-(`GetVirtualSizeAsync` → `GetVirtualHardDiskSettingData`) opens the VHDX
-file the same way `ResizeVirtualHardDisk` itself does, and that open fails
-with a sharing violation whenever a running VM already has the disk open —
-precisely the case this feature exists for: a pod is using the volume, the
-PVC is edited, and `--handle-volume-inuse-error=false` is what lets
-`external-resizer` even try.
+**A disk anything has open is grown through the host holding it, never
+locally — even where the local call would work.** `VhdxService`'s local
+read-before-write check (`GetVirtualSizeAsync` →
+`GetVirtualHardDiskSettingData`) and resize run on a purely local CIM session,
+on whichever host owns the agent role. Issued from any host but the running
+VM's, both fail on a disk that VM has open — precisely the case this feature
+exists for: a pod is using the volume, the PVC is edited, and
+`--handle-volume-inuse-error=false` is what lets `external-resizer` even try.
+Issued from the VM's own host, both succeed, answered by the vmms holding the
+file — which is why a successful local read is not proof nothing holds the
+disk, and why growing it locally there would skip the VM's `vm:`
+serialization.
 
-Both `GetVirtualHardDiskSettingData` and `ResizeVirtualHardDisk` work fine
-against an attached, running disk, but only when issued from the host
-actually running the VM. `CimVirtualDiskManager` otherwise always uses a
-purely local CIM session, on whichever host happens to own the agent
-role — a different host from the VM's the moment the two aren't the same
-node. So `ExpandAsync` tries the local read first — correct and cheaper
-whenever it works — and only on `VhdxInUseException` falls back to
-`IHyperVHostClient.GetDiskSizeAsync`/`ResizeDiskAsync`, host-targeted
-methods that read and grow the disk through the VM's own host instead.
+So `ExpandAsync` first opens the VHDX sharing nothing, an open every holder
+refuses on every host. Only a disk that open succeeds against is read and grown
+locally; anything else is read and grown through
+`IHyperVHostClient.GetDiskInfoAsync`/`ResizeDiskAsync` on the VM's own host,
+while holding that VM.
 
-That fallback needs to know which VM has the disk attached, and CSI's
-`ControllerExpandVolumeRequest` carries no node ID the way
-`ControllerPublishVolume`/`UnpublishVolume`'s does. Rather than have the
-agent search the cluster for it — the same expensive reverse query
-[node identity resolution](node-identity-and-attach.md) prices, a fan-out
-this RPC has no cheaper reason to pay than `DeleteVolume` does — the Go
-driver looks it up itself before enqueueing the job: a `VolumeAttachment`
-names the Kubernetes node, and `CSINode` is where that node's own CSI node
-ID (this driver's Hyper-V VM ID) is recorded, the same two lookups
-`external-attacher` itself makes to build the node ID it hands
-`ControllerPublishVolume`. A lookup that finds nothing (the common case:
-an unattached or not-yet-attached volume) leaves the hint empty and
-changes nothing — the local read already handles that case. A lookup that
-errors fails the RPC outright rather than guessing "unattached," since a
-Kubernetes API this driver cannot reach is indistinguishable from "nothing
-attached" if the error is swallowed, and reporting an attached volume as
-unattached is exactly the state that would send the agent's local read
-into a sharing violation with no hint left to recover from.
+That fallback needs two things CSI's `ControllerExpandVolumeRequest` does
+not carry, unlike `ControllerPublishVolume`/`UnpublishVolume`'s node ID: the
+host to send the path-only CIM calls to, and the VM whose `vm:` target the
+resize has to hold (see design.md's "Snapshots and VM serialization"). The
+agent works both out from the path, with no Kubernetes lookup and no node ID:
+the VHDX's CSV coordinator lists which nodes have the file open through the
+CSV metadata channel, each node's NetFT address maps it to a host name, and
+only the clustered VMs on those nodes are asked which of them references the
+disk — [docs/csv-file-open-ownership.md](csv-file-open-ownership.md) has the
+mechanism and what was measured. The listing usually names one node, and two
+when something besides the VM is reading the file from another node (this
+agent's own snapshot copy, most often); a node counts only if one of its VMs
+references the disk. The coordinator is checked last, and only when no listed
+node has such a VM: its own opens never appear in its listing, so a VM running
+on it shows up as an empty listing, or as one naming only the other reader.
+Neither outcome needs every VM in the cluster asked.
+
+Because the VM is only known once that trace has run, and a job's targets are
+fixed when it is enqueued, the ExpandVolume job holds only `expand:<volumeId>`:
+it traces the disk, enqueues an internal `ExpandDisk` job under
+`volume:<volumeId>` plus `vm:<vmId>`, and waits for it up to the agent's
+`ExpandDiskWaitTimeout` (20s, inside the controller's own poll budget). A
+resize still queued behind a snapshot copy on that VM when the wait runs out
+comes back ABORTED naming what it is queued behind, and the resizer's retry
+waits on the same queued job rather than starting another. `ExpandDisk`
+traces the disk again when it runs, and refuses with ABORTED to grow it
+through any VM but the one it holds.
+
+The controller keys the job on the volume ID and the requested size
+(`<volumeId>@<sizeBytes>`), not the volume alone. The agent hands back any job
+for the same key that is still running, so keyed on the volume, a larger
+request made while a smaller expansion was still in flight — a PVC edited again
+before the first resize finished — would get the smaller job's result and fail
+as expanded below the requested size. With the size in the key it gets a job of
+its own, which `expand:` queues behind the first.
 
 **`external-resizer` is deployed, and `allowVolumeExpansion` defaults to
 true.** Without the sidecar this RPC has no caller — the same relationship

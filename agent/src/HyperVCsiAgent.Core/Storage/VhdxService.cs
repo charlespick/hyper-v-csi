@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using HyperVCsiAgent.Core.Cluster;
 using HyperVCsiAgent.Core.Configuration;
 using HyperVCsiAgent.Core.HostControl;
 using HyperVCsiAgent.Core.Jobs;
@@ -70,6 +69,25 @@ public sealed class VhdxService : IVhdxService, IDisposable
     /// </summary>
     private const int UserMappedFileHResult = unchecked((int)0x800704C8);
 
+    /// <summary>
+    /// The operation type of the internal job that actually reads and grows a
+    /// volume's disk, started by <see cref="ExpandAsync"/>.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately absent from <see cref="JobDispatcher.Resolve"/>, as
+    /// <see cref="SnapshotService.CopySnapshot"/> is: its targets are only
+    /// right because ExpandAsync traced the disk before enqueueing it, and one
+    /// enqueued directly over HTTP would carry whatever targets the dispatcher
+    /// could guess without doing that.
+    /// </remarks>
+    public const string ExpandDisk = "ExpandDisk";
+
+    /// <summary>
+    /// How often <see cref="AwaitExpandDiskAsync"/> looks at the resize job -
+    /// the same interval SnapshotService polls its copy job at.
+    /// </summary>
+    private static readonly TimeSpan ExpandDiskPollInterval = TimeSpan.FromMilliseconds(250);
+
     private readonly IVirtualDiskManager _diskManager;
 
     /// <summary>
@@ -82,16 +100,21 @@ public sealed class VhdxService : IVhdxService, IDisposable
     private readonly IDiskCopier _copier;
 
     /// <summary>
-    /// Used only by <see cref="ExpandAsync"/>'s fallback, when a VHDX cannot be
-    /// read locally because a running VM already has it open: there is no
-    /// cheaper way to learn which VM that is, since CSI's ExpandVolume request
-    /// carries no node ID the way ControllerPublishVolume/UnpublishVolume's
-    /// does.
+    /// Traces a disk this agent cannot read locally - because a running VM has
+    /// it open - to the host holding it, and the VM on that host. Consulted on
+    /// that path only: an expand of an attached volume, and a CreateVolume
+    /// replay of one.
     /// </summary>
-    private readonly IClusterService _cluster;
+    private readonly IVhdxLocationService _location;
 
-    /// <summary>Same fallback as <see cref="_cluster"/>: reads and grows the disk through the VM's own host once it is found.</summary>
+    /// <summary>Reads, and grows, a disk through the host <see cref="_location"/> found holding it.</summary>
     private readonly IHyperVHostClient _host;
+
+    /// <summary>
+    /// Where <see cref="ExpandAsync"/> starts its <see cref="ExpandDisk"/> job -
+    /// the same one-way dependency SnapshotService has on it for its copy.
+    /// </summary>
+    private readonly IJobStore _jobs;
 
     private readonly AgentOptions _options;
     private readonly ILogger<VhdxService> _logger;
@@ -109,16 +132,18 @@ public sealed class VhdxService : IVhdxService, IDisposable
     public VhdxService(
         IVirtualDiskManager diskManager,
         IDiskCopier copier,
-        IClusterService cluster,
+        IVhdxLocationService location,
         IHyperVHostClient host,
+        IJobStore jobs,
         SnapshotCopySlots copySlots,
         IOptions<AgentOptions> options,
         ILogger<VhdxService> logger)
     {
         _diskManager = diskManager;
         _copier = copier;
-        _cluster = cluster;
+        _location = location;
         _host = host;
+        _jobs = jobs;
         _copySlots = copySlots;
         _options = options.Value;
         _logger = logger;
@@ -174,14 +199,35 @@ public sealed class VhdxService : IVhdxService, IDisposable
             // never ran) and starts over cleanly.
             if (File.Exists(path))
             {
-                var existingSize = await _diskManager.GetVirtualSizeAsync(
-                    path, _options.DiskOperationTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
+                long existingSize;
+                Guid? heldDiskId = null;
+                try
+                {
+                    existingSize = await _diskManager.GetVirtualSizeAsync(
+                        path, _options.DiskOperationTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
+                }
+                catch (VhdxInUseException)
+                {
+                    // Attached to a running VM - the normal state of any
+                    // already-bound PVC replaying CreateVolume. The host that
+                    // has it open can still read it, so the replay is answered
+                    // with the disk's real size rather than taken on trust.
+                    // The identity comes back from that host too:
+                    // VhdxDiskIdentity's own read below opens the file the same
+                    // way this read just failed to.
+                    var held = await ReadThroughHolderAsync(volumeName, path, attempt.Token).ConfigureAwait(false);
+                    existingSize = held.VirtualSizeBytes;
+                    heldDiskId = held.DiskId;
+                }
+
                 if (existingSize >= sizeBytes && existingSize - sizeBytes <= SizeTolerance)
                 {
+                    var existingDiskId = heldDiskId
+                        ?? await ReadExistingDiskIdAsync(volumeName, path, attempt.Token).ConfigureAwait(false);
                     _logger.LogInformation(
                         "CreateVolume {VolumeName}: {Path} already exists at {ExistingSize} bytes, satisfying the requested {RequestedSize}",
                         volumeName, path, existingSize, sizeBytes);
-                    return new CreateVolumeResult(volumeName, existingSize, AlreadyPresent: true);
+                    return new CreateVolumeResult(volumeName, existingSize, AlreadyPresent: true, existingDiskId);
                 }
 
                 // CSI mandates ALREADY_EXISTS - not an overwrite, not a second
@@ -206,9 +252,14 @@ public sealed class VhdxService : IVhdxService, IDisposable
                 inProgressPath, sizeBytes, _options.DiskOperationTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
 
             File.Move(inProgressPath, path);
+            // Read fresh off the file the create just published, not the
+            // in-progress path: the rename above is what makes this "the
+            // volume", and reading before it would describe a file that may
+            // yet be discarded if something below still fails.
+            var diskId = await VhdxDiskIdentity.ReadAsync(path, attempt.Token).ConfigureAwait(false);
             _logger.LogInformation(
                 "CreateVolume {VolumeName}: created {Path} at {ActualSize} bytes", volumeName, path, actualSize);
-            return new CreateVolumeResult(volumeName, actualSize, AlreadyPresent: false);
+            return new CreateVolumeResult(volumeName, actualSize, AlreadyPresent: false, diskId);
         }
         catch (TimeoutException ex)
         {
@@ -304,14 +355,30 @@ public sealed class VhdxService : IVhdxService, IDisposable
             // larger than requested.
             if (File.Exists(path))
             {
-                var existingSize = await _diskManager.GetVirtualSizeAsync(
-                    path, _options.SnapshotCopyTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
+                long existingSize;
+                Guid? heldDiskId = null;
+                try
+                {
+                    existingSize = await _diskManager.GetVirtualSizeAsync(
+                        path, _options.SnapshotCopyTimeout - elapsed.Elapsed, attempt.Token).ConfigureAwait(false);
+                }
+                catch (VhdxInUseException)
+                {
+                    // Same as CreateEmptyAsync's own catch: read the attached
+                    // disk, identity included, through the host holding it.
+                    var held = await ReadThroughHolderAsync(volumeName, path, attempt.Token).ConfigureAwait(false);
+                    existingSize = held.VirtualSizeBytes;
+                    heldDiskId = held.DiskId;
+                }
+
                 if (existingSize >= sizeBytes)
                 {
+                    var existingDiskId = heldDiskId
+                        ?? await ReadExistingDiskIdAsync(volumeName, path, attempt.Token).ConfigureAwait(false);
                     _logger.LogInformation(
                         "CreateVolume {VolumeName}: {Path} already exists at {ExistingSize} bytes, satisfying the requested {RequestedSize}",
                         volumeName, path, existingSize, sizeBytes);
-                    return new CreateVolumeResult(volumeName, existingSize, AlreadyPresent: true);
+                    return new CreateVolumeResult(volumeName, existingSize, AlreadyPresent: true, existingDiskId);
                 }
 
                 throw JobFailureException.AlreadyExists(
@@ -394,7 +461,11 @@ public sealed class VhdxService : IVhdxService, IDisposable
                 _logger.LogInformation(
                     "CreateVolume {VolumeName}: restored {Path} from snapshot {SnapshotId} at {ActualSize} bytes in {Elapsed}",
                     volumeName, path, sourceSnapshotId, actualSize, elapsed.Elapsed);
-                return new CreateVolumeResult(volumeName, actualSize, AlreadyPresent: false);
+                // newId is already this file's identity - ResetDiskIdentifierAsync
+                // set it above, before the copy was ever grown or published, so
+                // there is no reason to pay for a second read of the file to
+                // learn what this call already knows.
+                return new CreateVolumeResult(volumeName, actualSize, AlreadyPresent: false, newId);
             }
             finally
             {
@@ -428,7 +499,27 @@ public sealed class VhdxService : IVhdxService, IDisposable
         }
     }
 
-    public async Task<ExpandVolumeResult> ExpandAsync(string volumeId, long newSizeBytes, string? nodeId, CancellationToken cancellationToken)
+    /// <remarks>
+    /// Two jobs, the way CreateSnapshot is, and for a reason of the same kind.
+    /// Growing a disk a running VM has open goes through that VM's host, and
+    /// issue #14's D10 requires holding the VM's <c>vm:</c> target while it
+    /// does - but which VM that is, if any, is only known once the path has
+    /// been traced to whoever holds it, and a job's targets are fixed when it
+    /// is enqueued. So this method, running under ExpandVolume's own
+    /// <see cref="JobTargets.Expansion"/> target, traces the disk first, then
+    /// enqueues <see cref="ExpandDisk"/> under <see cref="JobTargets.Volume"/>
+    /// plus that VM's <see cref="JobTargets.Vm"/>, and waits for it - bounded
+    /// by <see cref="AgentOptions.ExpandDiskWaitTimeout"/>, which is what keeps
+    /// a job waiting on one enqueued after it from becoming a deadlock; see
+    /// InMemoryJobStore's own remarks on that shape.
+    /// <para>
+    /// The trace here is advisory. ExpandDisk can sit queued behind a snapshot
+    /// copy of a disk on the same VM for hours, so it traces the disk again
+    /// when it runs, and refuses to grow it through any VM but the one it
+    /// holds.
+    /// </para>
+    /// </remarks>
+    public async Task<ExpandVolumeResult> ExpandAsync(string volumeId, long newSizeBytes, CancellationToken cancellationToken)
     {
         if (newSizeBytes <= 0)
         {
@@ -447,6 +538,130 @@ public sealed class VhdxService : IVhdxService, IDisposable
 
         var path = ResolveVolumePath(volumeId);
 
+        var vmId = await FindHoldingVmAsync(volumeId, path, cancellationToken).ConfigureAwait(false);
+
+        string[] targets = vmId is null
+            ? [JobTargets.Volume(volumeId)]
+            : [JobTargets.Volume(volumeId), JobTargets.Vm(vmId)];
+
+        // Keyed on the volume and the size together, so a retry after
+        // AwaitExpandDiskAsync gives up waits on the resize already queued
+        // rather than lining up a second one behind it - but a request for a
+        // larger size, which the PVC being edited again produces, never
+        // attaches to a queued resize that will only grow the disk to the
+        // earlier, smaller one. It queues behind that resize on the same
+        // targets instead, and grows the disk the rest of the way.
+        var resize = _jobs.GetOrCreate(
+            $"{volumeId}@{newSizeBytes}", ExpandDisk, targets,
+            async (job, ct) => job.Result = await ExpandDiskAsync(volumeId, newSizeBytes, vmId, ct).ConfigureAwait(false));
+
+        return await AwaitExpandDiskAsync(resize, volumeId, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The VM, if any, <see cref="ExpandAsync"/>'s resize will reach into - the
+    /// one whose <c>vm:</c> target it has to be enqueued under. Null for a disk
+    /// nothing has open, and for one no clustered VM holds:
+    /// <see cref="ExpandDiskAsync"/> looks again under the volume's own target
+    /// and reports what it finds properly.
+    /// </summary>
+    /// <remarks>
+    /// Decided by <see cref="OpenHandleProbe"/>, not by whether a local read of
+    /// the disk fails: on the VM's own host that read succeeds - the vmms
+    /// holding the file answers it - so a VM sharing a host with the agent
+    /// would otherwise get resized with no <c>vm:</c> target held at all.
+    /// </remarks>
+    private async Task<string?> FindHoldingVmAsync(string volumeId, string path, CancellationToken cancellationToken)
+    {
+        if (!File.Exists(path) || !OpenHandleProbe.IsHeldOpen(path))
+        {
+            return null;
+        }
+
+        using var attempt = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        attempt.CancelAfter(_options.DiskOperationTimeout);
+
+        try
+        {
+            var location = await LocateHolderAsync(volumeId, path, attempt.Token).ConfigureAwait(false);
+            return location?.VmId;
+        }
+        catch (OperationCanceledException) when (attempt.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            throw new JobFailureException(
+                AgentErrorCodes.Internal,
+                $"expanding volume {volumeId} timed out after {_options.DiskOperationTimeout} finding what has its disk open");
+        }
+    }
+
+    /// <summary>
+    /// Waits for <paramref name="resize"/> and hands back its result, or fails
+    /// with Aborted once <see cref="AgentOptions.ExpandDiskWaitTimeout"/> has
+    /// passed without it finishing.
+    /// </summary>
+    /// <remarks>
+    /// Leaves the resize queued when it gives up, the same choice
+    /// SnapshotService.AwaitCheckpointAsync makes for its copy: cancelling it
+    /// would give up the place it already has in its volume's and VM's
+    /// queues, and the resizer's retry would join them again from the back.
+    /// </remarks>
+    private async Task<ExpandVolumeResult> AwaitExpandDiskAsync(Job resize, string volumeId, CancellationToken cancellationToken)
+    {
+        using var wait = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        wait.CancelAfter(_options.ExpandDiskWaitTimeout);
+
+        while (true)
+        {
+            // Through the store rather than off the instance GetOrCreate
+            // returned: Get reads Status, Result and Error together under the
+            // store's own lock, so a Succeeded seen here always comes with the
+            // result that went with it.
+            var observed = _jobs.Get(resize.Id);
+            switch (observed?.Status)
+            {
+                case JobStatus.Succeeded:
+                    return observed.Result as ExpandVolumeResult
+                        ?? throw new JobFailureException(
+                            AgentErrorCodes.Internal, $"resizing volume {volumeId} finished without reporting a size");
+
+                case JobStatus.Failed:
+                    throw new JobFailureException(
+                        observed.ErrorCode ?? AgentErrorCodes.Internal,
+                        observed.Error ?? $"resizing volume {volumeId} failed with no detail");
+
+                case null:
+                    throw new JobFailureException(
+                        AgentErrorCodes.Internal, $"the resize job for volume {volumeId} is no longer in the job store");
+            }
+
+            try
+            {
+                await Task.Delay(ExpandDiskPollInterval, wait.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (wait.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                var behind = _jobs.Get(resize.Id)?.QueuedBehind;
+                throw new JobFailureException(
+                    AgentErrorCodes.Aborted,
+                    behind is null
+                        ? $"expanding volume {volumeId} has not finished after {_options.ExpandDiskWaitTimeout}; " +
+                          "retrying waits on the same resize"
+                        : $"expanding volume {volumeId} is queued behind {behind.OperationType} on {behind.Target}; " +
+                          "retrying waits on the same resize rather than starting another");
+            }
+        }
+    }
+
+    /// <summary>
+    /// <see cref="ExpandDisk"/>'s body: reads the disk and grows it, locally or
+    /// through the host holding it, while holding the volume and - when
+    /// <paramref name="heldVmId"/> is set - that VM.
+    /// </summary>
+    private async Task<ExpandVolumeResult> ExpandDiskAsync(
+        string volumeId, long newSizeBytes, string? heldVmId, CancellationToken cancellationToken)
+    {
+        var path = ResolveVolumePath(volumeId);
+
         using var attempt = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         attempt.CancelAfter(_options.DiskOperationTimeout);
 
@@ -458,6 +673,25 @@ public sealed class VhdxService : IVhdxService, IDisposable
             if (!File.Exists(path))
             {
                 throw JobFailureException.NotFound($"volume {volumeId} has no disk at {path} to expand");
+            }
+
+            // A disk a clustered VM holds goes through the traced host, and
+            // only a VM this job holds vm: for is grown there - including a VM
+            // on this very host, whose hold the local read below would not
+            // report: that read succeeds there, answered by the vmms holding
+            // the file. See OpenHandleProbe.
+            //
+            // Held, but by no clustered VM, falls through to the local path:
+            // a reader that shares - a backup or a scanner, or another
+            // operation's own probe of this file in that same moment - is not
+            // in the way of a local read or resize, and not anything to hold
+            // a vm: target for. A holder that does refuse the local read is
+            // reported by the catch below.
+            if (OpenHandleProbe.IsHeldOpen(path)
+                && await TryExpandThroughHolderAsync(volumeId, path, newSizeBytes, heldVmId, attempt).ConfigureAwait(false)
+                    is { } throughHolder)
+            {
+                return throughHolder;
             }
 
             // Read first, and this read is what makes the whole operation
@@ -476,7 +710,16 @@ public sealed class VhdxService : IVhdxService, IDisposable
             }
             catch (VhdxInUseException)
             {
-                return await ExpandAttachedAsync(volumeId, path, newSizeBytes, nodeId, attempt).ConfigureAwait(false);
+                // Open, and refusing the local read, but no clustered VM on any
+                // node that could be holding it references it. A genuine
+                // inconsistency - an unmanaged handle on the CSV, most
+                // plausibly - not a transient state a retry fixes on its own,
+                // so it is reported rather than guessed past.
+                return await TryExpandThroughHolderAsync(volumeId, path, newSizeBytes, heldVmId, attempt).ConfigureAwait(false)
+                    ?? throw new JobFailureException(
+                        AgentErrorCodes.Internal,
+                        $"volume {volumeId} at {path} is open, but no clustered VM on a node that could be holding it " +
+                        "has it attached; check for an unmanaged handle on the CSV");
             }
 
             // Only ever grows. Hyper-V will happily shrink a VHDX, and doing so
@@ -523,43 +766,45 @@ public sealed class VhdxService : IVhdxService, IDisposable
     }
 
     /// <summary>
-    /// ExpandAsync's fallback for a VHDX that could not be read locally because
-    /// something else has it open. Resolves <paramref name="nodeId"/> - the CSI
-    /// node ID the Go driver found via Kubernetes' VolumeAttachment API, the
-    /// same lookup external-attacher itself does to build a node_id - to a VM
-    /// and its owning host, then reads and grows the disk through that host
-    /// instead of locally. IHyperVHostClient does not share
-    /// GetVirtualSizeAsync's limitation: the host actually running the VM can
-    /// read and resize an attached, running disk without opening the file the
-    /// way a peer host's local call does.
+    /// ExpandDiskAsync's path for a VHDX something has open: traces it to the
+    /// clustered VM holding it and the host that VM runs on, then reads and
+    /// grows the disk through that host instead of locally - or returns null
+    /// when no clustered VM holds it, leaving the caller to decide what that
+    /// means for its own path. The host is the whole of what the calls need -
+    /// measured, the same path-only call from any other host fails with the
+    /// same "used by another process" the local read does, and succeeds at
+    /// once from the holder. The VM is what the job has to be holding while it
+    /// grows it.
     /// </summary>
-    private async Task<ExpandVolumeResult> ExpandAttachedAsync(
-        string volumeId, string path, long newSizeBytes, string? nodeId, CancellationTokenSource attempt)
+    private async Task<ExpandVolumeResult?> TryExpandThroughHolderAsync(
+        string volumeId, string path, long newSizeBytes, string? heldVmId, CancellationTokenSource attempt)
     {
-        if (string.IsNullOrWhiteSpace(nodeId))
+        var location = await LocateHolderAsync(volumeId, path, attempt.Token).ConfigureAwait(false);
+        if (location is null)
         {
-            // The local read failed because something has the file open, but
-            // the driver found no VolumeAttachment naming a node for it. That
-            // combination is a genuine inconsistency - an unmanaged handle on
-            // the CSV, most plausibly - not a transient state a retry fixes on
-            // its own, so it is reported rather than guessed past.
-            throw new JobFailureException(
-                AgentErrorCodes.Internal,
-                $"volume {volumeId} at {path} could not be read because something has it open, but no node " +
-                "was given to check; check for an unmanaged handle on the CSV");
+            return null;
         }
 
-        var vm = await _cluster.ResolveVmAsync(nodeId, attempt.Token).ConfigureAwait(false)
-            ?? throw new JobFailureException(
-                AgentErrorCodes.Internal,
-                $"volume {volumeId} at {path} could not be read locally, and node {nodeId} names no clustered " +
-                "virtual machine to try instead");
+        var (host, vmId) = (location.HostName, location.VmId);
+
+        if (heldVmId is null || JobTargets.Vm(heldVmId) != JobTargets.Vm(vmId))
+        {
+            // The disk is open by a VM this job is not holding vm: for -
+            // attached, or moved to another VM, while it sat queued. Growing it
+            // anyway is exactly D10. Aborted rather than a harder failure: the
+            // retry traces the disk again and queues behind the right VM.
+            throw new JobFailureException(
+                AgentErrorCodes.Aborted,
+                $"volume {volumeId} is open by VM {vmId}, which this resize was not queued against " +
+                (heldVmId is null ? "(it found the disk unattached)" : $"(it was queued against {heldVmId})") +
+                "; retrying queues it behind that VM instead");
+        }
 
         _logger.LogInformation(
-            "ExpandVolume {VolumeId}: {Path} could not be read locally; trying {VmId} on {Host}, which node {NodeId} resolves to",
-            volumeId, path, vm.VmId, vm.OwningHost, nodeId);
+            "ExpandVolume {VolumeId}: {Path} is open by {VmId} on {Host}; reading and growing it through that host",
+            volumeId, path, vmId, host);
 
-        var currentSize = await _host.GetDiskSizeAsync(vm.OwningHost, vm.VmId, path, attempt.Token).ConfigureAwait(false);
+        var currentSize = (await _host.GetDiskInfoAsync(host, path, attempt.Token).ConfigureAwait(false)).VirtualSizeBytes;
 
         // Same never-shrinks guarantee as the local path, on the size now read
         // through the owning host instead of locally.
@@ -571,12 +816,80 @@ public sealed class VhdxService : IVhdxService, IDisposable
             return new ExpandVolumeResult(currentSize, AlreadyLargeEnough: true);
         }
 
-        var actualSize = await _host.ResizeDiskAsync(vm.OwningHost, vm.VmId, path, newSizeBytes, attempt.Token).ConfigureAwait(false);
+        var actualSize = await _host.ResizeDiskAsync(host, vmId, path, newSizeBytes, attempt.Token).ConfigureAwait(false);
 
         _logger.LogInformation(
             "ExpandVolume {VolumeId}: grew {Path} from {CurrentSize} to {ActualSize} bytes via {VmId} on {Host}",
-            volumeId, path, currentSize, actualSize, vm.VmId, vm.OwningHost);
+            volumeId, path, currentSize, actualSize, vmId, host);
         return new ExpandVolumeResult(actualSize, AlreadyLargeEnough: false);
+    }
+
+    /// <summary>
+    /// The clustered VM holding <paramref name="path"/> open and the node it
+    /// runs on, or null when no clustered VM that could be holding it
+    /// references it. For a disk the caller has just failed to read locally -
+    /// the premise <see cref="IVhdxLocationService.LocateAsync"/> needs.
+    /// </summary>
+    private async Task<VhdxLocation?> LocateHolderAsync(
+        string volumeId, string path, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await _location.LocateAsync(path, cancellationToken).ConfigureAwait(false);
+        }
+        catch (InvalidOperationException ex)
+        {
+            throw new JobFailureException(
+                AgentErrorCodes.Internal,
+                $"volume {volumeId} at {path} is open by something this agent could not trace: {ex.Message}",
+                ex);
+        }
+    }
+
+    /// <summary>
+    /// An existing volume's VirtualDiskId, for a CreateVolume replay: read off
+    /// the file itself, or - when a running VM's hold refuses that open -
+    /// through the host that VM runs on.
+    /// </summary>
+    /// <remarks>
+    /// Needed even though the replay's size read already succeeded locally. On
+    /// the VM's own host that CIM read is answered by the very vmms holding the
+    /// file, so no VhdxInUseException ever fires - measured - while this plain
+    /// file open is still refused by the VM's exclusive hold. The agent sharing
+    /// a host with the VM is ordinary, not an edge: the clustered role runs
+    /// wherever the cluster places it.
+    /// </remarks>
+    private async Task<Guid> ReadExistingDiskIdAsync(string volumeName, string path, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await VhdxDiskIdentity.ReadAsync(path, cancellationToken).ConfigureAwait(false);
+        }
+        catch (IOException ex) when (ex.HResult is SharingViolationHResult or LockViolationHResult or UserMappedFileHResult)
+        {
+            return (await ReadThroughHolderAsync(volumeName, path, cancellationToken).ConfigureAwait(false)).DiskId;
+        }
+    }
+
+    /// <summary>
+    /// Reads a disk a running VM has open through the host that VM runs on, for
+    /// a CreateVolume replay. Only a host with a VM confirmed to reference the
+    /// disk is asked: any other node that merely has the file open cannot read
+    /// it past the VM's hold any better than this one just failed to.
+    /// </summary>
+    private async Task<HostDiskInfo> ReadThroughHolderAsync(
+        string volumeName, string path, CancellationToken cancellationToken)
+    {
+        var location = await LocateHolderAsync(volumeName, path, cancellationToken).ConfigureAwait(false)
+            ?? throw new JobFailureException(
+                AgentErrorCodes.Internal,
+                $"volume {volumeName} at {path} is open, but no clustered VM on a node that could be holding it has " +
+                "it attached, so there is no host to read it through; check for an unmanaged handle on the CSV");
+
+        _logger.LogInformation(
+            "CreateVolume {VolumeName}: {Path} is open by {VmId} on {Host}; reading it through that host",
+            volumeName, path, location.VmId, location.HostName);
+        return await _host.GetDiskInfoAsync(location.HostName, path, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task DeleteAsync(string volumeId, CancellationToken cancellationToken)

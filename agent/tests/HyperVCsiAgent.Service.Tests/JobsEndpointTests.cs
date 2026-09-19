@@ -68,7 +68,10 @@ public sealed class JobsEndpointTests : IDisposable
 
         Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
         using var body = await ReadJsonAsync(response);
-        Assert.Equal($"/v1/jobs/{body.RootElement.GetProperty("id").GetString()}", response.Headers.Location?.ToString());
+        var id = body.RootElement.GetProperty("id").GetString();
+        Assert.Equal($"/v1/jobs/{id}", response.Headers.Location?.ToString());
+
+        (await WaitForCompletionAsync(client, id)).Dispose();
     }
 
     [Fact]
@@ -160,9 +163,12 @@ public sealed class JobsEndpointTests : IDisposable
         using var created = await ReadJsonAsync(await client.PostAsJsonAsync("/v1/jobs", CreateVolumeRequest("pvc-1", 4096)));
         using var deleted = await ReadJsonAsync(await client.PostAsJsonAsync("/v1/jobs", DeleteVolumeRequest("pvc-1")));
 
-        Assert.NotEqual(
-            created.RootElement.GetProperty("id").GetString(),
-            deleted.RootElement.GetProperty("id").GetString());
+        var createdId = created.RootElement.GetProperty("id").GetString();
+        var deletedId = deleted.RootElement.GetProperty("id").GetString();
+        Assert.NotEqual(createdId, deletedId);
+
+        (await WaitForCompletionAsync(client, createdId)).Dispose();
+        (await WaitForCompletionAsync(client, deletedId)).Dispose();
     }
 
     [Theory]
@@ -382,6 +388,12 @@ public sealed class JobsEndpointTests : IDisposable
             throw new NotSupportedException("a VM list of zero means the sweep never asks this");
 
         public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) => _discovery.Task;
+
+        public Task<IReadOnlyList<ClusterSharedVolume>> ListSharedVolumesAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException("no disk in this file is held open, so nothing traces one to a shared volume");
+
+        public Task<IReadOnlyList<string>> ListNodesAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException("no disk in this file is held open, so nothing traces one to a node");
     }
 
     private static object CreateVolumeRequest(string name, long sizeBytes) => new
@@ -423,8 +435,17 @@ public sealed class JobsEndpointTests : IDisposable
         Assert.Equal(HttpStatusCode.Accepted, accepted.StatusCode);
 
         using var enqueued = await ReadJsonAsync(accepted);
-        var id = enqueued.RootElement.GetProperty("id").GetString();
+        return await WaitForCompletionAsync(client, enqueued.RootElement.GetProperty("id").GetString());
+    }
 
+    /// <summary>
+    /// Polls a job until it is terminal. Every test that enqueues a job has to
+    /// wait for it: the store's shutdown cancels running jobs but does not
+    /// wait for them, so a job left running can still hold a VHDX open in the
+    /// directory <see cref="Dispose"/> deletes.
+    /// </summary>
+    private static async Task<JsonDocument> WaitForCompletionAsync(HttpClient client, string? id)
+    {
         var deadline = DateTime.UtcNow.AddSeconds(5);
         while (true)
         {
@@ -452,8 +473,8 @@ public sealed class JobsEndpointTests : IDisposable
         JsonDocument.Parse(await response.Content.ReadAsStringAsync());
 
     /// <summary>
-    /// Writes a real placeholder file so the service's existence check and
-    /// atomic rename run against an actual filesystem.
+    /// Writes a real minimal VHDX so the service's existence check, atomic
+    /// rename and VirtualDiskId read-back run against an actual filesystem.
     /// </summary>
     private sealed class FakeVirtualDiskManager : IVirtualDiskManager
     {
@@ -464,7 +485,7 @@ public sealed class JobsEndpointTests : IDisposable
         public async Task CreateDynamicVhdxAsync(string path, long maxInternalSizeBytes, TimeSpan remainingBudget, CancellationToken cancellationToken)
         {
             CreateCount++;
-            await File.WriteAllTextAsync(path, "fake vhdx", cancellationToken);
+            await File.WriteAllBytesAsync(path, MinimalVhdxBuilder.Build(maxInternalSizeBytes, Guid.NewGuid()), cancellationToken);
             _sizes[Path.GetFileName(path)] = maxInternalSizeBytes;
         }
 

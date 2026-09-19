@@ -102,6 +102,13 @@ if (OperatingSystem.IsWindows())
     builder.Services.AddSingleton<IClusterService, MsClusterService>();
     builder.Services.AddSingleton<IHyperVHostClient, CimHyperVHostClient>();
     builder.Services.AddSingleton<IDiskCopier, WindowsDiskCopier>();
+
+    // One NetFT address table for the process: it is the part of locating a
+    // VHDX that fans out to every node, and its cache is only worth anything
+    // if every lookup shares it.
+    builder.Services.AddSingleton<ICsvNodeProbe, CimCsvNodeProbe>();
+    builder.Services.AddSingleton<NetFtAddressTable>();
+    builder.Services.AddSingleton<IVhdxLocationService, CsvFileOwnershipService>();
 }
 else
 {
@@ -109,6 +116,7 @@ else
     builder.Services.AddSingleton<IClusterService, UnsupportedClusterService>();
     builder.Services.AddSingleton<IHyperVHostClient, UnsupportedHyperVHostClient>();
     builder.Services.AddSingleton<IDiskCopier, UnsupportedDiskCopier>();
+    builder.Services.AddSingleton<IVhdxLocationService, UnsupportedVhdxLocationService>();
 }
 
 #if DEBUG

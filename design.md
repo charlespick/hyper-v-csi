@@ -91,14 +91,19 @@ Design guidance for all implemenation, in no particular order
 A Hyper-V checkpoint is **VM-wide**, not per-disk — freezing one attached
 volume's base VHDX freezes every other disk attached to that VM too. The
 driver holds one checkpoint for the entire duration of a snapshot's copy, so
-the copy job takes the VM as a serialization target (`vm:<nodeId>`) alongside
+the copy job takes the VM as a serialization target (`vm:<vmId>`) alongside
 the source volume (`volume:<sourceId>`), and everything else that reaches into
 that VM — attach, detach, expand, and every other snapshot on it — queues
 behind it until the copy publishes and the checkpoint's merge collapses.
 
-`ExpandVolume` holds `vm:` too, whenever its node hint is present, because its
-attached-disk fallback resizes the VHDX through the VM's owning host — the
-same kind of reach into the VM that attach and detach already serialize on.
+`ExpandVolume`'s resize holds `vm:` too, whenever the disk turns out to be open
+by a VM, because it then grows the VHDX through that VM's host — the same kind
+of reach into the VM that attach and detach already serialize on. Neither a
+snapshot nor an expand is told which VM that is: the agent traces the VHDX's
+path to the host holding it open and the clustered VM on that host
+([docs/csv-file-open-ownership.md](docs/csv-file-open-ownership.md)), and
+since a job's targets are fixed when it is enqueued, the VM-holding work is a
+second, internal job enqueued once the trace has named the VM.
 The invariant this establishes is *every operation that resolves a VM and
 issues a call against it holds that VM's target for the duration*. It is easy
 to violate by omission — `ExpandVolume` did, until it was found — so a

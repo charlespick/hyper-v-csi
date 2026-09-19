@@ -82,6 +82,11 @@ spec:
             - --endpoint=unix:///csi/csi.sock
             - --v={{ .Values.logging.verbosity }}
             - --kvp-pool-dir=/var/lib/hyperv
+            {{- if .Values.node.unsafeAllowMissingDiskId }}
+            # See node.unsafeAllowMissingDiskId in values.yaml - a migration
+            # escape hatch, not meant to stay on.
+            - --allow-missing-disk-id
+            {{- end }}
           volumeMounts:
             - name: socket-dir
               mountPath: /csi

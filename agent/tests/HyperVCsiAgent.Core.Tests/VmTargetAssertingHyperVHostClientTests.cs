@@ -128,18 +128,29 @@ public class VmTargetAssertingHyperVHostClientTests
         // Classification and size reads are advisory under this design - see
         // this decorator's own remarks for why forcing a target onto them
         // would push the fast CreateSnapshot job onto the VM queue - so they
-        // must never be asserted, job context or none.
+        // must never be asserted, job context or none. That goes for tracing a
+        // disk to its VM and reading an attached disk's size too: both run
+        // before anything knows which vm: there would be to hold, and a
+        // CreateVolume replay reads through the host holding none at all.
         var inner = new RecordingHostClient();
         var client = new VmTargetAssertingHyperVHostClient(inner);
 
         var attached = await client.FindAttachedDiskAsync("hv-01", VmId, @"C:\path.vhdx", CancellationToken.None);
+        await client.ReferencesDiskAsync("hv-01", VmId, @"C:\path.vhdx", includeDifferencingChains: true, CancellationToken.None);
+        await client.GetDiskInfoAsync("hv-01", @"C:\path.vhdx", CancellationToken.None);
 
         Assert.Null(attached);
         Assert.Equal(("hv-01", VmId, @"C:\path.vhdx"), inner.LastFindAttached);
+        Assert.Equal(("hv-01", VmId, @"C:\path.vhdx"), inner.LastReferencesDisk);
+        Assert.Equal(("hv-01", @"C:\path.vhdx"), inner.LastGetDiskInfo);
     }
 
     private sealed class RecordingHostClient : IHyperVHostClient
     {
+        public (string HostName, string VmId, string VhdxPath)? LastReferencesDisk { get; private set; }
+
+        public (string HostName, string VhdxPath)? LastGetDiskInfo { get; private set; }
+
         public (string HostName, string VmId, string VhdxPath, DiskSlot Slot)? LastAttach { get; private set; }
 
         public (string HostName, string VmId, string VhdxPath)? LastDetach { get; private set; }
@@ -176,8 +187,18 @@ public class VmTargetAssertingHyperVHostClientTests
             return Task.CompletedTask;
         }
 
-        public Task<long> GetDiskSizeAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
-            Task.FromResult(0L);
+        public Task<bool> ReferencesDiskAsync(
+            string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken)
+        {
+            LastReferencesDisk = (hostName, vmId, vhdxPath);
+            return Task.FromResult(true);
+        }
+
+        public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken)
+        {
+            LastGetDiskInfo = (hostName, vhdxPath);
+            return Task.FromResult(new HostDiskInfo(4096, Guid.Empty));
+        }
 
         public Task<long> ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken)
         {

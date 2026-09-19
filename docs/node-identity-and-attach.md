@@ -127,16 +127,49 @@ fan-out.
 
 ## Publish context and `vmbusdisk.Resolve`
 
-**The publish context is load-bearing.** Attach returns the SCSI
-controller's VMBus instance GUID and the LUN, because that pair is the
-only thing telling `NodeStageVolume` which of the guest's block devices
-this volume is — the CSV path means nothing inside the VM. A Linux guest
-sees the same GUID under `/sys/bus/vmbus/devices`, which is the
-assumption the node plugin is built on; a real attach-then-stage against
-`csidevnode01` resolved it correctly to `/dev/sdb`, confirming the
-assumption on that guest. If it ever turns out not to hold on some other
-kernel or Hyper-V version, the fallback is the disk's SCSI page-83
-identifier, which would mean returning that in the publish context too.
+**The publish context locates; volume_context verifies.** Attach returns
+the SCSI controller's VMBus instance GUID and the LUN, because that pair
+is the only thing telling `NodeStageVolume` which of the guest's block
+devices this volume *might* be — the CSV path means nothing inside the
+VM. A Linux guest sees the same GUID under `/sys/bus/vmbus/devices`, which
+is the assumption the node plugin is built on; a real attach-then-stage
+against `csidevnode01` resolved it correctly to `/dev/sdb`, confirming the
+assumption on that guest.
+
+That coordinate is a slot, not an identity — the LUN is reassignable the
+moment something detaches, and nothing about resolving it proves the
+disk sitting there is *this* volume's VHDX rather than whatever the last
+attach or a raced concurrent one left behind. `CreateVolume` closes that
+gap by reading the VHDX's own `VirtualDiskId` (Hyper-V's
+`DiskIdentifier`) off the file at creation time — the one moment the
+disk is guaranteed unattached and readable — and returning it in
+`volume_context` under `diskId`, which `external-provisioner` persists
+onto the PV and hands back on every later `NodeStageVolume`. Package
+`diskidentity` (`csi-driver/internal/diskidentity`) confirms the two
+agree: once `vmbusdisk.Resolve` names a device, it reads that device's
+SCSI VPD page 0x83 (Device Identification) data from
+`/sys/block/<dev>/device/vpd_pg83` and checks for the `VirtualDiskId`'s
+bytes in it, before `stageVolume` ever calls `FormatAndMount`. A
+mismatch, or a page that cannot be read at all — an older kernel or
+storage stack with no VPD page 0x83 exposed, the "Open decision" this
+was tracked under — both fail the stage closed rather than mounting on
+the coordinate alone; see the package doc for the byte layout, which is
+measured against a real Hyper-V host and guest (three VHDXes attached to
+`csidevnode01`, each `vpd_pg83` capture checked against
+`Get-VHD -Path ... | Select DiskIdentifier` on the owning host,
+`CSIDEV01`), not derived from the SCSI or MS-VHDX specs alone.
+
+A PV created before this check existed has no `diskId` in its
+`volume_context`, and `external-provisioner` keeps replaying that same,
+disk-ID-less context on every later `NodeStageVolume` — so by default such
+a PV now fails to stage with `InvalidArgument`. The Helm chart's
+`node.unsafeAllowMissingDiskId` (`--allow-missing-disk-id`) is a migration
+escape hatch for exactly that PV: set, `NodeStageVolume` accepts a missing
+`diskId` and falls back to `vmbusdisk.Resolve`'s coordinate alone for that
+one volume, same as before this check existed. A `volume_context` that does
+carry a `diskId` is still verified against it regardless of the flag. Off
+by default; turn it back off once every such PV has been recreated with a
+`volume_context` that carries a `diskId`.
 
 `vmbusdisk.Resolve` is what turns that pair into a device path, and it
 walks a fixed chain: the VMBus channel directory at

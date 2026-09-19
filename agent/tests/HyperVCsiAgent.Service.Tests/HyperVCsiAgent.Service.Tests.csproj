@@ -27,6 +27,10 @@
     <!-- Shared with HyperVCsiAgent.Core.Tests rather than duplicated: same
          attribute, same skip rationale, one source of truth. -->
     <Compile Include="..\HyperVCsiAgent.Core.Tests\WindowsOnlyFactAttribute.cs" Link="WindowsOnlyFactAttribute.cs" />
+    <!-- CreateVolume reads the VirtualDiskId back off the file it just made,
+         so a fake disk manager has to write something VhdxDiskIdentity can
+         parse. -->
+    <Compile Include="..\HyperVCsiAgent.Core.Tests\MinimalVhdxBuilder.cs" Link="MinimalVhdxBuilder.cs" />
   </ItemGroup>
 
 </Project>

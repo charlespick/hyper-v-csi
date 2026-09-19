@@ -104,4 +104,22 @@ public interface IClusterService
     /// </para>
     /// </remarks>
     Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Every Cluster Shared Volume in the cluster, with the node currently
+    /// coordinating each.
+    /// </summary>
+    /// <remarks>
+    /// Coordination moves on its own - CSV ownership fails over and rebalances
+    /// independently of any VM - so this is a reading, not a fact to hold on
+    /// to: a caller caching it should expect it to go stale in seconds.
+    /// </remarks>
+    Task<IReadOnlyList<ClusterSharedVolume>> ListSharedVolumesAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// The name of every node in the cluster the cluster does not report Down.
+    /// Paused and joining nodes are included: a paused node still runs VMs
+    /// until it is drained.
+    /// </summary>
+    Task<IReadOnlyList<string>> ListNodesAsync(CancellationToken cancellationToken);
 }

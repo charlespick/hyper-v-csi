@@ -112,51 +112,22 @@ public sealed class JobDispatcher(
                 }
 
                 return new ResolvedJob(
-                    // The one operation issue #14's D10 found holding less
-                    // than it reaches into: when the node hint is present,
-                    // this also takes vm:, not just volume:.
-                    // VhdxService.ExpandAsync falls through to
-                    // ExpandAttachedAsync when the local size read hits a
-                    // sharing violation, and that method resolves the VM and
-                    // issues GetDiskSizeAsync and then ResizeDiskAsync
-                    // against that VM's disk through its owning host -
-                    // reaching into the VM every bit as much as attach and
-                    // detach do, which already take vm: for exactly this
-                    // reason.
-                    //
-                    // Two orderings matter if this expand holds only
-                    // volume:. A checkpoint landing between the expand's
-                    // read and its write leaves ResizeDiskAsync operating on
-                    // a disk that now has a child, which Hyper-V refuses -
-                    // bad, not dangerous, just a retry loop for as long as
-                    // the checkpoint stands. A checkpoint take and a resize
-                    // issued against one VM at the same instant are two
-                    // concurrent CIM writes to that VM's storage
-                    // configuration, and whether vmms serializes them or
-                    // fails one of them is unverified (Phase 0's V6) - not
-                    // something to ship on "most likely".
-                    //
-                    // The node hint can be stale - the volume may have been
-                    // detached since the VolumeAttachment naming this hint
-                    // was written - in which case holding vm:
-                    // over-serializes slightly against a VM this expand
-                    // turns out not to touch. Harmless, and strictly the
-                    // safe direction to be wrong in.
-                    //
-                    // The honest cost: an expand of an attached volume now
-                    // queues behind any snapshot copy already holding that
-                    // VM, so ControllerExpandVolume can return ABORTED and
-                    // be retried by the resizer for that copy's whole
-                    // duration. That trade was already made the moment the
-                    // checkpoint moved into the copy job and started
-                    // holding vm: for its entire run; this closes the one
-                    // gap that trade left open, not a new one of its own.
-                    string.IsNullOrWhiteSpace(expandRequest.NodeId)
-                        ? [JobTargets.Volume(expandRequest.VolumeId)]
-                        : [JobTargets.Volume(expandRequest.VolumeId), JobTargets.Vm(expandRequest.NodeId)],
+                    // Neither volume: nor vm:, even though the resize reaches
+                    // both - issue #14's D10 still applies in full, it is just
+                    // honored one job down. Which VM (if any) has the disk open
+                    // is only known once the agent has traced the path to
+                    // whoever holds it, which is CIM work this method - called
+                    // on the HTTP request - must not wait on. So this job
+                    // traces it, then enqueues and waits on VhdxService's
+                    // internal ExpandDisk job, which takes volume: and, for a
+                    // disk a VM has open, that VM's vm: - see ExpandAsync.
+                    // expand: only keeps repeat requests for one volume in
+                    // order; holding volume: here instead would deadlock
+                    // against the internal job that needs it.
+                    [JobTargets.Expansion(expandRequest.VolumeId)],
                     async (job, cancellationToken) =>
                         job.Result = await vhdxService
-                            .ExpandAsync(expandRequest.VolumeId, expandRequest.SizeBytes, expandRequest.NodeId, cancellationToken)
+                            .ExpandAsync(expandRequest.VolumeId, expandRequest.SizeBytes, cancellationToken)
                             .ConfigureAwait(false));
 
             case VolumeExists:
@@ -231,8 +202,7 @@ public sealed class JobDispatcher(
                     async (job, cancellationToken) =>
                         job.Result = await snapshotService
                             .CreateAsync(
-                                createSnapshotRequest.SourceVolumeId, createSnapshotRequest.SnapshotName,
-                                createSnapshotRequest.NodeId, cancellationToken)
+                                createSnapshotRequest.SourceVolumeId, createSnapshotRequest.SnapshotName, cancellationToken)
                             .ConfigureAwait(false));
 
             case DeleteSnapshot:

@@ -659,25 +659,10 @@ public sealed class MsClusterService : IClusterService
             // One unfiltered enumeration for every resource's owner, rather
             // than one WHERE-Name query per VM resource - see this method's
             // own remarks on the cost that would otherwise reintroduce.
-            // OrdinalIgnoreCase, not Ordinal: these names arrive from the
-            // registry mirror and from WMI, and FindResourceName's own
-            // comment already records that those two sources do not agree on
-            // case for the values they share. A case-sensitive join here
-            // would drop VMs at random depending on how a resource happened
-            // to be named.
-            var owners = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            Dictionary<string, string> owners;
             using (var session = CimSession.Create(null))
             {
-                var options = deadline.Options("reading MSCluster_Resource.OwnerNode", cancellationToken);
-                foreach (var resource in session.QueryInstances(
-                    NamespaceName, "WQL", "SELECT Name, OwnerNode FROM MSCluster_Resource", options))
-                {
-                    if (resource.CimInstanceProperties["Name"]?.Value is string name
-                        && resource.CimInstanceProperties["OwnerNode"]?.Value is string owner)
-                    {
-                        owners[name] = owner;
-                    }
-                }
+                owners = ReadResourceOwners(session, deadline, cancellationToken);
             }
 
             var vms = new List<ClusteredVm>(vmResources.Count);
@@ -723,4 +708,132 @@ public sealed class MsClusterService : IClusterService
             _logger.LogInformation("listed {Count} clustered VMs across the cluster", vms.Count);
             return vms;
         }, cancellationToken);
+
+    /// <summary>
+    /// See <see cref="IClusterService.ListSharedVolumesAsync"/>.
+    /// </summary>
+    /// <remarks>
+    /// Two reads joined in memory, the shape <see cref="ListVmsAsync"/> uses
+    /// and for the same reason. <c>MSCluster_ClusterSharedVolume</c> carries no
+    /// owner of its own - measured, its one useful property is the mount path
+    /// in <c>Name</c> - so the coordinator is the <c>OwnerNode</c> of the
+    /// physical disk resource the volume is associated with: the node
+    /// <c>Get-ClusterSharedVolume</c> reports, and the one whose CSV open-file
+    /// listing was measured to carry that volume's remote opens and no other
+    /// volume's.
+    /// </remarks>
+    public Task<IReadOnlyList<ClusterSharedVolume>> ListSharedVolumesAsync(CancellationToken cancellationToken) =>
+        Task.Run<IReadOnlyList<ClusterSharedVolume>>(() =>
+        {
+            var deadline = CimDeadline.After(_hostOperationTimeout);
+
+            using var session = CimSession.Create(null);
+
+            var resourceByVolume = new List<(string VolumePath, string ResourceName)>();
+            var linkOptions = deadline.Options("reading MSCluster_ClusterSharedVolumeToResource", cancellationToken);
+            foreach (var link in session.QueryInstances(
+                NamespaceName, "WQL", "SELECT * FROM MSCluster_ClusterSharedVolumeToResource", linkOptions))
+            {
+                // Both ends arrive as key-only references, which is all this
+                // needs: Name is each class's key property.
+                if (link.CimInstanceProperties["GroupComponent"]?.Value is CimInstance volume
+                    && volume.CimInstanceProperties["Name"]?.Value is string volumePath
+                    && link.CimInstanceProperties["PartComponent"]?.Value is CimInstance resource
+                    && resource.CimInstanceProperties["Name"]?.Value is string resourceName)
+                {
+                    resourceByVolume.Add((volumePath.TrimEnd('\\'), resourceName));
+                }
+            }
+
+            if (resourceByVolume.Count == 0)
+            {
+                return Array.Empty<ClusterSharedVolume>();
+            }
+
+            var owners = ReadResourceOwners(session, deadline, cancellationToken);
+
+            var volumes = new List<ClusterSharedVolume>(resourceByVolume.Count);
+            foreach (var (volumePath, resourceName) in resourceByVolume)
+            {
+                if (!owners.TryGetValue(resourceName, out var owner) || string.IsNullOrWhiteSpace(owner))
+                {
+                    // Left out rather than thrown, the same trade ListVmsAsync
+                    // makes: one volume in an odd state must not make every
+                    // other volume's files unlocatable too.
+                    _logger.LogWarning(
+                        "the cluster reports no owning node for Cluster Shared Volume {VolumePath} (resource {ResourceName}); " +
+                        "nothing on it can be located until it has one",
+                        volumePath, resourceName);
+                    continue;
+                }
+
+                volumes.Add(new ClusterSharedVolume(volumePath, owner));
+            }
+
+            _logger.LogDebug("listed {Count} Cluster Shared Volumes", volumes.Count);
+            return volumes;
+        }, cancellationToken);
+
+    public Task<IReadOnlyList<string>> ListNodesAsync(CancellationToken cancellationToken) =>
+        Task.Run<IReadOnlyList<string>>(() =>
+        {
+            var deadline = CimDeadline.After(_hostOperationTimeout);
+
+            using var session = CimSession.Create(null);
+            var options = deadline.Options("listing MSCluster_Node", cancellationToken);
+
+            var nodes = new List<string>();
+            foreach (var node in session.QueryInstances(NamespaceName, "WQL", "SELECT Name, State FROM MSCluster_Node", options))
+            {
+                if (node.CimInstanceProperties["Name"]?.Value is not string name || string.IsNullOrWhiteSpace(name))
+                {
+                    continue;
+                }
+
+                // ClusterNodeState 1 is Down, the one state left out: a Down node
+                // has nothing open and cannot answer, and asking it anyway costs
+                // the caller a full CIM timeout. Paused and Joining stay in - a
+                // paused node keeps running its VMs until it is drained - and so
+                // does a state this cannot read, which is asked about rather than
+                // guessed Down.
+                if (ToRawState(node.CimInstanceProperties["State"]?.Value) == 1)
+                {
+                    _logger.LogDebug("{NodeName} is Down; leaving it out of the node list", name);
+                    continue;
+                }
+
+                nodes.Add(name);
+            }
+
+            return nodes;
+        }, cancellationToken);
+
+    /// <summary>
+    /// Every cluster resource's owning node, keyed by resource name, from one
+    /// unfiltered enumeration.
+    /// </summary>
+    /// <remarks>
+    /// OrdinalIgnoreCase, not Ordinal: callers join this against names from
+    /// the registry mirror and from other WMI classes, and FindResourceName's
+    /// own comment already records that those sources do not agree on case
+    /// for the values they share. A case-sensitive join would drop entries at
+    /// random depending on how a resource happened to be named.
+    /// </remarks>
+    private static Dictionary<string, string> ReadResourceOwners(
+        CimSession session, CimDeadline deadline, CancellationToken cancellationToken)
+    {
+        var owners = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var options = deadline.Options("reading MSCluster_Resource.OwnerNode", cancellationToken);
+        foreach (var resource in session.QueryInstances(
+            NamespaceName, "WQL", "SELECT Name, OwnerNode FROM MSCluster_Resource", options))
+        {
+            if (resource.CimInstanceProperties["Name"]?.Value is string name
+                && resource.CimInstanceProperties["OwnerNode"]?.Value is string owner)
+            {
+                owners[name] = owner;
+            }
+        }
+
+        return owners;
+    }
 }

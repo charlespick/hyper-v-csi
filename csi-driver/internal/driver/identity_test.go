@@ -32,7 +32,7 @@ func TestGetPluginInfoReportsTheDriverIdentity(t *testing.T) {
 	// CSIDriver object and every StorageClass's provisioner, and changing it
 	// once volumes exist orphans their PersistentVolumes. Pinned here so a
 	// rename has to be a deliberate edit to this test.
-	server := &identityServer{driver: New("", nil, nil)}
+	server := &identityServer{driver: New("", nil, false)}
 
 	resp, err := server.GetPluginInfo(context.Background(), &csi.GetPluginInfoRequest{})
 	if err != nil {
@@ -49,7 +49,7 @@ func TestGetPluginInfoReportsTheDriverIdentity(t *testing.T) {
 
 func TestProbeChecksTheAgentIsReachable(t *testing.T) {
 	agent := newFakeHealthEndpoint(t, http.StatusOK)
-	server := &identityServer{driver: New("", agentclient.New(agent.URL), nil)}
+	server := &identityServer{driver: New("", agentclient.New(agent.URL), false)}
 
 	resp, err := server.Probe(context.Background(), &csi.ProbeRequest{})
 	if err != nil {
@@ -89,7 +89,7 @@ func TestProbeUnreachableAgentIsNotReady(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			server := &identityServer{driver: New("", test.agent(t), nil)}
+			server := &identityServer{driver: New("", test.agent(t), false)}
 
 			_, err := server.Probe(context.Background(), &csi.ProbeRequest{})
 
@@ -107,7 +107,7 @@ func TestProbeWithoutAnAgentIsReady(t *testing.T) {
 	// Node mode: no agent address is configured, and no node RPC calls the
 	// agent. Reporting unready for a dependency this plugin does not have would
 	// hold back a node plugin that can mount perfectly well.
-	server := &identityServer{driver: New("node-1", nil, nil)}
+	server := &identityServer{driver: New("node-1", nil, false)}
 
 	resp, err := server.Probe(context.Background(), &csi.ProbeRequest{})
 	if err != nil {

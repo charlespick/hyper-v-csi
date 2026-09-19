@@ -430,7 +430,8 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
         });
 
         var service = new SnapshotService(
-            disks, copier, store, cluster, host, hostSlots, copySlots, options, NullLogger<SnapshotService>.Instance);
+            disks, copier, store, cluster, new NeverCalledVhdxLocationService(), host, hostSlots, copySlots, options,
+            NullLogger<SnapshotService>.Instance);
 
         _disposables.Add(store);
         _disposables.Add(copySlots);
@@ -490,6 +491,22 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
 
         public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) =>
             throw new InvalidOperationException("the cluster database is not present, as if this host were not clustered at all");
+
+        public Task<IReadOnlyList<ClusterSharedVolume>> ListSharedVolumesAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<IReadOnlyList<string>> ListNodesAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+    }
+
+    /// <summary>
+    /// The reaper resumes and reaps against a VM it already knows from the
+    /// cluster; nothing it drives starts from a bare path.
+    /// </summary>
+    private sealed class NeverCalledVhdxLocationService : IVhdxLocationService
+    {
+        public Task<VhdxLocation?> LocateAsync(string path, CancellationToken cancellationToken) =>
+            throw new NotSupportedException("the reaper never traces a disk from its path");
     }
 
     /// <summary>
@@ -530,6 +547,8 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
 
             return job;
         }
+
+        public Job? FindActive(string idempotencyKey, string operationType) => _inner.FindActive(idempotencyKey, operationType);
 
         public Job? Get(string id) => _inner.Get(id);
 
@@ -723,7 +742,11 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
         public Task<bool> IsChainCollapsedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
             Task.FromResult(!_byHost.TryGetValue(hostName, out var entries) || entries.Count == 0);
 
-        public Task<long> GetDiskSizeAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+        public Task<bool> ReferencesDiskAsync(
+            string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
         public Task<AttachedDisk?> FindAttachedDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
@@ -765,5 +788,11 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
 
         public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) =>
             Task.FromResult<IReadOnlyList<ClusteredVm>>(Vms.Values.ToList());
+
+        public Task<IReadOnlyList<ClusterSharedVolume>> ListSharedVolumesAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException("the reaper never locates a disk on a shared volume");
+
+        public Task<IReadOnlyList<string>> ListNodesAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException("the reaper never locates a disk on a shared volume");
     }
 }

@@ -15,7 +15,9 @@ import (
 	"k8s.io/klog/v2"
 	mount "k8s.io/mount-utils"
 
+	"github.com/charlespick/hyper-v-csi/csi-driver/internal/diskidentity"
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/fsstats"
+	"github.com/charlespick/hyper-v-csi/csi-driver/internal/guidnorm"
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/vmbusdisk"
 )
 
@@ -189,6 +191,32 @@ func (s *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolu
 			"publish context %q is %q, which is not a non-negative integer", publishContextLun, lunValue)
 	}
 
+	// Unlike controllerId/lun, this comes from volume_context - CreateVolume
+	// set it once, at creation, and external-provisioner persists it onto the
+	// PV - not the publish context attach returns fresh on every publish. See
+	// volumeContextDiskID and package diskidentity: it is what lets stageVolume
+	// confirm the device vmbusdisk.Resolve finds by controller/LUN is actually
+	// this volume before ever formatting it, rather than trusting the slot.
+	diskID := req.GetVolumeContext()[volumeContextDiskID]
+	if diskID == "" {
+		if !s.driver.AllowMissingDiskID {
+			klog.V(2).InfoS("NodeStageVolume: rejected, missing volume context disk id", "volumeId", volumeID, "target", target)
+			return nil, status.Errorf(codes.InvalidArgument, "volume context %q is required", volumeContextDiskID)
+		}
+		// --allow-missing-disk-id: an operator's explicit acknowledgment that
+		// this PV predates the disk ID check and is running with it disabled
+		// until replaced. stageVolume skips diskidentity.Verify entirely below
+		// rather than trusting a zero-value diskID against it.
+		klog.Warningf(
+			"NodeStageVolume: volume %s has no volume context %q; staging it without verifying the resolved disk's identity because --allow-missing-disk-id is set",
+			volumeID, volumeContextDiskID)
+	} else if _, err := guidnorm.Normalize(diskID); err != nil {
+		klog.V(2).InfoS("NodeStageVolume: rejected, invalid volume context disk id",
+			"volumeId", volumeID, "target", target, "diskId", diskID, "err", err)
+		return nil, status.Errorf(codes.InvalidArgument,
+			"volume context %q is %q, which is not a GUID: %v", volumeContextDiskID, diskID, err)
+	}
+
 	unlock, err := s.acquireMountLock("NodeStageVolume", volumeID, target)
 	if err != nil {
 		klog.V(2).InfoS("NodeStageVolume: rejected, already in progress", "volumeId", volumeID, "target", target)
@@ -202,7 +230,7 @@ func (s *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolu
 	options := mountOptions(mountVolume.GetMountFlags(), readOnly)
 
 	err = runBounded(ctx, clampToCallerDeadline(ctx, stageOperationBudget), unlock, func() error {
-		return s.stageVolume(controllerID, int32(lun), target, fsType, options, readOnly)
+		return s.stageVolume(controllerID, int32(lun), diskID, target, fsType, options, readOnly)
 	})
 	if err != nil {
 		klog.ErrorS(err, "NodeStageVolume: staging failed",
@@ -235,8 +263,12 @@ func (s *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolu
 func runBounded(ctx context.Context, budget time.Duration, unlock func(), work func() error) error {
 	done := make(chan error, 1)
 	go func() {
-		defer unlock()
-		done <- safeWork(work)
+		// Unlock before sending, not after: a deferred unlock ran after the
+		// send, so this could return success while the key was still held,
+		// and an immediate follow-up call on the same key got ABORTED.
+		err := safeWork(work)
+		unlock()
+		done <- err
 	}()
 
 	select {
@@ -270,7 +302,7 @@ func safeWork(work func() error) (err error) {
 // in outlives the RPC when the caller's wait times out first, so it bounds
 // vmbusdisk.Resolve with its own budget (stageOperationBudget) rather than a
 // context that may already be cancelled by the time this returns.
-func (s *nodeServer) stageVolume(controllerID string, lun int32, target, fsType string, options []string, readOnly bool) error {
+func (s *nodeServer) stageVolume(controllerID string, lun int32, diskID, target, fsType string, options []string, readOnly bool) error {
 	// Resolved before the already-mounted check, not after, because that
 	// check now needs devicePath to confirm an existing mount at target is
 	// this volume's own device rather than trusting the path match (see
@@ -285,6 +317,26 @@ func (s *nodeServer) stageVolume(controllerID string, lun int32, target, fsType 
 			return status.Errorf(codes.Aborted, "waiting for the disk to appear in the guest: %v", err)
 		}
 		return status.Errorf(codes.Internal, "resolving device for controller %s lun %d: %v", controllerID, lun, err)
+	}
+
+	// vmbusdisk.Resolve only proves a disk exists at this controller/LUN
+	// slot; it says nothing about which VHDX Hyper-V put there - the gap
+	// resolve github issue 30 is about. Confirming devicePath's own VPD page
+	// 0x83 carries this volume's VirtualDiskId is what actually closes it,
+	// before FormatAndMount ever touches the device. A single small sysfs
+	// read, so this costs nothing worth measuring next to the poll above it.
+	// Both a mismatch and an unreadable page fail closed: guessing which
+	// disk this is risks silently formatting the wrong one.
+	//
+	// diskID is only ever empty here when NodeStageVolume let it through
+	// under --allow-missing-disk-id, in which case there is nothing to check
+	// devicePath against and this falls back to trusting the controller/LUN
+	// slot alone, same as before resolve github issue 30.
+	if diskID != "" {
+		if err := diskidentity.Verify(s.sysRoot, devicePath, diskID); err != nil {
+			return status.Errorf(codes.Internal,
+				"confirming %s is volume %s's own disk before mounting it: %v", devicePath, diskID, err)
+		}
 	}
 
 	alreadyMounted, err := s.alreadyMountedCompatibly(target, "staging target", readOnly, devicePath)

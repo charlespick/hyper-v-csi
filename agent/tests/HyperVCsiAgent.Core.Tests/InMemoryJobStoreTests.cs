@@ -24,6 +24,25 @@ public class InMemoryJobStoreTests
     }
 
     [Fact]
+    public async Task FindActive_ReturnsTheLiveJobOnlyWhilePendingOrRunning()
+    {
+        var store = new InMemoryJobStore();
+        var release = new TaskCompletionSource();
+
+        Assert.Null(store.FindActive("pvc-1", "CreateVolume"));
+
+        var job = store.GetOrCreate("pvc-1", "CreateVolume", ["vol-pvc-1"], async (_, _) => await release.Task);
+
+        Assert.Same(job, store.FindActive("pvc-1", "CreateVolume"));
+        Assert.Null(store.FindActive("pvc-1", "DeleteVolume"));
+
+        release.SetResult();
+        await WaitForTerminal(job);
+
+        Assert.Null(store.FindActive("pvc-1", "CreateVolume"));
+    }
+
+    [Fact]
     public async Task GetOrCreate_AfterFailure_StartsAFreshJob()
     {
         var store = new InMemoryJobStore();
@@ -218,10 +237,10 @@ public class InMemoryJobStoreTests
     [Fact]
     public async Task GetOrCreate_RepeatedTarget_IsCountedOnce()
     {
-        // An expand whose stale node hint resolves to the same string as its
-        // volume target is not a caller error worth rejecting - it is one
-        // resource named twice. Counting it twice would leave Pending at 1 after
-        // the job finished and wedge that target forever.
+        // A caller naming the same target twice is not a caller error worth
+        // rejecting - it is one resource named twice. Counting it twice would
+        // leave Pending at 1 after the job finished and wedge that target
+        // forever.
         var store = new InMemoryJobStore();
 
         var job = store.GetOrCreate("1", "Op", ["A", "A"], (_, _) => Task.CompletedTask);

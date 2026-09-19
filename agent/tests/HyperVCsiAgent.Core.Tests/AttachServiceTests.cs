@@ -578,6 +578,12 @@ public sealed class AttachServiceTests : IDisposable
 
         public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) =>
             throw new NotSupportedException();
+
+        public Task<IReadOnlyList<ClusterSharedVolume>> ListSharedVolumesAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<IReadOnlyList<string>> ListNodesAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
     }
 
     private sealed class FakeHostClient : IHyperVHostClient
@@ -713,7 +719,11 @@ public sealed class AttachServiceTests : IDisposable
             return Task.CompletedTask;
         }
 
-        public Task<long> GetDiskSizeAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+        public Task<bool> ReferencesDiskAsync(
+            string hostName, string vmId, string vhdxPath, bool includeDifferencingChains, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
         public Task<long> ResizeDiskAsync(string hostName, string vmId, string vhdxPath, long newSizeBytes, CancellationToken cancellationToken) =>
