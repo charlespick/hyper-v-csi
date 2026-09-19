@@ -184,9 +184,9 @@ This isn't a gap in the search — NetFT is deliberately excluded from the
 cluster's public network model because it isn't a network an
 administrator configures or a resource can depend on; it's self-managing
 infrastructure. Its addresses are self-assigned the same way IPv4 APIPA
-is, which is also why they aren't in DNS. **The address-matching step
-against each node's own `Get-NetIPAddress` output isn't a workaround for
-a missing feature — it's the only mechanism that exists**, because the
+is, which is also why they aren't in DNS. **Matching against the
+addresses each node reports on its own adapter isn't a workaround for a
+missing feature — it's the only mechanism that exists**, because the
 adapter that carries this traffic is intentionally invisible to every
 higher-level cluster API.
 
@@ -194,11 +194,48 @@ The practical mitigation is caching, not avoidance: a NetFT address is
 assigned once per node for as long as that node stays a cluster member
 (comparable to how a NIC keeps its APIPA address until it's reconfigured
 or the link drops) — it is not reassigned per file, per volume, or per
-query. Build the address→node table with one fan-out across
-`Get-ClusterNode` (cluster-node-count-sized, so two calls on this
-cluster) and cache it, refreshing on cluster membership change rather
-than on every open-file lookup. That keeps the resolution step's cost
-independent of how often files are queried.
+query. Build the address→node table with one fan-out across the cluster's
+nodes (`SELECT Name, State FROM MSCluster_Node`, the read behind
+`IClusterService.ListNodesAsync` — cluster-node-count-sized, so two calls
+on this cluster) and cache it, refreshing on cluster membership change
+rather than on every open-file lookup. That keeps the resolution step's
+cost independent of how often files are queried.
+
+### The call shape the agent uses
+
+`Get-NetAdapter -IncludeHidden` is how the adapter was *identified*
+above. It is not what the agent runs. `CimCsvNodeProbe.ReadNetFtAddressesAsync`
+reads a node's addresses with one CIM query, through the same
+`Microsoft.Management.Infrastructure` session every other remote read in
+this agent uses rather than through PowerShell:
+
+```csharp
+using var session = CimSession.Create(nodeName); // null for local
+var options = deadline.Options($"reading NetFT addresses on {nodeName}", cancellationToken);
+
+foreach (var adapter in session.QueryInstances(
+             @"root\cimv2", "WQL",
+             "SELECT IPAddress FROM Win32_NetworkAdapterConfiguration WHERE ServiceName = 'NetFT'",
+             options))
+{
+    // IPAddress is a string[] carrying both the IPv4 APIPA and the IPv6
+    // link-local address the adapter self-assigns.
+}
+```
+
+Keyed on `ServiceName` — the adapter's driver service — rather than on its
+display name or interface alias. Both of those are localized and
+renumbered, and "Local Area Connection* 1" above is exactly the shape
+that cannot be matched on across an arbitrary cluster; the driver service
+name is stable. Unlike the `MSFT_SmbOpenFile` read, this one is ordinary
+WQL: `Win32_NetworkAdapterConfiguration` is a normal CIMv2 provider with
+working `WHERE` support, so nothing has to travel as a custom operation
+option here.
+
+Measured at 60-90ms against a live node, which is why each node's read is
+bounded at 10s rather than the full `HostOperationTimeout`: a node still
+silent after that is not worth holding a table rebuild — and every lookup
+waiting on it — for.
 
 ## A real hostname exists one layer down — not yet a usable join
 
@@ -291,12 +328,11 @@ which is what makes the ambiguity resolvable rather than fatal.
    `Path`, which is a low-level device path.
 4. A match: resolve `ClientComputerName` to a node using a cached
    address→node table (each node's own link-local address on its NetFT
-   adapter — find the adapter with `Get-NetAdapter -IncludeHidden` where
-   `ComponentID` is `ROOT\NetFt`, then read its address with
-   `Get-NetIPAddress -AddressFamily IPv6 -InterfaceIndex <that adapter>`),
-   rebuilt on cluster membership change rather than per lookup — see above
-   for why no cluster API does this translation for you. That node is the
-   holder.
+   adapter, read per node with
+   `SELECT IPAddress FROM Win32_NetworkAdapterConfiguration WHERE ServiceName = 'NetFT'`
+   — see "The call shape the agent uses" above), rebuilt on cluster
+   membership change rather than per lookup — see above for why no cluster
+   API does this translation for you. That node is the holder.
 5. No match: the holder is the coordinator node itself — the empty result
    is only unambiguous because step 1 already established the file is
    open by *someone*.
