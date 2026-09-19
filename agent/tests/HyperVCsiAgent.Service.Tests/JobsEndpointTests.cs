@@ -458,8 +458,8 @@ public sealed class JobsEndpointTests : IDisposable
         JsonDocument.Parse(await response.Content.ReadAsStringAsync());
 
     /// <summary>
-    /// Writes a real placeholder file so the service's existence check and
-    /// atomic rename run against an actual filesystem.
+    /// Writes a real minimal VHDX so the service's existence check, atomic
+    /// rename and VirtualDiskId read-back run against an actual filesystem.
     /// </summary>
     private sealed class FakeVirtualDiskManager : IVirtualDiskManager
     {
@@ -470,7 +470,7 @@ public sealed class JobsEndpointTests : IDisposable
         public async Task CreateDynamicVhdxAsync(string path, long maxInternalSizeBytes, TimeSpan remainingBudget, CancellationToken cancellationToken)
         {
             CreateCount++;
-            await File.WriteAllTextAsync(path, "fake vhdx", cancellationToken);
+            await File.WriteAllBytesAsync(path, MinimalVhdxBuilder.Build(maxInternalSizeBytes, Guid.NewGuid()), cancellationToken);
             _sizes[Path.GetFileName(path)] = maxInternalSizeBytes;
         }
 
