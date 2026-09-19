@@ -380,8 +380,22 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
             var disks = ReadActiveDisks(session, vmIds, deadline, cancellationToken);
+            if (disks.Count == 0 && vmIds.Count > 0)
+            {
+                // Every VM the cluster places here, and not one registered
+                // with this host's vmms. One of them having migrated since the
+                // cluster was read is ordinary; all of them at once is more
+                // likely a host this read cannot see into than a host that
+                // emptied, and "none of these VMs references the path" would
+                // be a positive claim made on no evidence. Refused, so the
+                // caller counts this host as one it could not ask.
+                throw new InvalidOperationException(
+                    $"the cluster places {string.Join(", ", vmIds)} on {hostName}, but none of them has an active " +
+                    "configuration there");
+            }
+
             return FindDiskReferences(
-                session, disks, vhdxPath, includeDifferencingChains, _hostOperationTimeout, cancellationToken, _logger);
+                session, disks, vhdxPath, includeDifferencingChains, deadline, cancellationToken, _logger);
         }, cancellationToken);
 
     public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken) =>
@@ -876,13 +890,22 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     /// the path, so it is set aside rather than allowed to stop the walk.
     /// </para>
     /// <para>
-    /// Each VM's chains get a <paramref name="budgetPerVm"/> of their own
-    /// rather than sharing one across the host, the budget each VM had when it
-    /// was asked about alone. The walk is a read per disk per hop, so its cost
-    /// does grow with the VMs on the host, unlike the configuration match; one
-    /// shared budget would let a dense host run out part way and take the VMs
-    /// already found down with it. A VM whose own budget runs out is reported
-    /// as unresolved, the same as a chain that cannot be walked.
+    /// One <paramref name="deadline"/> for the whole call, the one
+    /// <see cref="FindDiskReferencesAsync"/> started - absolute, as
+    /// <see cref="CimDeadline"/> is everywhere, so a host call has one bound
+    /// however many VMs it walks, and the host slot the caller holds across it
+    /// is held no longer than that. The walk is a read per disk per hop, so on
+    /// a dense host it can outrun that budget. What it found by then is kept,
+    /// not discarded: every VM's configuration is matched in memory first, at
+    /// no cost to the budget, and a VM the walk reached and found built on the
+    /// path is an answer whether or not the walk got further. The VMs it did
+    /// not get to walk are reported unresolved, the same as a chain that
+    /// cannot be walked - not read as "no" - and the answer as a whole is
+    /// marked <see cref="DiskReferences.RanOutOfTime"/>, since the host has
+    /// then not answered for all its VMs. A read the budget ran out on while
+    /// in flight comes back as a <see cref="CimException"/> rather than the
+    /// <see cref="TimeoutException"/> of one refused before it was issued, and
+    /// is treated the same once the budget is spent.
     /// </para>
     /// </remarks>
     private static DiskReferences FindDiskReferences(
@@ -890,58 +913,83 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         Dictionary<string, List<string>> disks,
         string vhdxPath,
         bool includeDifferencingChains,
-        TimeSpan budgetPerVm,
+        CimDeadline deadline,
         CancellationToken cancellationToken,
         ILogger logger)
     {
         var references = new List<string>();
         var unresolved = new List<UnresolvedDiskReference>();
+
+        // Configuration first, for every VM: in memory, so it can never be the
+        // part the budget runs out on.
+        var toWalk = new List<(string VmId, List<string> Paths)>();
+        foreach (var (vmId, paths) in disks)
+        {
+            if (paths.Any(path => SamePath(path, vhdxPath)))
+            {
+                references.Add(vmId);
+            }
+            else if (includeDifferencingChains && paths.Count > 0)
+            {
+                toWalk.Add((vmId, paths));
+            }
+        }
+
         CimInstance? imageService = null;
+        var ranOutOfTime = false;
         try
         {
-            foreach (var (vmId, paths) in disks)
+            for (var next = 0; next < toWalk.Count; next++)
             {
-                if (paths.Any(path => SamePath(path, vhdxPath)))
-                {
-                    references.Add(vmId);
-                    continue;
-                }
-
-                if (!includeDifferencingChains || paths.Count == 0)
-                {
-                    continue;
-                }
-
-                var deadline = CimDeadline.After(budgetPerVm);
-                imageService ??= GetImageManagementService(session, deadline, cancellationToken);
-
+                var (vmId, paths) = toWalk[next];
                 var chainFailures = new List<string>();
                 var builtOn = false;
-                foreach (var attached in paths)
+                try
                 {
-                    try
+                    imageService ??= GetImageManagementService(session, deadline, cancellationToken);
+                    foreach (var attached in paths)
                     {
-                        if (IsBuiltOn(session, imageService, attached, vhdxPath, deadline, cancellationToken))
+                        try
                         {
-                            builtOn = true;
-                            break;
+                            if (IsBuiltOn(session, imageService, attached, vhdxPath, deadline, cancellationToken))
+                            {
+                                builtOn = true;
+                                break;
+                            }
+                        }
+                        catch (CimException) when (deadline.HasExpired)
+                        {
+                            // A call the budget ran out on in flight comes back
+                            // as a CimException, not the TimeoutException one
+                            // refused before it was issued - the same budget
+                            // spent either way, so the same answer below rather
+                            // than one chain's failure followed by the next
+                            // read failing for want of time.
+                            throw;
+                        }
+                        catch (Exception ex) when (ex is InvalidOperationException or CimException)
+                        {
+                            logger.LogDebug(ex,
+                                "could not walk {Attached}'s differencing chain on {VmId}; carrying on with its other disks", attached, vmId);
+                            chainFailures.Add($"{attached}: {ex.Message}");
                         }
                     }
-                    catch (Exception ex) when (ex is InvalidOperationException or CimException)
-                    {
-                        logger.LogDebug(ex,
-                            "could not walk {Attached}'s differencing chain on {VmId}; carrying on with its other disks", attached, vmId);
-                        chainFailures.Add($"{attached}: {ex.Message}");
-                    }
-                    catch (TimeoutException ex)
-                    {
-                        // This VM's own budget is spent, so every chain still
-                        // to walk on it would fail the same way - but the VMs
-                        // after it each start a budget of their own.
-                        logger.LogDebug(ex, "ran out of time walking {VmId}'s differencing chains at {Attached}", vmId, attached);
-                        chainFailures.Add($"{attached} and any after it: {ex.Message}");
-                        break;
-                    }
+                }
+                catch (Exception ex) when (ex is TimeoutException || (ex is CimException && deadline.HasExpired))
+                {
+                    // The call's budget is spent, and every read still to make
+                    // would fail the same way. Kept: whatever was found. Owed:
+                    // this VM and every one after it, as not known either way -
+                    // and the host as a whole, as not fully asked.
+                    logger.LogDebug(ex,
+                        "ran out of time walking differencing chains at {VmId}, with {Remaining} VMs left to walk",
+                        vmId, toWalk.Count - next);
+                    unresolved.AddRange(toWalk.Skip(next).Select(left => new UnresolvedDiskReference(
+                        left.VmId,
+                        $"no disk on it was found to be {vhdxPath}, and the walk of its differencing chains ran out of " +
+                        $"time before it could tell: {ex.Message}")));
+                    ranOutOfTime = true;
+                    break;
                 }
 
                 if (builtOn)
@@ -962,7 +1010,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             imageService?.Dispose();
         }
 
-        return new DiskReferences(references, unresolved);
+        return new DiskReferences(references, unresolved, ranOutOfTime);
     }
 
     /// <summary>

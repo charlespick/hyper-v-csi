@@ -106,18 +106,36 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
         // chains first would make every VM on a candidate node pay a read per
         // disk per hop before the one that simply lists the path is reached.
         var failures = new List<string>();
+        var unaskedHosts = new List<string>();
         foreach (var includeDifferencingChains in new[] { false, true })
         {
             failures.Clear();
+            unaskedHosts.Clear();
             foreach (var stage in stages)
             {
                 var matches = await FindReferencingVmsAsync(
-                    vms, stage, fullPath, includeDifferencingChains, failures, cancellationToken).ConfigureAwait(false);
+                    vms, stage, fullPath, includeDifferencingChains, failures, unaskedHosts, cancellationToken).ConfigureAwait(false);
 
                 switch (matches.Count)
                 {
                     case 0:
                         continue;
+
+                    case 1 when unaskedHosts.Count > 0:
+                        // One VM found, but a node that could be holding the
+                        // file was never asked at all. The refusal below - two
+                        // VMs referencing one path - is only as good as having
+                        // asked every candidate, and a second VM on the node
+                        // that could not be asked is exactly what it exists to
+                        // catch. A VM that could not be checked on a node that
+                        // did answer is a different matter, and does not stop
+                        // this: that is one VM's configuration, not a node's
+                        // whole worth of VMs.
+                        throw new InvalidOperationException(
+                            $"{path} is referenced by {matches[0].VmId} on {matches[0].HostName}, but " +
+                            $"{string.Join(", ", unaskedHosts)} could not be asked, or did not answer for every VM in " +
+                            $"time, whether a VM there references it too, so {matches[0].VmId} cannot be told to be " +
+                            $"the only one: {string.Join("; ", failures)}");
 
                     case 1:
                         _logger.LogDebug(
@@ -172,7 +190,7 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
 
             try
             {
-                var info = await _host.GetDiskInfoAsync(hostName, path, cancellationToken).ConfigureAwait(false);
+                var info = await _host.GetDiskInfoAsync(hostName, fullPath, cancellationToken).ConfigureAwait(false);
                 _logger.LogDebug(
                     "{Path} read through {HostName}, per {Coordinator}'s CSV open files", fullPath, hostName, volume.CoordinatorNode);
                 return new HeldDiskInfo(hostName, info);
@@ -280,10 +298,18 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
     /// Whatever cannot be checked - a VM whose differencing chains cannot be
     /// walked, or a host that cannot be asked at all - is recorded in
     /// <paramref name="failures"/> and passed over rather than allowed to stop
-    /// the rest: it says nothing about whether another VM references the path.
+    /// the other hosts being asked: it says nothing about whether another VM
+    /// references the path. A host that could not be asked, or did not get
+    /// through all of its VMs in time, is also recorded in
+    /// <paramref name="unaskedHosts"/>, which is what stops
+    /// <see cref="LocateAsync"/> believing a single VM found elsewhere.
+    /// </para>
+    /// <para>
     /// A VM the cluster lists on a host that no longer has it has migrated
     /// since the listing, and wherever it went, it is not what has this file
-    /// open here; the host simply does not answer for it.
+    /// open here; the host simply does not answer for it - unless the host
+    /// has none of the VMs the cluster lists there, which the host refuses as
+    /// a contradiction and this counts as a host not asked.
     /// </para>
     /// </remarks>
     private async Task<List<VhdxLocation>> FindReferencingVmsAsync(
@@ -292,6 +318,7 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
         string fullPath,
         bool includeDifferencingChains,
         List<string> failures,
+        List<string> unaskedHosts,
         CancellationToken cancellationToken)
     {
         var matches = new List<VhdxLocation>();
@@ -311,14 +338,16 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
             // while it traces, and holding one across every candidate would
             // starve those nodes' attaches for the length of the trace. One
             // slot for the call, not the cap: in the differencing pass that
-            // call is a whole host's chain walk, but it still leaves the
-            // host's other slots to its attaches.
+            // call is a whole host's chain walk, but it is one call under one
+            // HostOperationTimeout however many VMs it walks, and it leaves
+            // the host's other slots to its attaches.
             if (!await TryTakeHostSlotAsync(hostName, cancellationToken).ConfigureAwait(false))
             {
                 _logger.LogWarning(
                     "could not ask {HostName} whether its VMs reference {Path}: {Reason}; carrying on with the others",
                     hostName, fullPath, SlotWaitTimedOut(hostName));
                 failures.Add($"the VMs on {hostName} ({string.Join(", ", vmIds)}): {SlotWaitTimedOut(hostName)}");
+                unaskedHosts.Add(hostName);
                 continue;
             }
 
@@ -333,6 +362,7 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
                 _logger.LogWarning(ex,
                     "could not ask {HostName} whether its VMs reference {Path}; carrying on with the others", hostName, fullPath);
                 failures.Add($"the VMs on {hostName} ({string.Join(", ", vmIds)}): {ex.Message}");
+                unaskedHosts.Add(hostName);
                 continue;
             }
             finally
@@ -347,6 +377,13 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
                     "could not tell whether {VmId} on {HostName} references {Path}: {Reason}; carrying on with the others",
                     unresolved.VmId, hostName, fullPath, unresolved.Reason);
                 failures.Add($"{unresolved.VmId} on {hostName}: {unresolved.Reason}");
+            }
+
+            if (references.RanOutOfTime)
+            {
+                // Answered, but not for every VM on it: as good as a host not
+                // asked where a second VM referencing the path is concerned.
+                unaskedHosts.Add(hostName);
             }
         }
 

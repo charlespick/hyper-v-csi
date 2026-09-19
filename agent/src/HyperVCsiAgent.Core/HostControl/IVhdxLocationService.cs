@@ -45,7 +45,9 @@ public interface IVhdxLocationService
     /// the path, or - with no VM found to reference it - a VM's differencing
     /// chain could not be walked far enough to tell, or a candidate node could
     /// not be asked at all, whether it failed or none of its host operation
-    /// slots came free in time. Each is refused rather than guessed past.
+    /// slots came free in time. A node that could not be asked also refuses a
+    /// single VM found elsewhere, since a second VM referencing the path there
+    /// cannot be ruled out. Each is refused rather than guessed past.
     /// </exception>
     Task<VhdxLocation?> LocateAsync(string path, CancellationToken cancellationToken);
 

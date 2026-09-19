@@ -66,13 +66,25 @@ public interface IHyperVHostClient
     /// asking about a host running a hundred VMs costs the same round trips as
     /// asking about one running a single VM. A VM in
     /// <paramref name="vmIds"/> that is not registered on the host - migrated
-    /// away since the caller listed it - is simply not among the answers.
+    /// away since the caller listed it - is simply not among the answers, as
+    /// long as some other VM asked about is; the host having none of them at
+    /// all is refused rather than answered.
+    /// <para>
+    /// One host-operation budget bounds the whole call. A differencing walk
+    /// that outruns it keeps whatever it found, reports the VMs it did not get
+    /// to as <see cref="DiskReferences.Unresolved"/>, and says so with
+    /// <see cref="DiskReferences.RanOutOfTime"/>.
+    /// </para>
     /// </remarks>
     /// <param name="includeDifferencingChains">
     /// False answers from configuration alone. True also walks every other
     /// disk's chain, one read per disk per hop - worth paying only once no VM
     /// has been found referencing the path directly.
     /// </param>
+    /// <exception cref="InvalidOperationException">
+    /// None of <paramref name="vmIds"/> has an active configuration on the
+    /// host - a host that cannot be told about, not one that says no.
+    /// </exception>
     Task<DiskReferences> FindDiskReferencesAsync(
         string hostName,
         IReadOnlyCollection<string> vmIds,

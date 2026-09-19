@@ -544,13 +544,116 @@ public sealed class CsvFileOwnershipServiceTests
     }
 
     [Fact]
-    public async Task LocateAsync_AHostThatCannotBeAsked_DoesNotHideAnotherThatHoldsThePath()
+    public async Task LocateAsync_ASingleVmFound_IsRefusedWhileANodeThatCouldHoldThePathWasNeverAsked()
     {
+        // csidev03's VM references the path, but csidev01 has it open too and
+        // could not be asked. A second VM there - a differencing base shared
+        // by two VMs' children - is exactly what the two-VM refusal exists to
+        // catch, and it can only catch what it was allowed to ask.
         _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address), new(PvcRelative, Dev03Address)];
         _host.Unreachable.Add("csidev01");
         _host.References.Add(("csidev03", "vm-3"));
 
-        Assert.Equal(new VhdxLocation("csidev03", "vm-3"), await NewService().LocateAsync(Pvc, CancellationToken.None));
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => NewService().LocateAsync(Pvc, CancellationToken.None));
+
+        Assert.Contains("referenced by vm-3 on csidev03", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("csidev01 could not be asked, or did not answer for every VM in time", failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task LocateAsync_ASingleVmFound_IsRefusedWhenAListedNodesSlotsNeverCameFree()
+    {
+        // The same refusal when the node was not asked because the wait for
+        // one of its host slots ran out, rather than because it failed.
+        _options.HostOperationTimeout = TimeSpan.FromMilliseconds(100);
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address), new(PvcRelative, Dev03Address)];
+        _host.References.Add(("csidev03", "vm-3"));
+        for (var slot = 0; slot < _options.MaxConcurrentHostOperations; slot++)
+        {
+            await _slots.WaitAsync("csidev01", CancellationToken.None);
+        }
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => NewService().LocateAsync(Pvc, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10)));
+
+        Assert.Contains("csidev01 could not be asked, or did not answer for every VM in time", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("operation slots on csidev01", failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task LocateAsync_ASingleVmFound_OnANodeThatAnswered_StandsDespiteAnUncheckableVmThere()
+    {
+        // The narrower case keeps its old answer: a node that answered, with
+        // one VM whose chains could not be walked, is one VM's configuration
+        // in doubt, not a whole node left unasked.
+        _cluster.Vms = [new("vm-1", "csidev01"), new("vm-4", "csidev01"), new("vm-2", "csidev02")];
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address)];
+        _host.Unreadable.Add("vm-4");
+        _host.ChainReferences.Add(("csidev01", "vm-1"));
+
+        Assert.Equal(new VhdxLocation("csidev01", "vm-1"), await NewService().LocateAsync(Pvc, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task LocateAsync_AHostThatCannotBeAsked_InALaterStage_DoesNotStopAnEarlierMatch()
+    {
+        // The coordinator is only asked when no listed node's VM references
+        // the path; a listed node that does answer ends the trace before the
+        // coordinator is reached, asked or not.
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address)];
+        _host.Unreachable.Add("csidev02");
+        _host.References.Add(("csidev01", "vm-1"));
+
+        Assert.Equal(new VhdxLocation("csidev01", "vm-1"), await NewService().LocateAsync(Pvc, CancellationToken.None));
+        Assert.Equal(["csidev01"], _host.ReferenceCalls);
+    }
+
+    [Fact]
+    public async Task LocateAsync_ASingleVmFound_IsRefusedWhenAListedNodeRanOutOfTimeWalkingChains()
+    {
+        // The chain pass, where a differencing base shared by two VMs' children
+        // shows up: csidev01 answered, but ran out of time before walking all
+        // its VMs, so it has not said none of them is built on the path either.
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address), new(PvcRelative, Dev03Address)];
+        _host.RunsOutOfTime.Add("csidev01");
+        _host.ChainReferences.Add(("csidev03", "vm-3"));
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => NewService().LocateAsync(Pvc, CancellationToken.None));
+
+        Assert.Contains("referenced by vm-3 on csidev03", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("csidev01 could not be asked, or did not answer for every VM in time", failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task LocateAsync_ASingleVmFound_IsRefusedWhenAListedNodeHasNoneOfItsClusteredVms()
+    {
+        // The cluster places vm-1 on csidev01, and csidev01 has no such VM:
+        // a contradiction the host refuses, not a "no" - so it counts as a
+        // node not asked, and vm-3 cannot be told to be the only VM.
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address), new(PvcRelative, Dev03Address)];
+        _host.Migrated.Add("vm-1");
+        _host.References.Add(("csidev03", "vm-3"));
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => NewService().LocateAsync(Pvc, CancellationToken.None));
+
+        Assert.Contains("csidev01 could not be asked", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("none of them has an active configuration there", failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ReadThroughHolderAsync_ReadsTheNormalizedPath()
+    {
+        // The node is asked to read the same normalized path the volume was
+        // matched against, not whatever spelling the caller passed.
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address)];
+        _host.Readable["csidev01"] = new HostDiskInfo(4096, Guid.NewGuid());
+
+        await NewService().ReadThroughHolderAsync(@"C:\ClusterStorage\Volume2\hyperv-csi\.\volumes\pvc-1.vhdx", CancellationToken.None);
+
+        Assert.Equal([Pvc], _host.DiskInfoPaths);
     }
 
     [Fact]
@@ -879,6 +982,9 @@ public sealed class CsvFileOwnershipServiceTests
         /// <summary>VMs with an unrelated disk whose differencing chain cannot be walked.</summary>
         public HashSet<string> Unreadable { get; } = [];
 
+        /// <summary>Hosts whose differencing walk runs out of its budget before walking any chain.</summary>
+        public HashSet<string> RunsOutOfTime { get; } = new(StringComparer.OrdinalIgnoreCase);
+
         /// <summary>Hosts that cannot be asked at all.</summary>
         public HashSet<string> Unreachable { get; } = new(StringComparer.OrdinalIgnoreCase);
 
@@ -904,6 +1010,9 @@ public sealed class CsvFileOwnershipServiceTests
         /// <summary>Every host asked to read the path, in the order it was asked.</summary>
         public List<string> DiskInfoCalls { get; } = [];
 
+        /// <summary>The path each of <see cref="DiskInfoCalls"/> was asked to read.</summary>
+        public List<string> DiskInfoPaths { get; } = [];
+
         public Task<DiskReferences> FindDiskReferencesAsync(
             string hostName, IReadOnlyCollection<string> vmIds, string vhdxPath, bool includeDifferencingChains,
             CancellationToken cancellationToken)
@@ -917,6 +1026,27 @@ public sealed class CsvFileOwnershipServiceTests
             }
 
             var registered = vmIds.Where(vmId => !Migrated.Contains(vmId)).ToList();
+            if (registered.Count == 0)
+            {
+                // The real client's refusal of a host with none of the asked
+                // VMs registered.
+                throw new InvalidOperationException(
+                    $"the cluster places {string.Join(", ", vmIds)} on {hostName}, but none of them has an active configuration there");
+            }
+
+            if (includeDifferencingChains && RunsOutOfTime.Contains(hostName))
+            {
+                // The budget spent before any chain was walked: direct
+                // references kept, every other VM owed.
+                var direct = registered.Where(vmId => References.Contains((hostName, vmId))).ToList();
+                return Task.FromResult(new DiskReferences(
+                    direct,
+                    registered.Except(direct)
+                        .Select(vmId => new UnresolvedDiskReference(vmId, "the walk ran out of time before it could tell"))
+                        .ToList(),
+                    RanOutOfTime: true));
+            }
+
             var references = registered
                 .Where(vmId => References.Contains((hostName, vmId))
                     || (includeDifferencingChains && ChainReferences.Contains((hostName, vmId))))
@@ -951,6 +1081,7 @@ public sealed class CsvFileOwnershipServiceTests
             lock (DiskInfoCalls)
             {
                 DiskInfoCalls.Add(hostName);
+                DiskInfoPaths.Add(vhdxPath);
             }
 
             return Readable.TryGetValue(hostName, out var info)
