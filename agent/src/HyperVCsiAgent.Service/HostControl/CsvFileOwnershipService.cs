@@ -39,8 +39,8 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
     /// Seconds, the same order as MsClusterService's own resource-name cache:
     /// coordination fails over and rebalances on its own. A stale coordinator
     /// is not silently wrong here - the node asked lists nothing for the
-    /// volume, which <see cref="LocateAsync"/> rechecks before believing - but
-    /// each one costs a second listing.
+    /// volume, which is rechecked before it is believed - but each one costs a
+    /// second read of that volume's coordinator and a second listing.
     /// </summary>
     public static readonly TimeSpan SharedVolumeCacheTtl = TimeSpan.FromSeconds(5);
 
@@ -63,8 +63,15 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
     private readonly ILogger<CsvFileOwnershipService> _logger;
 
     private readonly SemaphoreSlim _volumesLock = new(1, 1);
-    private IReadOnlyList<ClusterSharedVolume>? _volumes;
+    private IReadOnlyList<CachedVolume>? _volumes;
+    private long _volumesReadAt;
     private DateTimeOffset _volumesExpireAt = DateTimeOffset.MinValue;
+
+    /// <summary>
+    /// A logical clock ordering readings of the cluster against the probes
+    /// that act on them - see <see cref="NextStamp"/>.
+    /// </summary>
+    private long _stamps;
 
     public CsvFileOwnershipService(
         IClusterService cluster,
@@ -194,8 +201,11 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
     private async Task<(ClusterSharedVolume Volume, IReadOnlySet<string> Holders, string[][] Stages)> FindCandidatesAsync(
         string path, string fullPath, CancellationToken cancellationToken)
     {
-        var volume = await FindVolumeAsync(fullPath, forceRefresh: false, cancellationToken).ConfigureAwait(false)
-            ?? await FindVolumeAsync(fullPath, forceRefresh: true, cancellationToken).ConfigureAwait(false)
+        // A path on no volume in the cached reading may be on one created since
+        // - but only a reading older than this lookup could have missed it.
+        var lookupStamp = NextStamp();
+        var volume = await FindVolumeAsync(fullPath, refreshIfReadBefore: null, cancellationToken).ConfigureAwait(false)
+            ?? await FindVolumeAsync(fullPath, refreshIfReadBefore: lookupStamp, cancellationToken).ConfigureAwait(false)
             ?? throw new InvalidOperationException(NotOnSharedVolume(path));
 
         var holders = await ReadHoldersAsync(volume, fullPath, tolerateFailure: true, cancellationToken).ConfigureAwait(false);
@@ -207,7 +217,21 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
             // node asked no longer sees this volume's opens. Asked once more -
             // of the new coordinator if it changed, of the same node if the
             // listing itself failed - and this time a failure is final.
-            var fresh = await FindVolumeAsync(fullPath, forceRefresh: true, cancellationToken).ConfigureAwait(false)
+            //
+            // Only this one volume's coordinator is in question, so only it is
+            // re-read, keyed; every volume is listed again only if its disk
+            // resource has gone from the cluster altogether.
+            //
+            // Stamped once the listing has answered, not when it was asked: a
+            // move that lands while the listing is in flight is exactly what
+            // empties it, and only a reading started after the answer is sure
+            // to have seen that move.
+            var probeStamp = NextStamp();
+            _logger.LogDebug(
+                "{Coordinator} listed nothing open for {Path}, or could not be asked; confirming who coordinates {Volume} now",
+                volume.CoordinatorNode, fullPath, volume.Path);
+            var fresh = await ConfirmCoordinatorAsync(volume, probeStamp, cancellationToken).ConfigureAwait(false)
+                ?? await FindVolumeAsync(fullPath, refreshIfReadBefore: probeStamp, cancellationToken).ConfigureAwait(false)
                 ?? throw new InvalidOperationException(NotOnSharedVolume(path));
 
             if (holders is null || !string.Equals(fresh.CoordinatorNode, volume.CoordinatorNode, StringComparison.OrdinalIgnoreCase))
@@ -410,38 +434,59 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
     /// The Cluster Shared Volume <paramref name="fullPath"/> lives on, or null
     /// if none of the volumes the cluster reports contains it.
     /// </summary>
+    /// <param name="refreshIfReadBefore">
+    /// Null to take the cached reading while it is within
+    /// <see cref="SharedVolumeCacheTtl"/>. Otherwise a <see cref="NextStamp"/>
+    /// the caller took before whatever made the cached reading suspect: the
+    /// volumes are listed again unless the cached reading started after it -
+    /// see <see cref="GetVolumesAsync"/>.
+    /// </param>
     private async Task<ClusterSharedVolume?> FindVolumeAsync(
-        string fullPath, bool forceRefresh, CancellationToken cancellationToken)
+        string fullPath, long? refreshIfReadBefore, CancellationToken cancellationToken)
     {
-        var volumes = await GetVolumesAsync(forceRefresh, cancellationToken).ConfigureAwait(false);
+        var volumes = await GetVolumesAsync(refreshIfReadBefore, cancellationToken).ConfigureAwait(false);
 
         ClusterSharedVolume? best = null;
-        foreach (var volume in volumes)
+        foreach (var cached in volumes)
         {
-            var root = volume.Path.TrimEnd('\\');
+            var root = cached.Volume.Path.TrimEnd('\\');
             if (fullPath.Length > root.Length + 1
                 && fullPath[root.Length] == '\\'
                 && fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase)
                 && (best is null || root.Length > best.Path.Length))
             {
-                best = volume with { Path = root };
+                best = cached.Volume with { Path = root };
             }
         }
 
         return best;
     }
 
-    private async Task<IReadOnlyList<ClusterSharedVolume>> GetVolumesAsync(bool forceRefresh, CancellationToken cancellationToken)
+    /// <remarks>
+    /// A forced refresh is judged against when the cached reading was taken,
+    /// not simply done. What the caller needs is a reading that cannot predate
+    /// whatever made it doubt the one it had; a reading some other lookup
+    /// started after that point already is one. So a burst of lookups that all
+    /// doubt the same reading - a provisioner restart replaying every bound PVC
+    /// at once - lists the volumes once between them rather than once each.
+    /// </remarks>
+    private async Task<IReadOnlyList<CachedVolume>> GetVolumesAsync(long? refreshIfReadBefore, CancellationToken cancellationToken)
     {
         await _volumesLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            if (!forceRefresh && _volumes is { } cached && _timeProvider.GetUtcNow() < _volumesExpireAt)
+            if (_volumes is { } cached
+                && (refreshIfReadBefore is { } stamp
+                    ? _volumesReadAt > stamp
+                    : _timeProvider.GetUtcNow() < _volumesExpireAt))
             {
                 return cached;
             }
 
-            _volumes = await _cluster.ListSharedVolumesAsync(cancellationToken).ConfigureAwait(false);
+            var readAt = NextStamp();
+            var volumes = await _cluster.ListSharedVolumesAsync(cancellationToken).ConfigureAwait(false);
+            _volumes = volumes.Select(volume => new CachedVolume(volume, readAt)).ToArray();
+            _volumesReadAt = readAt;
 
             // From when the read finished, not when it started - the same
             // reasoning MsClusterService gives for its own cache.
@@ -453,6 +498,102 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
             _volumesLock.Release();
         }
     }
+
+    /// <summary>
+    /// <paramref name="volume"/> with the coordinator the cluster reports for
+    /// it now, read keyed on its one disk resource - or null when the cluster
+    /// no longer reports that resource, or reports it with no owner, and only
+    /// a fresh listing of every volume can say where the path now lives.
+    /// </summary>
+    /// <remarks>
+    /// The question an empty or failed open-file listing raises is whether
+    /// this one volume's coordination moved since the reading the listing was
+    /// asked of, and that is one resource's owner - not every volume and every
+    /// resource in the cluster, which is what listing the volumes again reads.
+    /// <para>
+    /// Skipped when this volume's coordinator was already read after
+    /// <paramref name="probeStamp"/> - taken once the probe had answered - by
+    /// another lookup's own confirmation or by a fresh listing: that reading
+    /// started after the probe came back empty, so it cannot predate it, which
+    /// is the whole of what this read is for. The answer is written back to
+    /// the cache, so the lookups after it ask the right node first.
+    /// </para>
+    /// <para>
+    /// A listing started after the probe that no longer has this volume at all
+    /// is an answer too: the disk has stopped being a Cluster Shared Volume,
+    /// which a keyed read of its resource - still a cluster disk, still owned -
+    /// would not say. Null then, for that listing to decide where the path is.
+    /// </para>
+    /// </remarks>
+    private async Task<ClusterSharedVolume?> ConfirmCoordinatorAsync(
+        ClusterSharedVolume volume, long probeStamp, CancellationToken cancellationToken)
+    {
+        await _volumesLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var index = -1;
+            for (var i = 0; _volumes is not null && i < _volumes.Count; i++)
+            {
+                if (string.Equals(_volumes[i].Volume.ResourceName, volume.ResourceName, StringComparison.OrdinalIgnoreCase))
+                {
+                    index = i;
+                    break;
+                }
+            }
+
+            if (index >= 0 && _volumes![index].ReadAt > probeStamp)
+            {
+                return volume with { CoordinatorNode = _volumes[index].Volume.CoordinatorNode };
+            }
+
+            if (index < 0 && _volumes is not null && _volumesReadAt > probeStamp)
+            {
+                return null;
+            }
+
+            var readAt = NextStamp();
+            var coordinator = await _cluster.GetSharedVolumeCoordinatorAsync(volume, cancellationToken).ConfigureAwait(false);
+            if (coordinator is null)
+            {
+                return null;
+            }
+
+            var confirmed = volume with { CoordinatorNode = coordinator };
+            if (index >= 0)
+            {
+                var volumes = _volumes!.ToArray();
+                volumes[index] = new CachedVolume(volumes[index].Volume with { CoordinatorNode = coordinator }, readAt);
+                _volumes = volumes;
+            }
+
+            return confirmed;
+        }
+        finally
+        {
+            _volumesLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// The next value of a logical clock private to this service, taken before
+    /// every read of the cluster's volumes, at the start of each lookup, and
+    /// once an open-file listing has come back empty or failed. A reading
+    /// stamped after one of those stamps started after that point, so it
+    /// cannot be the stale reading that made the lookup doubt the one it had.
+    /// </summary>
+    /// <remarks>
+    /// A counter, not a timestamp: two operations inside one tick of the clock
+    /// would compare equal, and "did this reading start after that probe" has
+    /// to have an answer.
+    /// </remarks>
+    private long NextStamp() => Interlocked.Increment(ref _stamps);
+
+    /// <summary>
+    /// One volume as last read, and the <see cref="NextStamp"/> taken before
+    /// that read started - by a listing of every volume, or by a keyed
+    /// confirmation of this one's coordinator.
+    /// </summary>
+    private sealed record CachedVolume(ClusterSharedVolume Volume, long ReadAt);
 
     private static string NotOnSharedVolume(string path) =>
         $"{path} is not on any Cluster Shared Volume the cluster reports a coordinator for, so there is no node to ask who has it open";

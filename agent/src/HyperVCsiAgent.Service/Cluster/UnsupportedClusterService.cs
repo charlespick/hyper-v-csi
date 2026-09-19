@@ -30,6 +30,9 @@ public sealed class UnsupportedClusterService : IClusterService
     public Task<IReadOnlyList<ClusterSharedVolume>> ListSharedVolumesAsync(CancellationToken cancellationToken) =>
         throw Unsupported();
 
+    public Task<string?> GetSharedVolumeCoordinatorAsync(ClusterSharedVolume volume, CancellationToken cancellationToken) =>
+        throw Unsupported();
+
     public Task<IReadOnlyList<string>> ListNodesAsync(CancellationToken cancellationToken) =>
         throw Unsupported();
 

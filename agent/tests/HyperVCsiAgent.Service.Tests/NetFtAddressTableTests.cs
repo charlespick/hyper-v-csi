@@ -267,5 +267,8 @@ public sealed class NetFtAddressTableTests
 
         public Task<IReadOnlyList<ClusterSharedVolume>> ListSharedVolumesAsync(CancellationToken cancellationToken) =>
             throw new NotSupportedException();
+
+        public Task<string?> GetSharedVolumeCoordinatorAsync(ClusterSharedVolume volume, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
     }
 }

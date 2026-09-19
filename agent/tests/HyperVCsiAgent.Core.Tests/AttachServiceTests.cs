@@ -582,6 +582,9 @@ public sealed class AttachServiceTests : IDisposable
         public Task<IReadOnlyList<ClusterSharedVolume>> ListSharedVolumesAsync(CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
+        public Task<string?> GetSharedVolumeCoordinatorAsync(ClusterSharedVolume volume, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
         public Task<IReadOnlyList<string>> ListNodesAsync(CancellationToken cancellationToken) =>
             throw new NotSupportedException();
     }

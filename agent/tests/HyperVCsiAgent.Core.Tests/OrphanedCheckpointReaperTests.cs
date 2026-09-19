@@ -495,6 +495,9 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
         public Task<IReadOnlyList<ClusterSharedVolume>> ListSharedVolumesAsync(CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
+        public Task<string?> GetSharedVolumeCoordinatorAsync(ClusterSharedVolume volume, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
         public Task<IReadOnlyList<string>> ListNodesAsync(CancellationToken cancellationToken) =>
             throw new NotSupportedException();
     }
@@ -794,6 +797,9 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
             Task.FromResult<IReadOnlyList<ClusteredVm>>(Vms.Values.ToList());
 
         public Task<IReadOnlyList<ClusterSharedVolume>> ListSharedVolumesAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException("the reaper never locates a disk on a shared volume");
+
+        public Task<string?> GetSharedVolumeCoordinatorAsync(ClusterSharedVolume volume, CancellationToken cancellationToken) =>
             throw new NotSupportedException("the reaper never locates a disk on a shared volume");
 
         public Task<IReadOnlyList<string>> ListNodesAsync(CancellationToken cancellationToken) =>

@@ -2471,6 +2471,9 @@ public sealed class SnapshotServiceTests : IDisposable
         public Task<IReadOnlyList<ClusterSharedVolume>> ListSharedVolumesAsync(CancellationToken cancellationToken) =>
             throw new InvalidOperationException("SnapshotService traces through IVhdxLocationService, never the cluster directly");
 
+        public Task<string?> GetSharedVolumeCoordinatorAsync(ClusterSharedVolume volume, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("SnapshotService traces through IVhdxLocationService, never the cluster directly");
+
         public Task<IReadOnlyList<string>> ListNodesAsync(CancellationToken cancellationToken) =>
             throw new InvalidOperationException("SnapshotService traces through IVhdxLocationService, never the cluster directly");
     }
@@ -2615,6 +2618,9 @@ public sealed class SnapshotServiceTests : IDisposable
             throw new NotSupportedException("SnapshotService never lists cluster VMs");
 
         public Task<IReadOnlyList<ClusterSharedVolume>> ListSharedVolumesAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException("SnapshotService traces through IVhdxLocationService, never the cluster directly");
+
+        public Task<string?> GetSharedVolumeCoordinatorAsync(ClusterSharedVolume volume, CancellationToken cancellationToken) =>
             throw new NotSupportedException("SnapshotService traces through IVhdxLocationService, never the cluster directly");
 
         public Task<IReadOnlyList<string>> ListNodesAsync(CancellationToken cancellationToken) =>

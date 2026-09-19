@@ -3,6 +3,7 @@ using HyperVCsiAgent.Core.Configuration;
 using HyperVCsiAgent.Core.HostControl;
 using Microsoft.Extensions.Options;
 using HyperVCsiAgent.Service.HostControl;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace HyperVCsiAgent.Service.Tests;
@@ -23,6 +24,7 @@ public sealed class CsvFileOwnershipServiceTests
     private readonly FakeHost _host = new();
     private readonly AgentOptions _options = new() { MaxConcurrentHostOperations = 4 };
     private readonly HostOperationSlots _slots;
+    private readonly CapturingLogger _logger = new();
 
     public CsvFileOwnershipServiceTests()
     {
@@ -35,7 +37,7 @@ public sealed class CsvFileOwnershipServiceTests
         _probe.Addresses["csidev01"] = ["fe80::5555:2b8c:de84:3bf7"];
         _probe.Addresses["csidev02"] = ["fe80::1429:5bed:d08a:d5a8"];
         _probe.Addresses["csidev03"] = ["fe80::3"];
-        _cluster.Volumes.Enqueue([new ClusterSharedVolume(Volume2, "csidev02")]);
+        _cluster.Volumes.Enqueue([Csv(Volume2, "csidev02")]);
         _cluster.Vms = [new("vm-1", "csidev01"), new("vm-2", "csidev02"), new("vm-3", "csidev03")];
     }
 
@@ -93,9 +95,12 @@ public sealed class CsvFileOwnershipServiceTests
         Assert.Equal(new VhdxLocation("csidev02", "vm-2"), await NewService().LocateAsync(Pvc, CancellationToken.None));
 
         // Only the coordinator's VMs are asked, and the empty listing was
-        // checked against a fresh reading of the coordinator before that.
+        // checked against a fresh reading of the coordinator before that - of
+        // this one volume's coordinator, keyed, not every volume again
+        // (issue #36).
         Assert.Equal(["vm-2"], _host.Asked);
-        Assert.Equal(2, _cluster.SharedVolumeReads);
+        Assert.Equal(1, _cluster.SharedVolumeReads);
+        Assert.Equal(["Cluster Disk (Volume2)"], _cluster.CoordinatorReads);
     }
 
     [Fact]
@@ -197,12 +202,217 @@ public sealed class CsvFileOwnershipServiceTests
     {
         // The cached reading still names csidev02, which no longer sees this
         // volume's opens; the fresh one names csidev01, which does.
-        _cluster.Volumes.Enqueue([new ClusterSharedVolume(Volume2, "csidev01")]);
+        _cluster.Volumes.Enqueue([Csv(Volume2, "csidev01")]);
+        _probe.OpenFiles["csidev01"] = [new(PvcRelative, Dev02Address)];
+        _host.References.Add(("csidev02", "vm-2"));
+        var service = NewService();
+
+        Assert.Equal(new VhdxLocation("csidev02", "vm-2"), await service.LocateAsync(Pvc, CancellationToken.None));
+        Assert.Equal(["csidev02", "csidev01"], _probe.OpenFileReads);
+
+        // Found by re-reading this volume's coordinator alone, and written back:
+        // the next lookup asks the node coordinating it now, first time.
+        Assert.Equal(1, _cluster.SharedVolumeReads);
+        Assert.Equal(["Cluster Disk (Volume2)"], _cluster.CoordinatorReads);
+
+        _probe.OpenFileReads.Clear();
+        Assert.Equal(new VhdxLocation("csidev02", "vm-2"), await service.LocateAsync(Pvc, CancellationToken.None));
+        Assert.Equal(["csidev01"], _probe.OpenFileReads);
+    }
+
+    [Fact]
+    public async Task LocateAsync_WhenTheVolumesDiskResourceIsGone_ListsEveryVolumeAgain()
+    {
+        // The keyed re-read has nothing to answer about: the volume's resource
+        // is no longer in the cluster, so only a fresh listing can say which
+        // volume the path is on now, and who coordinates it.
+        _cluster.Volumes.Enqueue([Csv(Volume2, "csidev01")]);
+        _cluster.GoneResources.Add("Cluster Disk (Volume2)");
         _probe.OpenFiles["csidev01"] = [new(PvcRelative, Dev02Address)];
         _host.References.Add(("csidev02", "vm-2"));
 
         Assert.Equal(new VhdxLocation("csidev02", "vm-2"), await NewService().LocateAsync(Pvc, CancellationToken.None));
+        Assert.Equal(2, _cluster.SharedVolumeReads);
         Assert.Equal(["csidev02", "csidev01"], _probe.OpenFileReads);
+    }
+
+    [Fact]
+    public async Task LocateAsync_EachLookupWhoseListingComesBackEmpty_ConfirmsTheCoordinatorAfresh()
+    {
+        // Sharing a confirmation is only safe between lookups whose probes both
+        // started before it. One lookup after another each probed after the
+        // last confirmation, so each has to confirm for itself.
+        _probe.OpenFiles["csidev02"] = [];
+        _host.References.Add(("csidev02", "vm-2"));
+        var service = NewService();
+
+        await service.LocateAsync(Pvc, CancellationToken.None);
+        await service.LocateAsync(Pvc, CancellationToken.None);
+
+        Assert.Equal(2, _cluster.CoordinatorReads.Count);
+        Assert.Equal(1, _cluster.SharedVolumeReads);
+    }
+
+    [Fact]
+    public async Task ReadThroughHolderAsync_ABurstWhoseListingsAllComeBackEmpty_SharesConfirmationsRatherThanOneEach()
+    {
+        // Issue #36: a provisioner restart replays every bound PVC at once, and
+        // for each whose VM runs on the coordinator the listing comes back
+        // empty. A confirmation that starts after a lookup's listing answered
+        // is as fresh as that lookup needs, so the lookups queued behind one
+        // confirmation share it, or share the one after it - never one each.
+        //
+        // Pinned by holding every listing until all of the lookups are past
+        // finding their volume - which takes the cache's lock the first
+        // confirmation holds - and then holding that confirmation until every
+        // listing has answered: whichever lookup confirms next starts after
+        // all of them, and nothing is left to confirm a third time. Whether
+        // that second one is needed at all depends on which lookup happened to
+        // confirm first, so either count is right; five is not.
+        const int Burst = 5;
+        _probe.OpenFiles["csidev02"] = [];
+        _host.Readable["csidev02"] = new HostDiskInfo(4096, Guid.NewGuid());
+        var service = NewService();
+
+        // Warm the volume cache, so every lookup in the burst probes from the
+        // same reading.
+        await service.ReadThroughHolderAsync(Pvc, CancellationToken.None);
+        _cluster.CoordinatorReads.Clear();
+
+        var answered = 0;
+        _logger.OnLog = message =>
+        {
+            if (message.Contains("listed nothing open", StringComparison.Ordinal))
+            {
+                Interlocked.Increment(ref answered);
+            }
+        };
+        var releaseFirstConfirmation = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _cluster.BeforeCoordinatorRead = () => _cluster.CoordinatorReads.Count == 1 ? releaseFirstConfirmation.Task : Task.CompletedTask;
+
+        var probing = 0;
+        var releaseListings = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _probe.BeforeOpenFileRead = () =>
+        {
+            Interlocked.Increment(ref probing);
+            return releaseListings.Task;
+        };
+
+        var reads = Enumerable.Range(0, Burst)
+            .Select(_ => Task.Run(() => service.ReadThroughHolderAsync(Pvc, CancellationToken.None)))
+            .ToArray();
+        await WaitUntilAsync(() => Volatile.Read(ref probing) == Burst);
+        releaseListings.SetResult();
+        await WaitUntilAsync(() => Volatile.Read(ref answered) == Burst && _cluster.CoordinatorReads.Count == 1);
+        releaseFirstConfirmation.SetResult();
+
+        foreach (var read in reads)
+        {
+            Assert.Equal("csidev02", (await read).HostName);
+        }
+
+        Assert.InRange(_cluster.CoordinatorReads.Count, 1, 2);
+        Assert.Equal(1, _cluster.SharedVolumeReads);
+    }
+
+    [Fact]
+    public async Task ReadThroughHolderAsync_AListingNewerThanTheEmptyProbeThatNoLongerHasTheVolume_IsBelieved()
+    {
+        // Another lookup listed the volumes after this one's probe came back
+        // empty, and the volume was gone from that listing: the disk stopped
+        // being a Cluster Shared Volume. A keyed read of its resource - still
+        // a cluster disk, still owned - would say otherwise, so it is not
+        // asked, and the path is refused as on no volume.
+        _probe.OpenFiles["csidev02"] = [new("x.vhdx", Dev01Address)];
+        _host.Readable["csidev01"] = new HostDiskInfo(4096, Guid.NewGuid());
+        var service = NewService();
+
+        var probeAnswered = new ManualResetEventSlim();
+        var resume = new ManualResetEventSlim();
+        _logger.OnLog = message =>
+        {
+            if (message.Contains("listed nothing open", StringComparison.Ordinal) && !probeAnswered.IsSet)
+            {
+                probeAnswered.Set();
+                resume.Wait(TimeSpan.FromSeconds(10));
+            }
+        };
+
+        var stale = Task.Run(() => service.ReadThroughHolderAsync(Pvc, CancellationToken.None));
+        Assert.True(probeAnswered.Wait(TimeSpan.FromSeconds(10)));
+
+        _cluster.Volumes.Clear();
+        _cluster.Volumes.Enqueue([Csv(@"C:\ClusterStorage\Volume3", "csidev02")]);
+        Assert.Equal("csidev01", (await service.ReadThroughHolderAsync(@"C:\ClusterStorage\Volume3\x.vhdx", CancellationToken.None)).HostName);
+        resume.Set();
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(() => stale);
+        Assert.Contains("not on any Cluster Shared Volume", failure.Message, StringComparison.Ordinal);
+        Assert.Empty(_cluster.CoordinatorReads);
+        Assert.Equal(2, _cluster.SharedVolumeReads);
+    }
+
+    [Fact]
+    public async Task ReadThroughHolderAsync_AConfirmationStartedBeforeTheProbeAnswered_IsNotReused()
+    {
+        // Coordination can move while a listing is in flight - that is what
+        // empties it. A confirmation that started before this lookup's listing
+        // answered may have read the coordinator from before the move, so this
+        // lookup confirms again rather than trust it.
+        _probe.OpenFiles["csidev02"] = [];
+        _host.Readable["csidev02"] = new HostDiskInfo(4096, Guid.NewGuid());
+        var service = NewService();
+        await service.ReadThroughHolderAsync(Pvc, CancellationToken.None);
+        _cluster.CoordinatorReads.Clear();
+
+        // The slow lookup's listing goes out first and is held; the quick one
+        // then probes, comes back empty and confirms, all while the slow
+        // listing is still out. Only then does the slow one answer - after
+        // the quick one's confirmation started, so that confirmation may
+        // predate whatever emptied the slow one's listing.
+        var slowListing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var slowListingStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _probe.BeforeOpenFileRead = () =>
+        {
+            if (slowListingStarted.TrySetResult())
+            {
+                return slowListing.Task;
+            }
+
+            return Task.CompletedTask;
+        };
+
+        var slow = Task.Run(() => service.ReadThroughHolderAsync(Pvc, CancellationToken.None));
+        await slowListingStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        await service.ReadThroughHolderAsync(Pvc, CancellationToken.None);
+        Assert.Single(_cluster.CoordinatorReads);
+
+        slowListing.SetResult();
+        await slow;
+
+        Assert.Equal(2, _cluster.CoordinatorReads.Count);
+    }
+
+    [Fact]
+    public async Task LocateAsync_APathOnNoCachedVolume_IsListedAgainOnce()
+    {
+        // A volume created since the cached reading: the path is on none of the
+        // volumes it knows, so the volumes are listed again before the path is
+        // refused.
+        var service = NewService();
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address)];
+        _host.References.Add(("csidev01", "vm-1"));
+        await service.LocateAsync(Pvc, CancellationToken.None);
+
+        _cluster.Volumes.Clear();
+        _cluster.Volumes.Enqueue([Csv(Volume2, "csidev02"), Csv(@"C:\ClusterStorage\Volume3", "csidev02")]);
+        _probe.OpenFiles["csidev02"] = [new("pvc-9.vhdx", Dev01Address)];
+
+        Assert.Equal(
+            new VhdxLocation("csidev01", "vm-1"),
+            await service.LocateAsync(@"C:\ClusterStorage\Volume3\pvc-9.vhdx", CancellationToken.None));
+        Assert.Equal(2, _cluster.SharedVolumeReads);
     }
 
     [Fact]
@@ -239,8 +449,8 @@ public sealed class CsvFileOwnershipServiceTests
         _cluster.Volumes.Clear();
         _cluster.Volumes.Enqueue(
         [
-            new ClusterSharedVolume(@"C:\ClusterStorage\Volume1", "csidev01"),
-            new ClusterSharedVolume(@"C:\ClusterStorage\Volume10", "csidev02"),
+            Csv(@"C:\ClusterStorage\Volume1", "csidev01"),
+            Csv(@"C:\ClusterStorage\Volume10", "csidev02"),
         ]);
         _probe.OpenFiles["csidev02"] = [new("pvc-1.vhdx", Dev01Address)];
         _host.References.Add(("csidev01", "vm-1"));
@@ -265,7 +475,7 @@ public sealed class CsvFileOwnershipServiceTests
     [Fact]
     public async Task LocateAsync_ReusesTheVolumeReadingUntilItExpires()
     {
-        _cluster.Volumes.Enqueue([new ClusterSharedVolume(Volume2, "csidev02")]);
+        _cluster.Volumes.Enqueue([Csv(Volume2, "csidev02")]);
         _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address)];
         _host.References.Add(("csidev01", "vm-1"));
         var service = NewService();
@@ -491,6 +701,41 @@ public sealed class CsvFileOwnershipServiceTests
         Assert.Empty(_host.DiskInfoCalls);
     }
 
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (!condition())
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                throw new TimeoutException("condition never became true");
+            }
+
+            await Task.Delay(10);
+        }
+    }
+
+    /// <summary>
+    /// Hands every formatted log line to <see cref="OnLog"/> - the one signal
+    /// a test can wait on that the service has stamped an empty listing.
+    /// </summary>
+    private sealed class CapturingLogger : ILogger<CsvFileOwnershipService>
+    {
+        public Action<string>? OnLog { get; set; }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter) =>
+            OnLog?.Invoke(formatter(state, exception));
+    }
+
+    /// <summary>A volume whose disk resource is named after its mount point, as the cluster names them by default.</summary>
+    private static ClusterSharedVolume Csv(string path, string coordinator) =>
+        new(path, coordinator, $"Cluster Disk ({Path.GetFileName(path)})");
+
     private CsvFileOwnershipService NewService() =>
         new(
             _cluster,
@@ -500,7 +745,7 @@ public sealed class CsvFileOwnershipServiceTests
             new NetFtAddressTable(_cluster, _probe, _clock, NullLogger<NetFtAddressTable>.Instance),
             Options.Create(_options),
             _clock,
-            NullLogger<CsvFileOwnershipService>.Instance);
+            _logger);
 
     private sealed class FakeCluster : IClusterService
     {
@@ -521,6 +766,42 @@ public sealed class CsvFileOwnershipServiceTests
             SharedVolumeReads++;
             var reading = Volumes.Count > 1 ? Volumes.Dequeue() : Volumes.Peek();
             return Task.FromResult<IReadOnlyList<ClusterSharedVolume>>(reading);
+        }
+
+        /// <summary>Every volume resource whose coordinator was read on its own, in order.</summary>
+        public List<string> CoordinatorReads { get; } = [];
+
+        /// <summary>Volume resources the cluster no longer reports.</summary>
+        public HashSet<string> GoneResources { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Awaited after each keyed read is recorded, to hold it in flight.</summary>
+        public Func<Task>? BeforeCoordinatorRead { get; set; }
+
+        /// <summary>
+        /// The coordinator the reading a listing would hand out next reports -
+        /// the cluster as it stands now, read for one volume without handing
+        /// that reading out. A disk that reading no longer lists as a volume is
+        /// still a cluster disk with its last owner, as the real keyed read of
+        /// its resource would find it, unless it is gone from the cluster.
+        /// </summary>
+        public async Task<string?> GetSharedVolumeCoordinatorAsync(ClusterSharedVolume volume, CancellationToken cancellationToken)
+        {
+            lock (CoordinatorReads)
+            {
+                CoordinatorReads.Add(volume.ResourceName);
+            }
+
+            if (BeforeCoordinatorRead is { } before)
+            {
+                await before();
+            }
+
+            return GoneResources.Contains(volume.ResourceName)
+                ? null
+                : Volumes.Peek()
+                    .FirstOrDefault(current => string.Equals(current.ResourceName, volume.ResourceName, StringComparison.OrdinalIgnoreCase))
+                    ?.CoordinatorNode
+                    ?? volume.CoordinatorNode;
         }
 
         public Task<IReadOnlyList<string>> ListNodesAsync(CancellationToken cancellationToken) =>
@@ -556,16 +837,28 @@ public sealed class CsvFileOwnershipServiceTests
 
         public int FailOpenFileReads { get; set; }
 
-        public Task<IReadOnlyList<CsvOpenFile>> ReadCsvOpenFilesAsync(string nodeName, CancellationToken cancellationToken)
+        /// <summary>Awaited at the start of every open-file read, to hold probes in flight.</summary>
+        public Func<Task>? BeforeOpenFileRead { get; set; }
+
+        public async Task<IReadOnlyList<CsvOpenFile>> ReadCsvOpenFilesAsync(string nodeName, CancellationToken cancellationToken)
         {
-            OpenFileReads.Add(nodeName);
+            lock (OpenFileReads)
+            {
+                OpenFileReads.Add(nodeName);
+            }
+
+            if (BeforeOpenFileRead is { } before)
+            {
+                await before();
+            }
+
             if (FailOpenFileReads > 0)
             {
                 FailOpenFileReads--;
                 throw new TimeoutException($"{nodeName} did not answer");
             }
 
-            return Task.FromResult<IReadOnlyList<CsvOpenFile>>(OpenFiles.GetValueOrDefault(nodeName) ?? []);
+            return OpenFiles.GetValueOrDefault(nodeName) ?? [];
         }
 
         public Task<IReadOnlyList<string>> ReadNetFtAddressesAsync(string nodeName, CancellationToken cancellationToken) =>
@@ -655,7 +948,11 @@ public sealed class CsvFileOwnershipServiceTests
 
         public Task<HostDiskInfo> GetDiskInfoAsync(string hostName, string vhdxPath, CancellationToken cancellationToken)
         {
-            DiskInfoCalls.Add(hostName);
+            lock (DiskInfoCalls)
+            {
+                DiskInfoCalls.Add(hostName);
+            }
+
             return Readable.TryGetValue(hostName, out var info)
                 ? Task.FromResult(info)
                 : throw new InvalidOperationException(

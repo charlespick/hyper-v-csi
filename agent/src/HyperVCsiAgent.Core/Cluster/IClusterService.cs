@@ -117,6 +117,19 @@ public interface IClusterService
     Task<IReadOnlyList<ClusterSharedVolume>> ListSharedVolumesAsync(CancellationToken cancellationToken);
 
     /// <summary>
+    /// The node coordinating <paramref name="volume"/> now, read afresh for
+    /// that one volume - or null when the cluster no longer reports its disk
+    /// resource, or reports it with no owner.
+    /// </summary>
+    /// <remarks>
+    /// The keyed counterpart to <see cref="ListSharedVolumesAsync"/>, for a
+    /// caller that holds a reading of one volume and needs to know whether its
+    /// coordinator has moved since: one keyed read of one resource, rather
+    /// than every volume and every resource in the cluster again.
+    /// </remarks>
+    Task<string?> GetSharedVolumeCoordinatorAsync(ClusterSharedVolume volume, CancellationToken cancellationToken);
+
+    /// <summary>
     /// The name of every node in the cluster the cluster does not report Down.
     /// Paused and joining nodes are included: a paused node still runs VMs
     /// until it is drained.

@@ -12,4 +12,10 @@ namespace HyperVCsiAgent.Core.Cluster;
 /// physical disk resource. Every other node's metadata operations on the volume
 /// are forwarded here, which is what makes it the one node able to list them.
 /// </param>
-public sealed record ClusterSharedVolume(string Path, string CoordinatorNode);
+/// <param name="ResourceName">
+/// The name of that physical disk resource - the key its owner is read under,
+/// kept so one volume's coordinator can be re-read on its own
+/// (<see cref="IClusterService.GetSharedVolumeCoordinatorAsync"/>) instead of
+/// listing every volume again.
+/// </param>
+public sealed record ClusterSharedVolume(string Path, string CoordinatorNode, string ResourceName);

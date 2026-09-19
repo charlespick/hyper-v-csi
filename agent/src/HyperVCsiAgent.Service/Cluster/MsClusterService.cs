@@ -767,11 +767,39 @@ public sealed class MsClusterService : IClusterService
                     continue;
                 }
 
-                volumes.Add(new ClusterSharedVolume(volumePath, owner));
+                volumes.Add(new ClusterSharedVolume(volumePath, owner, resourceName));
             }
 
             _logger.LogDebug("listed {Count} Cluster Shared Volumes", volumes.Count);
             return volumes;
+        }, cancellationToken);
+
+    /// <summary>
+    /// See <see cref="IClusterService.GetSharedVolumeCoordinatorAsync"/>.
+    /// </summary>
+    /// <remarks>
+    /// The same keyed read <see cref="ResolveVmAsync"/> makes of a VM's
+    /// resource, asked of the volume's physical disk resource instead - the
+    /// resource whose <c>OwnerNode</c> <see cref="ListSharedVolumesAsync"/>
+    /// already takes as the coordinator. Keyed on <c>Name</c>, so it does not
+    /// scan - see <see cref="ReadResourceStatus"/>'s own measurement against
+    /// the unkeyed full scan, whose cost grows with every resource in the
+    /// cluster while this one's does not.
+    /// </remarks>
+    public Task<string?> GetSharedVolumeCoordinatorAsync(ClusterSharedVolume volume, CancellationToken cancellationToken) =>
+        Task.Run(() =>
+        {
+            var deadline = CimDeadline.After(_hostOperationTimeout);
+            var owner = ReadResourceStatus(volume.ResourceName, deadline, cancellationToken)?.OwnerNode;
+            if (string.IsNullOrWhiteSpace(owner))
+            {
+                _logger.LogDebug(
+                    "the cluster reports no owning node for Cluster Shared Volume {VolumePath} (resource {ResourceName})",
+                    volume.Path, volume.ResourceName);
+                return null;
+            }
+
+            return owner;
         }, cancellationToken);
 
     public Task<IReadOnlyList<string>> ListNodesAsync(CancellationToken cancellationToken) =>

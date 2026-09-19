@@ -392,6 +392,9 @@ public sealed class JobsEndpointTests : IDisposable
         public Task<IReadOnlyList<ClusterSharedVolume>> ListSharedVolumesAsync(CancellationToken cancellationToken) =>
             throw new NotSupportedException("no disk in this file is held open, so nothing traces one to a shared volume");
 
+        public Task<string?> GetSharedVolumeCoordinatorAsync(ClusterSharedVolume volume, CancellationToken cancellationToken) =>
+            throw new NotSupportedException("no disk in this file is held open, so nothing traces one to a shared volume");
+
         public Task<IReadOnlyList<string>> ListNodesAsync(CancellationToken cancellationToken) =>
             throw new NotSupportedException("no disk in this file is held open, so nothing traces one to a node");
     }
