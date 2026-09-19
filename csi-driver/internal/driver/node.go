@@ -263,8 +263,12 @@ func (s *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolu
 func runBounded(ctx context.Context, budget time.Duration, unlock func(), work func() error) error {
 	done := make(chan error, 1)
 	go func() {
-		defer unlock()
-		done <- safeWork(work)
+		// Unlock before sending, not after: a deferred unlock ran after the
+		// send, so this could return success while the key was still held,
+		// and an immediate follow-up call on the same key got ABORTED.
+		err := safeWork(work)
+		unlock()
+		done <- err
 	}()
 
 	select {
