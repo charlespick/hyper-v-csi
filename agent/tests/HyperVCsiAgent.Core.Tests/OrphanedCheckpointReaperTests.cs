@@ -1,4 +1,4 @@
-using HyperVCsiAgent.Core.Cluster;
+﻿using HyperVCsiAgent.Core.Cluster;
 using HyperVCsiAgent.Core.Configuration;
 using HyperVCsiAgent.Core.HostControl;
 using HyperVCsiAgent.Core.Jobs;
@@ -443,7 +443,7 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
         var disks = new FakeVirtualDiskManager();
         var copier = new FakeDiskCopier();
         var store = new RecordingJobStore();
-        var host = new FakeHostClient();
+        var host = new FakeHostClient { VolumesRoot = _volumesRoot };
         var copySlots = new SnapshotCopySlots(Options.Create(new AgentOptions { MaxConcurrentSnapshotCopies = 4 }));
         var hostSlots = new HostOperationSlots(Options.Create(new AgentOptions { MaxConcurrentHostOperations = 4 }));
         var options = Options.Create(new AgentOptions
@@ -692,6 +692,22 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
         public void SeedRawCheckpoint(string host, string vmId, string elementName, string? notes) =>
             SeedRawCheckpoint(host, vmId, elementName, notes, ownedOnly: true);
 
+        /// <summary>The volumes directory an owned checkpoint's frozen disk is resolved under.</summary>
+        public string? VolumesRoot { get; init; }
+
+        /// <summary>
+        /// What a seeded checkpoint froze: the one volume an owned identity
+        /// names - what a real checkpoint of a VM holding just that disk would
+        /// record - and nothing known for anything else.
+        /// </summary>
+        private IReadOnlyList<string>? FrozenDisksFor(string elementName)
+        {
+            var parts = elementName.Split('/');
+            return VolumesRoot is not null && elementName.StartsWith(CheckpointMatching.OwnedPrefix, StringComparison.Ordinal) && parts.Length >= 3
+                ? [Path.GetFullPath(Path.Combine(VolumesRoot, parts[1] + VolumeNaming.VhdxExtension))]
+                : null;
+        }
+
         private void SeedRawCheckpoint(string host, string vmId, string elementName, string? notes, bool ownedOnly)
         {
             if (ownedOnly && !elementName.StartsWith(CheckpointMatching.OwnedPrefix, StringComparison.Ordinal))
@@ -705,7 +721,7 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
                 _byHost[host] = entries;
             }
 
-            entries.Add(new Entry(vmId, new Checkpoint($"checkpoint:{elementName}", elementName, notes)));
+            entries.Add(new Entry(vmId, new Checkpoint($"checkpoint:{elementName}", elementName, notes, FrozenDisksFor(elementName))));
         }
 
         public Task<IReadOnlyList<Checkpoint>> ListOwnedCheckpointsAsync(string hostName, string vmId, CancellationToken cancellationToken)
@@ -785,9 +801,6 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
 
         public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             Task.FromResult(true);
-
-        public Task<IReadOnlyList<string>> ReadCheckpointDisksAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
-            Task.FromResult<IReadOnlyList<string>>([]);
 
         public Task<bool> IsCollapsedOntoAsync(string hostName, string vmId, IReadOnlyCollection<string> frozenDisks, CancellationToken cancellationToken) =>
             Task.FromResult(!_byHost.TryGetValue(hostName, out var entries) || entries.Count == 0);

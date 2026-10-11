@@ -325,25 +325,6 @@ public interface IHyperVHostClient
     Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken);
 
     /// <summary>
-    /// The disks a checkpoint froze: the paths its own configuration records,
-    /// which are the files the VM's disks sit on top of while it stands, and
-    /// what they return to once its merge has collapsed.
-    /// </summary>
-    /// <remarks>
-    /// Read before <see cref="DestroyCheckpointAsync"/>, which removes the
-    /// configuration this comes from, so a caller can then wait on exactly the
-    /// chains that checkpoint created with <see cref="IsCollapsedOntoAsync"/> -
-    /// not a guess at them from the source alone, which misses the sibling
-    /// disks a VM-wide checkpoint also froze, and not every chain on the VM,
-    /// which would wait on one a different checkpoint left standing. Measured
-    /// against a real host: these are the base <c>.vhdx</c> paths (or, over an
-    /// older checkpoint, the <c>.avhdx</c> the disk was running on), and the
-    /// active disks' immediate parents while the checkpoint stands.
-    /// </remarks>
-    /// <exception cref="VmNotOnHostException">The checkpoint is not found on this host.</exception>
-    Task<IReadOnlyList<string>> ReadCheckpointDisksAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken);
-
-    /// <summary>
     /// Whether every disk in the VM's configuration either is one of
     /// <paramref name="frozenDisks"/> or does not sit directly on one - true
     /// once the merge of the checkpoint that froze them has collapsed its
@@ -351,7 +332,7 @@ public interface IHyperVHostClient
     /// </summary>
     /// <remarks>
     /// The post-merge wait's predicate, asked about exactly the disks a
-    /// checkpoint froze (<see cref="ReadCheckpointDisksAsync"/>), or about the
+    /// checkpoint froze (<see cref="Checkpoint.FrozenDisks"/>), or about the
     /// source alone when the checkpoint was already gone. Exactly those, for
     /// issue #38: a checkpoint is VM-wide, so releasing the VM once only the
     /// source had collapsed hands the next job on it a sibling still merging,

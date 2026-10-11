@@ -842,19 +842,123 @@ public sealed class SnapshotServiceTests : IDisposable
     }
 
     [WindowsOnlyFact]
-    public async Task CreateAsync_CheckpointDisksUnknown_MergeWaitWatchesTheSourceAlone()
+    public async Task CreateAsync_CheckpointTakenOnTopOfAnotherSinceClassification_IsMergedAwayAndTheCopyRefused()
     {
-        // The fallback: nothing could be read off the checkpoint, so the
-        // only chain known to be this merge's is the source's.
+        // A backup product checkpointed the VM between this copy's
+        // classification and its own checkpoint: ours froze the .avhdx that
+        // product left in front of pvc-1, not pvc-1 itself. Copying pvc-1 now
+        // would publish data from that product's moment under a creation time
+        // from ours.
         var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
-        var host = new FakeHostClient();
+        var underneath = VolumePath("pvc-1")[..^VolumeNaming.VhdxExtension.Length] + "_9A1B.avhdx";
+        var host = new FakeHostClient { FrozenDisks = [underneath] };
         var harness = NewHarness(cluster: cluster, location: TracedToVm1(), host: host);
         WriteAttachedVolume("pvc-1", 4096);
 
-        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None));
 
-        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+        Assert.Equal(AgentErrorCodes.Aborted, failure.ErrorCode);
+        Assert.Contains("did not freeze", failure.Message);
+        Assert.Empty(harness.Copier.Destinations);
+        Assert.False(File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+
+        // Merged away, not left for the reaper to resume through.
+        await WaitForAsync(() => host.DestroyedCheckpointElementNames.Count == 1);
+        Assert.Equal(["hyperv-csi/pvc-1/snapshot-abc"], host.DestroyedCheckpointElementNames);
+        Assert.Equal([underneath], host.CollapseCheckedOnto);
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_WhatTheCheckpointFrozeUnknown_RefusesRatherThanGuessing()
+    {
+        // The read of what the checkpoint froze failed. Unknown is not "fine":
+        // the copy is refused, and with nothing read off the checkpoint the
+        // merge wait watches the source alone.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient { FrozenDisksUnknown = true };
+        var harness = NewHarness(cluster: cluster, location: TracedToVm1(), host: host);
+        WriteAttachedVolume("pvc-1", 4096);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.Aborted, failure.ErrorCode);
+        Assert.Empty(harness.Copier.Destinations);
+        await WaitForAsync(() => host.DestroyedCheckpointElementNames.Count == 1);
         Assert.Equal([VolumePath("pvc-1")], host.CollapseCheckedOnto);
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_ResumingThroughAnOwnedCheckpointThatDidNotFreezeTheSource_IsRefusedToo()
+    {
+        // An earlier attempt's checkpoint, still standing - but taken over
+        // something else's, so resuming through it would backdate the same way.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient { FrozenDisks = [VolumePath("pvc-1")[..^VolumeNaming.VhdxExtension.Length] + "_9A1B.avhdx"] };
+        await host.CreateCheckpointAsync("host-1", "vm-1", "hyperv-csi/pvc-1/snapshot-abc", "{}", CancellationToken.None);
+        var harness = NewHarness(cluster: cluster, location: TracedToVm1(), host: host);
+        WriteAttachedVolume("pvc-1", 4096);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.Aborted, failure.ErrorCode);
+        Assert.Empty(harness.Copier.Destinations);
+        await WaitForAsync(() => host.DestroyedCheckpointElementNames.Count == 1);
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_ForeignVerdictOnABusyVm_IsReportedRatherThanQueued()
+    {
+        // A backup run keeping vm-1's queue busier than the checkpoint wait.
+        // Only the copy job, holding vm-1, can name the foreign checkpoint
+        // behind pvc-2 - and every retry's wait would otherwise run out first
+        // and say "queued behind another copy". The last verdict is reported
+        // instead, while a fresh copy queues to look again.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient
+        {
+            ClassifyFaultForPath = path => HoldsVm1() && path == VolumePath("pvc-2") ? UntaggedRoot(ForeignCheckpoint) : null,
+        };
+        var harness = NewHarness(
+            cluster: cluster, location: TracedToVm1(), host: host,
+            snapshotCheckpointWaitTimeout: TimeSpan.FromMilliseconds(300));
+        WriteAttachedVolume("pvc-1", 4096);
+        WriteAttachedVolume("pvc-2", 4096);
+        WriteAttachedVolume("pvc-3", 4096);
+        using var release = new SemaphoreSlim(0);
+        harness.Copier.DuringCopy = _ => release.WaitAsync();
+
+        try
+        {
+            // pvc-1's copy holds vm-1; pvc-2's first copy queues behind it.
+            await harness.Service.CreateAsync("pvc-1", "snapshot-a", CancellationToken.None);
+            await WaitForAsync(() => harness.Copier.Destinations.Count == 1);
+            var queued = await Assert.ThrowsAsync<JobFailureException>(
+                () => harness.Service.CreateAsync("pvc-2", "snapshot-b", CancellationToken.None));
+            Assert.Contains("queued behind another copy", queued.Message);
+
+            // pvc-1 finishes; pvc-2's copy runs, holding vm-1, and names the
+            // checkpoint - with nobody waiting to hear it.
+            release.Release();
+            await WaitForAsync(() => harness.Store.Created.Any(job =>
+                job.IdempotencyKey == "pvc-2~snapshot-b" && job.Status == JobStatus.Failed));
+
+            // The queue is busy again when the snapshotter retries.
+            await harness.Service.CreateAsync("pvc-3", "snapshot-c", CancellationToken.None);
+            await WaitForAsync(() => harness.Copier.Destinations.Count == 2);
+            var retried = await Assert.ThrowsAsync<JobFailureException>(
+                () => harness.Service.CreateAsync("pvc-2", "snapshot-b", CancellationToken.None));
+
+            Assert.Equal(AgentErrorCodes.FailedPrecondition, retried.ErrorCode);
+            Assert.Contains("\"Veeam restore point\"", retried.Message);
+            Assert.Contains("last copy attempt", retried.Message);
+        }
+        finally
+        {
+            release.Release(4);
+        }
     }
 
     [WindowsOnlyFact]
@@ -2442,6 +2546,11 @@ public sealed class SnapshotServiceTests : IDisposable
 
         // A read through the holder lands on this harness's host, the way the
         // real service sends it to the host it found.
+        if (host is FakeHostClient fakeHost)
+        {
+            fakeHost.UseVolumesRoot(_volumesRoot);
+        }
+
         if (location is FakeVhdxLocationService fakeLocation)
         {
             fakeLocation.Reader ??= host;
@@ -2887,9 +2996,6 @@ public sealed class SnapshotServiceTests : IDisposable
         public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             throw Unexpected();
 
-        public Task<IReadOnlyList<string>> ReadCheckpointDisksAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
-            Task.FromResult<IReadOnlyList<string>>([]);
-
         public Task<bool> IsCollapsedOntoAsync(string hostName, string vmId, IReadOnlyCollection<string> frozenDisks, CancellationToken cancellationToken) =>
             throw Unexpected();
     }
@@ -3096,6 +3202,13 @@ public sealed class SnapshotServiceTests : IDisposable
         /// </summary>
         public Func<int, Exception?>? ClassifyFault { get; set; }
 
+        /// <summary>
+        /// Asked on every call with the path being classified, after
+        /// <see cref="ClassifyFault"/>: an exception to throw for that disk, or
+        /// null to classify normally.
+        /// </summary>
+        public Func<string, Exception?>? ClassifyFaultForPath { get; set; }
+
         private int _classifyCalls;
 
         public int ClassifyCalls => Volatile.Read(ref _classifyCalls);
@@ -3107,6 +3220,11 @@ public sealed class SnapshotServiceTests : IDisposable
             if (ClassifyFault?.Invoke(call) is { } fault)
             {
                 throw fault;
+            }
+
+            if (ClassifyFaultForPath?.Invoke(vhdxPath) is { } pathFault)
+            {
+                throw pathFault;
             }
 
             if (ChainTooDeepToWalk)
@@ -3155,7 +3273,7 @@ public sealed class SnapshotServiceTests : IDisposable
                 throw new InvalidOperationException("CreateSnapshot said no");
             }
 
-            var checkpoint = new Checkpoint($"checkpoint:{elementName}", elementName, notesJson);
+            var checkpoint = new Checkpoint($"checkpoint:{elementName}", elementName, notesJson, FrozenDisksFor(elementName));
             _checkpointsByElementName[elementName] = checkpoint;
             CreatedCheckpointElementNames.Add(elementName);
             return Task.FromResult(checkpoint);
@@ -3210,16 +3328,54 @@ public sealed class SnapshotServiceTests : IDisposable
             Task.FromResult(!CheckpointsNotConfigured);
 
         /// <summary>
-        /// What ReadCheckpointDisksAsync answers for any checkpoint: the disks
-        /// it froze. Empty by default, which the service treats as unknown.
+        /// What every checkpoint this fake creates says it froze. Empty, the
+        /// default, means the one volume its identity names - what a real
+        /// checkpoint of a VM holding just that disk would record - resolved
+        /// under <see cref="VolumesRoot"/>.
         /// </summary>
         public IReadOnlyList<string> FrozenDisks { get; set; } = [];
 
+        /// <summary>Makes every checkpoint this fake creates report what it froze as unknown, as a failed read does.</summary>
+        public bool FrozenDisksUnknown { get; set; }
+
+        /// <summary>The volumes directory a checkpoint's default frozen disk is resolved under; set by the harness.</summary>
+        public string? VolumesRoot { get; set; }
+
+        /// <summary>
+        /// Sets <see cref="VolumesRoot"/> and gives any checkpoint a test seeded
+        /// before the harness existed the frozen disk it would have had.
+        /// </summary>
+        public void UseVolumesRoot(string volumesRoot)
+        {
+            VolumesRoot = volumesRoot;
+            foreach (var (elementName, checkpoint) in _checkpointsByElementName.ToList())
+            {
+                if (checkpoint.FrozenDisks is { Count: 0 })
+                {
+                    _checkpointsByElementName[elementName] = checkpoint with { FrozenDisks = FrozenDisksFor(elementName) };
+                }
+            }
+        }
+
+        private IReadOnlyList<string>? FrozenDisksFor(string elementName)
+        {
+            if (FrozenDisksUnknown)
+            {
+                return null;
+            }
+
+            if (FrozenDisks.Count > 0 || VolumesRoot is null)
+            {
+                return FrozenDisks;
+            }
+
+            // hyperv-csi/<volumeId>/<snapshotName>
+            var volumeId = elementName.Split('/')[1];
+            return [Path.GetFullPath(Path.Combine(VolumesRoot, volumeId + VolumeNaming.VhdxExtension))];
+        }
+
         /// <summary>The disks the last post-merge wait watched collapse.</summary>
         public IReadOnlyCollection<string>? CollapseCheckedOnto { get; private set; }
-
-        public Task<IReadOnlyList<string>> ReadCheckpointDisksAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
-            Task.FromResult(FrozenDisks);
 
         public Task<bool> IsCollapsedOntoAsync(string hostName, string vmId, IReadOnlyCollection<string> frozenDisks, CancellationToken cancellationToken)
         {

@@ -63,9 +63,6 @@ public sealed class UnsupportedHyperVHostClient : IHyperVHostClient
     public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
         throw Unsupported();
 
-    public Task<IReadOnlyList<string>> ReadCheckpointDisksAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
-            throw new NotSupportedException();
-
     public Task<bool> IsCollapsedOntoAsync(string hostName, string vmId, IReadOnlyCollection<string> frozenDisks, CancellationToken cancellationToken) =>
         throw Unsupported();
 

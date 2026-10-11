@@ -216,6 +216,21 @@ chain rooted on untagged checkpoints as a foreign checkpoint at once —
 its hold nothing of this driver's can be creating one. That includes one
 this driver created and never tagged, which nothing will ever clean up.
 
+"Behind" is specific to the chain: a checkpoint records the disks it froze,
+and only checkpoints whose frozen disks include a disk in this volume's chain
+count. An operator's checkpoint from before the volume was attached froze
+nothing this chain stands on, and is never named for it.
+
+The `vm:` hold keeps out this driver, not a backup product or an operator, so
+the copy job also checks after the fact that its own checkpoint froze the
+source itself. If something checkpointed the VM in between, the source is not
+among the disks the copy job's checkpoint froze, and copying would publish
+data from that earlier moment under a newer creation time. So the checkpoint
+is merged away and the copy refused; the retry then names whatever is in the
+way. When a busy VM queue keeps a retry from reaching its copy within
+`SnapshotCheckpointWaitTimeout`, the last foreign-checkpoint verdict for that
+snapshot is reported instead of "queued", so the operator still hears about it.
+
 The other two states are not this process's work in progress, so no lock
 settles them, and both clear on their own. Both are asked about again, every
 250ms for up to `ChainSettleTimeout` (3s by default), and end `Aborted` if

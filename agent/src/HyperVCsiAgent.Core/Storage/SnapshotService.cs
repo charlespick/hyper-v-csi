@@ -1,4 +1,5 @@
-﻿using System.Diagnostics;
+﻿using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
@@ -201,6 +202,27 @@ public sealed class SnapshotService : ISnapshotService
     /// here to remember to remove them.
     /// </remarks>
     private readonly ConditionalWeakTable<Job, CopyPrologue> _copyPrologues = new();
+
+    /// <summary>
+    /// The last FailedPrecondition verdict a copy job reached for each
+    /// snapshot ID - a foreign checkpoint named by
+    /// <see cref="DecideUntaggedRoot"/>, chiefly - kept until a copy of that
+    /// snapshot publishes.
+    /// </summary>
+    /// <remarks>
+    /// That verdict is only ever reached by the copy job, which holds
+    /// <c>vm:</c>, and it reaches the caller only through
+    /// <see cref="AwaitCheckpointAsync"/> while that wait lasts. On a VM whose
+    /// queue is busier than <see cref="AgentOptions.SnapshotCheckpointWaitTimeout"/>
+    /// - a backup run, the setting issue #38 comes from - every retry's wait
+    /// would run out first and answer "queued behind another copy, see the
+    /// ReFS guidance", and the operator would never be told about the
+    /// checkpoint they actually have to deal with. So the wait reports the
+    /// last verdict instead, saying it is the last one, while the fresh copy
+    /// it enqueued goes on to look again. In memory, like every job: a restart
+    /// forgets it, and the next copy to run finds it again.
+    /// </remarks>
+    private readonly ConcurrentDictionary<string, string> _lastCopyVerdicts = new(StringComparer.Ordinal);
 
     /// <summary>
     /// One bit, in a class so <see cref="_copyPrologues"/> can hand the same
@@ -794,6 +816,15 @@ public sealed class SnapshotService : ISnapshotService
             }
             catch (OperationCanceledException) when (wait.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
             {
+                // A verdict the last copy of this snapshot reached, if any,
+                // rather than "queued": see _lastCopyVerdicts.
+                if (_lastCopyVerdicts.TryGetValue(snapshotId, out var verdict))
+                {
+                    throw JobFailureException.FailedPrecondition(
+                        $"{verdict} (from this snapshot's last copy attempt; a fresh one is queued behind other work " +
+                        "on the same VM and will look again)");
+                }
+
                 throw new JobFailureException(
                     AgentErrorCodes.Aborted,
                     $"snapshot {snapshotId} is queued behind another copy on the same VM; a Hyper-V checkpoint " +
@@ -1079,6 +1110,10 @@ public sealed class SnapshotService : ISnapshotService
             {
                 var checkpointTaken = false;
 
+                // The checkpoint the copy reads through, taken or resumed
+                // below - checked against the source before a byte moves.
+                Checkpoint? frozenBy = null;
+
                 if (vm is not null && attachment is not null)
                 {
                     switch (attachment.Kind)
@@ -1094,6 +1129,7 @@ public sealed class SnapshotService : ISnapshotService
                             // the base, and it is still standing under
                             // this exact identity. Nothing to take - the
                             // copy reads through what is already there.
+                            frozenBy = attachment.OwnedCheckpoint;
                             checkpointTaken = true;
                             break;
 
@@ -1151,7 +1187,7 @@ public sealed class SnapshotService : ISnapshotService
                             // remains the real answer, and this ordering
                             // is what keeps NTFS merely slow rather than
                             // divergent.
-                            await CreateOwnedCheckpointAsync(
+                            frozenBy = await CreateOwnedCheckpointAsync(
                                 vm, elementName, sourceVolumeId, snapshotName, snapshotId, attempt, cancellationToken)
                                 .ConfigureAwait(false);
                             checkpointTaken = true;
@@ -1162,6 +1198,37 @@ public sealed class SnapshotService : ISnapshotService
                                 AgentErrorCodes.Internal,
                                 $"unrecognized attachment classification {attachment.Kind}");
                     }
+                }
+
+                // Issue #38's backdating guard, checked after the fact rather
+                // than before it: did the checkpoint this copy reads through
+                // freeze the source itself? vm: keeps out this driver, not a
+                // backup product, an operator or vmms, and the copy job
+                // classified before it queued for the copy slot - so a
+                // checkpoint someone else took in between would sit under
+                // this one, freezing the source at *its* earlier moment while
+                // the snapshot reports a creation time from this one. A
+                // pre-check could only narrow that window; reading what this
+                // checkpoint froze closes it, since the base it copies is
+                // frozen at this checkpoint's moment exactly when the source
+                // is among its frozen disks. Not known counts as no: the copy
+                // is refused rather than published on a guess.
+                if (checkpointTaken && !FrozeTheSource(frozenBy, sourcePath))
+                {
+                    _logger.LogWarning(
+                        "CopySnapshot {SnapshotId}: checkpoint {ElementName} did not freeze {Source} itself (froze {Frozen}); " +
+                        "something else checkpointed the VM underneath it, so it is merged away and the copy refused",
+                        snapshotId, frozenBy?.ElementName ?? elementName, sourcePath,
+                        frozenBy?.FrozenDisks is { } frozen ? string.Join(", ", frozen) : "unknown");
+                    await DestroyOwnedCheckpointAndWaitAsync(
+                        snapshotId, sourceVolumeId, snapshotName, vmId!, sourcePath, attempt.Token).ConfigureAwait(false);
+                    throw new JobFailureException(
+                        AgentErrorCodes.Aborted,
+                        $"snapshot {snapshotId} cannot be copied yet: the checkpoint it took of {vmId} did not freeze " +
+                        $"{sourcePath} itself - another checkpoint was taken underneath it since the volume was last " +
+                        "looked at, and copying through both would report a newer creation time than the data it " +
+                        "holds. This snapshot's checkpoint was merged away; the retry looks again and names whatever " +
+                        "is in the way");
                 }
 
                 _logger.LogInformation(
@@ -1260,6 +1327,15 @@ public sealed class SnapshotService : ISnapshotService
             // position to promise cleanup - this is best-effort on top of that.
             TryDeleteMarker(snapshotId, copyingPath);
             _logger.LogError(ex, "CopySnapshot {SnapshotId}: copying {Source} failed", snapshotId, sourcePath);
+
+            // A verdict for an operator - a foreign checkpoint, chiefly - kept
+            // for the fast job to report should its next wait run out on a
+            // busy queue; see _lastCopyVerdicts.
+            if (ex is JobFailureException { ErrorCode: AgentErrorCodes.FailedPrecondition } verdict)
+            {
+                _lastCopyVerdicts[snapshotId] = verdict.Message;
+            }
+
             throw;
         }
     }
@@ -1620,6 +1696,21 @@ public sealed class SnapshotService : ISnapshotService
             "automatically");
 
     /// <summary>
+    /// Whether <paramref name="checkpoint"/> froze <paramref name="sourcePath"/>
+    /// itself - the condition under which the base the copy reads is frozen at
+    /// this checkpoint's moment. False when that is not known.
+    /// </summary>
+    /// <remarks>
+    /// Compared the way <c>CimHyperVHostClient</c> compares every path a host
+    /// echoes back - trimmed, case-insensitive, otherwise verbatim: vmms
+    /// reports a disk by the path it was attached with, and this driver
+    /// attaches by exactly the path it resolves here.
+    /// </remarks>
+    private static bool FrozeTheSource(Checkpoint? checkpoint, string sourcePath) =>
+        checkpoint?.FrozenDisks is { } frozen
+        && frozen.Any(disk => string.Equals(disk.Trim(), sourcePath.Trim(), StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
     /// The unattached case, and the case of a source held by anything but a VM
     /// this driver manages: open the source directly and report its allocated
     /// size, or refuse if whatever has it open does not share it.
@@ -1853,37 +1944,14 @@ public sealed class SnapshotService : ISnapshotService
             return null;
         }
 
-        // Read before the destroy, which removes the configuration they are
-        // read from: exactly the disks this checkpoint froze, so the merge
-        // wait can watch every chain it created - a VM-wide checkpoint froze
-        // the sibling volumes too - and none it did not (see
-        // IHyperVHostClient.IsCollapsedOntoAsync). A failure here costs only
-        // that precision: the wait falls back to the source alone, as it did
-        // before this read existed.
-        IReadOnlyList<string>? frozenDisks = null;
-        try
-        {
-            await _hostSlots.WaitAsync(vm.OwningHost, cancellationToken).ConfigureAwait(false);
-            try
-            {
-                frozenDisks = await _host.ReadCheckpointDisksAsync(vm.OwningHost, checkpoint, cancellationToken)
-                    .ConfigureAwait(false);
-            }
-            finally
-            {
-                _hostSlots.Release(vm.OwningHost);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex,
-                "CopySnapshot {SnapshotId}: could not read the disks checkpoint {ElementName} froze on {VmId}; " +
-                "its merge will be watched on the source alone",
-                snapshotId, elementName, vm.VmId);
-        }
-
+        // The disks it froze came with the lookup above - read off the
+        // checkpoint's own configuration, which the destroy below removes -
+        // so the merge wait can watch every chain it created (a VM-wide
+        // checkpoint froze the sibling volumes too) and none it did not (see
+        // IHyperVHostClient.IsCollapsedOntoAsync). Unknown costs only that
+        // precision: the wait falls back to the source alone.
         await DestroyOwnedCheckpointAsync(snapshotId, vm, checkpoint, cancellationToken).ConfigureAwait(false);
-        return frozenDisks;
+        return checkpoint.FrozenDisks;
     }
 
     /// <summary>
@@ -1950,7 +2018,7 @@ public sealed class SnapshotService : ISnapshotService
     /// <c>vm:</c> (see <see cref="DecideUntaggedRoot"/> and
     /// <see cref="RetryWhileTransientAsync"/>) relies on never seeing. And
     /// exactly those chains, read off the checkpoint before it is destroyed
-    /// (<see cref="IHyperVHostClient.ReadCheckpointDisksAsync"/>), not every
+    /// (<see cref="Checkpoint.FrozenDisks"/>), not every
     /// chain on the VM: a sibling sitting under some other, long-lived
     /// checkpoint - a backup product's, an operator's - is not this merge's
     /// to wait for, and waiting on it would hold the VM for the whole of
