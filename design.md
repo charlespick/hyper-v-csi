@@ -199,12 +199,14 @@ it is being taken or merged. Two moments of that look wrong in a single read:
 the checkpoint after Hyper-V creates it and before this driver tags it, which
 is a second CIM call, and an `.avhdx` whose setting data reads back empty
 while it is created or merged. Classifying the source therefore reads the
-chain again, every 250ms for up to `ChainSettleTimeout` (5s by default),
+chain again, every 250ms for up to `ChainSettleTimeout` (3s by default),
 before concluding anything. A chain that showed the same untagged checkpoints
 for the whole window is reported as a foreign checkpoint, `FailedPrecondition`,
-naming each one and when it was taken. Anything still changing when the
-window ends is `Aborted`, with no advice to delete anything, because what is
-in motion is almost certainly this driver's own work.
+naming each one and when it was taken. Anything else when the window ends —
+checkpoints still changing, a disk still unreadable, or a chain with no
+checkpoint behind it at all, which is a merge still collapsing it — is
+`Aborted`, with no advice to delete anything, because what is in motion is
+almost certainly this driver's own work.
 
 ### ReFS and copy mechanism
 
@@ -264,7 +266,7 @@ startup pass.
 A create writes `<volume>~creating.vhdx` and a copy writes
 `<snapshot>~copying.vhdx`, renaming either into place only once it is
 complete, and deleting it if the job fails or is canceled. On a graceful stop
-the agent refuses new jobs (`POST /v1/jobs` answers 503), cancels the
+the agent stops listening, refuses any job still being enqueued, cancels the
 running ones, and waits up to `ShutdownDrainTimeout` (60s by default) for
 them to finish unwinding before the process exits and the clustered role
 moves. A canceled copy stops between chunks, so the wait is normally seconds;
@@ -276,8 +278,8 @@ total has to stay inside the Generic Service resource's `PendingTimeout`
 A hard kill, a lost node or a drain that ran out of time still leaves markers
 behind, so a startup sweep removes any it finds. It runs before
 `OrphanedCheckpointReaper` and so before RPC intake opens, when no job of the
-new process can own a marker, and it leaves anything still open or created
-after it began.
+new process can own a marker. It leaves anything still open, and if it has
+not finished within 30s it lets startup go on and removes nothing further.
 
 ## Scalability posture
 

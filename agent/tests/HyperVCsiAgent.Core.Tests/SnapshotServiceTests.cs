@@ -742,10 +742,10 @@ public sealed class SnapshotServiceTests : IDisposable
     }
 
     [WindowsOnlyFact]
-    public async Task CreateAsync_AttachedVolumeBehindAForeignChain_FailsAsFailedPrecondition()
+    public async Task CreateAsync_AttachedVolumeBehindAChainTooDeepToWalk_FailsAsFailedPreconditionAtOnce()
     {
         var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
-        var host = new FakeHostClient { ForeignChainInTheWay = true };
+        var host = new FakeHostClient { ChainTooDeepToWalk = true };
         var harness = NewHarness(cluster: cluster, location: TracedToVm1(), host: host);
         WriteAttachedVolume("pvc-1", 4096);
 
@@ -754,6 +754,7 @@ public sealed class SnapshotServiceTests : IDisposable
 
         Assert.Equal(AgentErrorCodes.FailedPrecondition, failure.ErrorCode);
         Assert.Empty(harness.Copier.Destinations);
+        Assert.Equal(1, host.ClassifyCalls);
     }
 
     [WindowsOnlyFact]
@@ -837,6 +838,30 @@ public sealed class SnapshotServiceTests : IDisposable
 
         Assert.Equal(AgentErrorCodes.Aborted, failure.ErrorCode);
         Assert.DoesNotContain("delete", failure.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_ChainWithNoCheckpointBehindItForTheWholeWindow_IsAbortedNotForeign()
+    {
+        // A sibling's checkpoint already destroyed, its merge still
+        // collapsing the chain: unchanged on every look, and still this
+        // driver's own work. Nothing to name, nothing to delete.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient
+        {
+            ClassifyFault = _ => new DiskChainUnsettledException(
+                DiskChainUnsettledReason.UntaggedRoot, "the checkpoint at the root of that chain is not one this driver tagged"),
+        };
+        var harness = NewHarness(
+            cluster: cluster, location: TracedToVm1(), host: host, chainSettleTimeout: TimeSpan.FromMilliseconds(600));
+        WriteAttachedVolume("pvc-1", 4096);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.Aborted, failure.ErrorCode);
+        Assert.DoesNotContain("delete", failure.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.True(host.ClassifyCalls >= 2);
     }
 
     [WindowsOnlyFact]
@@ -2829,8 +2854,12 @@ public sealed class SnapshotServiceTests : IDisposable
         /// <summary>What ClassifyAttachmentAsync reports when no owned checkpoint already covers the path.</summary>
         public VolumeAttachmentKind AttachmentKind { get; set; } = VolumeAttachmentKind.Direct;
 
-        /// <summary>Makes ClassifyAttachmentAsync throw, the way an unresolved foreign chain does.</summary>
-        public bool ForeignChainInTheWay { get; set; }
+        /// <summary>
+        /// Makes ClassifyAttachmentAsync throw a plain InvalidOperationException, the way a chain
+        /// too deep to walk does - refused at once, never asked again. An untagged root is
+        /// <see cref="ClassifyFault"/>'s job now.
+        /// </summary>
+        public bool ChainTooDeepToWalk { get; set; }
 
         /// <summary>Makes CreateCheckpointAsync throw CheckpointsNotConfiguredException, as it does against a real VM not set to ProductionOnly.</summary>
         public bool CheckpointsNotConfigured { get; set; }
@@ -2914,10 +2943,10 @@ public sealed class SnapshotServiceTests : IDisposable
                 throw fault;
             }
 
-            if (ForeignChainInTheWay)
+            if (ChainTooDeepToWalk)
             {
                 throw new InvalidOperationException(
-                    $"{vhdxPath} sits behind a foreign checkpoint this driver did not tag");
+                    $"{vhdxPath} sits behind a differencing chain too deep to walk to its end");
             }
 
             // Routed through the exact same two pure functions

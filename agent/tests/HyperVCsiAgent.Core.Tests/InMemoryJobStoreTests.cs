@@ -449,6 +449,35 @@ public class InMemoryJobStoreTests
     }
 
     [Fact]
+    public async Task DrainAsync_AJobStillQueuedWhenTheStopBegins_NeverRunsItsWork()
+    {
+        var store = new InMemoryJobStore();
+        var started = new TaskCompletionSource();
+        var release = new TaskCompletionSource();
+        var queuedRan = false;
+
+        store.GetOrCreate("pvc-1", "CreateVolume", ["volume:pvc-1"], async (_, _) =>
+        {
+            started.SetResult();
+            await release.Task;
+        });
+        var queued = store.GetOrCreate("pvc-1", "DeleteVolume", ["volume:pvc-1"], (_, _) =>
+        {
+            queuedRan = true;
+            return Task.CompletedTask;
+        });
+
+        await started.Task;
+        var drain = store.DrainAsync(TimeSpan.FromSeconds(10), CancellationToken.None);
+        release.SetResult();
+
+        Assert.Empty(await drain);
+        Assert.False(queuedRan);
+        Assert.Equal(JobStatus.Failed, queued.Status);
+        Assert.Equal(AgentErrorCodes.Aborted, queued.ErrorCode);
+    }
+
+    [Fact]
     public async Task DrainAsync_WithNothingInFlight_ReturnsAtOnce()
     {
         var store = new InMemoryJobStore();

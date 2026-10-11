@@ -1455,8 +1455,9 @@ public sealed class SnapshotService : ISnapshotService
     /// driver's checkpoint between its creation and its tag, so it is reported
     /// as a foreign checkpoint - <c>FailedPrecondition</c>, naming each one so
     /// an operator can confirm that before deleting it. Anything else - a disk
-    /// that still could not be read, checkpoints that changed between looks -
-    /// is still in motion and nothing an operator should touch, so it is
+    /// that still could not be read, checkpoints that changed between looks, a
+    /// chain with no checkpoint behind it at all (a merge still collapsing it)
+    /// - is still in motion and nothing an operator should touch, so it is
     /// <c>Aborted</c>, which every CSI sidecar retries, with no advice to
     /// delete anything.
     /// </para>
@@ -1482,7 +1483,16 @@ public sealed class SnapshotService : ISnapshotService
             catch (DiskChainUnsettledException ex)
             {
                 first ??= ex;
-                unchangedUntagged &= ex.Reason == DiskChainUnsettledReason.UntaggedRoot && SameCheckpoints(first, ex);
+
+                // A look with no checkpoints at all never counts towards
+                // "foreign": a chain left behind with nothing at its root is
+                // what a checkpoint already destroyed looks like while its
+                // merge is still collapsing the chain - which can run as long
+                // as the copy it protected - and that is this driver's own
+                // work, not something to tell an operator to delete.
+                unchangedUntagged &= ex.Reason == DiskChainUnsettledReason.UntaggedRoot
+                    && ex.Checkpoints.Count > 0
+                    && SameCheckpoints(first, ex);
 
                 if (looks >= 2 && elapsed.Elapsed >= _options.ChainSettleTimeout)
                 {
@@ -1518,11 +1528,11 @@ public sealed class SnapshotService : ISnapshotService
             && a.Checkpoints.Select(c => c.SettingsPath).Order(StringComparer.Ordinal)
                 .SequenceEqual(b.Checkpoints.Select(c => c.SettingsPath).Order(StringComparer.Ordinal), StringComparer.Ordinal);
 
+        // Never empty where it is called: a look with no checkpoints never
+        // counts towards the foreign answer this names them for.
         static string DescribeCheckpoints(IReadOnlyList<UntaggedCheckpoint> checkpoints) =>
-            checkpoints.Count == 0
-                ? "none - the chain has no checkpoint behind it at all"
-                : string.Join(", ", checkpoints.Select(c =>
-                    $"\"{c.ElementName}\" (created {(c.CreatedAt is { } created ? created.ToString("u") : "at an unknown time")})"));
+            string.Join(", ", checkpoints.Select(c =>
+                $"\"{c.ElementName}\" (created {(c.CreatedAt is { } created ? created.ToString("u") : "at an unknown time")})"));
     }
 
     /// <summary>

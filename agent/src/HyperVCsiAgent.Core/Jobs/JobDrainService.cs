@@ -16,12 +16,21 @@ namespace HyperVCsiAgent.Core.Jobs;
 /// the container disposes singletons only after every hosted service has
 /// stopped, which is after the host has stopped waiting on anything.
 /// <c>StopAsync</c> is inside that wait. Hosted services stop in reverse
-/// registration order, and <c>Program.cs</c> registers this last so it stops
-/// first: in-flight jobs are canceled the moment the stop begins, not after
-/// the other services have taken their turn. Kestrel stops after all of them,
-/// so job requests keep arriving during the drain - the store refuses them,
-/// and <c>POST /v1/jobs</c> answers 503 for the controller to retry against
-/// whichever node the role comes up on next.
+/// registration order, and <c>Program.cs</c> registers this last of its own
+/// so it stops first among them: in-flight jobs are canceled before the
+/// reaper and the others take their turn.
+/// <para>
+/// Kestrel is not among them. <c>WebApplicationBuilder</c> registers its web
+/// host service after every service <c>Program.cs</c> adds, so it is the
+/// first to stop - measured on .NET 10: by this service's <c>StopAsync</c>
+/// the listener already refuses connections, and during
+/// <c>IHostedLifecycleService.StoppingAsync</c> it accepts them but never
+/// answers, so draining there would buy nothing. The controller therefore
+/// sees the drain as an agent it cannot reach - <c>Unavailable</c>, retried
+/// against wherever the role comes up next - and cannot poll the jobs being
+/// drained. That is the same failover it already handles; what the drain
+/// adds is that those jobs clean up after themselves before the role moves.
+/// </para>
 /// </remarks>
 public sealed class JobDrainService : IHostedService
 {

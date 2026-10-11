@@ -38,9 +38,10 @@ public sealed class DiskChainUnsettledException : InvalidOperationException
     /// For <see cref="DiskChainUnsettledReason.UntaggedRoot"/>, every
     /// checkpoint the VM had when the chain was looked at - none of them
     /// tagged by this driver, or the reason would not be this one. Possibly
-    /// empty: a checkpoint already merged away, with the disk not yet
-    /// re-pointed, leaves a chain behind and no checkpoint at all. Always
-    /// empty for <see cref="DiskChainUnsettledReason.UnreadableDisk"/>.
+    /// empty: a checkpoint already destroyed, with its merge still collapsing
+    /// the chain, leaves a chain behind and no checkpoint at all - which is
+    /// why an empty list is never read as foreign however long it lasts.
+    /// Always empty for <see cref="DiskChainUnsettledReason.UnreadableDisk"/>.
     /// </summary>
     public IReadOnlyList<UntaggedCheckpoint> Checkpoints { get; }
 }

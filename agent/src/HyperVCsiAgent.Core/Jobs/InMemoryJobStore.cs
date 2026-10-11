@@ -434,6 +434,18 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
             // call: it exists so issue #14's D10 guard rail can assert that a
             // VM-mutating call happens while this job's own targets are held,
             // and holding starts and ends exactly where the run delegate does.
+            // Queued behind a job that finished after the stop began: never
+            // started, rather than started on a token already canceled. Run
+            // delegates do real work before their first token check - a
+            // create clears its old marker and the volumes directory - and
+            // none of it belongs to a process on its way out. Thrown rather
+            // than returned so it goes through the catch and finally below
+            // like any other failure, and the drain counts it finished.
+            if (_shutdown.IsCancellationRequested)
+            {
+                throw new JobFailureException(AgentErrorCodes.Aborted, "the agent shut down before this job started");
+            }
+
             using (JobExecutionContext.Enter(targets))
             {
                 await run(job, _shutdown.Token).ConfigureAwait(false);

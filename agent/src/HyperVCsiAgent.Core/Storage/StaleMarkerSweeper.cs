@@ -31,13 +31,16 @@ namespace HyperVCsiAgent.Core.Storage;
 /// finishes before any RPC can enqueue one either.
 /// </para>
 /// <para>
-/// <b>What else guards a removal.</b> Two further checks, on a handle to the
-/// file itself rather than on its name. The open shares nothing but delete,
-/// so it fails while anything has the file open - a vmms on some host still
-/// finishing the create a killed process asked it for, or an old owner whose
-/// drain is somehow still running. And a marker created after this sweep
-/// began is left alone, which is what keeps the sweep honest if it is still
-/// running when <see cref="StartupBudget"/> lets startup carry on without it.
+/// <b>What else guards a removal.</b> The open that precedes each delete
+/// shares nothing but delete, so it fails while anything has the file open -
+/// a vmms on some host still finishing the create a killed process asked it
+/// for, or an old owner whose drain is somehow still running. And if the
+/// sweep is still running when <see cref="StartupBudget"/> lets startup carry
+/// on without it, it stops deleting there and then: from that point a job of
+/// this process could own a marker. A creation-time check would not do in its
+/// place - NTFS file-name tunneling hands a file deleted and recreated under
+/// the same name within seconds its predecessor's creation time, which is
+/// exactly what a re-driven create does to its own marker.
 /// </para>
 /// <para>
 /// <b>Never fails startup.</b> Every failure is logged and passed over: a
@@ -57,47 +60,51 @@ public sealed class StaleMarkerSweeper : IHostedService
     private static readonly TimeSpan StartupBudget = TimeSpan.FromSeconds(30);
 
     private readonly AgentOptions _options;
-    private readonly TimeProvider _clock;
     private readonly ILogger<StaleMarkerSweeper> _logger;
 
-    public StaleMarkerSweeper(IOptions<AgentOptions> options, TimeProvider clock, ILogger<StaleMarkerSweeper> logger)
+    public StaleMarkerSweeper(IOptions<AgentOptions> options, ILogger<StaleMarkerSweeper> logger)
     {
         _options = options.Value;
-        _clock = clock;
         _logger = logger;
     }
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
-        var sweep = Task.Run(Sweep, CancellationToken.None);
+        using var stop = new CancellationTokenSource();
+        var sweep = Task.Run(() => Sweep(stop.Token), CancellationToken.None);
         try
         {
             await sweep.WaitAsync(StartupBudget, cancellationToken).ConfigureAwait(false);
         }
-        catch (TimeoutException)
+        catch (Exception ex) when (ex is TimeoutException or OperationCanceledException)
         {
+            // Canceled before the using above disposes it, and the sweep only
+            // ever reads IsCancellationRequested, which stays answerable on a
+            // disposed source.
+            stop.Cancel();
             _logger.LogWarning(
-                "The startup sweep for stale ~creating/~copying markers has not finished after {Budget}; " +
-                "starting without waiting for it", StartupBudget);
+                "The startup sweep for stale ~creating/~copying markers did not finish within {Budget}; " +
+                "starting without it, and it removes nothing further", StartupBudget);
         }
     }
 
     public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
-    /// <summary>The sweep itself, returning how many markers it removed.</summary>
-    internal int Sweep()
+    /// <summary>
+    /// The sweep itself, returning how many markers it removed. Removes
+    /// nothing once <paramref name="stop"/> is canceled.
+    /// </summary>
+    internal int Sweep(CancellationToken stop)
     {
-        var startedAt = _clock.GetUtcNow().UtcDateTime;
-
         try
         {
-            var removed = SweepDirectory(_options.CsvVolumesRoot, VhdxService.InProgressSuffix, startedAt);
+            var removed = SweepDirectory(_options.CsvVolumesRoot, VhdxService.InProgressSuffix, stop);
 
             // Blank when snapshots are not configured on this node - see
             // AgentOptions.Validate.
             if (!string.IsNullOrWhiteSpace(_options.CsvSnapshotsRoot))
             {
-                removed += SweepDirectory(_options.CsvSnapshotsRoot, SnapshotNaming.InProgressSuffix, startedAt);
+                removed += SweepDirectory(_options.CsvSnapshotsRoot, SnapshotNaming.InProgressSuffix, stop);
             }
 
             return removed;
@@ -109,7 +116,7 @@ public sealed class StaleMarkerSweeper : IHostedService
         }
     }
 
-    private int SweepDirectory(string directory, string suffix, DateTime startedAt)
+    private int SweepDirectory(string directory, string suffix, CancellationToken stop)
     {
         string[] candidates;
         try
@@ -133,7 +140,7 @@ public sealed class StaleMarkerSweeper : IHostedService
             // The pattern is matched against 8.3 short names as well as long
             // ones, so it is the filter for the directory listing and this is
             // the actual test.
-            if (Path.GetFileName(path).EndsWith(suffix, StringComparison.OrdinalIgnoreCase) && TryRemove(path, startedAt))
+            if (Path.GetFileName(path).EndsWith(suffix, StringComparison.OrdinalIgnoreCase) && TryRemove(path, stop))
             {
                 removed++;
             }
@@ -142,7 +149,7 @@ public sealed class StaleMarkerSweeper : IHostedService
         return removed;
     }
 
-    private bool TryRemove(string path, DateTime startedAt)
+    private bool TryRemove(string path, CancellationToken stop)
     {
         try
         {
@@ -152,13 +159,16 @@ public sealed class StaleMarkerSweeper : IHostedService
             // the handle closes - is still allowed through it.
             using var handle = File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.Delete);
 
-            var created = File.GetCreationTimeUtc(handle);
-            if (created >= startedAt)
+            // Checked with the handle held, as the last thing before the
+            // delete: nothing can open the marker in between.
+            if (stop.IsCancellationRequested)
             {
-                _logger.LogDebug("Leaving {Path} in place: it was created after the sweep began", path);
                 return false;
             }
 
+            // For the log only - see this class's remarks for why it decides
+            // nothing.
+            var created = File.GetCreationTimeUtc(handle);
             File.Delete(path);
             _logger.LogInformation(
                 "Removed {Path}, created {Created:o} by a job that did not finish before the agent last stopped",

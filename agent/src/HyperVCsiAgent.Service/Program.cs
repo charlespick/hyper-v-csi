@@ -187,9 +187,10 @@ builder.Services.AddHostedService<OrphanedCheckpointReaper>();
 // hosted service rather than folded into the reaper that owns the gate.
 builder.Services.AddHostedService<SnapshotStorageWarningService>();
 
-// Last, so it is the first hosted service to stop: in-flight jobs are canceled
-// and drained the moment the host begins stopping, rather than after the
-// others have taken their turn. See JobDrainService's own remarks.
+// Last of this file's hosted services, so it is the first of them to stop:
+// in-flight jobs are canceled and drained before the reaper and the others
+// take their turn. Kestrel stops before any of them - see JobDrainService's
+// own remarks.
 builder.Services.AddHostedService<JobDrainService>();
 
 builder.Services.AddSingleton<JobDispatcher>();
@@ -293,9 +294,13 @@ app.MapPost("/v1/jobs", (
     }
     catch (JobStoreStoppingException)
     {
-        // The agent is draining on its way out - Kestrel stops last, so
-        // requests still arrive. 503 for the same reason as the gate above:
-        // the sidecar retries, and by then the role is up on another node.
+        // The agent has begun stopping. Kestrel is the first thing a stop
+        // shuts and it waits out the requests it is serving (see
+        // JobDrainService's remarks), so this should not be reachable in a
+        // normal stop - it is here so a refusal that does reach a request,
+        // past Kestrel's own grace period, is an answer rather than a 500.
+        // 503 for the same reason as the gate above: the sidecar retries,
+        // and by then the role is up on another node.
         logger.LogInformation(
             "{OperationType} {IdempotencyKey}: rejected, the agent is shutting down",
             request.OperationType, request.IdempotencyKey);

@@ -33,7 +33,7 @@ public sealed class StaleMarkerSweeperTests : IDisposable
         var creating = WriteOld(_volumes, "pvc-1~creating.vhdx");
         var copying = WriteOld(_snapshots, "pvc-1~snap-1~copying.vhdx");
 
-        var removed = Sweeper().Sweep();
+        var removed = Sweeper().Sweep(CancellationToken.None);
 
         Assert.Equal(2, removed);
         Assert.False(File.Exists(creating));
@@ -51,7 +51,7 @@ public sealed class StaleMarkerSweeperTests : IDisposable
         // among the volumes is nothing VhdxService wrote.
         var misplaced = WriteOld(_volumes, "pvc-1~snap-1~copying.vhdx");
 
-        Assert.Equal(0, Sweeper().Sweep());
+        Assert.Equal(0, Sweeper().Sweep(CancellationToken.None));
         Assert.True(File.Exists(volume));
         Assert.True(File.Exists(snapshot));
         Assert.True(File.Exists(tombstone));
@@ -65,20 +65,20 @@ public sealed class StaleMarkerSweeperTests : IDisposable
 
         using (new FileStream(creating, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
         {
-            Assert.Equal(0, Sweeper().Sweep());
+            Assert.Equal(0, Sweeper().Sweep(CancellationToken.None));
         }
 
         Assert.True(File.Exists(creating));
     }
 
     [Fact]
-    public void Sweep_LeavesAMarkerCreatedAfterItBegan()
+    public void Sweep_OnceStopped_RemovesNothingFurther()
     {
-        var creating = Path.Combine(_volumes, "pvc-1~creating.vhdx");
-        File.WriteAllBytes(creating, [1]);
-        File.SetCreationTimeUtc(creating, DateTime.UtcNow.AddMinutes(5));
+        // Where StartAsync leaves a sweep that outran its budget: from then on
+        // a job of this process could own any marker it finds.
+        var creating = WriteOld(_volumes, "pvc-1~creating.vhdx");
 
-        Assert.Equal(0, Sweeper().Sweep());
+        Assert.Equal(0, Sweeper().Sweep(new CancellationToken(canceled: true)));
         Assert.True(File.Exists(creating));
     }
 
@@ -87,8 +87,8 @@ public sealed class StaleMarkerSweeperTests : IDisposable
     {
         Directory.Delete(_root, recursive: true);
 
-        Assert.Equal(0, Sweeper().Sweep());
-        Assert.Equal(0, Sweeper(snapshotsRoot: string.Empty).Sweep());
+        Assert.Equal(0, Sweeper().Sweep(CancellationToken.None));
+        Assert.Equal(0, Sweeper(snapshotsRoot: string.Empty).Sweep(CancellationToken.None));
     }
 
     [Fact]
@@ -103,7 +103,6 @@ public sealed class StaleMarkerSweeperTests : IDisposable
 
     private StaleMarkerSweeper Sweeper(string? snapshotsRoot = null) => new(
         Options.Create(new AgentOptions { CsvVolumesRoot = _volumes, CsvSnapshotsRoot = snapshotsRoot ?? _snapshots }),
-        TimeProvider.System,
         NullLogger<StaleMarkerSweeper>.Instance);
 
     private static string WriteOld(string directory, string name)

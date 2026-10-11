@@ -144,12 +144,16 @@ public sealed class AgentOptions
     /// for an operator to do.
     /// <para>
     /// Kept short, because the first of these waits sits inside CreateSnapshot's
-    /// fast job, and that job, waits included, has to fit the controller's own
-    /// polling budget (<c>jobPollBudget</c>, 24s effective) alongside
-    /// <see cref="SnapshotCheckpointWaitTimeout"/>.
+    /// fast job, ahead of <see cref="SnapshotCheckpointWaitTimeout"/>, and the
+    /// two together are meant to fit the controller's own polling budget
+    /// (<c>jobPollBudget</c>, 24s effective): 3s and 20s leave a second for
+    /// the CIM calls around them. A fast job that sits out both in full can
+    /// still outrun that budget; the controller then reports its own generic
+    /// timeout and the snapshotter's retry finds the same job, so nothing is
+    /// lost but the explanation. Raising this means lowering that one.
     /// </para>
     /// </remarks>
-    public TimeSpan ChainSettleTimeout { get; set; } = TimeSpan.FromSeconds(5);
+    public TimeSpan ChainSettleTimeout { get; set; } = TimeSpan.FromSeconds(3);
 
     /// <summary>
     /// How long a copy that has already been granted its VM and volume

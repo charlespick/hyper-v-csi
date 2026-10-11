@@ -313,14 +313,15 @@ public sealed class JobsEndpointTests : IDisposable
     }
 
     [Fact]
-    public async Task PostJobs_OnceTheStoreIsDraining_Returns503AndPollsStillAnswer()
+    public async Task PostJobs_RefusedByAStoppingStore_Returns503RatherThanA500()
     {
         var client = _factory.CreateClient();
         var done = await RunToCompletionAsync(client, CreateVolumeRequest("pvc-1", 4096));
         var id = done.RootElement.GetProperty("id").GetString();
 
-        // What JobDrainService does when the host begins stopping. Kestrel
-        // stops after it, so requests keep arriving in that window.
+        // Not the production ordering - there Kestrel has stopped before the
+        // drain begins (see JobDrainService), so this pins only the handler:
+        // a refusal from a stopping store must reach the caller as a 503.
         var store = _factory.Services.GetRequiredService<Core.Jobs.InMemoryJobStore>();
         Assert.Empty(await store.DrainAsync(TimeSpan.Zero, CancellationToken.None));
 
