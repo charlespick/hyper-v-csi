@@ -1104,29 +1104,36 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                     // the same reason.
                     using var vm = GetComputerSystem(session, hostName, vmId, deadline, cancellationToken);
 
-                    // Only the checkpoints behind this chain - the ones whose
-                    // frozen disks include a disk in it - not every checkpoint
+                    // The checkpoints behind this chain are the ones whose
+                    // frozen disks include a disk in it, not every checkpoint
                     // on the VM. A checkpoint is VM-wide, but it froze only
                     // the disks the VM had when it was taken: an operator's
                     // checkpoint from before this volume was attached is not
                     // what this chain stands on, and naming it to an operator
                     // as "delete this" - for a chain that is really a merge
                     // still collapsing - would be the very advice issue #38
-                    // is about. One CIM enumeration, fed to every question
+                    // is about. So only those are ever named; a checkpoint
+                    // whose frozen disks could not be read is never named
+                    // either. One CIM enumeration, fed to every question
                     // below, so their answers are about a single look at the
                     // VM's checkpoints.
                     chain.Add(parent);
-                    var checkpoints = ReadCheckpointIdentities(session, vmId, deadline, cancellationToken)
-                        .Where(checkpoint => checkpoint.FrozenDisks is { } frozen
-                            && frozen.Any(disk => chain.Any(link => SamePath(disk, link))))
-                        .ToList();
+                    var checkpoints = ReadCheckpointIdentities(session, vmId, deadline, cancellationToken);
 
-                    // Exact match first: is the checkpoint at this chain's
-                    // root *this* snapshot's own, to resume past? A prefix
-                    // match here is exactly the bug this replaced - it let a
-                    // snapshot named e.g. "snap" adopt, and later destroy, a
-                    // checkpoint actually standing for a sibling snapshot
-                    // named "snap-2".
+                    bool IsBehindChain(Checkpoint checkpoint) =>
+                        checkpoint.FrozenDisks is { } frozen
+                        && frozen.Any(disk => chain.Any(link => SamePath(disk, link)));
+
+                    // Exact match first, against every checkpoint on the VM:
+                    // is the checkpoint at this chain's root *this*
+                    // snapshot's own, to resume past? Not narrowed to the
+                    // chain - this exact identity is unique, and a frozen-disk
+                    // read that failed must not lose this snapshot's own
+                    // checkpoint and send a resume down the "still merging"
+                    // path while it stands. A prefix match here is exactly
+                    // the bug this replaced - it let a snapshot named e.g.
+                    // "snap" adopt, and later destroy, a checkpoint actually
+                    // standing for a sibling snapshot named "snap-2".
                     if (CheckpointMatching.FindExact(checkpoints, thisSnapshotElementName) is { } owned)
                     {
                         return new VolumeAttachment(VolumeAttachmentKind.BehindOwnedCheckpoint, owned);
@@ -1142,8 +1149,13 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                     // remarks. Returned immediately rather than through the
                     // caller's retry on DiskChainUnsettledException: a
                     // checkpoint was found and positively identified, so
-                    // there is nothing left to wait out.
-                    if (CheckpointMatching.FindAnyOwned(checkpoints) is { } other)
+                    // there is nothing left to wait out. One of ours whose
+                    // frozen disks could not be read still counts - it
+                    // cannot be ruled out as what this chain stands on, and
+                    // what this answer leads to is a refusal, not a delete.
+                    if (CheckpointMatching.FindAnyOwned(
+                            checkpoints.Where(checkpoint => checkpoint.FrozenDisks is null || IsBehindChain(checkpoint)))
+                        is { } other)
                     {
                         return new VolumeAttachment(VolumeAttachmentKind.BehindOtherSnapshotsCheckpoint, other);
                     }
@@ -1168,6 +1180,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                         "chain is built on it, and the checkpoint at the root of that chain is not one this driver " +
                         "tagged",
                         checkpoints
+                            .Where(IsBehindChain)
                             .Select(checkpoint => new UntaggedCheckpoint(
                                 checkpoint.SettingsPath, checkpoint.ElementName, checkpoint.CreatedAt))
                             .ToList());

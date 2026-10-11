@@ -884,6 +884,11 @@ public sealed class SnapshotServiceTests : IDisposable
             () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None));
 
         Assert.Equal(AgentErrorCodes.Aborted, failure.ErrorCode);
+
+        // Said as what it is - an unreadable configuration - not as a
+        // checkpoint underneath that an operator would go looking for.
+        Assert.Contains("could not be read", failure.Message);
+        Assert.DoesNotContain("underneath", failure.Message);
         Assert.Empty(harness.Copier.Destinations);
         await WaitForAsync(() => host.DestroyedCheckpointElementNames.Count == 1);
         Assert.Equal([VolumePath("pvc-1")], host.CollapseCheckedOnto);

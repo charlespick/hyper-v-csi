@@ -1227,20 +1227,33 @@ public sealed class SnapshotService : ISnapshotService
                 // is refused rather than published on a guess.
                 if (checkpointTaken && !FrozeTheSource(frozenBy, sourcePath))
                 {
+                    // Two different reasons, told apart so neither sends an
+                    // operator looking for the wrong thing: something really
+                    // did checkpoint the VM underneath, or which disks the
+                    // checkpoint froze could not be read at all.
+                    var unknown = frozenBy?.FrozenDisks is null;
                     _logger.LogWarning(
-                        "CopySnapshot {SnapshotId}: checkpoint {ElementName} did not freeze {Source} itself (froze {Frozen}); " +
-                        "something else checkpointed the VM underneath it, so it is merged away and the copy refused",
-                        snapshotId, frozenBy?.ElementName ?? elementName, sourcePath,
-                        frozenBy?.FrozenDisks is { } frozen ? string.Join(", ", frozen) : "unknown");
+                        unknown
+                            ? "CopySnapshot {SnapshotId}: could not read which disks checkpoint {ElementName} froze, so " +
+                              "{Source} cannot be confirmed frozen at its moment; merging it away and refusing the copy"
+                            : "CopySnapshot {SnapshotId}: checkpoint {ElementName} did not freeze {Source} itself; " +
+                              "something else checkpointed the VM underneath it, so it is merged away and the copy refused",
+                        snapshotId, frozenBy?.ElementName ?? elementName, sourcePath);
                     await DestroyOwnedCheckpointAndWaitAsync(
                         snapshotId, sourceVolumeId, snapshotName, vmId!, sourcePath, attempt.Token).ConfigureAwait(false);
                     throw new JobFailureException(
                         AgentErrorCodes.Aborted,
-                        $"snapshot {snapshotId} cannot be copied yet: the checkpoint it took of {vmId} did not freeze " +
-                        $"{sourcePath} itself - another checkpoint was taken underneath it since the volume was last " +
-                        "looked at, and copying through both would report a newer creation time than the data it " +
-                        "holds. This snapshot's checkpoint was merged away; the retry looks again and names whatever " +
-                        "is in the way");
+                        unknown
+                            ? $"snapshot {snapshotId} cannot be copied yet: which disks the checkpoint it took of {vmId} " +
+                              $"froze could not be read on {vm?.OwningHost}, so it cannot be confirmed that the copy " +
+                              $"would capture {sourcePath} at the moment it reports. The checkpoint was merged away and " +
+                              "the snapshot is retried automatically; if this persists, check that the agent can read " +
+                              "the VM's checkpoint configuration on that host"
+                            : $"snapshot {snapshotId} cannot be copied yet: the checkpoint it took of {vmId} did not " +
+                              $"freeze {sourcePath} itself - another checkpoint was taken underneath it since the volume " +
+                              "was last looked at, and copying through both would report a newer creation time than " +
+                              "the data it holds. This snapshot's checkpoint was merged away; the retry looks again " +
+                              "and names whatever is in the way");
                 }
 
                 _logger.LogInformation(
