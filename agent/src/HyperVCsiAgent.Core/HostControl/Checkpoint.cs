@@ -29,4 +29,18 @@ namespace HyperVCsiAgent.Core.HostControl;
 /// older build of this driver, before this property existed, may not carry
 /// one either.
 /// </param>
-public sealed record Checkpoint(string SettingsPath, string ElementName, string? Notes);
+/// <param name="FrozenDisks">
+/// The disks this checkpoint froze, from its own configuration: the files the
+/// VM's disks sit directly on while it stands, and return to once its merge
+/// collapses - measured against a real host. What ties a checkpoint to a
+/// particular disk's chain, which a checkpoint being VM-wide otherwise leaves
+/// unsaid. Null when it could not be read, which every caller treats as "not
+/// known" rather than "nothing".
+/// </param>
+/// <param name="CreatedAt">When it was taken, for naming it to an operator; nothing decides on it.</param>
+public sealed record Checkpoint(
+    string SettingsPath,
+    string ElementName,
+    string? Notes,
+    IReadOnlyList<string>? FrozenDisks = null,
+    DateTimeOffset? CreatedAt = null);

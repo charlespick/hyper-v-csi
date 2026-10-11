@@ -49,6 +49,12 @@ public interface IVhdxLocationService
     /// single VM found elsewhere, since a second VM referencing the path there
     /// cannot be ruled out. Each is refused rather than guessed past.
     /// </exception>
+    /// <exception cref="DiskChainUnsettledException">
+    /// The one case of the above worth asking again about: no VM was found to
+    /// reference the path, and the only thing standing in the way of saying
+    /// so is a disk whose setting data came back empty on a VM's chain - see
+    /// <see cref="UnresolvedDiskReference.Unsettled"/>.
+    /// </exception>
     Task<VhdxLocation?> LocateAsync(string path, CancellationToken cancellationToken);
 
     /// <summary>

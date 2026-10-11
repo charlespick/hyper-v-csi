@@ -110,15 +110,6 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     /// </summary>
     private static readonly TimeSpan CheckpointDiscoveryPollInterval = TimeSpan.FromMilliseconds(250);
 
-    /// <summary>
-    /// How many times <see cref="ClassifyAttachmentAsync"/> re-checks an
-    /// ambiguous chain before believing it. Bounds a real but narrow and
-    /// self-clearing race - see <see cref="AmbiguousChainException"/> - to a
-    /// second or so, not the kind of wait that should ever mask a genuinely
-    /// foreign checkpoint for long.
-    /// </summary>
-    private const int MaxAttachmentClassificationAttempts = 5;
-
     private readonly ILogger<CimHyperVHostClient> _logger;
     private readonly TimeSpan _hostOperationTimeout;
 
@@ -469,46 +460,18 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
 
-            // Retried rather than a single query: measured against a real
-            // host, DestroySnapshot's checkpoint object can disappear a
-            // moment before the VM's disk actually re-points to the base -
-            // the merge itself lags the checkpoint's own removal by a beat.
-            // A single query in that window sees a chain with no owned
-            // checkpoint at its root, which is indistinguishable from a
-            // genuinely foreign one without waiting a moment and asking
-            // again. Re-fetches the active settings fresh each attempt,
-            // unlike FindNewCheckpoint's retry: what has to change here is
-            // the VM's own disk configuration, not an association's
-            // eventual consistency, and a stale settings snapshot would
-            // never show that.
-            //
-            // Only the genuinely-ambiguous case retries here. A chain rooted
-            // in a checkpoint this driver tagged for a *different* snapshot
-            // is not ambiguous - a checkpoint was found and positively
-            // identified - so ClassifyAttachment returns that answer
-            // immediately rather than throwing AmbiguousChainException, and
-            // this loop never sees it.
-            for (var attempt = 0; ; attempt++)
-            {
-                using var settings = GetActiveSettings(session, hostName, vmId, deadline, cancellationToken);
-                try
-                {
-                    return ClassifyAttachment(
-                        session, settings, hostName, vmId, vhdxPath, thisSnapshotElementName, deadline, cancellationToken);
-                }
-                catch (AmbiguousChainException ex) when (attempt < MaxAttachmentClassificationAttempts - 1)
-                {
-                    // Expected and self-clearing, not swallowed silently: see
-                    // this loop's own remarks for why attempt < the last one
-                    // retries rather than lets this become the caller-visible
-                    // failure.
-                    _logger.LogDebug(ex,
-                        "attempt {Attempt} to classify {VhdxPath}'s attachment to {VmId} on {HostName} was ambiguous; retrying",
-                        attempt + 1, vhdxPath, vmId, hostName);
-                    cancellationToken.ThrowIfCancellationRequested();
-                    Thread.Sleep(CheckpointDiscoveryPollInterval);
-                }
-            }
+            // One look, not a retry loop: a chain that cannot be settled
+            // comes back as DiskChainUnsettledException and the caller
+            // decides - see SnapshotService.DecideUntaggedRoot and
+            // RetryWhileTransientAsync. This used to retry here itself, five
+            // times 250ms, and no amount of retrying could have been enough:
+            // a sibling snapshot's checkpoint is untagged from its creation
+            // until TagCheckpoint's own CIM call lands, however long that
+            // takes on a busy host, and only a caller holding the VM's vm:
+            // target can rule that out.
+            using var settings = GetActiveSettings(session, hostName, vmId, deadline, cancellationToken);
+            return ClassifyAttachment(
+                session, settings, hostName, vmId, vhdxPath, thisSnapshotElementName, deadline, cancellationToken);
         }, cancellationToken);
 
     public Task<Checkpoint> CreateCheckpointAsync(
@@ -560,7 +523,27 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
 
             _logger.LogInformation(
                 "created checkpoint {ElementName} of {VmId} on {HostName}", elementName, vmId, hostName);
-            return new Checkpoint(taggedPath, elementName, notesJson);
+
+            // What it froze, off the instance just read - the caller checks
+            // the source is among them before it copies (issue #38: anything
+            // that slipped a checkpoint underneath since the classification
+            // shows up here as the source missing). Unread is reported as
+            // unknown, never as nothing: the checkpoint exists either way, and
+            // failing here would only strand it.
+            List<string>? frozenDisks;
+            try
+            {
+                frozenDisks = ReadFrozenDisks(session, created, deadline, cancellationToken);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogWarning(ex,
+                    "created checkpoint {ElementName} of {VmId} on {HostName} but could not read which disks it froze",
+                    elementName, vmId, hostName);
+                frozenDisks = null;
+            }
+
+            return new Checkpoint(taggedPath, elementName, notesJson, frozenDisks, ReadCreationTime(created));
         }, cancellationToken);
 
     public Task<Checkpoint?> FindOwnedCheckpointAsync(
@@ -635,36 +618,44 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             return IsProductionOnlyCheckpoints(activeSettings);
         }, cancellationToken);
 
-    public Task<bool> IsChainCollapsedAsync(
-        string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+    public Task<bool> IsCollapsedOntoAsync(
+        string hostName, string vmId, IReadOnlyCollection<string> frozenDisks, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
             _logger.LogDebug(
-                "checking whether {VhdxPath}'s differencing chain on {VmId} on {HostName} has collapsed", vhdxPath, vmId, hostName);
+                "checking whether {VmId} on {HostName} still has a differencing disk on any of {FrozenDisks}",
+                vmId, hostName, frozenDisks);
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
             using var settings = GetActiveSettings(session, hostName, vmId, deadline, cancellationToken);
-            return IsChainCollapsed(session, settings, vhdxPath, deadline, cancellationToken, _logger);
+            return IsCollapsedOnto(session, settings, frozenDisks, deadline, cancellationToken, _logger);
         }, cancellationToken);
 
     /// <summary>
-    /// <see cref="IsChainCollapsedAsync"/>'s traversal. Structurally the same
-    /// walk <see cref="ClassifyAttachment"/> does, and deliberately its own
-    /// copy rather than a shared one, for the same reason
+    /// <see cref="IsCollapsedOntoAsync"/>'s check. Its own code rather than a
+    /// walk shared with <see cref="ClassifyAttachment"/>, for the same reason
     /// <see cref="ClassifyAttachment"/>'s own remarks give for not sharing
-    /// with <see cref="LocateDisk"/>: this method must never throw on an
-    /// unresolved chain, and every other walk in this file must keep doing
+    /// with <see cref="LocateDisk"/>: this method must never throw on a disk
+    /// it cannot read, and every other walk in this file must keep doing
     /// exactly that.
     /// </summary>
-    private static bool IsChainCollapsed(
+    /// <remarks>
+    /// One level, not a walk: a disk the merge has re-pointed is one of
+    /// <paramref name="frozenDisks"/> itself, and one it has not sits directly
+    /// on one of them. So an attached disk that is a frozen one is settled
+    /// without being read, and once the merge is done no disk is read at all -
+    /// which keeps a disk this merge never touched, readable or not, out of
+    /// the question.
+    /// </remarks>
+    private static bool IsCollapsedOnto(
         CimSession session,
         CimInstance settings,
-        string vhdxPath,
+        IReadOnlyCollection<string> frozenDisks,
         CimDeadline deadline,
         CancellationToken cancellationToken,
         ILogger logger)
     {
-        var otherDisks = new List<string>();
+        var notFrozen = new List<string>();
 
         foreach (var disk in DeviceSettings(session, settings, "Msvm_StorageAllocationSettingData", deadline, cancellationToken))
         {
@@ -675,90 +666,52 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                     continue;
                 }
 
-                if (disk.CimInstanceProperties["HostResource"]?.Value is not string[] { Length: > 0 } hostResource)
+                if (disk.CimInstanceProperties["HostResource"]?.Value is string[] { Length: > 0 } hostResource
+                    && !frozenDisks.Any(frozen => SamePath(frozen, hostResource[0])))
                 {
-                    continue;
+                    notFrozen.Add(hostResource[0]);
                 }
-
-                if (SamePath(hostResource[0], vhdxPath))
-                {
-                    return true;
-                }
-
-                otherDisks.Add(hostResource[0]);
             }
         }
 
-        // Nothing else references vhdxPath at all, so there is no chain left
-        // to collapse - the same answer a VHDX that was never behind a
-        // checkpoint in the first place gets.
-        if (otherDisks.Count == 0)
+        if (notFrozen.Count == 0)
         {
             return true;
         }
 
         using var imageService = GetImageManagementService(session, deadline, cancellationToken);
 
-        foreach (var attached in otherDisks)
+        foreach (var attached in notFrozen)
         {
-            var descendant = attached;
-            var depth = 0;
+            cancellationToken.ThrowIfCancellationRequested();
 
-            for (; depth < MaxDifferencingChainDepth; depth++)
+            string? parent;
+            try
             {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                string? parent;
-                try
-                {
-                    parent = ParentPathOf(session, imageService, descendant, deadline, cancellationToken);
-                }
-                catch (InvalidOperationException ex)
-                {
-                    // ParentPathOf could not read this disk's setting data,
-                    // so whether it is still built on vhdxPath is unknown.
-                    // Every throwing walk in this file treats an unreadable
-                    // disk as a reason to refuse the whole operation; this
-                    // one instead answers "not collapsed yet" - its one
-                    // caller is polling a merge already under way, and a
-                    // momentarily unreadable disk is exactly what polling
-                    // during an active reconfiguration looks like. Logged
-                    // rather than swallowed outright, though: a disk that
-                    // stays unreadable across many polls of the same merge is
-                    // worth an operator's attention even though no single
-                    // poll should fail over it.
-                    logger.LogDebug(ex,
-                        "could not read {Descendant}'s setting data while checking whether its chain has collapsed onto {VhdxPath}; treating it as not collapsed yet",
-                        descendant, vhdxPath);
-                    return false;
-                }
-
-                if (parent is null)
-                {
-                    break;
-                }
-
-                if (SamePath(parent, vhdxPath))
-                {
-                    // Still stacked on vhdxPath - whoever the checkpoint at
-                    // the root of this chain belongs to is not this
-                    // method's question. The merge this caller is waiting on
-                    // has not re-pointed the chain yet.
-                    return false;
-                }
-
-                descendant = parent;
+                parent = ParentPathOf(session, imageService, attached, deadline, cancellationToken);
+            }
+            catch (InvalidOperationException ex)
+            {
+                // Whether this disk still sits on a frozen one is unknown.
+                // Every throwing walk in this file treats an unreadable disk
+                // as a reason to refuse the whole operation; this one instead
+                // answers "not collapsed yet" - its one caller is polling a
+                // merge already under way, and a momentarily unreadable disk
+                // is exactly what polling during an active reconfiguration
+                // looks like. Logged rather than swallowed outright, though:
+                // a disk that stays unreadable across many polls of the same
+                // merge is worth an operator's attention even though no
+                // single poll should fail over it.
+                logger.LogDebug(ex,
+                    "could not read {Attached}'s setting data while checking whether it still sits on a frozen disk; treating it as not collapsed yet",
+                    attached);
+                return false;
             }
 
-            if (depth == MaxDifferencingChainDepth)
+            if (parent is not null && frozenDisks.Any(frozen => SamePath(frozen, parent)))
             {
-                // Unresolved within the bound. GuardAgainstDifferencingChain
-                // and ClassifyAttachment both refuse to guess past this and
-                // throw, because their callers are deciding whether an
-                // operation is safe to start. This method's one caller is
-                // polling a merge it already started, not deciding whether
-                // to start one, so an unresolved chain reads the same way an
-                // ordinary in-progress merge does: not collapsed yet.
+                // Still stacked on a disk the checkpoint froze: the merge has
+                // not re-pointed it yet.
                 return false;
             }
         }
@@ -871,7 +824,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     /// <summary>
     /// <see cref="FindDiskReferencesAsync"/>'s matching over
     /// <see cref="ReadActiveDisks"/>' answer - the walk
-    /// <see cref="IsChainCollapsed"/> does, asking the other question: whether
+    /// <see cref="IsCollapsedOnto"/> does, asking the other question: whether
     /// anything on each VM is <paramref name="vhdxPath"/> or is built on it.
     /// </summary>
     /// <remarks>
@@ -943,6 +896,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             {
                 var (vmId, paths) = toWalk[next];
                 var chainFailures = new List<string>();
+                var everyFailureUnreadable = true;
                 var builtOn = false;
                 try
                 {
@@ -972,6 +926,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                             logger.LogDebug(ex,
                                 "could not walk {Attached}'s differencing chain on {VmId}; carrying on with its other disks", attached, vmId);
                             chainFailures.Add($"{attached}: {ex.Message}");
+                            everyFailureUnreadable &= ex is UnreadableSettingDataException;
                         }
                     }
                 }
@@ -1001,7 +956,8 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                     unresolved.Add(new UnresolvedDiskReference(
                         vmId,
                         $"no disk on it was found to be {vhdxPath} or built on it, but {chainFailures.Count} of its " +
-                        $"differencing chains could not be walked to tell: {string.Join("; ", chainFailures)}"));
+                        $"differencing chains could not be walked to tell: {string.Join("; ", chainFailures)}",
+                        Unsettled: everyFailureUnreadable));
                 }
             }
         }
@@ -1108,13 +1064,34 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         foreach (var attached in otherDisks)
         {
             var descendant = attached;
+
+            // The disks this chain stands on, nearest first: what a
+            // checkpoint must have frozen to be behind it.
+            var chain = new List<string>();
             var depth = 0;
 
             for (; depth < MaxDifferencingChainDepth; depth++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                if (ParentPathOf(session, imageService, descendant, deadline, cancellationToken) is not { } parent)
+                string? parent;
+                try
+                {
+                    parent = ParentPathOf(session, imageService, descendant, deadline, cancellationToken);
+                }
+                catch (UnreadableSettingDataException ex)
+                {
+                    // Measured in production: during concurrent snapshots on
+                    // one VM, an .avhdx a sibling's checkpoint is creating or
+                    // merging reads back empty for a few seconds - usually a
+                    // different volume's disk than this one, since every
+                    // disk on the VM gets a link in the chain. Unsettled
+                    // rather than refused, for the caller to ask again.
+                    throw new DiskChainUnsettledException(
+                        DiskChainUnsettledReason.UnreadableDisk, ex.Message, innerException: ex);
+                }
+
+                if (parent is null)
                 {
                     break;
                 }
@@ -1127,20 +1104,36 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                     // the same reason.
                     using var vm = GetComputerSystem(session, hostName, vmId, deadline, cancellationToken);
 
-                    // One CIM enumeration, fed to both match modes below,
-                    // rather than one query per mode: what has to agree is
-                    // the two questions' answers about a single snapshot of
-                    // the VM's checkpoints, not two separately-fetched views
-                    // that could disagree if something changed on the host
-                    // between them.
+                    // The checkpoints behind this chain are the ones whose
+                    // frozen disks include a disk in it, not every checkpoint
+                    // on the VM. A checkpoint is VM-wide, but it froze only
+                    // the disks the VM had when it was taken: an operator's
+                    // checkpoint from before this volume was attached is not
+                    // what this chain stands on, and naming it to an operator
+                    // as "delete this" - for a chain that is really a merge
+                    // still collapsing - would be the very advice issue #38
+                    // is about. So only those are ever named; a checkpoint
+                    // whose frozen disks could not be read is never named
+                    // either. One CIM enumeration, fed to every question
+                    // below, so their answers are about a single look at the
+                    // VM's checkpoints.
+                    chain.Add(parent);
                     var checkpoints = ReadCheckpointIdentities(session, vmId, deadline, cancellationToken);
 
-                    // Exact match first: is the checkpoint at this chain's
-                    // root *this* snapshot's own, to resume past? A prefix
-                    // match here is exactly the bug this replaced - it let a
-                    // snapshot named e.g. "snap" adopt, and later destroy, a
-                    // checkpoint actually standing for a sibling snapshot
-                    // named "snap-2".
+                    bool IsBehindChain(Checkpoint checkpoint) =>
+                        checkpoint.FrozenDisks is { } frozen
+                        && frozen.Any(disk => chain.Any(link => SamePath(disk, link)));
+
+                    // Exact match first, against every checkpoint on the VM:
+                    // is the checkpoint at this chain's root *this*
+                    // snapshot's own, to resume past? Not narrowed to the
+                    // chain - this exact identity is unique, and a frozen-disk
+                    // read that failed must not lose this snapshot's own
+                    // checkpoint and send a resume down the "still merging"
+                    // path while it stands. A prefix match here is exactly
+                    // the bug this replaced - it let a snapshot named e.g.
+                    // "snap" adopt, and later destroy, a checkpoint actually
+                    // standing for a sibling snapshot named "snap-2".
                     if (CheckpointMatching.FindExact(checkpoints, thisSnapshotElementName) is { } owned)
                     {
                         return new VolumeAttachment(VolumeAttachmentKind.BehindOwnedCheckpoint, owned);
@@ -1148,32 +1141,52 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
 
                     // Not this snapshot's. Before concluding the chain is
                     // foreign, ask the driver-level question instead of the
-                    // per-snapshot one: is *any* checkpoint here one this
+                    // per-snapshot one: is *any* checkpoint behind it one this
                     // driver tagged, just for a different (volume, snapshot)
                     // attempt? A checkpoint is VM-wide, so a sibling volume's
                     // checkpoint re-points this chain exactly as this
                     // snapshot's own would - see VolumeAttachmentKind's own
                     // remarks. Returned immediately rather than through the
-                    // AmbiguousChainException retry below: a checkpoint was
-                    // found and positively identified, so there is nothing
-                    // ambiguous left to wait out.
-                    if (CheckpointMatching.FindAnyOwned(checkpoints) is { } other)
+                    // caller's retry on DiskChainUnsettledException: a
+                    // checkpoint was found and positively identified, so
+                    // there is nothing left to wait out. One of ours whose
+                    // frozen disks could not be read still counts - it
+                    // cannot be ruled out as what this chain stands on, and
+                    // what this answer leads to is a refusal, not a delete.
+                    if (CheckpointMatching.FindAnyOwned(
+                            checkpoints.Where(checkpoint => checkpoint.FrozenDisks is null || IsBehindChain(checkpoint)))
+                        is { } other)
                     {
                         return new VolumeAttachment(VolumeAttachmentKind.BehindOtherSnapshotsCheckpoint, other);
                     }
 
-                    // Ambiguous rather than definitely foreign: the checkpoint
-                    // at the root of this chain might be ours, already merged
-                    // away in the instant before the disk pointer catches up
-                    // - see ClassifyAttachmentAsync's retry. Only becomes the
-                    // caller-visible "foreign chain" failure once that retry
-                    // is exhausted.
-                    throw new AmbiguousChainException(
+                    // Unsettled rather than definitely foreign: the checkpoint
+                    // at the root of this chain might be ours - created but
+                    // not yet tagged, which is a second CIM call after the
+                    // create (see CreateCheckpointAsync) - or there may be no
+                    // checkpoint behind it at all, one already destroyed whose
+                    // merge has not re-pointed the disk yet. Only the caller
+                    // can tell: one holding the VM's vm: target knows no
+                    // checkpoint of this driver's is being created meanwhile
+                    // (SnapshotService.DecideUntaggedRoot). The checkpoints
+                    // behind the chain are carried so that caller can name
+                    // them to an operator - and an empty list says the merge
+                    // case, which it asks about again instead. No advice to
+                    // delete anything here - this look alone cannot tell an
+                    // operator's checkpoint from this driver's own.
+                    throw new DiskChainUnsettledException(
+                        DiskChainUnsettledReason.UntaggedRoot,
                         $"{vhdxPath} is not attached to {vmId} directly, but {attached} is and its differencing " +
                         "chain is built on it, and the checkpoint at the root of that chain is not one this driver " +
-                        "tagged - delete the foreign checkpoint before snapshotting this volume");
+                        "tagged",
+                        checkpoints
+                            .Where(IsBehindChain)
+                            .Select(checkpoint => new UntaggedCheckpoint(
+                                checkpoint.SettingsPath, checkpoint.ElementName, checkpoint.CreatedAt))
+                            .ToList());
                 }
 
+                chain.Add(parent);
                 descendant = parent;
             }
 
@@ -1190,16 +1203,14 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     }
 
     /// <summary>
-    /// A chain rooted on the target path with no owned checkpoint at its
-    /// root - which is either a genuinely foreign checkpoint, or this
-    /// driver's own, already merged away, with the disk pointer not yet
-    /// caught up. <see cref="ClassifyAttachmentAsync"/> retries a few times
-    /// before letting one of these become the caller-visible
-    /// <see cref="InvalidOperationException"/>; deriving from it means an
-    /// exhausted retry needs no unwrapping to surface the same message and
-    /// type the interface already documents.
+    /// <see cref="ParentPathOf"/>'s read came back with no setting data. An
+    /// <see cref="InvalidOperationException"/> so every walk that refuses on an
+    /// unreadable disk goes on refusing exactly as before; its own type so the
+    /// two walks that treat it as unsettled - <see cref="ClassifyAttachment"/>
+    /// and <see cref="FindDiskReferences"/> - can tell it from a chain too deep
+    /// to walk.
     /// </summary>
-    private sealed class AmbiguousChainException(string message) : InvalidOperationException(message);
+    private sealed class UnreadableSettingDataException(string message) : InvalidOperationException(message);
 
     private static void EnsureProductionOnlyCheckpoints(string vmId, CimInstance activeSettings)
     {
@@ -1367,19 +1378,82 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     {
         var checkpoints = new List<Checkpoint>();
 
-        foreach (var checkpoint in CheckpointSettings(session, vmId, deadline, cancellationToken))
+        // Materialized before any disk is read, as every other multi-query
+        // path in this file does: each frozen-disk read is a query of its
+        // own, and none is issued while the checkpoint enumeration is still
+        // open on the same session.
+        var instances = CheckpointSettings(session, vmId, deadline, cancellationToken).ToList();
+        try
         {
-            using (checkpoint)
+            foreach (var checkpoint in instances)
             {
-                if (checkpoint.CimInstanceProperties["ElementName"]?.Value is string { Length: > 0 } elementName)
+                // Per checkpoint, and unknown rather than fatal: one a backup
+                // product removes between the enumeration and this read must
+                // not take the whole answer down with it. Unknown leaves it
+                // out of ClassifyAttachment's behind-the-chain set and sends
+                // the merge wait back to the source alone - the safe side of
+                // both.
+                List<string>? frozenDisks;
+                try
                 {
-                    checkpoints.Add(new Checkpoint(FullPathTextOf(checkpoint), elementName, ReadNotes(checkpoint)));
+                    frozenDisks = ReadFrozenDisks(session, checkpoint, deadline, cancellationToken);
                 }
+                catch (CimException) when (!deadline.HasExpired)
+                {
+                    frozenDisks = null;
+                }
+
+                // Every checkpoint, named or not: an unnamed one cannot match
+                // this driver's identity, but it can still be what a disk's
+                // chain stands on, which ClassifyAttachment has to see.
+                checkpoints.Add(new Checkpoint(
+                    FullPathTextOf(checkpoint),
+                    checkpoint.CimInstanceProperties["ElementName"]?.Value as string ?? string.Empty,
+                    ReadNotes(checkpoint),
+                    frozenDisks,
+                    ReadCreationTime(checkpoint)));
+            }
+        }
+        finally
+        {
+            foreach (var checkpoint in instances)
+            {
+                checkpoint.Dispose();
             }
         }
 
         return checkpoints;
     }
+
+    /// <summary>
+    /// The disks a checkpoint froze, from its own configuration - see
+    /// <see cref="Checkpoint.FrozenDisks"/>. One association query per
+    /// checkpoint, the same one <see cref="DeviceSettings"/> runs against a
+    /// VM's active configuration.
+    /// </summary>
+    private static List<string> ReadFrozenDisks(
+        CimSession session, CimInstance checkpoint, CimDeadline deadline, CancellationToken cancellationToken)
+    {
+        var disks = new List<string>();
+        foreach (var disk in DeviceSettings(session, checkpoint, "Msvm_StorageAllocationSettingData", deadline, cancellationToken))
+        {
+            using (disk)
+            {
+                if ((disk.CimInstanceProperties["ResourceSubType"]?.Value as string) == VirtualHardDiskSubType
+                    && disk.CimInstanceProperties["HostResource"]?.Value is string[] { Length: > 0 } hostResource)
+                {
+                    disks.Add(hostResource[0]);
+                }
+            }
+        }
+
+        return disks;
+    }
+
+    private static DateTimeOffset? ReadCreationTime(CimInstance checkpoint) =>
+        checkpoint.CimInstanceProperties["CreationTime"]?.Value is DateTime created
+            ? new DateTimeOffset(created.ToUniversalTime())
+            : null;
 
     /// <summary>
     /// The first non-empty element of <c>Notes</c>, or null. <c>TagCheckpoint</c>
@@ -1773,7 +1847,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         // either, not a new gap introduced by moving off System.Management.
         if (result.OutParameters["SettingData"]?.Value as string is not { Length: > 0 } settingData)
         {
-            throw new InvalidOperationException(
+            throw new UnreadableSettingDataException(
                 $"could not read the setting data for {vhdxPath}, so whether it has a parent disk is unknown");
         }
 

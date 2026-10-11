@@ -1,4 +1,4 @@
-using HyperVCsiAgent.Core.Cluster;
+﻿using HyperVCsiAgent.Core.Cluster;
 using HyperVCsiAgent.Core.Configuration;
 using HyperVCsiAgent.Core.HostControl;
 using HyperVCsiAgent.Core.Jobs;
@@ -250,6 +250,35 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
     }
 
     [Fact]
+    public async Task SweepAsync_OnceTheStoreIsStopping_EndsQuietlyWithoutTryingTheRest()
+    {
+        // An interval pass that lands in the shutdown drain: the store refuses
+        // everything from here on, which is no checkpoint's fault and nothing
+        // to log an error over per checkpoint - the next process's startup
+        // pass finds them all again.
+        var cluster = new FakeClusterService
+        {
+            Vms =
+            {
+                ["vm-1"] = new ClusteredVm("vm-1", "host-1"),
+                ["vm-2"] = new ClusteredVm("vm-2", "host-1"),
+            },
+        };
+        var harness = NewHarness(cluster);
+        WriteVolume("pvc-1", 4096);
+        WriteVolume("pvc-2", 4096);
+        Directory.CreateDirectory(_snapshotsRoot);
+        harness.Host.SeedOwnedCheckpoint("host-1", "vm-1", "pvc-1", "snap-a");
+        harness.Host.SeedOwnedCheckpoint("host-1", "vm-2", "pvc-2", "snap-b");
+        harness.Store.Stopping = true;
+
+        await NewReaper(harness).SweepAsync(CancellationToken.None);
+
+        Assert.Equal(1, harness.Store.Refusals);
+        Assert.Empty(harness.Store.Created);
+    }
+
+    [Fact]
     public async Task SweepAsync_AHostThatIsNotLive_IsSkipped()
     {
         var cluster = new FakeClusterService
@@ -414,7 +443,7 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
         var disks = new FakeVirtualDiskManager();
         var copier = new FakeDiskCopier();
         var store = new RecordingJobStore();
-        var host = new FakeHostClient();
+        var host = new FakeHostClient { VolumesRoot = _volumesRoot };
         var copySlots = new SnapshotCopySlots(Options.Create(new AgentOptions { MaxConcurrentSnapshotCopies = 4 }));
         var hostSlots = new HostOperationSlots(Options.Create(new AgentOptions { MaxConcurrentHostOperations = 4 }));
         var options = Options.Create(new AgentOptions
@@ -534,9 +563,21 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
         /// </summary>
         public HashSet<string> FailEnqueueFor { get; } = [];
 
+        /// <summary>Refuses every enqueue the way a draining InMemoryJobStore does.</summary>
+        public bool Stopping { get; set; }
+
+        /// <summary>How many enqueues <see cref="Stopping"/> refused.</summary>
+        public int Refusals { get; private set; }
+
         public Job GetOrCreate(
             string idempotencyKey, string operationType, IReadOnlyCollection<string> targets, Func<Job, CancellationToken, Task> run)
         {
+            if (Stopping)
+            {
+                Refusals++;
+                throw new JobStoreStoppingException();
+            }
+
             if (FailEnqueueFor.Contains(idempotencyKey))
             {
                 throw new InvalidOperationException($"this store refuses {idempotencyKey}");
@@ -651,6 +692,22 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
         public void SeedRawCheckpoint(string host, string vmId, string elementName, string? notes) =>
             SeedRawCheckpoint(host, vmId, elementName, notes, ownedOnly: true);
 
+        /// <summary>The volumes directory an owned checkpoint's frozen disk is resolved under.</summary>
+        public string? VolumesRoot { get; init; }
+
+        /// <summary>
+        /// What a seeded checkpoint froze: the one volume an owned identity
+        /// names - what a real checkpoint of a VM holding just that disk would
+        /// record - and nothing known for anything else.
+        /// </summary>
+        private IReadOnlyList<string>? FrozenDisksFor(string elementName)
+        {
+            var parts = elementName.Split('/');
+            return VolumesRoot is not null && elementName.StartsWith(CheckpointMatching.OwnedPrefix, StringComparison.Ordinal) && parts.Length >= 3
+                ? [Path.GetFullPath(Path.Combine(VolumesRoot, parts[1] + VolumeNaming.VhdxExtension))]
+                : null;
+        }
+
         private void SeedRawCheckpoint(string host, string vmId, string elementName, string? notes, bool ownedOnly)
         {
             if (ownedOnly && !elementName.StartsWith(CheckpointMatching.OwnedPrefix, StringComparison.Ordinal))
@@ -664,7 +721,7 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
                 _byHost[host] = entries;
             }
 
-            entries.Add(new Entry(vmId, new Checkpoint($"checkpoint:{elementName}", elementName, notes)));
+            entries.Add(new Entry(vmId, new Checkpoint($"checkpoint:{elementName}", elementName, notes, FrozenDisksFor(elementName))));
         }
 
         public Task<IReadOnlyList<Checkpoint>> ListOwnedCheckpointsAsync(string hostName, string vmId, CancellationToken cancellationToken)
@@ -745,7 +802,7 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
         public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             Task.FromResult(true);
 
-        public Task<bool> IsChainCollapsedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+        public Task<bool> IsCollapsedOntoAsync(string hostName, string vmId, IReadOnlyCollection<string> frozenDisks, CancellationToken cancellationToken) =>
             Task.FromResult(!_byHost.TryGetValue(hostName, out var entries) || entries.Count == 0);
 
         public Task<DiskReferences> FindDiskReferencesAsync(

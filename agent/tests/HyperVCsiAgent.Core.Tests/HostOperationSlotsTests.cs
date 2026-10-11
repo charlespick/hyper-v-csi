@@ -314,7 +314,7 @@ public sealed class HostOperationSlotsTests : IDisposable
         public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
-        public Task<bool> IsChainCollapsedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+        public Task<bool> IsCollapsedOntoAsync(string hostName, string vmId, IReadOnlyCollection<string> frozenDisks, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
     }
 }

@@ -191,6 +191,53 @@ either its in-progress marker or its published file on the CSV, and fails
 `Aborted` if that wait expires, leaving the copy queued rather than cancelling
 it so the next retry keeps its place rather than re-joining at the back.
 
+### Concurrent snapshots on one VM
+
+A checkpoint is VM-wide, so snapshotting two volumes on one VM at once —
+any backup product's normal run — lets each see the other's checkpoint while
+it is being taken or merged. Three moments of that look wrong in a single
+read: the checkpoint after Hyper-V creates it and before this driver tags it,
+which is a second CIM call; a chain still built on the volume after its
+checkpoint is destroyed, until the merge re-points the disk; and an `.avhdx`
+whose setting data reads back empty while it is created or merged.
+
+None of them is decided by watching. Every checkpoint this driver creates,
+tags or destroys, it does inside a job holding the VM's `vm:` target — and a
+job that destroys one keeps that target until every chain that checkpoint
+created has collapsed — read off the checkpoint before it is destroyed, so its
+sibling volumes' too, and nothing a different checkpoint left standing — so the
+question "is this untagged checkpoint ours, mid-creation?" has a definite
+answer for a job that holds that target too — and the copy job does, from
+before it re-classifies the source until after it acts. The fast job, which
+holds no `vm:`, therefore never judges a chain it cannot classify: it measures
+the source as attached and enqueues the copy. The copy job then reports a
+chain rooted on untagged checkpoints as a foreign checkpoint at once —
+`FailedPrecondition`, naming each one and when it was taken — because under
+its hold nothing of this driver's can be creating one. That includes one
+this driver created and never tagged, which nothing will ever clean up.
+
+"Behind" is specific to the chain: a checkpoint records the disks it froze,
+and only checkpoints whose frozen disks include a disk in this volume's chain
+count. An operator's checkpoint from before the volume was attached froze
+nothing this chain stands on, and is never named for it.
+
+The `vm:` hold keeps out this driver, not a backup product or an operator, so
+the copy job also checks after the fact that its own checkpoint froze the
+source itself. If something checkpointed the VM in between, the source is not
+among the disks the copy job's checkpoint froze, and copying would publish
+data from that earlier moment under a newer creation time. So the checkpoint
+is merged away and the copy refused; the retry then names whatever is in the
+way. When a busy VM queue keeps a retry from reaching its copy within
+`SnapshotCheckpointWaitTimeout`, the last foreign-checkpoint verdict for that
+snapshot is reported instead of "queued", so the operator still hears about it.
+
+The other two states are not this process's work in progress, so no lock
+settles them, and both clear on their own. Both are asked about again, every
+250ms for up to `ChainSettleTimeout` (3s by default), and end `Aborted` if
+they have not cleared — which every sidecar retries, and which advises
+deleting nothing. Either ending is harmless, so that window trades error
+noise against latency, never safety.
+
 ### ReFS and copy mechanism
 
 | CSV filesystem | Copy mechanism | 500 GB allocated | VM frozen for |
@@ -243,6 +290,26 @@ still earns its keep afterward, for two cases the startup pass cannot reach: a
 merge that exceeds `CheckpointMergeTimeout` with no restart involved at all,
 and a host that was still unreachable — and so skipped — during the one
 startup pass.
+
+### Stopping, and what a stop leaves behind
+
+A create writes `<volume>~creating.vhdx` and a copy writes
+`<snapshot>~copying.vhdx`, renaming either into place only once it is
+complete, and deleting it if the job fails or is canceled. On a graceful stop
+the agent stops listening, refuses any job still being enqueued, cancels the
+running ones, and waits up to `ShutdownDrainTimeout` (60s by default) for
+them to finish unwinding before the process exits and the clustered role
+moves. A canceled copy stops between chunks, so the wait is normally seconds;
+the bound is for a Hyper-V call already in flight, which no cancellation
+interrupts. The host's own shutdown timeout is set to that plus 15s, and the
+total has to stay inside the Generic Service resource's `PendingTimeout`
+(three minutes by default) or the cluster terminates the process mid-drain.
+
+A hard kill, a lost node or a drain that ran out of time still leaves markers
+behind, so a startup sweep removes any it finds. It runs before
+`OrphanedCheckpointReaper` and so before RPC intake opens, when no job of the
+new process can own a marker. It leaves anything still open, and if it has
+not finished within 30s it lets startup go on and removes nothing further.
 
 ## Scalability posture
 

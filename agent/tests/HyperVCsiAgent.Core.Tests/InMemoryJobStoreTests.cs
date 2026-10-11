@@ -390,6 +390,141 @@ public class InMemoryJobStoreTests
         Assert.Equal(JobStatus.Failed, job.Status);
     }
 
+    [Fact]
+    public async Task DrainAsync_WaitsForACanceledJobToFinishUnwinding()
+    {
+        var store = new InMemoryJobStore();
+        var started = new TaskCompletionSource();
+        var unwound = false;
+
+        // The shape that matters: a job that observes cancellation, but whose
+        // cleanup on the way out still takes time - VhdxService deleting its
+        // ~creating marker after an uncancellable CIM call returns.
+        var job = store.GetOrCreate("pvc-1", "CreateVolume", ["volume:pvc-1"], async (_, cancellationToken) =>
+        {
+            started.SetResult();
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            finally
+            {
+                await Task.Delay(200, CancellationToken.None);
+                unwound = true;
+            }
+        });
+
+        await started.Task;
+        var unfinished = await store.DrainAsync(TimeSpan.FromSeconds(10), CancellationToken.None);
+
+        Assert.Empty(unfinished);
+        Assert.True(unwound);
+        Assert.Equal(JobStatus.Failed, job.Status);
+    }
+
+    [Fact]
+    public async Task DrainAsync_ReturnsWhatIsStillRunningWhenTheBoundRunsOut()
+    {
+        var store = new InMemoryJobStore();
+        var started = new TaskCompletionSource();
+        var release = new TaskCompletionSource();
+
+        // Ignores its token, as an in-flight CIM call does.
+        var running = store.GetOrCreate("pvc-1", "CreateVolume", ["volume:pvc-1"], async (_, _) =>
+        {
+            started.SetResult();
+            await release.Task;
+        });
+        var queued = store.GetOrCreate("pvc-1", "DeleteVolume", ["volume:pvc-1"], (_, _) => Task.CompletedTask);
+
+        await started.Task;
+        var unfinished = await store.DrainAsync(TimeSpan.FromMilliseconds(100), CancellationToken.None);
+
+        Assert.Equal(new[] { running.Id, queued.Id }.Order(), unfinished.Select(job => job.Id).Order());
+        Assert.Contains(unfinished, job => job.Id == running.Id && job.Status == JobStatus.Running);
+        Assert.Contains(unfinished, job => job.Id == queued.Id && job.Status == JobStatus.Pending);
+
+        release.SetResult();
+        await WaitForTerminal(queued);
+    }
+
+    [Fact]
+    public async Task DrainAsync_AJobStillQueuedWhenTheStopBegins_NeverRunsItsWork()
+    {
+        var store = new InMemoryJobStore();
+        var started = new TaskCompletionSource();
+        var release = new TaskCompletionSource();
+        var queuedRan = false;
+
+        store.GetOrCreate("pvc-1", "CreateVolume", ["volume:pvc-1"], async (_, _) =>
+        {
+            started.SetResult();
+            await release.Task;
+        });
+        var queued = store.GetOrCreate("pvc-1", "DeleteVolume", ["volume:pvc-1"], (_, _) =>
+        {
+            queuedRan = true;
+            return Task.CompletedTask;
+        });
+
+        await started.Task;
+        var drain = store.DrainAsync(TimeSpan.FromSeconds(10), CancellationToken.None);
+        release.SetResult();
+
+        Assert.Empty(await drain);
+        Assert.False(queuedRan);
+        Assert.Equal(JobStatus.Failed, queued.Status);
+        Assert.Equal(AgentErrorCodes.Aborted, queued.ErrorCode);
+    }
+
+    [Fact]
+    public async Task DrainAsync_WithNothingInFlight_ReturnsAtOnce()
+    {
+        var store = new InMemoryJobStore();
+        var done = store.GetOrCreate("pvc-1", "CreateVolume", ["volume:pvc-1"], (_, _) => Task.CompletedTask);
+        await WaitForTerminal(done);
+
+        var unfinished = await store.DrainAsync(Timeout.InfiniteTimeSpan, CancellationToken.None);
+
+        Assert.Empty(unfinished);
+    }
+
+    [Fact]
+    public async Task GetOrCreate_OnceDraining_RefusesNewWorkButStillReturnsAnActiveJob()
+    {
+        var store = new InMemoryJobStore();
+        var started = new TaskCompletionSource();
+        var release = new TaskCompletionSource();
+
+        var active = store.GetOrCreate("pvc-1", "CreateVolume", ["volume:pvc-1"], async (_, _) =>
+        {
+            started.SetResult();
+            await release.Task;
+        });
+        await started.Task;
+
+        var drain = store.DrainAsync(TimeSpan.FromSeconds(10), CancellationToken.None);
+
+        Assert.Same(active, store.GetOrCreate("pvc-1", "CreateVolume", ["volume:pvc-1"], (_, _) =>
+            throw new InvalidOperationException("must not start a second run")));
+        Assert.Throws<JobStoreStoppingException>(() =>
+            store.GetOrCreate("pvc-2", "CreateVolume", ["volume:pvc-2"], (_, _) => Task.CompletedTask));
+
+        release.SetResult();
+        Assert.Empty(await drain);
+    }
+
+    [Fact]
+    public void GetOrCreate_AfterDispose_RefusesNewWork()
+    {
+        var store = new InMemoryJobStore();
+        store.Dispose();
+        store.Dispose();
+
+        Assert.Throws<JobStoreStoppingException>(() =>
+            store.GetOrCreate("pvc-1", "CreateVolume", ["volume:pvc-1"], (_, _) => Task.CompletedTask));
+    }
+
     private static async Task WaitForStatus(Job job, JobStatus status)
     {
         var deadline = DateTime.UtcNow.AddSeconds(2);

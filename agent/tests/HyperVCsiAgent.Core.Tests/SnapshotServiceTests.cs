@@ -640,7 +640,12 @@ public sealed class SnapshotServiceTests : IDisposable
         // past. FakeHostClient's checkpoint freezes nothing real, so the swap
         // is made by hand at the moment it is taken.
         var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
-        var host = new FakeHostClient();
+        // A VM-wide checkpoint: it froze a sibling volume and the node's OS
+        // disk along with pvc-1.
+        var host = new FakeHostClient
+        {
+            FrozenDisks = [VolumePath("pvc-1"), VolumePath("pvc-2"), @"C:\vms\node-a.vhdx"],
+        };
         var harness = NewHarness(cluster: cluster, location: TracedToVm1(), host: host);
         WriteVolume("pvc-1", 4096);
         var vmHold = HoldOpenExclusively(VolumePath("pvc-1"));
@@ -664,6 +669,11 @@ public sealed class SnapshotServiceTests : IDisposable
             Assert.Equal(["hyperv-csi/pvc-1/snapshot-abc"], host.CreatedCheckpointElementNames);
             await WaitForAsync(() => host.DestroyedCheckpointElementNames.Count == 1);
             Assert.Equal(["hyperv-csi/pvc-1/snapshot-abc"], host.DestroyedCheckpointElementNames);
+
+            // The merge wait watches every disk that checkpoint froze - the
+            // sibling's chain collapsing is as much this merge as pvc-1's -
+            // read off the checkpoint before it was destroyed.
+            Assert.Equal(host.FrozenDisks, host.CollapseCheckedOnto);
         }
         finally
         {
@@ -742,10 +752,10 @@ public sealed class SnapshotServiceTests : IDisposable
     }
 
     [WindowsOnlyFact]
-    public async Task CreateAsync_AttachedVolumeBehindAForeignChain_FailsAsFailedPrecondition()
+    public async Task CreateAsync_AttachedVolumeBehindAChainTooDeepToWalk_FailsAsFailedPreconditionAtOnce()
     {
         var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
-        var host = new FakeHostClient { ForeignChainInTheWay = true };
+        var host = new FakeHostClient { ChainTooDeepToWalk = true };
         var harness = NewHarness(cluster: cluster, location: TracedToVm1(), host: host);
         WriteAttachedVolume("pvc-1", 4096);
 
@@ -754,7 +764,464 @@ public sealed class SnapshotServiceTests : IDisposable
 
         Assert.Equal(AgentErrorCodes.FailedPrecondition, failure.ErrorCode);
         Assert.Empty(harness.Copier.Destinations);
+        Assert.Equal(1, host.ClassifyCalls);
     }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_ConcurrentSnapshotsOnOneVmWithASiblingsDiskUnreadableForAFewLooks_BothSucceed()
+    {
+        // Issue #38's production shape: two volumes on one VM snapshotted at
+        // once, and the setting-data read of a sibling's .avhdx coming back
+        // empty while its checkpoint is taken or merged. It cleared within
+        // seconds every time; so must the snapshots.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient
+        {
+            ClassifyFault = call => call <= 4 ? Unreadable("pvc-2_ABCD1234.avhdx") : null,
+        };
+        var harness = NewHarness(cluster: cluster, location: TracedToVm1(), host: host);
+        WriteAttachedVolume("pvc-1", 4096);
+        WriteAttachedVolume("pvc-2", 4096);
+
+        var results = await Task.WhenAll(
+            harness.Service.CreateAsync("pvc-1", "snapshot-a", CancellationToken.None),
+            harness.Service.CreateAsync("pvc-2", "snapshot-b", CancellationToken.None));
+
+        Assert.Equal(["pvc-1~snapshot-a", "pvc-2~snapshot-b"], results.Select(r => r.SnapshotId).Order());
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-a")) && File.Exists(SnapshotPath("pvc-2~snapshot-b")));
+        Assert.True(host.ClassifyCalls > 4);
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_FastJobSeesAnUntaggedRoot_DefersToTheCopyJobRatherThanJudgingIt()
+    {
+        // A sibling's checkpoint between its creation and TagCheckpoint, as
+        // the fast job - which holds no vm: - sees it. It has no fact that
+        // could tell that from a foreign checkpoint, so it does not try: it
+        // enqueues, and the copy job, holding vm:, finds the chain settled.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient
+        {
+            ClassifyFault = _ => HoldsVm1() ? null : UntaggedRoot(SiblingCheckpoint),
+        };
+        var harness = NewHarness(cluster: cluster, location: TracedToVm1(), host: host);
+        WriteAttachedVolume("pvc-1", 4096);
+
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+
+        Assert.Equal("pvc-1~snapshot-abc", result.SnapshotId);
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+        Assert.Equal(2, host.ClassifyCalls);
+        Assert.Single(host.CreatedCheckpointElementNames);
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_CopyJobSeesAnUntaggedRootUnderItsHold_IsAForeignCheckpointAtOnce()
+    {
+        // Holding vm:, nothing of this driver's can be creating a checkpoint
+        // on the VM, so the untagged one is decided on the spot - no window,
+        // which is an hour here to prove nothing waits for it.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient { ClassifyFault = _ => UntaggedRoot(ForeignCheckpoint) };
+        var harness = NewHarness(
+            cluster: cluster, location: TracedToVm1(), host: host, chainSettleTimeout: TimeSpan.FromHours(1));
+        WriteAttachedVolume("pvc-1", 4096);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.FailedPrecondition, failure.ErrorCode);
+        Assert.Contains("\"Veeam restore point\"", failure.Message);
+        Assert.Contains("2026-10-01 03:00:00Z", failure.Message);
+        Assert.Contains("delete it", failure.Message);
+
+        // One look by the fast job, which deferred; one by the copy job, which
+        // decided. No checkpoint taken on top of the foreign one.
+        Assert.Equal(2, host.ClassifyCalls);
+        Assert.Empty(host.CreatedCheckpointElementNames);
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_CheckpointTakenOnTopOfAnotherSinceClassification_IsMergedAwayAndTheCopyRefused()
+    {
+        // A backup product checkpointed the VM between this copy's
+        // classification and its own checkpoint: ours froze the .avhdx that
+        // product left in front of pvc-1, not pvc-1 itself. Copying pvc-1 now
+        // would publish data from that product's moment under a creation time
+        // from ours.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var underneath = VolumePath("pvc-1")[..^VolumeNaming.VhdxExtension.Length] + "_9A1B.avhdx";
+        var host = new FakeHostClient { FrozenDisks = [underneath] };
+        var harness = NewHarness(cluster: cluster, location: TracedToVm1(), host: host);
+        WriteAttachedVolume("pvc-1", 4096);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.Aborted, failure.ErrorCode);
+        Assert.Contains("did not freeze", failure.Message);
+        Assert.Empty(harness.Copier.Destinations);
+        Assert.False(File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+
+        // Merged away, not left for the reaper to resume through.
+        await WaitForAsync(() => host.DestroyedCheckpointElementNames.Count == 1);
+        Assert.Equal(["hyperv-csi/pvc-1/snapshot-abc"], host.DestroyedCheckpointElementNames);
+        Assert.Equal([underneath], host.CollapseCheckedOnto);
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_WhatTheCheckpointFrozeUnknown_RefusesRatherThanGuessing()
+    {
+        // The read of what the checkpoint froze failed. Unknown is not "fine":
+        // the copy is refused, and with nothing read off the checkpoint the
+        // merge wait watches the source alone.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient { FrozenDisksUnknown = true };
+        var harness = NewHarness(cluster: cluster, location: TracedToVm1(), host: host);
+        WriteAttachedVolume("pvc-1", 4096);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.Aborted, failure.ErrorCode);
+
+        // Said as what it is - an unreadable configuration - not as a
+        // checkpoint underneath that an operator would go looking for.
+        Assert.Contains("could not be read", failure.Message);
+        Assert.DoesNotContain("underneath", failure.Message);
+        Assert.Empty(harness.Copier.Destinations);
+        await WaitForAsync(() => host.DestroyedCheckpointElementNames.Count == 1);
+        Assert.Equal([VolumePath("pvc-1")], host.CollapseCheckedOnto);
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_ResumingThroughAnOwnedCheckpointThatDidNotFreezeTheSource_IsRefusedToo()
+    {
+        // An earlier attempt's checkpoint, still standing - but taken over
+        // something else's, so resuming through it would backdate the same way.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient { FrozenDisks = [VolumePath("pvc-1")[..^VolumeNaming.VhdxExtension.Length] + "_9A1B.avhdx"] };
+        await host.CreateCheckpointAsync("host-1", "vm-1", "hyperv-csi/pvc-1/snapshot-abc", "{}", CancellationToken.None);
+        var harness = NewHarness(cluster: cluster, location: TracedToVm1(), host: host);
+        WriteAttachedVolume("pvc-1", 4096);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.Aborted, failure.ErrorCode);
+        Assert.Empty(harness.Copier.Destinations);
+        await WaitForAsync(() => host.DestroyedCheckpointElementNames.Count == 1);
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_ForeignVerdictOnABusyVm_IsReportedRatherThanQueued()
+    {
+        // A backup run keeping vm-1's queue busier than the checkpoint wait.
+        // Only the copy job, holding vm-1, can name the foreign checkpoint
+        // behind pvc-2 - and every retry's wait would otherwise run out first
+        // and say "queued behind another copy". The last verdict is reported
+        // instead, while a fresh copy queues to look again.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient
+        {
+            ClassifyFaultForPath = path => HoldsVm1() && path == VolumePath("pvc-2") ? UntaggedRoot(ForeignCheckpoint) : null,
+        };
+        var harness = NewHarness(
+            cluster: cluster, location: TracedToVm1(), host: host,
+            snapshotCheckpointWaitTimeout: TimeSpan.FromMilliseconds(300));
+        WriteAttachedVolume("pvc-1", 4096);
+        WriteAttachedVolume("pvc-2", 4096);
+        WriteAttachedVolume("pvc-3", 4096);
+        using var release = new SemaphoreSlim(0);
+        harness.Copier.DuringCopy = _ => release.WaitAsync();
+
+        try
+        {
+            // pvc-1's copy holds vm-1; pvc-2's first copy queues behind it.
+            await harness.Service.CreateAsync("pvc-1", "snapshot-a", CancellationToken.None);
+            await WaitForAsync(() => harness.Copier.Destinations.Count == 1);
+            var queued = await Assert.ThrowsAsync<JobFailureException>(
+                () => harness.Service.CreateAsync("pvc-2", "snapshot-b", CancellationToken.None));
+            Assert.Contains("queued behind another copy", queued.Message);
+
+            // pvc-1 finishes; pvc-2's copy runs, holding vm-1, and names the
+            // checkpoint - with nobody waiting to hear it.
+            release.Release();
+            await WaitForAsync(() => harness.Store.Created.Any(job =>
+                job.IdempotencyKey == "pvc-2~snapshot-b" && job.Status == JobStatus.Failed));
+
+            // The queue is busy again when the snapshotter retries.
+            await harness.Service.CreateAsync("pvc-3", "snapshot-c", CancellationToken.None);
+            await WaitForAsync(() => harness.Copier.Destinations.Count == 2);
+            var retried = await Assert.ThrowsAsync<JobFailureException>(
+                () => harness.Service.CreateAsync("pvc-2", "snapshot-b", CancellationToken.None));
+
+            Assert.Equal(AgentErrorCodes.FailedPrecondition, retried.ErrorCode);
+            Assert.Contains("\"Veeam restore point\"", retried.Message);
+            Assert.Contains("last copy attempt", retried.Message);
+
+            // Deleted, then created again under the same name - the same ID.
+            // The old snapshot's verdict goes with it, not on to the new one.
+            await harness.Service.DeleteAsync("pvc-2~snapshot-b", CancellationToken.None);
+            var recreated = await Assert.ThrowsAsync<JobFailureException>(
+                () => harness.Service.CreateAsync("pvc-2", "snapshot-b", CancellationToken.None));
+            Assert.Equal(AgentErrorCodes.Aborted, recreated.ErrorCode);
+            Assert.Contains("queued behind another copy", recreated.Message);
+        }
+        finally
+        {
+            release.Release(4);
+        }
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_ForeignCheckpointWhileEveryCopySlotIsBusy_IsStillReportedAsForeign()
+    {
+        // A backup run with every copy slot taken by long copies. The copy job
+        // classifies before it queues for a slot, so a VM with a foreign
+        // checkpoint gets its verdict rather than "no copy slot" retried for
+        // as long as the run lasts.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient { ClassifyFault = _ => UntaggedRoot(ForeignCheckpoint) };
+        var harness = NewHarness(
+            cluster: cluster, location: TracedToVm1(), host: host, maxConcurrentSnapshotCopies: 1,
+            snapshotCopySlotWaitTimeout: TimeSpan.FromSeconds(30));
+        using var release = new SemaphoreSlim(0);
+        harness.Copier.DuringCopy = _ => release.WaitAsync();
+
+        // An unattached volume's copy takes the only slot and keeps it.
+        WriteVolume("pvc-9", 4096);
+        await harness.Service.CreateAsync("pvc-9", "snapshot-z", CancellationToken.None);
+        await WaitForAsync(() => harness.Copier.Destinations.Count == 1);
+
+        WriteAttachedVolume("pvc-1", 4096);
+        try
+        {
+            var failure = await Assert.ThrowsAsync<JobFailureException>(
+                () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None));
+
+            Assert.Equal(AgentErrorCodes.FailedPrecondition, failure.ErrorCode);
+            Assert.Contains("\"Veeam restore point\"", failure.Message);
+        }
+        finally
+        {
+            release.Release(2);
+        }
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_SiblingCheckpointMidCreation_NeverReadAsForeign()
+    {
+        // The race itself. pvc-1's copy is inside CreateCheckpointAsync,
+        // holding vm-1, when pvc-2's fast job classifies and - as on a real
+        // host before TagCheckpoint lands - sees an untagged root. pvc-2 must
+        // never be told about a foreign checkpoint: it defers, its copy queues
+        // behind pvc-1's on vm-1, and by the time it holds vm-1 the chain is
+        // settled.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        using var creating = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var host = new FakeHostClient
+        {
+            ClassifyFault = _ => !HoldsVm1() && creating.IsSet ? UntaggedRoot(SiblingCheckpoint) : null,
+        };
+        host.DuringCreate = () =>
+        {
+            if (!creating.IsSet)
+            {
+                creating.Set();
+                release.Wait(TimeSpan.FromSeconds(10));
+            }
+        };
+        var harness = NewHarness(cluster: cluster, location: TracedToVm1(), host: host);
+        WriteAttachedVolume("pvc-1", 4096);
+        WriteAttachedVolume("pvc-2", 4096);
+
+        var first = harness.Service.CreateAsync("pvc-1", "snapshot-a", CancellationToken.None);
+        Assert.True(creating.Wait(TimeSpan.FromSeconds(5)));
+
+        var second = harness.Service.CreateAsync("pvc-2", "snapshot-b", CancellationToken.None);
+        await WaitForAsync(() => host.ClassifyCalls >= 3);
+        release.Set();
+
+        await first;
+        await second;
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-a")) && File.Exists(SnapshotPath("pvc-2~snapshot-b")));
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_CopyJobSeesAChainWithNoCheckpointForAFewLooks_StillCopies()
+    {
+        // Measured right after a destroy: the checkpoint is gone a beat
+        // before the merge re-points the disk. Not this process's work in
+        // progress, so no lock settles it - the copy job asks again.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient
+        {
+            ClassifyFault = call => HoldsVm1() && call <= 3 ? MidMerge() : null,
+        };
+        var harness = NewHarness(cluster: cluster, location: TracedToVm1(), host: host);
+        WriteAttachedVolume("pvc-1", 4096);
+
+        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+        Assert.Single(host.CreatedCheckpointElementNames);
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_ChainWithNoCheckpointThatNeverClears_IsAbortedAndNeverNamesAnythingToDelete()
+    {
+        // A stuck merge, or a differencing disk attached by hand: nothing to
+        // name, and the .avhdx is the last thing to delete. Retryable, with
+        // somewhere to look if it does not clear.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient { ClassifyFault = _ => MidMerge() };
+        var harness = NewHarness(
+            cluster: cluster, location: TracedToVm1(), host: host, chainSettleTimeout: TimeSpan.FromMilliseconds(600));
+        WriteAttachedVolume("pvc-1", 4096);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.Aborted, failure.ErrorCode);
+        Assert.Contains("Do not delete the .avhdx", failure.Message);
+        Assert.Contains("Hyper-V Manager", failure.Message);
+        Assert.DoesNotContain("delete it", failure.Message);
+        Assert.DoesNotContain("Nothing needs doing", failure.Message);
+        Assert.Empty(host.CreatedCheckpointElementNames);
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_DiskStillUnreadableWhenTheWindowEnds_IsAbortedRatherThanFailedPrecondition()
+    {
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient { ClassifyFault = _ => Unreadable("pvc-1_C98ABDB0.avhdx") };
+        var harness = NewHarness(
+            cluster: cluster, location: TracedToVm1(), host: host, chainSettleTimeout: TimeSpan.FromMilliseconds(600));
+        WriteAttachedVolume("pvc-1", 4096);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.Aborted, failure.ErrorCode);
+        Assert.Contains("pvc-1_C98ABDB0.avhdx", failure.Message);
+        Assert.DoesNotContain("delete", failure.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_TraceTripsOnAnUnreadableDiskForAFewLooks_TracesAgainAndSucceeds()
+    {
+        // The Internal form in issue #38: the location service walking a
+        // holder VM's chains meets the same unreadable .avhdx.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var location = new FakeVhdxLocationService
+        {
+            VmId = "vm-1",
+            LocateFault = call => call <= 2 ? Unreadable("pvc-1_DD6233C3.avhdx") : null,
+        };
+        var harness = NewHarness(cluster: cluster, location: location, host: new FakeHostClient());
+        WriteAttachedVolume("pvc-1", 4096);
+
+        var result = await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+
+        Assert.Equal("pvc-1~snapshot-abc", result.SnapshotId);
+        Assert.True(location.LocateCalls >= 3);
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_TraceRefusedForAnyOtherReason_IsStillInternalAtOnce()
+    {
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var location = new FakeVhdxLocationService
+        {
+            VmId = "vm-1",
+            LocateFault = _ => new InvalidOperationException("the open-file listing names a client no node matches"),
+        };
+        var harness = NewHarness(cluster: cluster, location: location, host: new FakeHostClient());
+        WriteAttachedVolume("pvc-1", 4096);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
+        Assert.Equal(1, location.LocateCalls);
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_CopyJobsOwnClassificationUnsettledForAFewLooks_StillCopies()
+    {
+        // The first look is the fast job's, and settles; the ones after it
+        // are the copy job's re-classification under vm:, which asks again
+        // the same way.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient { ClassifyFault = call => call is >= 2 and <= 4 ? Unreadable("pvc-1_EDDD347F.avhdx") : null };
+        var harness = NewHarness(cluster: cluster, location: TracedToVm1(), host: host);
+        WriteAttachedVolume("pvc-1", 4096);
+
+        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+        Assert.Equal(5, host.ClassifyCalls);
+        Assert.Single(host.CreatedCheckpointElementNames);
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_CopyJobQueuesForItsHostSlotLongerThanTheWindow_StillGetsItsLooks()
+    {
+        // The backup run's contention: every slot on the host busy for longer
+        // than the whole window when the copy job comes to re-classify. The
+        // wait is not looking, so it must not use the window up - the copy
+        // takes its slot before the window starts and keeps it across looks.
+        var hostSlots = new HostOperationSlots(Options.Create(new AgentOptions { MaxConcurrentHostOperations = 1 }));
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        cluster.DuringResolve = () =>
+        {
+            cluster.DuringResolve = null;
+            hostSlots.WaitAsync("host-1", CancellationToken.None).GetAwaiter().GetResult();
+            _ = Task.Delay(600).ContinueWith(_ => hostSlots.Release("host-1"), TaskScheduler.Default);
+        };
+
+        // Look 1 is the fast job's; look 2, the copy job's first, is still
+        // unsettled; look 3 settles, one 250ms pause in - well inside the
+        // window once the slot wait is outside it, and past it when it was not.
+        var host = new FakeHostClient { ClassifyFault = call => call == 2 ? Unreadable("pvc-1_EDDD347F.avhdx") : null };
+        var harness = NewHarness(
+            cluster: cluster, location: TracedToVm1(), host: host, hostSlots: hostSlots,
+            chainSettleTimeout: TimeSpan.FromMilliseconds(300));
+        WriteAttachedVolume("pvc-1", 4096);
+
+        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+        Assert.Equal(3, host.ClassifyCalls);
+    }
+
+    private static readonly UntaggedCheckpoint SiblingCheckpoint =
+        new("checkpoint:untagged", "node-a - (10/10/2026 - 2:03:16 PM)", DateTimeOffset.Parse("2026-10-10T14:03:16Z"));
+
+    private static readonly UntaggedCheckpoint ForeignCheckpoint =
+        new("checkpoint:veeam", "Veeam restore point", DateTimeOffset.Parse("2026-10-01T03:00:00Z"));
+
+    private static DiskChainUnsettledException Unreadable(string avhdx) => new(
+        DiskChainUnsettledReason.UnreadableDisk,
+        $"could not read the setting data for C:\\ClusterStorage\\Volume2\\hyperv-csi\\volumes\\{avhdx}, so whether it has a parent disk is unknown");
+
+    private static DiskChainUnsettledException UntaggedRoot(UntaggedCheckpoint checkpoint) => new(
+        DiskChainUnsettledReason.UntaggedRoot,
+        "the checkpoint at the root of that chain is not one this driver tagged",
+        [checkpoint]);
+
+    /// <summary>A chain still built on the source with no checkpoint behind it - a merge not yet re-pointed.</summary>
+    private static DiskChainUnsettledException MidMerge() => new(
+        DiskChainUnsettledReason.UntaggedRoot,
+        "the checkpoint at the root of that chain is not one this driver tagged");
+
+    /// <summary>
+    /// Whether the classify call asking is the copy job's - the one holding
+    /// vm-1 - rather than the fast job's, which holds no vm: target.
+    /// </summary>
+    private static bool HoldsVm1() => JobExecutionContext.CurrentTargets?.Contains("vm:vm-1") == true;
 
     [WindowsOnlyFact]
     public async Task CreateAsync_AttachedVolumeAlreadyBehindOwnedCheckpoint_ResumesWithoutTakingANewOne()
@@ -2079,7 +2546,8 @@ public sealed class SnapshotServiceTests : IDisposable
         TimeSpan? checkpointMergeTimeout = null,
         int maxConcurrentHostOperations = 4,
         HostOperationSlots? hostSlots = null,
-        TimeSpan? hostOperationTimeout = null)
+        TimeSpan? hostOperationTimeout = null,
+        TimeSpan? chainSettleTimeout = null)
     {
         var disks = new FakeVirtualDiskManager();
         var copier = new FakeDiskCopier();
@@ -2091,6 +2559,11 @@ public sealed class SnapshotServiceTests : IDisposable
 
         // A read through the holder lands on this harness's host, the way the
         // real service sends it to the host it found.
+        if (host is FakeHostClient fakeHost)
+        {
+            fakeHost.UseVolumesRoot(_volumesRoot);
+        }
+
         if (location is FakeVhdxLocationService fakeLocation)
         {
             fakeLocation.Reader ??= host;
@@ -2112,7 +2585,11 @@ public sealed class SnapshotServiceTests : IDisposable
             // to resolve one or touch a checkpoint.
             cluster ?? new NeverCalledClusterService(),
             location ?? new FakeVhdxLocationService(),
-            host ?? new NeverCalledHostClient(),
+            // Wrapped the way Program.cs wraps the real client in a debug
+            // build: a checkpoint created, or a disk changed, outside the
+            // VM's vm: target fails the test - the fact issue #38's
+            // decision (SnapshotService.DecideUntaggedRoot) rests on.
+            new VmTargetAssertingHyperVHostClient(host ?? new NeverCalledHostClient()),
             slots,
             copySlots,
             Options.Create(new AgentOptions
@@ -2133,6 +2610,7 @@ public sealed class SnapshotServiceTests : IDisposable
                 CheckpointMergeTimeout = checkpointMergeTimeout ?? TimeSpan.FromSeconds(2),
                 MaxConcurrentHostOperations = maxConcurrentHostOperations,
                 HostOperationTimeout = hostOperationTimeout ?? TimeSpan.FromMinutes(2),
+                ChainSettleTimeout = chainSettleTimeout ?? TimeSpan.FromSeconds(1),
             }),
             NullLogger<SnapshotService>.Instance);
 
@@ -2531,7 +3009,7 @@ public sealed class SnapshotServiceTests : IDisposable
         public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             throw Unexpected();
 
-        public Task<bool> IsChainCollapsedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+        public Task<bool> IsCollapsedOntoAsync(string hostName, string vmId, IReadOnlyCollection<string> frozenDisks, CancellationToken cancellationToken) =>
             throw Unexpected();
     }
 
@@ -2564,9 +3042,21 @@ public sealed class SnapshotServiceTests : IDisposable
         /// </summary>
         public IHyperVHostClient? Reader { get; set; }
 
+        /// <summary>
+        /// Asked on every call with that call's 1-based number, before
+        /// answering: an exception to throw - a trace that tripped on a chain
+        /// mid-checkpoint, on that look - or null to answer normally.
+        /// </summary>
+        public Func<int, Exception?>? LocateFault { get; init; }
+
         public Task<VhdxLocation?> LocateAsync(string path, CancellationToken cancellationToken)
         {
-            Interlocked.Increment(ref _locateCalls);
+            var call = Interlocked.Increment(ref _locateCalls);
+            if (LocateFault?.Invoke(call) is { } fault)
+            {
+                throw fault;
+            }
+
             return Task.FromResult(VmId is null ? null : new VhdxLocation(Host, VmId));
         }
 
@@ -2605,8 +3095,14 @@ public sealed class SnapshotServiceTests : IDisposable
 
         public Dictionary<string, ClusteredVm> Vms { get; init; } = [];
 
-        public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
-            Task.FromResult(Vms.TryGetValue(nodeId, out var vm) ? vm : null);
+        /// <summary>Runs synchronously inside ResolveVmAsync - the copy job's first step, and only the copy job's.</summary>
+        public Action? DuringResolve { get; set; }
+
+        public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken)
+        {
+            DuringResolve?.Invoke();
+            return Task.FromResult(Vms.TryGetValue(nodeId, out var vm) ? vm : null);
+        }
 
         public Task<ClusteredVmState?> GetVmClusterStateAsync(string nodeId, CancellationToken cancellationToken) =>
             throw new NotSupportedException("SnapshotService never reads a VM's cluster resource state");
@@ -2643,8 +3139,12 @@ public sealed class SnapshotServiceTests : IDisposable
         /// <summary>What ClassifyAttachmentAsync reports when no owned checkpoint already covers the path.</summary>
         public VolumeAttachmentKind AttachmentKind { get; set; } = VolumeAttachmentKind.Direct;
 
-        /// <summary>Makes ClassifyAttachmentAsync throw, the way an unresolved foreign chain does.</summary>
-        public bool ForeignChainInTheWay { get; set; }
+        /// <summary>
+        /// Makes ClassifyAttachmentAsync throw a plain InvalidOperationException, the way a chain
+        /// too deep to walk does - refused at once, never asked again. An untagged root is
+        /// <see cref="ClassifyFault"/>'s job now.
+        /// </summary>
+        public bool ChainTooDeepToWalk { get; set; }
 
         /// <summary>Makes CreateCheckpointAsync throw CheckpointsNotConfiguredException, as it does against a real VM not set to ProductionOnly.</summary>
         public bool CheckpointsNotConfigured { get; set; }
@@ -2675,7 +3175,7 @@ public sealed class SnapshotServiceTests : IDisposable
         public List<string> DestroyedCheckpointElementNames { get; } = [];
 
         /// <summary>
-        /// Makes <see cref="IsChainCollapsedAsync"/> report the chain as
+        /// Makes <see cref="IsCollapsedOntoAsync"/> report the chain as
         /// still standing no matter what, for a test that needs a post-merge
         /// wait built on this member to time out rather than observe a
         /// collapse that never happens on a fake with no real merge to wait
@@ -2684,9 +3184,9 @@ public sealed class SnapshotServiceTests : IDisposable
         public bool ChainStaysUncollapsed { get; set; }
 
         /// <summary>
-        /// Makes <see cref="IsChainCollapsedAsync"/> throw, the way it does
+        /// Makes <see cref="IsCollapsedOntoAsync"/> throw, the way it does
         /// against a host the VM has live migrated off in the hours a merge
-        /// wait can span - <see cref="IHyperVHostClient.IsChainCollapsedAsync"/>
+        /// wait can span - <see cref="IHyperVHostClient.IsCollapsedOntoAsync"/>
         /// documents VmNotOnHostException for exactly that.
         /// </summary>
         public bool FailChainCollapsedChecks { get; set; }
@@ -2708,13 +3208,42 @@ public sealed class SnapshotServiceTests : IDisposable
         /// <summary>Every host GetDiskInfoAsync was asked on, including the calls it refused.</summary>
         public List<string> DiskInfoHosts { get; } = [];
 
+        /// <summary>
+        /// Asked on every call with that call's 1-based number, before
+        /// classifying: an exception to throw - a chain that has not settled,
+        /// on that look - or null to classify normally.
+        /// </summary>
+        public Func<int, Exception?>? ClassifyFault { get; set; }
+
+        /// <summary>
+        /// Asked on every call with the path being classified, after
+        /// <see cref="ClassifyFault"/>: an exception to throw for that disk, or
+        /// null to classify normally.
+        /// </summary>
+        public Func<string, Exception?>? ClassifyFaultForPath { get; set; }
+
+        private int _classifyCalls;
+
+        public int ClassifyCalls => Volatile.Read(ref _classifyCalls);
+
         public Task<VolumeAttachment> ClassifyAttachmentAsync(
             string hostName, string vmId, string vhdxPath, string thisSnapshotElementName, CancellationToken cancellationToken)
         {
-            if (ForeignChainInTheWay)
+            var call = Interlocked.Increment(ref _classifyCalls);
+            if (ClassifyFault?.Invoke(call) is { } fault)
+            {
+                throw fault;
+            }
+
+            if (ClassifyFaultForPath?.Invoke(vhdxPath) is { } pathFault)
+            {
+                throw pathFault;
+            }
+
+            if (ChainTooDeepToWalk)
             {
                 throw new InvalidOperationException(
-                    $"{vhdxPath} sits behind a foreign checkpoint this driver did not tag");
+                    $"{vhdxPath} sits behind a differencing chain too deep to walk to its end");
             }
 
             // Routed through the exact same two pure functions
@@ -2757,7 +3286,7 @@ public sealed class SnapshotServiceTests : IDisposable
                 throw new InvalidOperationException("CreateSnapshot said no");
             }
 
-            var checkpoint = new Checkpoint($"checkpoint:{elementName}", elementName, notesJson);
+            var checkpoint = new Checkpoint($"checkpoint:{elementName}", elementName, notesJson, FrozenDisksFor(elementName));
             _checkpointsByElementName[elementName] = checkpoint;
             CreatedCheckpointElementNames.Add(elementName);
             return Task.FromResult(checkpoint);
@@ -2811,13 +3340,64 @@ public sealed class SnapshotServiceTests : IDisposable
         public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             Task.FromResult(!CheckpointsNotConfigured);
 
-        public Task<bool> IsChainCollapsedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken)
+        /// <summary>
+        /// What every checkpoint this fake creates says it froze. Empty, the
+        /// default, means the one volume its identity names - what a real
+        /// checkpoint of a VM holding just that disk would record - resolved
+        /// under <see cref="VolumesRoot"/>.
+        /// </summary>
+        public IReadOnlyList<string> FrozenDisks { get; set; } = [];
+
+        /// <summary>Makes every checkpoint this fake creates report what it froze as unknown, as a failed read does.</summary>
+        public bool FrozenDisksUnknown { get; set; }
+
+        /// <summary>The volumes directory a checkpoint's default frozen disk is resolved under; set by the harness.</summary>
+        public string? VolumesRoot { get; set; }
+
+        /// <summary>
+        /// Sets <see cref="VolumesRoot"/> and gives any checkpoint a test seeded
+        /// before the harness existed the frozen disk it would have had.
+        /// </summary>
+        public void UseVolumesRoot(string volumesRoot)
+        {
+            VolumesRoot = volumesRoot;
+            foreach (var (elementName, checkpoint) in _checkpointsByElementName.ToList())
+            {
+                if (checkpoint.FrozenDisks is { Count: 0 })
+                {
+                    _checkpointsByElementName[elementName] = checkpoint with { FrozenDisks = FrozenDisksFor(elementName) };
+                }
+            }
+        }
+
+        private IReadOnlyList<string>? FrozenDisksFor(string elementName)
+        {
+            if (FrozenDisksUnknown)
+            {
+                return null;
+            }
+
+            if (FrozenDisks.Count > 0 || VolumesRoot is null)
+            {
+                return FrozenDisks;
+            }
+
+            // hyperv-csi/<volumeId>/<snapshotName>
+            var volumeId = elementName.Split('/')[1];
+            return [Path.GetFullPath(Path.Combine(VolumesRoot, volumeId + VolumeNaming.VhdxExtension))];
+        }
+
+        /// <summary>The disks the last post-merge wait watched collapse.</summary>
+        public IReadOnlyCollection<string>? CollapseCheckedOnto { get; private set; }
+
+        public Task<bool> IsCollapsedOntoAsync(string hostName, string vmId, IReadOnlyCollection<string> frozenDisks, CancellationToken cancellationToken)
         {
             if (FailChainCollapsedChecks)
             {
                 throw new InvalidOperationException($"{vmId} is not registered on {hostName}");
             }
 
+            CollapseCheckedOnto = frozenDisks;
             return Task.FromResult(!ChainStaysUncollapsed && _checkpointsByElementName.Count == 0);
         }
 

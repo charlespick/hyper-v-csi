@@ -88,7 +88,18 @@ builder.Logging.SetMinimumLevel(agentOptions.Logging.MinimumLevel);
 
 builder.Services.ConfigureHttpJsonOptions(options => AgentJson.Apply(options.SerializerOptions));
 builder.Services.AddSingleton(Options.Create(agentOptions));
-builder.Services.AddSingleton<IJobStore, InMemoryJobStore>();
+// Registered as itself too, for JobDrainService below, which drains it on
+// stop - a concern of this store, not of every IJobStore.
+builder.Services.AddSingleton<InMemoryJobStore>();
+builder.Services.AddSingleton<IJobStore>(services => services.GetRequiredService<InMemoryJobStore>());
+
+// The host's stop budget, which StopAsync's token and WindowsServiceLifetime's
+// own wait on the SCM's stop control both follow. The default 30 seconds
+// would cut the drain short; the margin is for the hosted services that stop
+// after it. See AgentOptions.ShutdownDrainTimeout for what this has to fit
+// inside in turn.
+builder.Services.Configure<HostOptions>(
+    options => options.ShutdownTimeout = agentOptions.ShutdownDrainTimeout + TimeSpan.FromSeconds(15));
 
 // Closed until OrphanedCheckpointReaper's startup sweep has finished
 // discovery-and-enqueue - see that class's own remarks, and the gate check
@@ -156,6 +167,11 @@ builder.Services.AddSingleton<IAttachService, AttachService>();
 // - so there is no cycle for the container to resolve.
 builder.Services.AddSingleton<ISnapshotService, SnapshotService>();
 
+// Ahead of OrphanedCheckpointReaper, and that order is the point: hosted
+// services start one at a time, so this sweep has finished before the reaper
+// resumes any copy or opens RPC intake - see StaleMarkerSweeper's own remarks.
+builder.Services.AddHostedService<StaleMarkerSweeper>();
+
 // Depends on ISnapshotService (registered just above) for ResumeCopy and
 // ReapOrphan, and on JobIntakeGate to open once its startup sweep is done -
 // no dependency runs the other way, so there is no cycle for the container
@@ -170,6 +186,12 @@ builder.Services.AddHostedService<OrphanedCheckpointReaper>();
 // SnapshotStorageWarningService's own remarks for why it is kept as its own
 // hosted service rather than folded into the reaper that owns the gate.
 builder.Services.AddHostedService<SnapshotStorageWarningService>();
+
+// Last of this file's hosted services, so it is the first of them to stop:
+// in-flight jobs are canceled and drained before the reaper and the others
+// take their turn. Kestrel stops before any of them - see JobDrainService's
+// own remarks.
+builder.Services.AddHostedService<JobDrainService>();
 
 builder.Services.AddSingleton<JobDispatcher>();
 builder.Services.AddSingleton(TimeProvider.System);
@@ -265,7 +287,27 @@ app.MapPost("/v1/jobs", (
         return Results.BadRequest(new { error = ex.Message });
     }
 
-    var job = jobStore.GetOrCreate(request.IdempotencyKey, request.OperationType, resolved.Targets, resolved.Run);
+    Job job;
+    try
+    {
+        job = jobStore.GetOrCreate(request.IdempotencyKey, request.OperationType, resolved.Targets, resolved.Run);
+    }
+    catch (JobStoreStoppingException)
+    {
+        // The agent has begun stopping. Kestrel is the first thing a stop
+        // shuts and it waits out the requests it is serving (see
+        // JobDrainService's remarks), so this should not be reachable in a
+        // normal stop - it is here so a refusal that does reach a request,
+        // past Kestrel's own grace period, is an answer rather than a 500.
+        // 503 for the same reason as the gate above: the sidecar retries,
+        // and by then the role is up on another node.
+        logger.LogInformation(
+            "{OperationType} {IdempotencyKey}: rejected, the agent is shutting down",
+            request.OperationType, request.IdempotencyKey);
+        return Results.Json(new { error = "the agent is shutting down; retry shortly" },
+            statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+
     logger.LogInformation(
         "{OperationType} {IdempotencyKey}: accepted as job {JobId} targeting {Targets}",
         request.OperationType, request.IdempotencyKey, job.Id, job.Targets);

@@ -147,14 +147,22 @@ public interface IHyperVHostClient
     /// actually standing for a different snapshot named <c>snap-2</c>.
     /// </param>
     /// <exception cref="VmNotOnHostException">The VM is not registered on this host.</exception>
+    /// <exception cref="DiskChainUnsettledException">
+    /// One look could not settle it: the VHDX sits behind a differencing chain
+    /// with no checkpoint this driver tagged at its root, or a disk on one of
+    /// the VM's chains could not be read. Either can be a sibling snapshot's
+    /// checkpoint mid-take or mid-merge, so this is answered after a single
+    /// attempt and the caller decides - an untagged root seen by a caller
+    /// holding the VM's <c>vm:</c> target cannot be this driver's in-flight
+    /// checkpoint, and is a foreign one, a backup product's recovery point,
+    /// or similar.
+    /// </exception>
     /// <exception cref="InvalidOperationException">
-    /// The VHDX sits behind a differencing chain that is not rooted in any
-    /// checkpoint this driver tagged at all - a foreign checkpoint, a backup
-    /// product's recovery point, or a chain this method could not walk to a
-    /// conclusion within its depth bound. Refused rather than guessed past, on
+    /// A chain this method could not walk to a conclusion within its depth
+    /// bound. Refused rather than guessed past, on
     /// <c>GuardAgainstDifferencingChain</c>'s own reasoning. A chain rooted in
     /// a checkpoint this driver tagged for a *different* snapshot does not
-    /// throw this - see <see cref="VolumeAttachment"/>'s
+    /// throw at all - see <see cref="VolumeAttachment"/>'s
     /// <c>BehindOtherSnapshotsCheckpoint</c>.
     /// </exception>
     Task<VolumeAttachment> ClassifyAttachmentAsync(
@@ -317,31 +325,43 @@ public interface IHyperVHostClient
     Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Whether the VM's configuration currently references
-    /// <paramref name="vhdxPath"/> directly, or does not reference anything
-    /// built on it at all - true either way. False only while a differencing
-    /// disk is still stacked on top of it.
+    /// Whether every disk in the VM's configuration either is one of
+    /// <paramref name="frozenDisks"/> or does not sit directly on one - true
+    /// once the merge of the checkpoint that froze them has collapsed its
+    /// chains, false while a differencing disk still stands on any of them.
     /// </summary>
     /// <remarks>
-    /// The post-merge wait's predicate. <see cref="DestroyCheckpointAsync"/>
+    /// The post-merge wait's predicate, asked about exactly the disks a
+    /// checkpoint froze (<see cref="Checkpoint.FrozenDisks"/>), or about the
+    /// source alone when the checkpoint was already gone. Exactly those, for
+    /// issue #38: a checkpoint is VM-wide, so releasing the VM once only the
+    /// source had collapsed hands the next job on it a sibling still merging,
+    /// this driver's own work it cannot tell from a stuck merge; and waiting
+    /// on every chain on the VM would stall on one a different, long-lived
+    /// checkpoint - a backup product's, an operator's - left standing. Only
+    /// the immediate parent is asked: a disk the merge has re-pointed is one
+    /// of the frozen disks itself, so once collapsed no disk is read at all.
+    /// <para>
+    /// <see cref="DestroyCheckpointAsync"/>
     /// is fire-and-forget and returns once the merge has *started*, and -
-    /// measured, per the comment already in <c>ClassifyAttachmentAsync</c>'s
-    /// own retry loop - the checkpoint's configuration object can disappear a
+    /// measured - the checkpoint's configuration object can disappear a
     /// moment *before* the VM's disk actually re-points to the base. So "the
     /// checkpoint object is gone" is not the same question as "the chain has
     /// collapsed", and only the second one tells a caller it is safe to
     /// release its hold on the VM.
+    /// </para>
     /// <para>
     /// Deliberately non-throwing and deliberately not judging ownership,
     /// unlike <see cref="ClassifyAttachmentAsync"/>: that method's callers -
     /// attach, detach, expand, snapshot - each have a specific reason to
     /// treat an unresolved or foreign chain as a hard failure requiring an
-    /// operator. This method's one caller only ever asks whether the chain
-    /// it already knows about, from a merge it already started, has finished
-    /// collapsing yet - an unresolved chain simply means "not collapsed yet",
-    /// not "something is wrong", so this returns false rather than throwing.
+    /// operator. This method's one caller only ever asks whether the chains
+    /// a merge it already started left behind have finished collapsing yet -
+    /// a disk that cannot be read simply means "not collapsed yet", not
+    /// "something is wrong", so this returns false rather than throwing.
     /// </para>
     /// </remarks>
     /// <exception cref="VmNotOnHostException">The VM is not registered on this host.</exception>
-    Task<bool> IsChainCollapsedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken);
+    Task<bool> IsCollapsedOntoAsync(
+        string hostName, string vmId, IReadOnlyCollection<string> frozenDisks, CancellationToken cancellationToken);
 }
