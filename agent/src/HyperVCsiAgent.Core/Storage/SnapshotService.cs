@@ -1462,8 +1462,14 @@ public sealed class SnapshotService : ISnapshotService
     /// delete anything.
     /// </para>
     /// <para>
-    /// At least two looks before either answer, whatever the window: one look
-    /// cannot say a chain stayed anything.
+    /// The window bounds when the last look may start, not how long a look
+    /// takes: each runs to the budgets it always had - its CIM deadline, its
+    /// wait for a host slot - because a token cannot interrupt a CIM call in
+    /// flight, and cutting a healthy but slow host's first look short would
+    /// fail every snapshot of an attached volume on it. So the answer comes
+    /// once the window is spent, never by forcing another look after it: the
+    /// worst case is the window plus one look. A chain seen in only one look
+    /// is never called foreign, since one look cannot say it stayed anything.
     /// </para>
     /// </remarks>
     /// <param name="verb">"taken" or "copied", for the message: which step of the snapshot could not proceed.</param>
@@ -1494,9 +1500,16 @@ public sealed class SnapshotService : ISnapshotService
                     && ex.Checkpoints.Count > 0
                     && SameCheckpoints(first, ex);
 
-                if (looks >= 2 && elapsed.Elapsed >= _options.ChainSettleTimeout)
+                // Ends as soon as the window is spent, however many looks fit
+                // in it. The window only decides whether to start another
+                // look - it cannot bound one already under way, which runs
+                // to its own CIM and host-slot budgets - so a slow first look
+                // must not buy a second one at full cost. One look, though,
+                // cannot say a chain stayed anything, so it never answers
+                // "foreign".
+                if (elapsed.Elapsed >= _options.ChainSettleTimeout)
                 {
-                    if (unchangedUntagged)
+                    if (looks >= 2 && unchangedUntagged)
                     {
                         throw JobFailureException.FailedPrecondition(
                             $"snapshot {snapshotId} cannot be {verb}: {ex.Message}, and that stayed unchanged for " +
@@ -1508,7 +1521,7 @@ public sealed class SnapshotService : ISnapshotService
 
                     throw new JobFailureException(
                         AgentErrorCodes.Aborted,
-                        $"snapshot {snapshotId} cannot be {verb} yet: {ex.Message}, and that was still changing after " +
+                        $"snapshot {snapshotId} cannot be {verb} yet: {ex.Message}, and that had not settled after " +
                         $"{elapsed.Elapsed.TotalSeconds:F0}s - most likely another snapshot's checkpoint on the same VM " +
                         "being taken or merged. Nothing needs doing; the snapshot is retried automatically",
                         ex);

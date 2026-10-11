@@ -865,6 +865,33 @@ public sealed class SnapshotServiceTests : IDisposable
     }
 
     [WindowsOnlyFact]
+    public async Task CreateAsync_FirstLookOutlastsTheWholeWindow_IsAbortedWithoutASecondLook()
+    {
+        // A slow host: the one look takes longer than the window itself. It
+        // must not buy a second full-cost look, and one look - however
+        // foreign it looks - cannot say the chain stayed that way.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient
+        {
+            ClassifyFault = _ =>
+            {
+                Thread.Sleep(TimeSpan.FromMilliseconds(500));
+                return UntaggedRoot(ForeignCheckpoint);
+            },
+        };
+        var harness = NewHarness(
+            cluster: cluster, location: TracedToVm1(), host: host, chainSettleTimeout: TimeSpan.FromMilliseconds(200));
+        WriteAttachedVolume("pvc-1", 4096);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.Aborted, failure.ErrorCode);
+        Assert.DoesNotContain("delete", failure.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(1, host.ClassifyCalls);
+    }
+
+    [WindowsOnlyFact]
     public async Task CreateAsync_DiskStillUnreadableWhenTheWindowEnds_IsAbortedRatherThanFailedPrecondition()
     {
         var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
