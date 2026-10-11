@@ -995,26 +995,40 @@ public sealed class SnapshotService : ISnapshotService
                         // destroyed is measured, and is why the CIM client
                         // retried this call itself before the retry moved
                         // here.
-                        attachment = await UntilChainSettlesAsync(snapshotId, "copied", async () =>
+                        //
+                        // One slot, taken before the window starts and held
+                        // across every look, as that in-client retry held
+                        // it: queueing for it under contention - the backup
+                        // run #38 comes from - must not use up the window
+                        // before the first look, and a look after a 250ms
+                        // pause must not queue again. Held for at most the
+                        // window plus one look. Unlike the fast path's, an
+                        // Aborted here is expensive: the snapshot's retry
+                        // re-enqueues its copy at the back of this VM's
+                        // queue, behind copies that can run for hours.
+                        await AcquireHostSlotAsync(
+                            vm, "classifying", snapshotId, _options.SnapshotCopyTimeout, attempt, cancellationToken)
+                            .ConfigureAwait(false);
+                        try
                         {
-                            await AcquireHostSlotAsync(
-                                vm, "classifying", snapshotId, _options.SnapshotCopyTimeout, attempt, cancellationToken)
-                                .ConfigureAwait(false);
-                            try
+                            attachment = await UntilChainSettlesAsync(snapshotId, "copied", async () =>
                             {
-                                return await _host.ClassifyAttachmentAsync(
-                                    vm.OwningHost, vm.VmId, sourcePath, elementName, attempt.Token).ConfigureAwait(false);
-                            }
-                            catch (InvalidOperationException ex) when (ex is not DiskChainUnsettledException)
-                            {
-                                throw JobFailureException.FailedPrecondition(
-                                    $"snapshot {snapshotId} cannot be copied: {ex.Message}");
-                            }
-                            finally
-                            {
-                                _hostSlots.Release(vm.OwningHost);
-                            }
-                        }, attempt.Token).ConfigureAwait(false);
+                                try
+                                {
+                                    return await _host.ClassifyAttachmentAsync(
+                                        vm.OwningHost, vm.VmId, sourcePath, elementName, attempt.Token).ConfigureAwait(false);
+                                }
+                                catch (InvalidOperationException ex) when (ex is not DiskChainUnsettledException)
+                                {
+                                    throw JobFailureException.FailedPrecondition(
+                                        $"snapshot {snapshotId} cannot be copied: {ex.Message}");
+                                }
+                            }, attempt.Token).ConfigureAwait(false);
+                        }
+                        finally
+                        {
+                            _hostSlots.Release(vm.OwningHost);
+                        }
 
                         switch (attachment.Kind)
                         {
@@ -1470,6 +1484,17 @@ public sealed class SnapshotService : ISnapshotService
     /// once the window is spent, never by forcing another look after it: the
     /// worst case is the window plus one look. A chain seen in only one look
     /// is never called foreign, since one look cannot say it stayed anything.
+    /// </para>
+    /// <para>
+    /// The window runs from before the first look, so whatever a look waits
+    /// for counts against it. The copy job takes its host slot outside this
+    /// method and holds it across every look, so queueing for it does not;
+    /// the fast job cannot do the same - its looks trace the holder, which
+    /// takes slots on whichever hosts it asks, inside the location service -
+    /// so there a look slowed by contention can leave no time for a second.
+    /// That is accepted rather than engineered around: the fast job's
+    /// Aborted costs one snapshotter retry a few seconds later, with nothing
+    /// queued yet to lose its place.
     /// </para>
     /// </remarks>
     /// <param name="verb">"taken" or "copied", for the message: which step of the snapshot could not proceed.</param>

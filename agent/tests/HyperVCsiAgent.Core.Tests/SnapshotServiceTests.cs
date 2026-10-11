@@ -965,6 +965,36 @@ public sealed class SnapshotServiceTests : IDisposable
         Assert.Single(host.CreatedCheckpointElementNames);
     }
 
+    [WindowsOnlyFact]
+    public async Task CreateAsync_CopyJobQueuesForItsHostSlotLongerThanTheWindow_StillGetsItsLooks()
+    {
+        // The backup run's contention: every slot on the host busy for longer
+        // than the whole window when the copy job comes to re-classify. The
+        // wait is not looking, so it must not use the window up - the copy
+        // takes its slot before the window starts and keeps it across looks.
+        var hostSlots = new HostOperationSlots(Options.Create(new AgentOptions { MaxConcurrentHostOperations = 1 }));
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        cluster.DuringResolve = () =>
+        {
+            cluster.DuringResolve = null;
+            hostSlots.WaitAsync("host-1", CancellationToken.None).GetAwaiter().GetResult();
+            _ = Task.Delay(600).ContinueWith(_ => hostSlots.Release("host-1"), TaskScheduler.Default);
+        };
+
+        // Look 1 is the fast job's; looks 2 and 3 are the copy job's, still
+        // unsettled; look 4 settles.
+        var host = new FakeHostClient { ClassifyFault = call => call is 2 or 3 ? Unreadable("pvc-1_EDDD347F.avhdx") : null };
+        var harness = NewHarness(
+            cluster: cluster, location: TracedToVm1(), host: host, hostSlots: hostSlots,
+            chainSettleTimeout: TimeSpan.FromMilliseconds(300));
+        WriteAttachedVolume("pvc-1", 4096);
+
+        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+        Assert.Equal(4, host.ClassifyCalls);
+    }
+
     private static readonly UntaggedCheckpoint SiblingCheckpoint =
         new("checkpoint:untagged", "node-a - (10/10/2026 - 2:03:16 PM)", DateTimeOffset.Parse("2026-10-10T14:03:16Z"));
 
@@ -2843,8 +2873,14 @@ public sealed class SnapshotServiceTests : IDisposable
 
         public Dictionary<string, ClusteredVm> Vms { get; init; } = [];
 
-        public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken) =>
-            Task.FromResult(Vms.TryGetValue(nodeId, out var vm) ? vm : null);
+        /// <summary>Runs synchronously inside ResolveVmAsync - the copy job's first step, and only the copy job's.</summary>
+        public Action? DuringResolve { get; set; }
+
+        public Task<ClusteredVm?> ResolveVmAsync(string nodeId, CancellationToken cancellationToken)
+        {
+            DuringResolve?.Invoke();
+            return Task.FromResult(Vms.TryGetValue(nodeId, out var vm) ? vm : null);
+        }
 
         public Task<ClusteredVmState?> GetVmClusterStateAsync(string nodeId, CancellationToken cancellationToken) =>
             throw new NotSupportedException("SnapshotService never reads a VM's cluster resource state");
