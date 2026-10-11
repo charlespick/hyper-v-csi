@@ -107,14 +107,17 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
         // disk per hop before the one that simply lists the path is reached.
         var failures = new List<string>();
         var unaskedHosts = new List<string>();
+        var unsettled = new List<string>();
         foreach (var includeDifferencingChains in new[] { false, true })
         {
             failures.Clear();
             unaskedHosts.Clear();
+            unsettled.Clear();
             foreach (var stage in stages)
             {
                 var matches = await FindReferencingVmsAsync(
-                    vms, stage, fullPath, includeDifferencingChains, failures, unaskedHosts, cancellationToken).ConfigureAwait(false);
+                    vms, stage, fullPath, includeDifferencingChains, failures, unaskedHosts, unsettled, cancellationToken)
+                    .ConfigureAwait(false);
 
                 switch (matches.Count)
                 {
@@ -157,9 +160,21 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
             // Nothing matched, but not everything could be asked, and null would
             // claim more than is known: callers read it as "no clustered VM holds
             // this file".
-            throw new InvalidOperationException(
+            //
+            // Told apart when every one of those failures is a disk that read
+            // back empty - a chain mid-checkpoint, most likely, which a look a
+            // few seconds from now answers. Anything else - a host that could
+            // not be asked, a walk out of time, a chain too deep - stays the
+            // plain refusal it always was. The message is the same either way.
+            var message =
                 $"{path} is open, and no clustered VM on a node that could be holding it was found to reference it, " +
-                $"but not all of those VMs could be checked: {string.Join("; ", failures)}");
+                $"but not all of those VMs could be checked: {string.Join("; ", failures)}";
+            if (unsettled.Count == failures.Count)
+            {
+                throw new DiskChainUnsettledException(DiskChainUnsettledReason.UnreadableDisk, message);
+            }
+
+            throw new InvalidOperationException(message);
         }
 
         _logger.LogDebug(
@@ -319,6 +334,7 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
         bool includeDifferencingChains,
         List<string> failures,
         List<string> unaskedHosts,
+        List<string> unsettled,
         CancellationToken cancellationToken)
     {
         var matches = new List<VhdxLocation>();
@@ -377,6 +393,10 @@ public sealed class CsvFileOwnershipService : IVhdxLocationService
                     "could not tell whether {VmId} on {HostName} references {Path}: {Reason}; carrying on with the others",
                     unresolved.VmId, hostName, fullPath, unresolved.Reason);
                 failures.Add($"{unresolved.VmId} on {hostName}: {unresolved.Reason}");
+                if (unresolved.Unsettled)
+                {
+                    unsettled.Add(failures[^1]);
+                }
             }
 
             if (references.RanOutOfTime)

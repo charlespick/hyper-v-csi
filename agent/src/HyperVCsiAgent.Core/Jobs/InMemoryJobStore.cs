@@ -24,6 +24,25 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
     private readonly CancellationTokenSource _shutdown = new();
     private readonly TimeProvider _clock;
 
+    /// <summary>
+    /// <see cref="ExecuteAsync"/> calls started and not yet through their
+    /// <c>finally</c> - Pending and Running jobs alike. Pending ones count
+    /// because they still read <see cref="_shutdown"/>'s token once their
+    /// predecessors finish, and still run their delegate, however briefly,
+    /// against a token that is already canceled.
+    /// </summary>
+    private int _active;
+
+    /// <summary>
+    /// Set once <see cref="DrainAsync"/> or <see cref="Dispose"/> has run:
+    /// <see cref="GetOrCreate"/> starts nothing new from then on.
+    /// </summary>
+    private bool _stopping;
+
+    private bool _disposed;
+
+    private readonly TaskCompletionSource _drained = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
     public InMemoryJobStore(TimeProvider? clock = null) => _clock = clock ?? TimeProvider.System;
 
     /// <summary>
@@ -101,6 +120,14 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
                 return existing;
             }
 
+            // After the dedupe above, not before it: handing back a job that
+            // already exists starts nothing, and the caller polling it sees
+            // whatever the shutdown made of it.
+            if (_stopping)
+            {
+                throw new JobStoreStoppingException();
+            }
+
             // Deduplicated so a caller that names one resource twice does not
             // double-count Pending and leave a queue that never
             // reaches zero. Ordered so the recorded Targets read the same way
@@ -131,6 +158,7 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
                 queue.Pending++;
             }
 
+            _active++;
             var task = ExecuteAsync(previous, distinct, job, run);
             foreach (var target in distinct)
             {
@@ -186,19 +214,7 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
             // copy this returns is unshared, so nothing about serializing it
             // afterward - which happens outside this lock, in the response
             // pipeline - can race a future write here.
-            var snapshot = new Job
-            {
-                Id = job.Id,
-                IdempotencyKey = job.IdempotencyKey,
-                OperationType = job.OperationType,
-                Targets = job.Targets,
-                CreatedAt = job.CreatedAt,
-                Status = job.Status,
-                Result = job.Result,
-                Error = job.Error,
-                ErrorCode = job.ErrorCode,
-                CompletedAt = job.CompletedAt,
-            };
+            var snapshot = CopyOf(job);
 
             // Computed here rather than stored when the job was enqueued or
             // when it started running, so it can never go stale: a value
@@ -256,11 +272,125 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
     }
 
     /// <summary>
-    /// Cancels the token held by in-flight jobs (the DI container disposes this
-    /// singleton on host shutdown). The CTS is deliberately never disposed:
-    /// job delegates may still be observing the token.
+    /// Stops starting new jobs, cancels the token every in-flight job runs
+    /// under, and waits up to <paramref name="timeout"/> for all of them to
+    /// finish - returning whichever had not by then, empty when every one did.
     /// </summary>
-    public void Dispose() => _shutdown.Cancel();
+    /// <remarks>
+    /// Canceling alone does not stop a job. A CIM call already in flight, a
+    /// <c>File.Move</c>, a block-clone FSCTL - none of them observe a token
+    /// once issued, and the cleanup a job runs on its way out (deleting its
+    /// <c>~creating</c> or <c>~copying</c> marker) only happens if the process
+    /// is still there to run it. This is what keeps it there:
+    /// <see cref="JobDrainService"/> awaits it from the host's stop, before the
+    /// process lets go and before the clustered role moves to another node,
+    /// where a re-driven create would otherwise be free to touch the same file
+    /// this process is still writing.
+    /// <para>
+    /// Bounded, because one wedged host call must not hold the role offline
+    /// indefinitely - a job still running when the bound expires is
+    /// abandoned exactly as it was before this existed, and
+    /// <see cref="Storage.StaleMarkerSweeper"/> on the next start collects
+    /// what it leaves behind. <paramref name="cancellationToken"/> ending the
+    /// wait early is treated the same as the bound expiring.
+    /// </para>
+    /// <para>
+    /// A Pending job counts as in flight: it is canceled along with the rest
+    /// and its delegate still runs, against a token that is already
+    /// canceled, once whatever it queued behind finishes.
+    /// </para>
+    /// </remarks>
+    public async Task<IReadOnlyList<Job>> DrainAsync(TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        bool disposed;
+        lock (_gate)
+        {
+            _stopping = true;
+            disposed = _disposed;
+            if (_active == 0)
+            {
+                _drained.TrySetResult();
+            }
+        }
+
+        // Outside the lock: Cancel runs every registered callback inline, and
+        // those belong to run delegates this store knows nothing about. A
+        // disposed store has already canceled, and may have disposed the CTS.
+        if (!disposed)
+        {
+            _shutdown.Cancel();
+        }
+
+        try
+        {
+            await _drained.Task.WaitAsync(timeout, cancellationToken).ConfigureAwait(false);
+            return [];
+        }
+        catch (TimeoutException)
+        {
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+
+        lock (_gate)
+        {
+            return _byId.Values
+                .Where(job => job.Status is JobStatus.Pending or JobStatus.Running)
+                .Select(CopyOf)
+                .ToArray();
+        }
+    }
+
+    /// <summary>
+    /// Stops starting new jobs and cancels the token held by in-flight ones -
+    /// what <see cref="DrainAsync"/> does, without the wait, for a host that
+    /// never ran it. The DI container disposes this singleton after every
+    /// hosted service has stopped, so in the agent this is a no-op behind
+    /// <see cref="JobDrainService"/>'s drain.
+    /// </summary>
+    /// <remarks>
+    /// The CTS is disposed only once nothing can still be observing its
+    /// token: with a job still in flight - a drain that ran out of time, or
+    /// no drain at all - it is left undisposed rather than pulled out from
+    /// under that job's delegate. Safe to call more than once.
+    /// </remarks>
+    public void Dispose()
+    {
+        bool idle;
+        lock (_gate)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            _stopping = true;
+            idle = _active == 0;
+        }
+
+        _shutdown.Cancel();
+
+        if (idle)
+        {
+            _shutdown.Dispose();
+        }
+    }
+
+    private static Job CopyOf(Job job) => new()
+    {
+        Id = job.Id,
+        IdempotencyKey = job.IdempotencyKey,
+        OperationType = job.OperationType,
+        Targets = job.Targets,
+        CreatedAt = job.CreatedAt,
+        Status = job.Status,
+        Result = job.Result,
+        Error = job.Error,
+        ErrorCode = job.ErrorCode,
+        CompletedAt = job.CompletedAt,
+    };
 
     private async Task ExecuteAsync(Task[] previous, string[] targets, Job job, Func<Job, CancellationToken, Task> run)
     {
@@ -351,6 +481,11 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
                     {
                         _queues.Remove(target);
                     }
+                }
+
+                if (--_active == 0 && _stopping)
+                {
+                    _drained.TrySetResult();
                 }
             }
         }

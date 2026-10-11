@@ -313,6 +313,26 @@ public sealed class JobsEndpointTests : IDisposable
     }
 
     [Fact]
+    public async Task PostJobs_OnceTheStoreIsDraining_Returns503AndPollsStillAnswer()
+    {
+        var client = _factory.CreateClient();
+        var done = await RunToCompletionAsync(client, CreateVolumeRequest("pvc-1", 4096));
+        var id = done.RootElement.GetProperty("id").GetString();
+
+        // What JobDrainService does when the host begins stopping. Kestrel
+        // stops after it, so requests keep arriving in that window.
+        var store = _factory.Services.GetRequiredService<Core.Jobs.InMemoryJobStore>();
+        Assert.Empty(await store.DrainAsync(TimeSpan.Zero, CancellationToken.None));
+
+        var response = await client.PostAsJsonAsync("/v1/jobs", CreateVolumeRequest("pvc-2", 4096));
+
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+        using var body = await ReadJsonAsync(response);
+        Assert.Contains("shutting down", body.RootElement.GetProperty("error").GetString(), StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(HttpStatusCode.OK, (await client.GetAsync($"/v1/jobs/{id}")).StatusCode);
+    }
+
+    [Fact]
     public async Task PostJobs_OnceTheStartupSweepFinishesDiscovery_Accepts()
     {
         var cluster = new FakeClusterService();
@@ -387,7 +407,11 @@ public sealed class JobsEndpointTests : IDisposable
         public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
             throw new NotSupportedException("a VM list of zero means the sweep never asks this");
 
-        public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) => _discovery.Task;
+        // Honors the token, as the real query does: the reaper cancels this on
+        // host stop, and a fake that ignored it held every host disposal here
+        // for the whole of HostOptions.ShutdownTimeout.
+        public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) =>
+            _discovery.Task.WaitAsync(cancellationToken);
 
         public Task<IReadOnlyList<ClusterSharedVolume>> ListSharedVolumesAsync(CancellationToken cancellationToken) =>
             throw new NotSupportedException("no disk in this file is held open, so nothing traces one to a shared volume");

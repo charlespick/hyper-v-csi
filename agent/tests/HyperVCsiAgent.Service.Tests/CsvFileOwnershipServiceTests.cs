@@ -168,6 +168,36 @@ public sealed class CsvFileOwnershipServiceTests
     }
 
     [Fact]
+    public async Task LocateAsync_WhenTheOnlyUncheckableVmIsMidCheckpoint_SaysToAskAgain()
+    {
+        // Issue #38's Internal form: the one thing standing between this and
+        // "no VM holds it" is a disk that read back empty, which clears.
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address)];
+        _host.MidCheckpoint.Add("vm-1");
+
+        var failure = await Assert.ThrowsAsync<DiskChainUnsettledException>(
+            () => NewService().LocateAsync(Pvc, CancellationToken.None));
+
+        Assert.Equal(DiskChainUnsettledReason.UnreadableDisk, failure.Reason);
+        Assert.Contains("vm-1 on csidev01", failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task LocateAsync_AMidCheckpointVmAlongsideAnyOtherFailure_IsThePlainRefusal()
+    {
+        _cluster.Vms = [new("vm-1", "csidev01"), new("vm-4", "csidev01"), new("vm-2", "csidev02")];
+        _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address)];
+        _host.MidCheckpoint.Add("vm-1");
+        _host.Unreadable.Add("vm-4");
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => NewService().LocateAsync(Pvc, CancellationToken.None));
+
+        Assert.Contains("vm-1 on csidev01", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("vm-4 on csidev01", failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task LocateAsync_RefusesTwoVmsReferencingOnePath()
     {
         _probe.OpenFiles["csidev02"] = [new(PvcRelative, Dev01Address), new(PvcRelative, Dev03Address)];
@@ -982,6 +1012,12 @@ public sealed class CsvFileOwnershipServiceTests
         /// <summary>VMs with an unrelated disk whose differencing chain cannot be walked.</summary>
         public HashSet<string> Unreadable { get; } = [];
 
+        /// <summary>
+        /// VMs with a disk whose setting data reads back empty, as one does
+        /// mid-checkpoint - reported unsettled, not just unresolved.
+        /// </summary>
+        public HashSet<string> MidCheckpoint { get; } = [];
+
         /// <summary>Hosts whose differencing walk runs out of its budget before walking any chain.</summary>
         public HashSet<string> RunsOutOfTime { get; } = new(StringComparer.OrdinalIgnoreCase);
 
@@ -1055,6 +1091,10 @@ public sealed class CsvFileOwnershipServiceTests
                 ? registered
                     .Where(vmId => Unreadable.Contains(vmId) && !references.Contains(vmId))
                     .Select(vmId => new UnresolvedDiskReference(vmId, $"a disk on {vmId} could not be read"))
+                    .Concat(registered
+                        .Where(vmId => MidCheckpoint.Contains(vmId) && !references.Contains(vmId))
+                        .Select(vmId => new UnresolvedDiskReference(
+                            vmId, $"a disk on {vmId} returned no setting data", Unsettled: true)))
                     .ToList()
                 : [];
 

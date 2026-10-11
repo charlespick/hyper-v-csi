@@ -147,14 +147,21 @@ public interface IHyperVHostClient
     /// actually standing for a different snapshot named <c>snap-2</c>.
     /// </param>
     /// <exception cref="VmNotOnHostException">The VM is not registered on this host.</exception>
+    /// <exception cref="DiskChainUnsettledException">
+    /// One look could not settle it: the VHDX sits behind a differencing chain
+    /// with no checkpoint this driver tagged at its root, or a disk on one of
+    /// the VM's chains could not be read. Either can be a sibling snapshot's
+    /// checkpoint mid-take or mid-merge, so this is answered after a single
+    /// attempt and the caller decides how long to keep asking - a chain that
+    /// stays untagged for that whole time is a foreign checkpoint, a backup
+    /// product's recovery point, or similar.
+    /// </exception>
     /// <exception cref="InvalidOperationException">
-    /// The VHDX sits behind a differencing chain that is not rooted in any
-    /// checkpoint this driver tagged at all - a foreign checkpoint, a backup
-    /// product's recovery point, or a chain this method could not walk to a
-    /// conclusion within its depth bound. Refused rather than guessed past, on
+    /// A chain this method could not walk to a conclusion within its depth
+    /// bound. Refused rather than guessed past, on
     /// <c>GuardAgainstDifferencingChain</c>'s own reasoning. A chain rooted in
     /// a checkpoint this driver tagged for a *different* snapshot does not
-    /// throw this - see <see cref="VolumeAttachment"/>'s
+    /// throw at all - see <see cref="VolumeAttachment"/>'s
     /// <c>BehindOtherSnapshotsCheckpoint</c>.
     /// </exception>
     Task<VolumeAttachment> ClassifyAttachmentAsync(

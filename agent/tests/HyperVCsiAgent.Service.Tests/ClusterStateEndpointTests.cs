@@ -237,7 +237,11 @@ public sealed class ClusterStateEndpointTests : IDisposable
         public Task<bool> IsHostLiveAsync(string hostName, CancellationToken cancellationToken) =>
             throw new NotSupportedException("no test in this file asks about host liveness");
 
-        public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) => _discovery.Task;
+        // Honors the token, as the real query does: the reaper cancels this on
+        // host stop, and a fake that ignored it held every host disposal here
+        // for the whole of HostOptions.ShutdownTimeout.
+        public Task<IReadOnlyList<ClusteredVm>> ListVmsAsync(CancellationToken cancellationToken) =>
+            _discovery.Task.WaitAsync(cancellationToken);
 
         public Task<IReadOnlyList<ClusterSharedVolume>> ListSharedVolumesAsync(CancellationToken cancellationToken) =>
             throw new NotSupportedException("no test in this file locates a disk");

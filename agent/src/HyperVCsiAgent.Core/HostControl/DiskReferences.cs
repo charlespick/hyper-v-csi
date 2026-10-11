@@ -25,4 +25,11 @@ public sealed record DiskReferences(
     IReadOnlyList<string> VmIds, IReadOnlyList<UnresolvedDiskReference> Unresolved, bool RanOutOfTime = false);
 
 /// <summary>A VM <see cref="DiskReferences"/> could not answer for, and why.</summary>
-public sealed record UnresolvedDiskReference(string VmId, string Reason);
+/// <param name="Unsettled">
+/// Every chain that stopped the answer did so on a disk whose setting data
+/// came back empty - what a chain looks like while a checkpoint on it is being
+/// taken or merged, and worth asking again about shortly rather than refusing
+/// over. See <see cref="DiskChainUnsettledReason.UnreadableDisk"/>. False when
+/// any chain failed for another reason, or the walk ran out of time.
+/// </param>
+public sealed record UnresolvedDiskReference(string VmId, string Reason, bool Unsettled = false);

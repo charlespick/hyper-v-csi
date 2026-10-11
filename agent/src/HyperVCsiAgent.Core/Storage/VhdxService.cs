@@ -32,7 +32,7 @@ public sealed class VhdxService : IVhdxService, IDisposable
     /// silently take the second with it. Any replacement has to keep that
     /// property: the character must be one no volume name can contain.
     /// </summary>
-    private const string InProgressSuffix = "~creating" + VhdxExtension;
+    internal const string InProgressSuffix = "~creating" + VhdxExtension;
 
     /// <summary>
     /// How far an existing disk may exceed the requested size and still count

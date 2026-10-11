@@ -110,15 +110,6 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     /// </summary>
     private static readonly TimeSpan CheckpointDiscoveryPollInterval = TimeSpan.FromMilliseconds(250);
 
-    /// <summary>
-    /// How many times <see cref="ClassifyAttachmentAsync"/> re-checks an
-    /// ambiguous chain before believing it. Bounds a real but narrow and
-    /// self-clearing race - see <see cref="AmbiguousChainException"/> - to a
-    /// second or so, not the kind of wait that should ever mask a genuinely
-    /// foreign checkpoint for long.
-    /// </summary>
-    private const int MaxAttachmentClassificationAttempts = 5;
-
     private readonly ILogger<CimHyperVHostClient> _logger;
     private readonly TimeSpan _hostOperationTimeout;
 
@@ -469,46 +460,17 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
 
-            // Retried rather than a single query: measured against a real
-            // host, DestroySnapshot's checkpoint object can disappear a
-            // moment before the VM's disk actually re-points to the base -
-            // the merge itself lags the checkpoint's own removal by a beat.
-            // A single query in that window sees a chain with no owned
-            // checkpoint at its root, which is indistinguishable from a
-            // genuinely foreign one without waiting a moment and asking
-            // again. Re-fetches the active settings fresh each attempt,
-            // unlike FindNewCheckpoint's retry: what has to change here is
-            // the VM's own disk configuration, not an association's
-            // eventual consistency, and a stale settings snapshot would
-            // never show that.
-            //
-            // Only the genuinely-ambiguous case retries here. A chain rooted
-            // in a checkpoint this driver tagged for a *different* snapshot
-            // is not ambiguous - a checkpoint was found and positively
-            // identified - so ClassifyAttachment returns that answer
-            // immediately rather than throwing AmbiguousChainException, and
-            // this loop never sees it.
-            for (var attempt = 0; ; attempt++)
-            {
-                using var settings = GetActiveSettings(session, hostName, vmId, deadline, cancellationToken);
-                try
-                {
-                    return ClassifyAttachment(
-                        session, settings, hostName, vmId, vhdxPath, thisSnapshotElementName, deadline, cancellationToken);
-                }
-                catch (AmbiguousChainException ex) when (attempt < MaxAttachmentClassificationAttempts - 1)
-                {
-                    // Expected and self-clearing, not swallowed silently: see
-                    // this loop's own remarks for why attempt < the last one
-                    // retries rather than lets this become the caller-visible
-                    // failure.
-                    _logger.LogDebug(ex,
-                        "attempt {Attempt} to classify {VhdxPath}'s attachment to {VmId} on {HostName} was ambiguous; retrying",
-                        attempt + 1, vhdxPath, vmId, hostName);
-                    cancellationToken.ThrowIfCancellationRequested();
-                    Thread.Sleep(CheckpointDiscoveryPollInterval);
-                }
-            }
+            // One look, not a retry loop: a chain that cannot be settled
+            // comes back as DiskChainUnsettledException and the caller asks
+            // again - see SnapshotService.UntilChainSettlesAsync, which owns
+            // how long that goes on. This used to retry here itself, five
+            // times 250ms, and that second was not enough: a sibling
+            // snapshot's checkpoint is untagged from its creation until
+            // TagCheckpoint's own CIM call lands, and on a busy host that
+            // outlasted the loop and reached the caller as "foreign".
+            using var settings = GetActiveSettings(session, hostName, vmId, deadline, cancellationToken);
+            return ClassifyAttachment(
+                session, settings, hostName, vmId, vhdxPath, thisSnapshotElementName, deadline, cancellationToken);
         }, cancellationToken);
 
     public Task<Checkpoint> CreateCheckpointAsync(
@@ -943,6 +905,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             {
                 var (vmId, paths) = toWalk[next];
                 var chainFailures = new List<string>();
+                var everyFailureUnreadable = true;
                 var builtOn = false;
                 try
                 {
@@ -972,6 +935,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                             logger.LogDebug(ex,
                                 "could not walk {Attached}'s differencing chain on {VmId}; carrying on with its other disks", attached, vmId);
                             chainFailures.Add($"{attached}: {ex.Message}");
+                            everyFailureUnreadable &= ex is UnreadableSettingDataException;
                         }
                     }
                 }
@@ -1001,7 +965,8 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                     unresolved.Add(new UnresolvedDiskReference(
                         vmId,
                         $"no disk on it was found to be {vhdxPath} or built on it, but {chainFailures.Count} of its " +
-                        $"differencing chains could not be walked to tell: {string.Join("; ", chainFailures)}"));
+                        $"differencing chains could not be walked to tell: {string.Join("; ", chainFailures)}",
+                        Unsettled: everyFailureUnreadable));
                 }
             }
         }
@@ -1114,7 +1079,24 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                if (ParentPathOf(session, imageService, descendant, deadline, cancellationToken) is not { } parent)
+                string? parent;
+                try
+                {
+                    parent = ParentPathOf(session, imageService, descendant, deadline, cancellationToken);
+                }
+                catch (UnreadableSettingDataException ex)
+                {
+                    // Measured in production: during concurrent snapshots on
+                    // one VM, an .avhdx a sibling's checkpoint is creating or
+                    // merging reads back empty for a few seconds - usually a
+                    // different volume's disk than this one, since every
+                    // disk on the VM gets a link in the chain. Unsettled
+                    // rather than refused, for the caller to ask again.
+                    throw new DiskChainUnsettledException(
+                        DiskChainUnsettledReason.UnreadableDisk, ex.Message, innerException: ex);
+                }
+
+                if (parent is null)
                 {
                     break;
                 }
@@ -1154,24 +1136,32 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                     // checkpoint re-points this chain exactly as this
                     // snapshot's own would - see VolumeAttachmentKind's own
                     // remarks. Returned immediately rather than through the
-                    // AmbiguousChainException retry below: a checkpoint was
-                    // found and positively identified, so there is nothing
-                    // ambiguous left to wait out.
+                    // caller's retry on DiskChainUnsettledException: a
+                    // checkpoint was found and positively identified, so
+                    // there is nothing left to wait out.
                     if (CheckpointMatching.FindAnyOwned(checkpoints) is { } other)
                     {
                         return new VolumeAttachment(VolumeAttachmentKind.BehindOtherSnapshotsCheckpoint, other);
                     }
 
-                    // Ambiguous rather than definitely foreign: the checkpoint
-                    // at the root of this chain might be ours, already merged
-                    // away in the instant before the disk pointer catches up
-                    // - see ClassifyAttachmentAsync's retry. Only becomes the
-                    // caller-visible "foreign chain" failure once that retry
-                    // is exhausted.
-                    throw new AmbiguousChainException(
+                    // Unsettled rather than definitely foreign: the checkpoint
+                    // at the root of this chain might be ours - created but
+                    // not yet tagged, which is a second CIM call after the
+                    // create (see CreateCheckpointAsync), or already merged
+                    // away in the instant before the disk pointer catches up.
+                    // Only the caller can tell, by looking again until it
+                    // either settles or has stayed this way long enough to be
+                    // believed. What the VM's checkpoints are is carried for
+                    // both halves of that: comparing one look with the next,
+                    // and naming them to an operator if it never changes. No
+                    // advice to delete anything here - this look alone cannot
+                    // tell an operator's checkpoint from this driver's own.
+                    throw new DiskChainUnsettledException(
+                        DiskChainUnsettledReason.UntaggedRoot,
                         $"{vhdxPath} is not attached to {vmId} directly, but {attached} is and its differencing " +
                         "chain is built on it, and the checkpoint at the root of that chain is not one this driver " +
-                        "tagged - delete the foreign checkpoint before snapshotting this volume");
+                        "tagged",
+                        ReadUntaggedCheckpoints(session, vmId, deadline, cancellationToken));
                 }
 
                 descendant = parent;
@@ -1190,16 +1180,43 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     }
 
     /// <summary>
-    /// A chain rooted on the target path with no owned checkpoint at its
-    /// root - which is either a genuinely foreign checkpoint, or this
-    /// driver's own, already merged away, with the disk pointer not yet
-    /// caught up. <see cref="ClassifyAttachmentAsync"/> retries a few times
-    /// before letting one of these become the caller-visible
-    /// <see cref="InvalidOperationException"/>; deriving from it means an
-    /// exhausted retry needs no unwrapping to surface the same message and
-    /// type the interface already documents.
+    /// <see cref="ParentPathOf"/>'s read came back with no setting data. An
+    /// <see cref="InvalidOperationException"/> so every walk that refuses on an
+    /// unreadable disk goes on refusing exactly as before; its own type so the
+    /// two walks that treat it as unsettled - <see cref="ClassifyAttachment"/>
+    /// and <see cref="FindDiskReferences"/> - can tell it from a chain too deep
+    /// to walk.
     /// </summary>
-    private sealed class AmbiguousChainException(string message) : InvalidOperationException(message);
+    private sealed class UnreadableSettingDataException(string message) : InvalidOperationException(message);
+
+    /// <summary>
+    /// Every checkpoint of the VM, with what an operator needs to recognize
+    /// one - for <see cref="ClassifyAttachment"/>'s untagged-root case, where
+    /// none of them is this driver's. Read separately from
+    /// <see cref="ReadCheckpointIdentities"/> rather than folded into it: only
+    /// this rare path needs <c>CreationTime</c>, and the three callers of that
+    /// one do not.
+    /// </summary>
+    private static List<UntaggedCheckpoint> ReadUntaggedCheckpoints(
+        CimSession session, string vmId, CimDeadline deadline, CancellationToken cancellationToken)
+    {
+        var checkpoints = new List<UntaggedCheckpoint>();
+
+        foreach (var checkpoint in CheckpointSettings(session, vmId, deadline, cancellationToken))
+        {
+            using (checkpoint)
+            {
+                checkpoints.Add(new UntaggedCheckpoint(
+                    FullPathTextOf(checkpoint),
+                    checkpoint.CimInstanceProperties["ElementName"]?.Value as string ?? string.Empty,
+                    checkpoint.CimInstanceProperties["CreationTime"]?.Value is DateTime created
+                        ? new DateTimeOffset(created.ToUniversalTime())
+                        : null));
+            }
+        }
+
+        return checkpoints;
+    }
 
     private static void EnsureProductionOnlyCheckpoints(string vmId, CimInstance activeSettings)
     {
@@ -1773,7 +1790,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         // either, not a new gap introduced by moving off System.Management.
         if (result.OutParameters["SettingData"]?.Value as string is not { Length: > 0 } settingData)
         {
-            throw new InvalidOperationException(
+            throw new UnreadableSettingDataException(
                 $"could not read the setting data for {vhdxPath}, so whether it has a parent disk is unknown");
         }
 

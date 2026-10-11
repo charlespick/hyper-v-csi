@@ -174,6 +174,38 @@ public class AgentOptionsValidationTests
         Assert.True(options.SnapshotCopyTimeout >= TimeSpan.FromHours(1));
     }
 
+    [Fact]
+    public void Validate_NonPositiveChainSettleTimeout_IsRejected()
+    {
+        var options = NewOptions();
+        options.ChainSettleTimeout = TimeSpan.Zero;
+
+        var failure = Assert.Throws<InvalidOperationException>(options.Validate);
+        Assert.Contains(nameof(AgentOptions.ChainSettleTimeout), failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_NegativeShutdownDrainTimeout_IsRejected_ButZeroIsNotWaitingAtAll()
+    {
+        var options = NewOptions();
+        options.ShutdownDrainTimeout = TimeSpan.Zero;
+        options.Validate();
+
+        options.ShutdownDrainTimeout = TimeSpan.FromSeconds(-1);
+        var failure = Assert.Throws<InvalidOperationException>(options.Validate);
+        Assert.Contains(nameof(AgentOptions.ShutdownDrainTimeout), failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_ShutdownDrainTimeout_LeavesTheHostMarginInsideTheClustersDefaultPendingTimeout()
+    {
+        // Program.cs sets the host's ShutdownTimeout to this plus 15s, and the
+        // whole stop has to finish inside the Generic Service resource's
+        // default PendingTimeout of three minutes or the cluster kills the
+        // process mid-drain.
+        Assert.True(NewOptions().ShutdownDrainTimeout + TimeSpan.FromSeconds(15) < TimeSpan.FromMinutes(3));
+    }
+
     private static AgentOptions NewOptions() =>
         new() { CsvVolumesRoot = "/tmp/volumes", CsvSnapshotsRoot = "/tmp/snapshots" };
 }

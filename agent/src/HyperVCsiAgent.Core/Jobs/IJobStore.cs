@@ -36,7 +36,10 @@ public interface IJobStore
     /// target proves no other job holding *that* target is running. It proves
     /// nothing at all about the other resource the job is touching.
     ///
-    /// The CancellationToken handed to run is canceled when the agent shuts down.
+    /// The CancellationToken handed to run is canceled when the agent shuts down,
+    /// and from then on a call that would start a fresh job throws
+    /// JobStoreStoppingException instead - one that finds an active job still
+    /// returns it.
     /// </summary>
     Job GetOrCreate(
         string idempotencyKey, string operationType, IReadOnlyCollection<string> targets, Func<Job, CancellationToken, Task> run);

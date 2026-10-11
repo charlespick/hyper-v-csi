@@ -129,6 +129,29 @@ public sealed class AgentOptions
     public TimeSpan ExpandDiskWaitTimeout { get; set; } = TimeSpan.FromSeconds(20);
 
     /// <summary>
+    /// How long a snapshot keeps re-reading a source volume's differencing
+    /// chain that will not settle - a disk on it that reads back empty, or a
+    /// checkpoint at its root this driver has not tagged - before answering
+    /// with what it has. See <see cref="HostControl.DiskChainUnsettledException"/>.
+    /// </summary>
+    /// <remarks>
+    /// A checkpoint is VM-wide, so snapshots of two volumes on one VM see
+    /// each other's checkpoints being taken and merged; measured in
+    /// production, that clears within a few seconds. A chain that stays
+    /// unchanged and untagged for this whole window is reported as a foreign
+    /// checkpoint (<c>FailedPrecondition</c>, naming it); one still changing
+    /// when it ends is reported as retryable (<c>Aborted</c>), with nothing
+    /// for an operator to do.
+    /// <para>
+    /// Kept short, because the first of these waits sits inside CreateSnapshot's
+    /// fast job, and that job, waits included, has to fit the controller's own
+    /// polling budget (<c>jobPollBudget</c>, 24s effective) alongside
+    /// <see cref="SnapshotCheckpointWaitTimeout"/>.
+    /// </para>
+    /// </remarks>
+    public TimeSpan ChainSettleTimeout { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
     /// How long a copy that has already been granted its VM and volume
     /// targets waits for one of the <see cref="MaxConcurrentSnapshotCopies"/>
     /// slots before giving up.
@@ -212,6 +235,29 @@ public sealed class AgentOptions
     /// </remarks>
     public TimeSpan OrphanedCheckpointSweepInterval { get; set; } = TimeSpan.FromMinutes(15);
 
+    /// <summary>
+    /// How long a stopping agent waits for its in-flight jobs to finish - or
+    /// to unwind, since stopping cancels them - before letting go of them as
+    /// they are. See <see cref="Jobs.InMemoryJobStore.DrainAsync"/>.
+    /// </summary>
+    /// <remarks>
+    /// A canceled job normally finishes within a second or two: copies stop
+    /// between chunks, and a create deletes its marker on the way out. What
+    /// can take longer is a single Hyper-V call already in flight, which no
+    /// token interrupts, and this is the bound on waiting for one. Zero skips
+    /// the wait entirely.
+    /// <para>
+    /// The host's own shutdown timeout is set from this, with a margin, and
+    /// the whole stop has to fit inside the failover cluster's
+    /// <c>PendingTimeout</c> for the agent's Generic Service resource -
+    /// three minutes unless an operator changed it - or the cluster gives up
+    /// on the offline and terminates the process mid-drain, which is the
+    /// outcome the drain exists to avoid. Raise both together, never this
+    /// alone.
+    /// </para>
+    /// </remarks>
+    public TimeSpan ShutdownDrainTimeout { get; set; } = TimeSpan.FromSeconds(60);
+
     public TlsOptions Tls { get; set; } = new();
 
     public AuthenticationOptions Authentication { get; set; } = new();
@@ -266,6 +312,12 @@ public sealed class AgentOptions
                 $"{SectionName}:{nameof(ExpandDiskWaitTimeout)} must be positive");
         }
 
+        if (ChainSettleTimeout <= TimeSpan.Zero)
+        {
+            throw new InvalidOperationException(
+                $"{SectionName}:{nameof(ChainSettleTimeout)} must be positive");
+        }
+
         if (SnapshotCopySlotWaitTimeout <= TimeSpan.Zero)
         {
             throw new InvalidOperationException(
@@ -300,6 +352,12 @@ public sealed class AgentOptions
         {
             throw new InvalidOperationException(
                 $"{SectionName}:{nameof(OrphanedCheckpointSweepInterval)} must be positive");
+        }
+
+        if (ShutdownDrainTimeout < TimeSpan.Zero)
+        {
+            throw new InvalidOperationException(
+                $"{SectionName}:{nameof(ShutdownDrainTimeout)} must not be negative");
         }
     }
 }
