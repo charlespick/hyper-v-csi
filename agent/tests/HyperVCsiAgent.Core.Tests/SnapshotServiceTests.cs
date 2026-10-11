@@ -664,6 +664,12 @@ public sealed class SnapshotServiceTests : IDisposable
             Assert.Equal(["hyperv-csi/pvc-1/snapshot-abc"], host.CreatedCheckpointElementNames);
             await WaitForAsync(() => host.DestroyedCheckpointElementNames.Count == 1);
             Assert.Equal(["hyperv-csi/pvc-1/snapshot-abc"], host.DestroyedCheckpointElementNames);
+
+            // The merge wait covers every driver volume's chain on the VM -
+            // the whole volumes directory - not just pvc-1's: a checkpoint is
+            // VM-wide, and a sibling still merging after the hold is released
+            // would be this driver's own work under the next job's vm:.
+            Assert.Equal(_volumesRoot, host.CollapseCheckedUnder);
         }
         finally
         {
@@ -829,6 +835,41 @@ public sealed class SnapshotServiceTests : IDisposable
         // decided. No checkpoint taken on top of the foreign one.
         Assert.Equal(2, host.ClassifyCalls);
         Assert.Empty(host.CreatedCheckpointElementNames);
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_ForeignCheckpointWhileEveryCopySlotIsBusy_IsStillReportedAsForeign()
+    {
+        // A backup run with every copy slot taken by long copies. The copy job
+        // classifies before it queues for a slot, so a VM with a foreign
+        // checkpoint gets its verdict rather than "no copy slot" retried for
+        // as long as the run lasts.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient { ClassifyFault = _ => UntaggedRoot(ForeignCheckpoint) };
+        var harness = NewHarness(
+            cluster: cluster, location: TracedToVm1(), host: host, maxConcurrentSnapshotCopies: 1,
+            snapshotCopySlotWaitTimeout: TimeSpan.FromSeconds(30));
+        using var release = new SemaphoreSlim(0);
+        harness.Copier.DuringCopy = _ => release.WaitAsync();
+
+        // An unattached volume's copy takes the only slot and keeps it.
+        WriteVolume("pvc-9", 4096);
+        await harness.Service.CreateAsync("pvc-9", "snapshot-z", CancellationToken.None);
+        await WaitForAsync(() => harness.Copier.Destinations.Count == 1);
+
+        WriteAttachedVolume("pvc-1", 4096);
+        try
+        {
+            var failure = await Assert.ThrowsAsync<JobFailureException>(
+                () => harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None));
+
+            Assert.Equal(AgentErrorCodes.FailedPrecondition, failure.ErrorCode);
+            Assert.Contains("\"Veeam restore point\"", failure.Message);
+        }
+        finally
+        {
+            release.Release(2);
+        }
     }
 
     [WindowsOnlyFact]
@@ -2402,7 +2443,11 @@ public sealed class SnapshotServiceTests : IDisposable
             // to resolve one or touch a checkpoint.
             cluster ?? new NeverCalledClusterService(),
             location ?? new FakeVhdxLocationService(),
-            host ?? new NeverCalledHostClient(),
+            // Wrapped the way Program.cs wraps the real client in a debug
+            // build: a checkpoint created, or a disk changed, outside the
+            // VM's vm: target fails the test - the fact issue #38's
+            // decision (SnapshotService.DecideUntaggedRoot) rests on.
+            new VmTargetAssertingHyperVHostClient(host ?? new NeverCalledHostClient()),
             slots,
             copySlots,
             Options.Create(new AgentOptions
@@ -2822,7 +2867,7 @@ public sealed class SnapshotServiceTests : IDisposable
         public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             throw Unexpected();
 
-        public Task<bool> IsChainCollapsedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+        public Task<bool> AreVolumeChainsCollapsedAsync(string hostName, string vmId, string volumesRoot, CancellationToken cancellationToken) =>
             throw Unexpected();
     }
 
@@ -2988,7 +3033,7 @@ public sealed class SnapshotServiceTests : IDisposable
         public List<string> DestroyedCheckpointElementNames { get; } = [];
 
         /// <summary>
-        /// Makes <see cref="IsChainCollapsedAsync"/> report the chain as
+        /// Makes <see cref="AreVolumeChainsCollapsedAsync"/> report the chain as
         /// still standing no matter what, for a test that needs a post-merge
         /// wait built on this member to time out rather than observe a
         /// collapse that never happens on a fake with no real merge to wait
@@ -2997,9 +3042,9 @@ public sealed class SnapshotServiceTests : IDisposable
         public bool ChainStaysUncollapsed { get; set; }
 
         /// <summary>
-        /// Makes <see cref="IsChainCollapsedAsync"/> throw, the way it does
+        /// Makes <see cref="AreVolumeChainsCollapsedAsync"/> throw, the way it does
         /// against a host the VM has live migrated off in the hours a merge
-        /// wait can span - <see cref="IHyperVHostClient.IsChainCollapsedAsync"/>
+        /// wait can span - <see cref="IHyperVHostClient.AreVolumeChainsCollapsedAsync"/>
         /// documents VmNotOnHostException for exactly that.
         /// </summary>
         public bool FailChainCollapsedChecks { get; set; }
@@ -3141,13 +3186,17 @@ public sealed class SnapshotServiceTests : IDisposable
         public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             Task.FromResult(!CheckpointsNotConfigured);
 
-        public Task<bool> IsChainCollapsedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken)
+        /// <summary>The volumes root the last post-merge wait asked about.</summary>
+        public string? CollapseCheckedUnder { get; private set; }
+
+        public Task<bool> AreVolumeChainsCollapsedAsync(string hostName, string vmId, string volumesRoot, CancellationToken cancellationToken)
         {
             if (FailChainCollapsedChecks)
             {
                 throw new InvalidOperationException($"{vmId} is not registered on {hostName}");
             }
 
+            CollapseCheckedUnder = volumesRoot;
             return Task.FromResult(!ChainStaysUncollapsed && _checkpointsByElementName.Count == 0);
         }
 

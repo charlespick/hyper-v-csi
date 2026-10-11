@@ -1928,7 +1928,7 @@ public sealed class VhdxServiceTests : IDisposable
         public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             throw new NotSupportedException("VhdxService never checkpoints anything");
 
-        public Task<bool> IsChainCollapsedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+        public Task<bool> AreVolumeChainsCollapsedAsync(string hostName, string vmId, string volumesRoot, CancellationToken cancellationToken) =>
             throw new NotSupportedException("VhdxService never checkpoints anything");
     }
 
@@ -1997,7 +1997,7 @@ public sealed class VhdxServiceTests : IDisposable
         public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
 
-        public Task<bool> IsChainCollapsedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+        public Task<bool> AreVolumeChainsCollapsedAsync(string hostName, string vmId, string volumesRoot, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
     }
 

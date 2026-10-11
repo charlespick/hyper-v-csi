@@ -26,7 +26,7 @@ namespace HyperVCsiAgent.Core.HostControl;
 /// <see cref="FindDiskReferencesAsync"/>, <see cref="GetDiskInfoAsync"/>,
 /// <see cref="ClassifyAttachmentAsync"/>,
 /// <see cref="FindOwnedCheckpointAsync"/>, <see cref="CanCheckpointAsync"/>,
-/// <see cref="IsChainCollapsedAsync"/> and
+/// <see cref="AreVolumeChainsCollapsedAsync"/> and
 /// <see cref="ListOwnedCheckpointsAsync"/>. Classification and size reads are
 /// advisory under this design - the copy job re-classifies while holding
 /// <c>vm:</c>, so a stale read here cannot mislead anything that acts - and
@@ -120,8 +120,8 @@ public sealed class VmTargetAssertingHyperVHostClient(IHyperVHostClient inner) :
     public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
         inner.CanCheckpointAsync(hostName, vmId, cancellationToken);
 
-    public Task<bool> IsChainCollapsedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
-        inner.IsChainCollapsedAsync(hostName, vmId, vhdxPath, cancellationToken);
+    public Task<bool> AreVolumeChainsCollapsedAsync(string hostName, string vmId, string volumesRoot, CancellationToken cancellationToken) =>
+        inner.AreVolumeChainsCollapsedAsync(hostName, vmId, volumesRoot, cancellationToken);
 
     /// <summary>
     /// <see cref="JobTargets.Vm"/> canonicalizes braces and case, and

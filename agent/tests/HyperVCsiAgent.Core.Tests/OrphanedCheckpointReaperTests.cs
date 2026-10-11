@@ -786,7 +786,7 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
         public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             Task.FromResult(true);
 
-        public Task<bool> IsChainCollapsedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+        public Task<bool> AreVolumeChainsCollapsedAsync(string hostName, string vmId, string volumesRoot, CancellationToken cancellationToken) =>
             Task.FromResult(!_byHost.TryGetValue(hostName, out var entries) || entries.Count == 0);
 
         public Task<DiskReferences> FindDiskReferencesAsync(

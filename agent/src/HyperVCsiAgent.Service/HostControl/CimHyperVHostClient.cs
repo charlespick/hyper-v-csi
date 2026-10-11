@@ -598,36 +598,46 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             return IsProductionOnlyCheckpoints(activeSettings);
         }, cancellationToken);
 
-    public Task<bool> IsChainCollapsedAsync(
-        string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+    public Task<bool> AreVolumeChainsCollapsedAsync(
+        string hostName, string vmId, string volumesRoot, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
             _logger.LogDebug(
-                "checking whether {VhdxPath}'s differencing chain on {VmId} on {HostName} has collapsed", vhdxPath, vmId, hostName);
+                "checking whether any differencing chain on {VmId} on {HostName} is still built on a volume in {VolumesRoot}",
+                vmId, hostName, volumesRoot);
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
             using var settings = GetActiveSettings(session, hostName, vmId, deadline, cancellationToken);
-            return IsChainCollapsed(session, settings, vhdxPath, deadline, cancellationToken, _logger);
+            return AreVolumeChainsCollapsed(session, settings, volumesRoot, deadline, cancellationToken, _logger);
         }, cancellationToken);
 
     /// <summary>
-    /// <see cref="IsChainCollapsedAsync"/>'s traversal. Structurally the same
-    /// walk <see cref="ClassifyAttachment"/> does, and deliberately its own
-    /// copy rather than a shared one, for the same reason
+    /// <see cref="AreVolumeChainsCollapsedAsync"/>'s traversal: every attached
+    /// disk's chain, walked to its end, looking for an ancestor in
+    /// <paramref name="volumesRoot"/>. Structurally the same walk
+    /// <see cref="ClassifyAttachment"/> does, and deliberately its own copy
+    /// rather than a shared one, for the same reason
     /// <see cref="ClassifyAttachment"/>'s own remarks give for not sharing
     /// with <see cref="LocateDisk"/>: this method must never throw on an
     /// unresolved chain, and every other walk in this file must keep doing
     /// exactly that.
     /// </summary>
-    private static bool IsChainCollapsed(
+    /// <remarks>
+    /// Only ancestors count. A disk attached as itself - a driver volume, or
+    /// the <c>.avhdx</c> a checkpoint put in front of one, which lives in the
+    /// same directory - is what the VM runs on; what has to be gone is a
+    /// differencing disk standing on top of a driver volume.
+    /// </remarks>
+    private static bool AreVolumeChainsCollapsed(
         CimSession session,
         CimInstance settings,
-        string vhdxPath,
+        string volumesRoot,
         CimDeadline deadline,
         CancellationToken cancellationToken,
         ILogger logger)
     {
-        var otherDisks = new List<string>();
+        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(volumesRoot));
+        var attachedDisks = new List<string>();
 
         foreach (var disk in DeviceSettings(session, settings, "Msvm_StorageAllocationSettingData", deadline, cancellationToken))
         {
@@ -638,31 +648,21 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                     continue;
                 }
 
-                if (disk.CimInstanceProperties["HostResource"]?.Value is not string[] { Length: > 0 } hostResource)
+                if (disk.CimInstanceProperties["HostResource"]?.Value is string[] { Length: > 0 } hostResource)
                 {
-                    continue;
+                    attachedDisks.Add(hostResource[0]);
                 }
-
-                if (SamePath(hostResource[0], vhdxPath))
-                {
-                    return true;
-                }
-
-                otherDisks.Add(hostResource[0]);
             }
         }
 
-        // Nothing else references vhdxPath at all, so there is no chain left
-        // to collapse - the same answer a VHDX that was never behind a
-        // checkpoint in the first place gets.
-        if (otherDisks.Count == 0)
+        if (attachedDisks.Count == 0)
         {
             return true;
         }
 
         using var imageService = GetImageManagementService(session, deadline, cancellationToken);
 
-        foreach (var attached in otherDisks)
+        foreach (var attached in attachedDisks)
         {
             var descendant = attached;
             var depth = 0;
@@ -679,20 +679,20 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                 catch (InvalidOperationException ex)
                 {
                     // ParentPathOf could not read this disk's setting data,
-                    // so whether it is still built on vhdxPath is unknown.
-                    // Every throwing walk in this file treats an unreadable
-                    // disk as a reason to refuse the whole operation; this
-                    // one instead answers "not collapsed yet" - its one
-                    // caller is polling a merge already under way, and a
-                    // momentarily unreadable disk is exactly what polling
-                    // during an active reconfiguration looks like. Logged
-                    // rather than swallowed outright, though: a disk that
-                    // stays unreadable across many polls of the same merge is
-                    // worth an operator's attention even though no single
-                    // poll should fail over it.
+                    // so whether it is still built on a driver volume is
+                    // unknown. Every throwing walk in this file treats an
+                    // unreadable disk as a reason to refuse the whole
+                    // operation; this one instead answers "not collapsed
+                    // yet" - its one caller is polling a merge already under
+                    // way, and a momentarily unreadable disk is exactly what
+                    // polling during an active reconfiguration looks like.
+                    // Logged rather than swallowed outright, though: a disk
+                    // that stays unreadable across many polls of the same
+                    // merge is worth an operator's attention even though no
+                    // single poll should fail over it.
                     logger.LogDebug(ex,
-                        "could not read {Descendant}'s setting data while checking whether its chain has collapsed onto {VhdxPath}; treating it as not collapsed yet",
-                        descendant, vhdxPath);
+                        "could not read {Descendant}'s setting data while checking whether chains on driver volumes in {VolumesRoot} have collapsed; treating it as not collapsed yet",
+                        descendant, volumesRoot);
                     return false;
                 }
 
@@ -701,12 +701,12 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                     break;
                 }
 
-                if (SamePath(parent, vhdxPath))
+                if (string.Equals(Path.GetDirectoryName(Path.GetFullPath(parent)), root, StringComparison.OrdinalIgnoreCase))
                 {
-                    // Still stacked on vhdxPath - whoever the checkpoint at
-                    // the root of this chain belongs to is not this
-                    // method's question. The merge this caller is waiting on
-                    // has not re-pointed the chain yet.
+                    // Still stacked on a driver volume - whoever the
+                    // checkpoint at the root of this chain belongs to is not
+                    // this method's question. The merge this caller is
+                    // waiting on has not re-pointed it yet.
                     return false;
                 }
 
@@ -834,7 +834,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     /// <summary>
     /// <see cref="FindDiskReferencesAsync"/>'s matching over
     /// <see cref="ReadActiveDisks"/>' answer - the walk
-    /// <see cref="IsChainCollapsed"/> does, asking the other question: whether
+    /// <see cref="AreVolumeChainsCollapsed"/> does, asking the other question: whether
     /// anything on each VM is <paramref name="vhdxPath"/> or is built on it.
     /// </summary>
     /// <remarks>

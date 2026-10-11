@@ -202,7 +202,9 @@ checkpoint is destroyed, until the merge re-points the disk; and an `.avhdx`
 whose setting data reads back empty while it is created or merged.
 
 None of them is decided by watching. Every checkpoint this driver creates,
-tags or destroys, it does inside a job holding the VM's `vm:` target, so the
+tags or destroys, it does inside a job holding the VM's `vm:` target — and a
+job that destroys one keeps that target until every chain the checkpoint left
+on the VM's volumes has collapsed, not just its own volume's — so the
 question "is this untagged checkpoint ours, mid-creation?" has a definite
 answer for a job that holds that target too — and the copy job does, from
 before it re-classifies the source until after it acts. The fast job, which
