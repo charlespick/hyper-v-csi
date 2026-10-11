@@ -6,14 +6,18 @@ namespace HyperVCsiAgent.Core.HostControl;
 /// checkpoint this driver tagged at its root. Both are what a chain looks like
 /// in the middle of being re-pointed - a checkpoint being taken, which this
 /// driver tags only in a second call after creating it, or one being merged
-/// away - so a caller asks again before believing either.
+/// away - so a caller does not believe either on this look alone.
 /// </summary>
 /// <remarks>
 /// Raised by <see cref="IHyperVHostClient.ClassifyAttachmentAsync"/> and
-/// <see cref="IVhdxLocationService.LocateAsync"/> after a single attempt. How
-/// long to keep asking, and what to conclude if it never settles, is the
-/// caller's decision - <c>SnapshotService</c> makes it against
-/// <see cref="Configuration.AgentOptions.ChainSettleTimeout"/>.
+/// <see cref="IVhdxLocationService.LocateAsync"/> after a single attempt; what
+/// to conclude is the caller's decision. <c>SnapshotService</c> decides an
+/// untagged root with checkpoints from holding the VM's <c>vm:</c> target -
+/// nothing of this process can be creating a checkpoint on the VM meanwhile -
+/// and asks again, within
+/// <see cref="Configuration.AgentOptions.ChainSettleTimeout"/>, only about an
+/// unreadable disk or a chain with no checkpoint behind it, which no lock
+/// settles.
 /// <para>
 /// An <see cref="InvalidOperationException"/>, so a caller that has not been
 /// taught to retry refuses exactly as it did before this type existed.

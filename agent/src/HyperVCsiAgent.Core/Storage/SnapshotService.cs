@@ -668,9 +668,9 @@ public sealed class SnapshotService : ISnapshotService
     private static readonly TimeSpan CheckpointWaitPollInterval = TimeSpan.FromMilliseconds(250);
 
     /// <summary>
-    /// How long <see cref="UntilChainSettlesAsync"/> waits between looks at a
-    /// chain that has not settled - the interval the CIM client's own retry
-    /// of the same question used before it moved here.
+    /// How long <see cref="RetryWhileTransientAsync"/> waits between looks at a
+    /// chain still in motion - the interval the CIM client's own retry of
+    /// the same question used before it moved here.
     /// </summary>
     private static readonly TimeSpan ChainSettlePollInterval = TimeSpan.FromMilliseconds(250);
 
@@ -987,31 +987,31 @@ public sealed class SnapshotService : ISnapshotService
                         // job's re-classification at run time, not a second,
                         // different call.
                         //
-                        // Asked again while the chain will not settle, the
-                        // same as InspectSourceAsync. Holding vm: rules out a
-                        // sibling copy's checkpoint being taken or merged
-                        // here, so this normally answers first time - but the
-                        // disk re-pointing a beat after its checkpoint is
-                        // destroyed is measured, and is why the CIM client
-                        // retried this call itself before the retry moved
-                        // here.
+                        // This is where issue #38's question gets answered,
+                        // because this job holds vm: - see
+                        // DecideUntaggedRoot. A chain whose root this
+                        // driver has not tagged is decided here and now,
+                        // from that hold, never from how long it was
+                        // watched. Only the two states a lock cannot settle
+                        // - an unreadable disk, a chain whose checkpoint is
+                        // gone but whose merge has not re-pointed the disk
+                        // yet, measured right after a destroy - are asked
+                        // again, by RetryWhileTransientAsync.
                         //
-                        // One slot, taken before the window starts and held
-                        // across every look, as that in-client retry held
-                        // it: queueing for it under contention - the backup
-                        // run #38 comes from - must not use up the window
-                        // before the first look, and a look after a 250ms
-                        // pause must not queue again. Held for at most the
-                        // window plus one look. Unlike the fast path's, an
-                        // Aborted here is expensive: the snapshot's retry
-                        // re-enqueues its copy at the back of this VM's
-                        // queue, behind copies that can run for hours.
+                        // One slot, taken before that retry starts and held
+                        // across every look, as the CIM client's own retry
+                        // of this call once held it: queueing for it under
+                        // contention must not use up the retry window, and
+                        // a look after a 250ms pause must not queue again.
+                        // An Aborted here is expensive - the snapshot's
+                        // retry re-enqueues its copy at the back of this
+                        // VM's queue - which is what the retry is for.
                         await AcquireHostSlotAsync(
                             vm, "classifying", snapshotId, _options.SnapshotCopyTimeout, attempt, cancellationToken)
                             .ConfigureAwait(false);
                         try
                         {
-                            attachment = await UntilChainSettlesAsync(snapshotId, "copied", async () =>
+                            attachment = await RetryWhileTransientAsync(snapshotId, "copied", async () =>
                             {
                                 try
                                 {
@@ -1024,6 +1024,10 @@ public sealed class SnapshotService : ISnapshotService
                                         $"snapshot {snapshotId} cannot be copied: {ex.Message}");
                                 }
                             }, attempt.Token).ConfigureAwait(false);
+                        }
+                        catch (DiskChainUnsettledException ex)
+                        {
+                            throw DecideUntaggedRoot(snapshotId, ex);
                         }
                         finally
                         {
@@ -1277,19 +1281,7 @@ public sealed class SnapshotService : ISnapshotService
     /// whether the VM is free to be copied - the copy queue (via <c>vm:</c>)
     /// decides that instead, and this method just measures.
     /// </remarks>
-    private Task<(long AllocatedBytes, string? VmId)> InspectSourceAsync(
-        string snapshotId, string sourceVolumeId, string snapshotName, string sourcePath,
-        CancellationTokenSource attempt, CancellationToken callerToken) =>
-        // The whole inspection, not just the classify call: locating the
-        // holder walks the same chains and trips on the same unreadable disks,
-        // and a source that a sibling's checkpoint is mid-merge on can stop
-        // being held at all between one look and the next.
-        UntilChainSettlesAsync(
-            snapshotId, "taken",
-            () => InspectSourceOnceAsync(snapshotId, sourceVolumeId, snapshotName, sourcePath, attempt, callerToken),
-            attempt.Token);
-
-    private async Task<(long AllocatedBytes, string? VmId)> InspectSourceOnceAsync(
+    private async Task<(long AllocatedBytes, string? VmId)> InspectSourceAsync(
         string snapshotId, string sourceVolumeId, string snapshotName, string sourcePath,
         CancellationTokenSource attempt, CancellationToken callerToken)
     {
@@ -1304,7 +1296,14 @@ public sealed class SnapshotService : ISnapshotService
             return (OpenSourceLocally(snapshotId, sourceVolumeId, sourcePath), null);
         }
 
-        var location = await LocateHolderAsync(snapshotId, sourcePath, attempt.Token).ConfigureAwait(false);
+        // Asked again only while the trace trips on a disk that reads back
+        // empty - the one thing standing between it and an answer, and a
+        // state a lock cannot settle (see RetryWhileTransientAsync). Unlike
+        // the classification below, there is no vm: to defer to yet: which
+        // VM holds the source is the very question being asked.
+        var location = await RetryWhileTransientAsync(
+            snapshotId, "taken", () => LocateHolderAsync(snapshotId, sourcePath, attempt.Token), attempt.Token)
+            .ConfigureAwait(false);
         if (location is null)
         {
             return (OpenSourceLocally(snapshotId, sourceVolumeId, sourcePath), null);
@@ -1312,7 +1311,10 @@ public sealed class SnapshotService : ISnapshotService
 
         var vm = new ClusteredVm(location.VmId, location.HostName);
         var elementName = CheckpointElementName(sourceVolumeId, snapshotName);
-        VolumeAttachment attachment;
+
+        // Null when the chain was not settled enough to classify - see the
+        // catch below. Measured and enqueued like any attached source.
+        VolumeAttachment? attachment;
 
         // Takes a slot on HostOperationSlots' shared cap, same as
         // AttachService's own attach and detach do - issue #14's D4. A
@@ -1327,14 +1329,30 @@ public sealed class SnapshotService : ISnapshotService
             attachment = await _host.ClassifyAttachmentAsync(
                 vm.OwningHost, vm.VmId, sourcePath, elementName, attempt.Token).ConfigureAwait(false);
         }
-        catch (InvalidOperationException ex) when (ex is not DiskChainUnsettledException)
+        catch (DiskChainUnsettledException ex)
+        {
+            // Not judged here, and not waited out either. Issue #38: this
+            // fast job holds no vm:, so a chain rooted on a checkpoint this
+            // driver has not tagged may be a sibling snapshot's, created a
+            // moment ago and not yet named - this job has no fact that could
+            // tell, and watching for a few seconds is not one. The copy job
+            // asks the same question again holding vm:, where the answer
+            // is decided rather than guessed (DecideUntaggedRoot) - the
+            // same deferral BehindOtherSnapshotsCheckpoint gets below, for
+            // the same reason. An unreadable disk or a chain mid-merge goes
+            // the same way: the copy job retries those itself.
+            _logger.LogDebug(ex,
+                "Snapshot {SnapshotId}: the source's differencing chain did not settle ({Reason}); leaving the " +
+                "judgment to the copy job, which holds {VmId}'s queue",
+                snapshotId, ex.Reason, vm.VmId);
+            attachment = null;
+        }
+        catch (InvalidOperationException ex)
         {
             // A chain this traversal could not resolve within its depth bound
             // - GuardAgainstDifferencingChain's own reasoning, reused here
-            // rather than duplicated - which no amount of asking again will
-            // shorten. An untagged chain or an unreadable disk is the other
-            // kind: it goes on to UntilChainSettlesAsync, which asks again,
-            // since production showed both clear on their own within seconds.
+            // rather than duplicated - which no amount of asking again, by
+            // this job or the copy job, will shorten.
             throw JobFailureException.FailedPrecondition(
                 $"snapshot {snapshotId} cannot be taken: {ex.Message}");
         }
@@ -1343,7 +1361,7 @@ public sealed class SnapshotService : ISnapshotService
             _hostSlots.Release(vm.OwningHost);
         }
 
-        switch (attachment.Kind)
+        switch (attachment?.Kind)
         {
             case VolumeAttachmentKind.NotAttached:
                 // Let go of between the trace and this call - answer from a
@@ -1366,6 +1384,10 @@ public sealed class SnapshotService : ISnapshotService
                 // this fast job holds no such thing - see RunCopyAsync's own
                 // remarks on this same classification for where that
                 // judgment moved to.
+            case null:
+                // Not settled enough to classify - the catch above. Still
+                // attached, as far as anything here knows: the trace found
+                // a VM referencing the source.
             case VolumeAttachmentKind.Direct:
                 // Nothing frozen yet. Taking the checkpoint is deferred to
                 // RunCopyAsync now (Decision 5: only once the copy is about
@@ -1411,7 +1433,7 @@ public sealed class SnapshotService : ISnapshotService
 
             default:
                 throw new JobFailureException(
-                    AgentErrorCodes.Internal, $"unrecognized attachment classification {attachment.Kind}");
+                    AgentErrorCodes.Internal, $"unrecognized attachment classification {attachment?.Kind}");
         }
     }
 
@@ -1436,7 +1458,7 @@ public sealed class SnapshotService : ISnapshotService
         }
         catch (InvalidOperationException ex) when (ex is not DiskChainUnsettledException)
         {
-            // An unsettled chain passes through to UntilChainSettlesAsync
+            // An unsettled chain passes through to RetryWhileTransientAsync
             // instead - the same unreadable disk ClassifyAttachmentAsync trips
             // on, met here while walking a holder VM's chains.
             throw new JobFailureException(
@@ -1448,62 +1470,58 @@ public sealed class SnapshotService : ISnapshotService
     }
 
     /// <summary>
+    /// Whether an unsettled chain is one of the two states a lock cannot
+    /// settle, and so worth asking about again: a disk that reads back with no
+    /// setting data, or a chain built on the source with no checkpoint behind
+    /// it at all. Anything else - a chain rooted on checkpoints this driver
+    /// did not tag - is decided rather than waited out; see
+    /// <see cref="DecideUntaggedRoot"/>.
+    /// </summary>
+    private static bool IsTransient(DiskChainUnsettledException ex) =>
+        ex.Reason == DiskChainUnsettledReason.UnreadableDisk || ex.Checkpoints.Count == 0;
+
+    /// <summary>
     /// Runs <paramref name="attempt"/>, asking again every
-    /// <see cref="ChainSettlePollInterval"/> while it reports a differencing
-    /// chain that has not settled, for up to
-    /// <see cref="AgentOptions.ChainSettleTimeout"/> - then decides what the
-    /// chain it never stopped reporting actually is.
+    /// <see cref="ChainSettlePollInterval"/> while it reports a transient
+    /// chain state (<see cref="IsTransient"/>), for up to
+    /// <see cref="AgentOptions.ChainSettleTimeout"/>, and then reporting it as
+    /// <c>Aborted</c>. Any other unsettled chain passes straight through.
     /// </summary>
     /// <remarks>
-    /// Issue #38: one CreateSnapshot a day failing during the backup window,
-    /// always on a VM several of whose volumes were being snapshotted at once.
-    /// A checkpoint is VM-wide, so a sibling's re-points this volume's chain
-    /// too, and two moments of that are indistinguishable from something
-    /// wrong in one look: the checkpoint after it is created and before
-    /// <c>TagCheckpoint</c> names it this driver's, and an <c>.avhdx</c> that
-    /// reads back with no setting data while it is created or merged. Each
-    /// cleared within seconds, every time.
+    /// Issue #38. This is deliberately not how a foreign checkpoint is told
+    /// from this driver's own: watching a chain for a few seconds cannot tell
+    /// those apart, and an earlier version of this method that tried made the
+    /// answer depend on how busy the host was. That question is decided from
+    /// a fact instead, by a caller holding <c>vm:</c> - see
+    /// <see cref="DecideUntaggedRoot"/>.
     /// <para>
-    /// When the window ends, the two halves part. A chain that showed the same
-    /// untagged checkpoints on every look, for the whole window, is not this
-    /// driver's checkpoint between its creation and its tag, so it is reported
-    /// as a foreign checkpoint - <c>FailedPrecondition</c>, naming each one so
-    /// an operator can confirm that before deleting it. Anything else - a disk
-    /// that still could not be read, checkpoints that changed between looks, a
-    /// chain with no checkpoint behind it at all (a merge still collapsing it)
-    /// - is still in motion and nothing an operator should touch, so it is
-    /// <c>Aborted</c>, which every CSI sidecar retries, with no advice to
-    /// delete anything.
+    /// What is left here are the two states no lock settles, because neither
+    /// is this process's work in progress. An <c>.avhdx</c> whose setting data
+    /// reads back empty - measured in production while a checkpoint on it was
+    /// being created or merged, and cleared within seconds every time. And a
+    /// chain still built on the source with no checkpoint behind it - measured
+    /// right after <c>DestroySnapshot</c>, whose checkpoint object disappears a
+    /// beat before the merge re-points the disk; the copy job waits for its
+    /// own disk's chain to collapse, not a sibling's. Asking again is safe for
+    /// both because neither ending can do harm: the state clears and the
+    /// snapshot goes on, or it does not and the answer is <c>Aborted</c>,
+    /// which every CSI sidecar retries and which advises deleting nothing. The
+    /// window only trades error noise against latency, never safety, which is
+    /// why it can be a plain time budget.
     /// </para>
     /// <para>
     /// The window bounds when the last look may start, not how long a look
     /// takes: each runs to the budgets it always had - its CIM deadline, its
-    /// wait for a host slot - because a token cannot interrupt a CIM call in
-    /// flight, and cutting a healthy but slow host's first look short would
-    /// fail every snapshot of an attached volume on it. So the answer comes
-    /// once the window is spent, never by forcing another look after it: the
-    /// worst case is the window plus one look. A chain seen in only one look
-    /// is never called foreign, since one look cannot say it stayed anything.
-    /// </para>
-    /// <para>
-    /// The window runs from before the first look, so whatever a look waits
-    /// for counts against it. The copy job takes its host slot outside this
-    /// method and holds it across every look, so queueing for it does not;
-    /// the fast job cannot do the same - its looks trace the holder, which
-    /// takes slots on whichever hosts it asks, inside the location service -
-    /// so there a look slowed by contention can leave no time for a second.
-    /// That is accepted rather than engineered around: the fast job's
-    /// Aborted costs one snapshotter retry a few seconds later, with nothing
-    /// queued yet to lose its place.
+    /// wait for a host slot - since a token cannot interrupt a CIM call in
+    /// flight. The answer comes once the window is spent, so the worst case is
+    /// the window plus one look.
     /// </para>
     /// </remarks>
     /// <param name="verb">"taken" or "copied", for the message: which step of the snapshot could not proceed.</param>
-    private async Task<T> UntilChainSettlesAsync<T>(
+    private async Task<T> RetryWhileTransientAsync<T>(
         string snapshotId, string verb, Func<Task<T>> attempt, CancellationToken cancellationToken)
     {
         var elapsed = Stopwatch.StartNew();
-        DiskChainUnsettledException? first = null;
-        var unchangedUntagged = true;
 
         for (var looks = 1; ; looks++)
         {
@@ -1511,67 +1529,75 @@ public sealed class SnapshotService : ISnapshotService
             {
                 return await attempt().ConfigureAwait(false);
             }
-            catch (DiskChainUnsettledException ex)
+            catch (DiskChainUnsettledException ex) when (IsTransient(ex))
             {
-                first ??= ex;
-
-                // A look with no checkpoints at all never counts towards
-                // "foreign": a chain left behind with nothing at its root is
-                // what a checkpoint already destroyed looks like while its
-                // merge is still collapsing the chain - which can run as long
-                // as the copy it protected - and that is this driver's own
-                // work, not something to tell an operator to delete.
-                unchangedUntagged &= ex.Reason == DiskChainUnsettledReason.UntaggedRoot
-                    && ex.Checkpoints.Count > 0
-                    && SameCheckpoints(first, ex);
-
-                // Ends as soon as the window is spent, however many looks fit
-                // in it. The window only decides whether to start another
-                // look - it cannot bound one already under way, which runs
-                // to its own CIM and host-slot budgets - so a slow first look
-                // must not buy a second one at full cost. One look, though,
-                // cannot say a chain stayed anything, so it never answers
-                // "foreign".
                 if (elapsed.Elapsed >= _options.ChainSettleTimeout)
                 {
-                    if (looks >= 2 && unchangedUntagged)
-                    {
-                        throw JobFailureException.FailedPrecondition(
-                            $"snapshot {snapshotId} cannot be {verb}: {ex.Message}, and that stayed unchanged for " +
-                            $"{elapsed.Elapsed.TotalSeconds:F0}s, so it is not a checkpoint this driver is still taking " +
-                            $"or merging. The VM's checkpoints: {DescribeCheckpoints(ex.Checkpoints)}. Once you have " +
-                            "confirmed the checkpoint is not one this driver took, delete it; the snapshot is retried " +
-                            "automatically");
-                    }
-
+                    var advice = ex.Reason == DiskChainUnsettledReason.UnreadableDisk
+                        ? "most likely a checkpoint on the same VM being created or merged. Nothing needs doing; " +
+                          "the snapshot is retried automatically"
+                        : "most likely a checkpoint already destroyed whose merge has not finished re-pointing the " +
+                          "disk. Do not delete the .avhdx; the snapshot is retried automatically, and if this does " +
+                          "not clear, check the VM's disk chain and merge status in Hyper-V Manager";
                     throw new JobFailureException(
                         AgentErrorCodes.Aborted,
-                        $"snapshot {snapshotId} cannot be {verb} yet: {ex.Message}, and that had not settled after " +
-                        $"{elapsed.Elapsed.TotalSeconds:F0}s - most likely another snapshot's checkpoint on the same VM " +
-                        "being taken or merged. Nothing needs doing; the snapshot is retried automatically",
+                        $"snapshot {snapshotId} cannot be {verb} yet: {ex.Message}, and that had not cleared after " +
+                        $"{elapsed.Elapsed.TotalSeconds:F0}s - {advice}",
                         ex);
                 }
 
                 // Expected during a backup run, and self-clearing - Debug, not
                 // Warning, for the same reason the job store's own retries are.
                 _logger.LogDebug(ex,
-                    "Snapshot {SnapshotId}: look {Look} at the source's differencing chain did not settle ({Reason}); asking again",
+                    "Snapshot {SnapshotId}: look {Look} at the source's differencing chain found it in motion ({Reason}); asking again",
                     snapshotId, looks, ex.Reason);
                 await Task.Delay(ChainSettlePollInterval, cancellationToken).ConfigureAwait(false);
             }
         }
-
-        static bool SameCheckpoints(DiskChainUnsettledException a, DiskChainUnsettledException b) =>
-            a.Reason == b.Reason
-            && a.Checkpoints.Select(c => c.SettingsPath).Order(StringComparer.Ordinal)
-                .SequenceEqual(b.Checkpoints.Select(c => c.SettingsPath).Order(StringComparer.Ordinal), StringComparer.Ordinal);
-
-        // Never empty where it is called: a look with no checkpoints never
-        // counts towards the foreign answer this names them for.
-        static string DescribeCheckpoints(IReadOnlyList<UntaggedCheckpoint> checkpoints) =>
-            string.Join(", ", checkpoints.Select(c =>
-                $"\"{c.ElementName}\" (created {(c.CreatedAt is { } created ? created.ToString("u") : "at an unknown time")})"));
     }
+
+    /// <summary>
+    /// The copy job's verdict on a source behind a chain whose root carries
+    /// checkpoints this driver did not tag: a foreign checkpoint,
+    /// <c>FailedPrecondition</c>, naming each one.
+    /// </summary>
+    /// <remarks>
+    /// Issue #38's question - is that checkpoint another tool's, or this
+    /// driver's own between <c>CreateSnapshot</c> and <c>TagCheckpoint</c>? -
+    /// answered from a fact rather than from watching. Every checkpoint this
+    /// process creates, tags or destroys, it does inside a job holding the
+    /// VM's <c>vm:</c> target (<see cref="RunCopyAsync"/>, and
+    /// <see cref="ISnapshotService.ReapOrphan"/>'s merge; the debug build's
+    /// <c>VmTargetAssertingHyperVHostClient</c> enforces it), and the copy job
+    /// asking this holds that target from before its classification until
+    /// after this decision. So no job of this process can be creating a
+    /// checkpoint on the VM while it looks, nor tag one before it decides.
+    /// <para>
+    /// What remains untagged under that hold is ownerless: another tool's - a
+    /// backup product's recovery point, an operator's checkpoint - or one this
+    /// driver created and never tagged, because <c>TagCheckpoint</c> failed or
+    /// a killed process left vmms to finish the create. Nothing retries a tag,
+    /// and the reaper only ever looks at tagged checkpoints, so in every case
+    /// it stays until an operator removes it, and saying so is correct. The
+    /// agent is a single clustered role, so no other process holds jobs for
+    /// the VM meanwhile.
+    /// </para>
+    /// <para>
+    /// Never reached with no checkpoints at all: that chain is transient (see
+    /// <see cref="IsTransient"/>) and ends <c>Aborted</c> instead, with nothing
+    /// to name. The fast job never calls this - it holds no <c>vm:</c>, so it
+    /// defers the question here.
+    /// </para>
+    /// </remarks>
+    private static JobFailureException DecideUntaggedRoot(string snapshotId, DiskChainUnsettledException ex) =>
+        JobFailureException.FailedPrecondition(
+            $"snapshot {snapshotId} cannot be copied: {ex.Message}. No snapshot by this driver can be creating a " +
+            "checkpoint on this VM right now - this copy holds the VM's queue - so it is another tool's, or one an " +
+            "interrupted create of this driver left untagged, which nothing will clean up. The VM's checkpoints: " +
+            string.Join(", ", ex.Checkpoints.Select(c =>
+                $"\"{c.ElementName}\" (created {(c.CreatedAt is { } created ? created.ToString("u") : "at an unknown time")})")) +
+            ". If a backup product owns it, let that job finish; otherwise delete it. The snapshot is retried " +
+            "automatically");
 
     /// <summary>
     /// The unattached case, and the case of a source held by anything but a VM

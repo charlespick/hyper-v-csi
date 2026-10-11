@@ -130,18 +130,18 @@ public sealed class AgentOptions
 
     /// <summary>
     /// How long a snapshot keeps re-reading a source volume's differencing
-    /// chain that will not settle - a disk on it that reads back empty, or a
-    /// checkpoint at its root this driver has not tagged - before answering
-    /// with what it has. See <see cref="HostControl.DiskChainUnsettledException"/>.
+    /// chain while it is in motion - a disk on it that reads back empty, or a
+    /// chain with no checkpoint behind it whose merge has not re-pointed the
+    /// disk yet - before answering <c>Aborted</c>. See
+    /// <see cref="HostControl.DiskChainUnsettledException"/>.
     /// </summary>
     /// <remarks>
-    /// A checkpoint is VM-wide, so snapshots of two volumes on one VM see
-    /// each other's checkpoints being taken and merged; measured in
-    /// production, that clears within a few seconds. A chain that stays
-    /// unchanged and untagged for this whole window is reported as a foreign
-    /// checkpoint (<c>FailedPrecondition</c>, naming it); one still changing
-    /// when it ends is reported as retryable (<c>Aborted</c>), with nothing
-    /// for an operator to do.
+    /// Only those two states, which no lock can settle and whose either ending
+    /// is harmless: they clear, or the answer is <c>Aborted</c>, retried by
+    /// every CSI sidecar and advising nothing destructive. So this trades error
+    /// noise against latency and nothing else. Whether a checkpoint this
+    /// driver did not tag is foreign is not decided by waiting at all - the
+    /// copy job decides it from holding the VM's <c>vm:</c> target.
     /// <para>
     /// Kept short, because the first of these waits sits inside CreateSnapshot's
     /// fast job, ahead of <see cref="SnapshotCheckpointWaitTimeout"/>, and the

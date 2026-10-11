@@ -152,9 +152,10 @@ public interface IHyperVHostClient
     /// with no checkpoint this driver tagged at its root, or a disk on one of
     /// the VM's chains could not be read. Either can be a sibling snapshot's
     /// checkpoint mid-take or mid-merge, so this is answered after a single
-    /// attempt and the caller decides how long to keep asking - a chain that
-    /// stays untagged for that whole time is a foreign checkpoint, a backup
-    /// product's recovery point, or similar.
+    /// attempt and the caller decides - an untagged root seen by a caller
+    /// holding the VM's <c>vm:</c> target cannot be this driver's in-flight
+    /// checkpoint, and is a foreign one, a backup product's recovery point,
+    /// or similar.
     /// </exception>
     /// <exception cref="InvalidOperationException">
     /// A chain this method could not walk to a conclusion within its depth

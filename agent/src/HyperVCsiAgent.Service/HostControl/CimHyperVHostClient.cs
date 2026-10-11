@@ -461,13 +461,14 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             using var session = CimSession.Create(hostName);
 
             // One look, not a retry loop: a chain that cannot be settled
-            // comes back as DiskChainUnsettledException and the caller asks
-            // again - see SnapshotService.UntilChainSettlesAsync, which owns
-            // how long that goes on. This used to retry here itself, five
-            // times 250ms, and that second was not enough: a sibling
-            // snapshot's checkpoint is untagged from its creation until
-            // TagCheckpoint's own CIM call lands, and on a busy host that
-            // outlasted the loop and reached the caller as "foreign".
+            // comes back as DiskChainUnsettledException and the caller
+            // decides - see SnapshotService.DecideUntaggedRoot and
+            // RetryWhileTransientAsync. This used to retry here itself, five
+            // times 250ms, and no amount of retrying could have been enough:
+            // a sibling snapshot's checkpoint is untagged from its creation
+            // until TagCheckpoint's own CIM call lands, however long that
+            // takes on a busy host, and only a caller holding the VM's vm:
+            // target can rule that out.
             using var settings = GetActiveSettings(session, hostName, vmId, deadline, cancellationToken);
             return ClassifyAttachment(
                 session, settings, hostName, vmId, vhdxPath, thisSnapshotElementName, deadline, cancellationToken);
@@ -1149,11 +1150,12 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                     // not yet tagged, which is a second CIM call after the
                     // create (see CreateCheckpointAsync), or already merged
                     // away in the instant before the disk pointer catches up.
-                    // Only the caller can tell, by looking again until it
-                    // either settles or has stayed this way long enough to be
-                    // believed. What the VM's checkpoints are is carried for
-                    // both halves of that: comparing one look with the next,
-                    // and naming them to an operator if it never changes. No
+                    // Only the caller can tell: one holding the VM's vm:
+                    // target knows no checkpoint of this driver's is being
+                    // created meanwhile (SnapshotService.DecideUntaggedRoot).
+                    // What the VM's checkpoints are is carried so that caller
+                    // can name them to an operator - and an empty list says
+                    // the merge case, which it asks about again instead. No
                     // advice to delete anything here - this look alone cannot
                     // tell an operator's checkpoint from this driver's own.
                     throw new DiskChainUnsettledException(

@@ -195,18 +195,30 @@ it so the next retry keeps its place rather than re-joining at the back.
 
 A checkpoint is VM-wide, so snapshotting two volumes on one VM at once —
 any backup product's normal run — lets each see the other's checkpoint while
-it is being taken or merged. Two moments of that look wrong in a single read:
-the checkpoint after Hyper-V creates it and before this driver tags it, which
-is a second CIM call, and an `.avhdx` whose setting data reads back empty
-while it is created or merged. Classifying the source therefore reads the
-chain again, every 250ms for up to `ChainSettleTimeout` (3s by default),
-before concluding anything. A chain that showed the same untagged checkpoints
-for the whole window is reported as a foreign checkpoint, `FailedPrecondition`,
-naming each one and when it was taken. Anything else when the window ends —
-checkpoints still changing, a disk still unreadable, or a chain with no
-checkpoint behind it at all, which is a merge still collapsing it — is
-`Aborted`, with no advice to delete anything, because what is in motion is
-almost certainly this driver's own work.
+it is being taken or merged. Three moments of that look wrong in a single
+read: the checkpoint after Hyper-V creates it and before this driver tags it,
+which is a second CIM call; a chain still built on the volume after its
+checkpoint is destroyed, until the merge re-points the disk; and an `.avhdx`
+whose setting data reads back empty while it is created or merged.
+
+None of them is decided by watching. Every checkpoint this driver creates,
+tags or destroys, it does inside a job holding the VM's `vm:` target, so the
+question "is this untagged checkpoint ours, mid-creation?" has a definite
+answer for a job that holds that target too — and the copy job does, from
+before it re-classifies the source until after it acts. The fast job, which
+holds no `vm:`, therefore never judges a chain it cannot classify: it measures
+the source as attached and enqueues the copy. The copy job then reports a
+chain rooted on untagged checkpoints as a foreign checkpoint at once —
+`FailedPrecondition`, naming each one and when it was taken — because under
+its hold nothing of this driver's can be creating one. That includes one
+this driver created and never tagged, which nothing will ever clean up.
+
+The other two states are not this process's work in progress, so no lock
+settles them, and both clear on their own. Both are asked about again, every
+250ms for up to `ChainSettleTimeout` (3s by default), and end `Aborted` if
+they have not cleared — which every sidecar retries, and which advises
+deleting nothing. Either ending is harmless, so that window trades error
+noise against latency, never safety.
 
 ### ReFS and copy mechanism
 
