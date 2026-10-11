@@ -598,46 +598,76 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
             return IsProductionOnlyCheckpoints(activeSettings);
         }, cancellationToken);
 
-    public Task<bool> AreVolumeChainsCollapsedAsync(
-        string hostName, string vmId, string volumesRoot, CancellationToken cancellationToken) =>
+    public Task<IReadOnlyList<string>> ReadCheckpointDisksAsync(
+        string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
+        Task.Run<IReadOnlyList<string>>(() =>
+        {
+            _logger.LogDebug(
+                "reading the disks checkpoint {ElementName} froze on {HostName}", checkpoint.ElementName, hostName);
+            var deadline = CimDeadline.After(_hostOperationTimeout);
+            using var session = CimSession.Create(hostName);
+            using var settings = session.GetInstance(
+                NamespaceName,
+                ReferenceToPath(checkpoint.SettingsPath),
+                deadline.Options($"reading checkpoint {checkpoint.ElementName}'s settings", cancellationToken));
+
+            // The checkpoint's own configuration, not the VM's active one: its
+            // disks are the files it froze - measured, the paths the active
+            // disks sit on top of while it stands.
+            var disks = new List<string>();
+            foreach (var disk in DeviceSettings(session, settings, "Msvm_StorageAllocationSettingData", deadline, cancellationToken))
+            {
+                using (disk)
+                {
+                    if ((disk.CimInstanceProperties["ResourceSubType"]?.Value as string) == VirtualHardDiskSubType
+                        && disk.CimInstanceProperties["HostResource"]?.Value is string[] { Length: > 0 } hostResource)
+                    {
+                        disks.Add(hostResource[0]);
+                    }
+                }
+            }
+
+            return disks;
+        }, cancellationToken);
+
+    public Task<bool> IsCollapsedOntoAsync(
+        string hostName, string vmId, IReadOnlyCollection<string> frozenDisks, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
             _logger.LogDebug(
-                "checking whether any differencing chain on {VmId} on {HostName} is still built on a volume in {VolumesRoot}",
-                vmId, hostName, volumesRoot);
+                "checking whether {VmId} on {HostName} still has a differencing disk on any of {FrozenDisks}",
+                vmId, hostName, frozenDisks);
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
             using var settings = GetActiveSettings(session, hostName, vmId, deadline, cancellationToken);
-            return AreVolumeChainsCollapsed(session, settings, volumesRoot, deadline, cancellationToken, _logger);
+            return IsCollapsedOnto(session, settings, frozenDisks, deadline, cancellationToken, _logger);
         }, cancellationToken);
 
     /// <summary>
-    /// <see cref="AreVolumeChainsCollapsedAsync"/>'s traversal: every attached
-    /// disk's chain, walked to its end, looking for an ancestor in
-    /// <paramref name="volumesRoot"/>. Structurally the same walk
-    /// <see cref="ClassifyAttachment"/> does, and deliberately its own copy
-    /// rather than a shared one, for the same reason
+    /// <see cref="IsCollapsedOntoAsync"/>'s check. Its own code rather than a
+    /// walk shared with <see cref="ClassifyAttachment"/>, for the same reason
     /// <see cref="ClassifyAttachment"/>'s own remarks give for not sharing
-    /// with <see cref="LocateDisk"/>: this method must never throw on an
-    /// unresolved chain, and every other walk in this file must keep doing
+    /// with <see cref="LocateDisk"/>: this method must never throw on a disk
+    /// it cannot read, and every other walk in this file must keep doing
     /// exactly that.
     /// </summary>
     /// <remarks>
-    /// Only ancestors count. A disk attached as itself - a driver volume, or
-    /// the <c>.avhdx</c> a checkpoint put in front of one, which lives in the
-    /// same directory - is what the VM runs on; what has to be gone is a
-    /// differencing disk standing on top of a driver volume.
+    /// One level, not a walk: a disk the merge has re-pointed is one of
+    /// <paramref name="frozenDisks"/> itself, and one it has not sits directly
+    /// on one of them. So an attached disk that is a frozen one is settled
+    /// without being read, and once the merge is done no disk is read at all -
+    /// which keeps a disk this merge never touched, readable or not, out of
+    /// the question.
     /// </remarks>
-    private static bool AreVolumeChainsCollapsed(
+    private static bool IsCollapsedOnto(
         CimSession session,
         CimInstance settings,
-        string volumesRoot,
+        IReadOnlyCollection<string> frozenDisks,
         CimDeadline deadline,
         CancellationToken cancellationToken,
         ILogger logger)
     {
-        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(volumesRoot));
-        var attachedDisks = new List<string>();
+        var notFrozen = new List<string>();
 
         foreach (var disk in DeviceSettings(session, settings, "Msvm_StorageAllocationSettingData", deadline, cancellationToken))
         {
@@ -648,80 +678,52 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                     continue;
                 }
 
-                if (disk.CimInstanceProperties["HostResource"]?.Value is string[] { Length: > 0 } hostResource)
+                if (disk.CimInstanceProperties["HostResource"]?.Value is string[] { Length: > 0 } hostResource
+                    && !frozenDisks.Any(frozen => SamePath(frozen, hostResource[0])))
                 {
-                    attachedDisks.Add(hostResource[0]);
+                    notFrozen.Add(hostResource[0]);
                 }
             }
         }
 
-        if (attachedDisks.Count == 0)
+        if (notFrozen.Count == 0)
         {
             return true;
         }
 
         using var imageService = GetImageManagementService(session, deadline, cancellationToken);
 
-        foreach (var attached in attachedDisks)
+        foreach (var attached in notFrozen)
         {
-            var descendant = attached;
-            var depth = 0;
+            cancellationToken.ThrowIfCancellationRequested();
 
-            for (; depth < MaxDifferencingChainDepth; depth++)
+            string? parent;
+            try
             {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                string? parent;
-                try
-                {
-                    parent = ParentPathOf(session, imageService, descendant, deadline, cancellationToken);
-                }
-                catch (InvalidOperationException ex)
-                {
-                    // ParentPathOf could not read this disk's setting data,
-                    // so whether it is still built on a driver volume is
-                    // unknown. Every throwing walk in this file treats an
-                    // unreadable disk as a reason to refuse the whole
-                    // operation; this one instead answers "not collapsed
-                    // yet" - its one caller is polling a merge already under
-                    // way, and a momentarily unreadable disk is exactly what
-                    // polling during an active reconfiguration looks like.
-                    // Logged rather than swallowed outright, though: a disk
-                    // that stays unreadable across many polls of the same
-                    // merge is worth an operator's attention even though no
-                    // single poll should fail over it.
-                    logger.LogDebug(ex,
-                        "could not read {Descendant}'s setting data while checking whether chains on driver volumes in {VolumesRoot} have collapsed; treating it as not collapsed yet",
-                        descendant, volumesRoot);
-                    return false;
-                }
-
-                if (parent is null)
-                {
-                    break;
-                }
-
-                if (string.Equals(Path.GetDirectoryName(Path.GetFullPath(parent)), root, StringComparison.OrdinalIgnoreCase))
-                {
-                    // Still stacked on a driver volume - whoever the
-                    // checkpoint at the root of this chain belongs to is not
-                    // this method's question. The merge this caller is
-                    // waiting on has not re-pointed it yet.
-                    return false;
-                }
-
-                descendant = parent;
+                parent = ParentPathOf(session, imageService, attached, deadline, cancellationToken);
+            }
+            catch (InvalidOperationException ex)
+            {
+                // Whether this disk still sits on a frozen one is unknown.
+                // Every throwing walk in this file treats an unreadable disk
+                // as a reason to refuse the whole operation; this one instead
+                // answers "not collapsed yet" - its one caller is polling a
+                // merge already under way, and a momentarily unreadable disk
+                // is exactly what polling during an active reconfiguration
+                // looks like. Logged rather than swallowed outright, though:
+                // a disk that stays unreadable across many polls of the same
+                // merge is worth an operator's attention even though no
+                // single poll should fail over it.
+                logger.LogDebug(ex,
+                    "could not read {Attached}'s setting data while checking whether it still sits on a frozen disk; treating it as not collapsed yet",
+                    attached);
+                return false;
             }
 
-            if (depth == MaxDifferencingChainDepth)
+            if (parent is not null && frozenDisks.Any(frozen => SamePath(frozen, parent)))
             {
-                // Unresolved within the bound. GuardAgainstDifferencingChain
-                // and ClassifyAttachment both refuse to guess past this and
-                // throw, because their callers are deciding whether an
-                // operation is safe to start. This method's one caller is
-                // polling a merge it already started, not deciding whether
-                // to start one, so an unresolved chain reads the same way an
-                // ordinary in-progress merge does: not collapsed yet.
+                // Still stacked on a disk the checkpoint froze: the merge has
+                // not re-pointed it yet.
                 return false;
             }
         }
@@ -834,7 +836,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     /// <summary>
     /// <see cref="FindDiskReferencesAsync"/>'s matching over
     /// <see cref="ReadActiveDisks"/>' answer - the walk
-    /// <see cref="AreVolumeChainsCollapsed"/> does, asking the other question: whether
+    /// <see cref="IsCollapsedOnto"/> does, asking the other question: whether
     /// anything on each VM is <paramref name="vhdxPath"/> or is built on it.
     /// </summary>
     /// <remarks>

@@ -325,27 +325,45 @@ public interface IHyperVHostClient
     Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Whether no disk in the VM's configuration is a differencing disk built,
-    /// at any depth, on a VHDX that lives directly in
-    /// <paramref name="volumesRoot"/> - this driver's volumes directory. False
-    /// while any chain left over a driver volume still stands.
+    /// The disks a checkpoint froze: the paths its own configuration records,
+    /// which are the files the VM's disks sit on top of while it stands, and
+    /// what they return to once its merge has collapsed.
     /// </summary>
     /// <remarks>
-    /// Every driver volume on the VM, not only the one a caller snapshotted:
-    /// a checkpoint is VM-wide, so its merge re-points every disk the VM had
-    /// when it was taken, and a caller that released its hold on the VM once
-    /// its own disk had collapsed would leave a sibling's still merging under
-    /// the next job that takes that hold - which would then find a chain with
-    /// no checkpoint behind it, the driver's own merge, and have no way to
-    /// tell it from a stuck one (issue #38). Disks whose chains are built on
-    /// anything outside <paramref name="volumesRoot"/> - a node's OS disk
-    /// differenced from a golden image, say - are not this driver's to wait
-    /// on, and are ignored.
+    /// Read before <see cref="DestroyCheckpointAsync"/>, which removes the
+    /// configuration this comes from, so a caller can then wait on exactly the
+    /// chains that checkpoint created with <see cref="IsCollapsedOntoAsync"/> -
+    /// not a guess at them from the source alone, which misses the sibling
+    /// disks a VM-wide checkpoint also froze, and not every chain on the VM,
+    /// which would wait on one a different checkpoint left standing. Measured
+    /// against a real host: these are the base <c>.vhdx</c> paths (or, over an
+    /// older checkpoint, the <c>.avhdx</c> the disk was running on), and the
+    /// active disks' immediate parents while the checkpoint stands.
+    /// </remarks>
+    /// <exception cref="VmNotOnHostException">The checkpoint is not found on this host.</exception>
+    Task<IReadOnlyList<string>> ReadCheckpointDisksAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Whether every disk in the VM's configuration either is one of
+    /// <paramref name="frozenDisks"/> or does not sit directly on one - true
+    /// once the merge of the checkpoint that froze them has collapsed its
+    /// chains, false while a differencing disk still stands on any of them.
+    /// </summary>
+    /// <remarks>
+    /// The post-merge wait's predicate, asked about exactly the disks a
+    /// checkpoint froze (<see cref="ReadCheckpointDisksAsync"/>), or about the
+    /// source alone when the checkpoint was already gone. Exactly those, for
+    /// issue #38: a checkpoint is VM-wide, so releasing the VM once only the
+    /// source had collapsed hands the next job on it a sibling still merging,
+    /// this driver's own work it cannot tell from a stuck merge; and waiting
+    /// on every chain on the VM would stall on one a different, long-lived
+    /// checkpoint - a backup product's, an operator's - left standing. Only
+    /// the immediate parent is asked: a disk the merge has re-pointed is one
+    /// of the frozen disks itself, so once collapsed no disk is read at all.
     /// <para>
-    /// The post-merge wait's predicate. <see cref="DestroyCheckpointAsync"/>
+    /// <see cref="DestroyCheckpointAsync"/>
     /// is fire-and-forget and returns once the merge has *started*, and -
-    /// measured, per the comment already in <c>ClassifyAttachmentAsync</c>'s
-    /// own retry loop - the checkpoint's configuration object can disappear a
+    /// measured - the checkpoint's configuration object can disappear a
     /// moment *before* the VM's disk actually re-points to the base. So "the
     /// checkpoint object is gone" is not the same question as "the chain has
     /// collapsed", and only the second one tells a caller it is safe to
@@ -358,10 +376,11 @@ public interface IHyperVHostClient
     /// treat an unresolved or foreign chain as a hard failure requiring an
     /// operator. This method's one caller only ever asks whether the chains
     /// a merge it already started left behind have finished collapsing yet -
-    /// an unresolved chain simply means "not collapsed yet",
-    /// not "something is wrong", so this returns false rather than throwing.
+    /// a disk that cannot be read simply means "not collapsed yet", not
+    /// "something is wrong", so this returns false rather than throwing.
     /// </para>
     /// </remarks>
     /// <exception cref="VmNotOnHostException">The VM is not registered on this host.</exception>
-    Task<bool> AreVolumeChainsCollapsedAsync(string hostName, string vmId, string volumesRoot, CancellationToken cancellationToken);
+    Task<bool> IsCollapsedOntoAsync(
+        string hostName, string vmId, IReadOnlyCollection<string> frozenDisks, CancellationToken cancellationToken);
 }

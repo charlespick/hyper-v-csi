@@ -1030,6 +1030,41 @@ public sealed class SnapshotService : ISnapshotService
                     {
                         _hostSlots.Release(vm.OwningHost);
                     }
+
+                    if (attachment.Kind == VolumeAttachmentKind.BehindOtherSnapshotsCheckpoint)
+                    {
+                        // This job holds vm: for its entire run, and
+                        // took that hold before it could even reach
+                        // this line - so no *other* copy job can be
+                        // mid-flight on this VM right now. A
+                        // checkpoint standing under a different
+                        // (volume, snapshot) identity is therefore
+                        // not a sibling's still-running copy (the
+                        // fast job's own InspectSourceAsync reads
+                        // this same classification differently,
+                        // because there it genuinely can be one); it
+                        // is an orphan nothing is driving anymore.
+                        // Copying through it would silently backdate
+                        // this snapshot to whenever that checkpoint
+                        // was actually taken - a checkpoint is
+                        // VM-wide, so this volume's base was already
+                        // frozen at that instant no matter which
+                        // checkpoint this job merges - and taking a
+                        // second checkpoint on top would leave the
+                        // VM two chains deep besides. Refused rather
+                        // than adopted or stacked (issue #14's
+                        // C1/C2): the only correct responses are
+                        // reap-then-restart or refuse, and nothing
+                        // here reaps.
+                        throw new JobFailureException(
+                            AgentErrorCodes.Internal,
+                            $"snapshot {snapshotId} cannot be copied: {sourcePath} sits behind checkpoint " +
+                            $"{attachment.OwnedCheckpoint!.ElementName}, which this driver took for a " +
+                            "different snapshot; since this job holds this VM's checkpoint lock for its " +
+                            "entire run, no other copy can be driving that checkpoint right now, so it " +
+                            "is an orphan an operator needs to clear rather than something safe to copy " +
+                            "through or stack a second checkpoint on top of");
+                    }
                 }
             }
 
@@ -1063,37 +1098,9 @@ public sealed class SnapshotService : ISnapshotService
                             break;
 
                         case VolumeAttachmentKind.BehindOtherSnapshotsCheckpoint:
-                            // This job holds vm: for its entire run, and
-                            // took that hold before it could even reach
-                            // this line - so no *other* copy job can be
-                            // mid-flight on this VM right now. A
-                            // checkpoint standing under a different
-                            // (volume, snapshot) identity is therefore
-                            // not a sibling's still-running copy (the
-                            // fast job's own InspectSourceAsync reads
-                            // this same classification differently,
-                            // because there it genuinely can be one); it
-                            // is an orphan nothing is driving anymore.
-                            // Copying through it would silently backdate
-                            // this snapshot to whenever that checkpoint
-                            // was actually taken - a checkpoint is
-                            // VM-wide, so this volume's base was already
-                            // frozen at that instant no matter which
-                            // checkpoint this job merges - and taking a
-                            // second checkpoint on top would leave the
-                            // VM two chains deep besides. Refused rather
-                            // than adopted or stacked (issue #14's
-                            // C1/C2): the only correct responses are
-                            // reap-then-restart or refuse, and nothing
-                            // here reaps.
-                            throw new JobFailureException(
-                                AgentErrorCodes.Internal,
-                                $"snapshot {snapshotId} cannot be copied: {sourcePath} sits behind checkpoint " +
-                                $"{attachment.OwnedCheckpoint!.ElementName}, which this driver took for a " +
-                                "different snapshot; since this job holds this VM's checkpoint lock for its " +
-                                "entire run, no other copy can be driving that checkpoint right now, so it " +
-                                "is an orphan an operator needs to clear rather than something safe to copy " +
-                                "through or stack a second checkpoint on top of");
+                            // Refused above, before the copy slot - see the
+                            // comment there for why.
+                            throw new UnreachableException();
 
                         case VolumeAttachmentKind.Direct:
                             // Nothing frozen yet, and this is the one
@@ -1794,7 +1801,12 @@ public sealed class SnapshotService : ISnapshotService
     /// in exactly the way this whole design avoids remembering anything
     /// checkpoint-shaped across a call boundary.
     /// </remarks>
-    private async Task DestroyOwnedCheckpointIfAnyAsync(
+    /// <returns>
+    /// The disks the destroyed checkpoint froze - what the merge wait watches
+    /// collapse - or null when there was no checkpoint to destroy, or its
+    /// disks could not be read; the caller then watches the source alone.
+    /// </returns>
+    private async Task<IReadOnlyList<string>?> DestroyOwnedCheckpointIfAnyAsync(
         string snapshotId, ClusteredVm vm, string elementName, CancellationToken cancellationToken)
     {
         Checkpoint? checkpoint;
@@ -1825,7 +1837,7 @@ public sealed class SnapshotService : ISnapshotService
             // if anything, is left for an operator, the same posture
             // DestroyOwnedCheckpointAsync's own catches below take.
             LogOrphanedCheckpoint(snapshotId, elementName, vm, "looking it up to merge it failed", ex);
-            return;
+            return null;
         }
 
         if (checkpoint is null)
@@ -1838,10 +1850,40 @@ public sealed class SnapshotService : ISnapshotService
             _logger.LogInformation(
                 "CopySnapshot {SnapshotId}: no checkpoint {ElementName} stands on {VmId} anymore; nothing to merge",
                 snapshotId, elementName, vm.VmId);
-            return;
+            return null;
+        }
+
+        // Read before the destroy, which removes the configuration they are
+        // read from: exactly the disks this checkpoint froze, so the merge
+        // wait can watch every chain it created - a VM-wide checkpoint froze
+        // the sibling volumes too - and none it did not (see
+        // IHyperVHostClient.IsCollapsedOntoAsync). A failure here costs only
+        // that precision: the wait falls back to the source alone, as it did
+        // before this read existed.
+        IReadOnlyList<string>? frozenDisks = null;
+        try
+        {
+            await _hostSlots.WaitAsync(vm.OwningHost, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                frozenDisks = await _host.ReadCheckpointDisksAsync(vm.OwningHost, checkpoint, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            finally
+            {
+                _hostSlots.Release(vm.OwningHost);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "CopySnapshot {SnapshotId}: could not read the disks checkpoint {ElementName} froze on {VmId}; " +
+                "its merge will be watched on the source alone",
+                snapshotId, elementName, vm.VmId);
         }
 
         await DestroyOwnedCheckpointAsync(snapshotId, vm, checkpoint, cancellationToken).ConfigureAwait(false);
+        return frozenDisks;
     }
 
     /// <summary>
@@ -1889,7 +1931,7 @@ public sealed class SnapshotService : ISnapshotService
     /// that VM would then hit <c>GuardAgainstDifferencingChain</c> against a
     /// chain that is on its way out but not yet gone - exactly the failure
     /// this method exists to prevent. So this waits for
-    /// <see cref="IHyperVHostClient.AreVolumeChainsCollapsedAsync"/> to report true
+    /// <see cref="IHyperVHostClient.IsCollapsedOntoAsync"/> to report true
     /// before returning, rather than for <see cref="IHyperVHostClient.FindOwnedCheckpointAsync"/>
     /// to report the checkpoint's configuration object gone:
     /// <see cref="HostControl.CimHyperVHostClient.ClassifyAttachmentAsync"/>'s
@@ -1899,18 +1941,26 @@ public sealed class SnapshotService : ISnapshotService
     /// the second one is safe to act on here.
     /// </para>
     /// <para>
-    /// Every driver volume's chain on the VM, not just
+    /// Every chain the checkpoint created, not just
     /// <paramref name="sourcePath"/>'s: a checkpoint is VM-wide, so its merge
     /// re-points every disk the VM had when it was taken. Releasing the hold
     /// once only this disk had collapsed would hand the next job on this VM
     /// a sibling volume still merging - a chain with no checkpoint behind it
     /// that is this driver's own work, which issue #38's decision under
     /// <c>vm:</c> (see <see cref="DecideUntaggedRoot"/> and
-    /// <see cref="RetryWhileTransientAsync"/>) relies on never seeing.
+    /// <see cref="RetryWhileTransientAsync"/>) relies on never seeing. And
+    /// exactly those chains, read off the checkpoint before it is destroyed
+    /// (<see cref="IHyperVHostClient.ReadCheckpointDisksAsync"/>), not every
+    /// chain on the VM: a sibling sitting under some other, long-lived
+    /// checkpoint - a backup product's, an operator's - is not this merge's
+    /// to wait for, and waiting on it would hold the VM for the whole of
+    /// <see cref="AgentOptions.CheckpointMergeTimeout"/> every time. With no
+    /// checkpoint left to read - an earlier attempt already destroyed it -
+    /// the source alone is watched, which is all that can be known.
     /// </para>
     /// <para>
     /// The poll backs off from 5s to a 30s ceiling rather than running flat:
-    /// <c>AreVolumeChainsCollapsedAsync</c> is a device-settings enumeration plus a
+    /// <c>IsCollapsedOntoAsync</c> is a device-settings enumeration plus a
     /// chain walk per attached disk, not a cheap call, and this can run for
     /// the whole merge - which for a multi-hour copy can itself be hours -
     /// across every VM mid-merge on a host. It now takes a
@@ -1981,7 +2031,11 @@ public sealed class SnapshotService : ISnapshotService
             return;
         }
 
-        await DestroyOwnedCheckpointIfAnyAsync(snapshotId, vm, elementName, cancellationToken).ConfigureAwait(false);
+        // The disks to watch collapse: the ones the checkpoint froze, or the
+        // source alone when there was no checkpoint left to read them from.
+        var frozenDisks = await DestroyOwnedCheckpointIfAnyAsync(snapshotId, vm, elementName, cancellationToken)
+            .ConfigureAwait(false);
+        IReadOnlyCollection<string> watched = frozenDisks is { Count: > 0 } ? frozenDisks : [sourcePath];
 
         using var mergeWait = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         mergeWait.CancelAfter(_options.CheckpointMergeTimeout);
@@ -2001,8 +2055,8 @@ public sealed class SnapshotService : ISnapshotService
                 bool collapsed;
                 try
                 {
-                    collapsed = await _host.AreVolumeChainsCollapsedAsync(
-                        vm.OwningHost, vm.VmId, _options.CsvVolumesRoot, mergeWait.Token)
+                    collapsed = await _host.IsCollapsedOntoAsync(
+                        vm.OwningHost, vm.VmId, watched, mergeWait.Token)
                         .ConfigureAwait(false);
                 }
                 finally
@@ -2048,7 +2102,7 @@ public sealed class SnapshotService : ISnapshotService
             // The most plausible cause is the one this loop cannot re-derive
             // its way out of: vm was resolved once, before a wait that can
             // run for hours, so a live migration in the meantime leaves
-            // vm.OwningHost stale and AreVolumeChainsCollapsedAsync throwing
+            // vm.OwningHost stale and IsCollapsedOntoAsync throwing
             // VmNotOnHostException against a host the VM has left. Stopping
             // here rather than re-resolving in a loop is deliberate:
             // RunCopyAsync publishes immediately below, so the next

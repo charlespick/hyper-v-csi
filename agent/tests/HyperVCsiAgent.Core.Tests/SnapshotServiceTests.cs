@@ -640,7 +640,12 @@ public sealed class SnapshotServiceTests : IDisposable
         // past. FakeHostClient's checkpoint freezes nothing real, so the swap
         // is made by hand at the moment it is taken.
         var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
-        var host = new FakeHostClient();
+        // A VM-wide checkpoint: it froze a sibling volume and the node's OS
+        // disk along with pvc-1.
+        var host = new FakeHostClient
+        {
+            FrozenDisks = [VolumePath("pvc-1"), VolumePath("pvc-2"), @"C:\vms\node-a.vhdx"],
+        };
         var harness = NewHarness(cluster: cluster, location: TracedToVm1(), host: host);
         WriteVolume("pvc-1", 4096);
         var vmHold = HoldOpenExclusively(VolumePath("pvc-1"));
@@ -665,11 +670,10 @@ public sealed class SnapshotServiceTests : IDisposable
             await WaitForAsync(() => host.DestroyedCheckpointElementNames.Count == 1);
             Assert.Equal(["hyperv-csi/pvc-1/snapshot-abc"], host.DestroyedCheckpointElementNames);
 
-            // The merge wait covers every driver volume's chain on the VM -
-            // the whole volumes directory - not just pvc-1's: a checkpoint is
-            // VM-wide, and a sibling still merging after the hold is released
-            // would be this driver's own work under the next job's vm:.
-            Assert.Equal(_volumesRoot, host.CollapseCheckedUnder);
+            // The merge wait watches every disk that checkpoint froze - the
+            // sibling's chain collapsing is as much this merge as pvc-1's -
+            // read off the checkpoint before it was destroyed.
+            Assert.Equal(host.FrozenDisks, host.CollapseCheckedOnto);
         }
         finally
         {
@@ -835,6 +839,22 @@ public sealed class SnapshotServiceTests : IDisposable
         // decided. No checkpoint taken on top of the foreign one.
         Assert.Equal(2, host.ClassifyCalls);
         Assert.Empty(host.CreatedCheckpointElementNames);
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_CheckpointDisksUnknown_MergeWaitWatchesTheSourceAlone()
+    {
+        // The fallback: nothing could be read off the checkpoint, so the
+        // only chain known to be this merge's is the source's.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient();
+        var harness = NewHarness(cluster: cluster, location: TracedToVm1(), host: host);
+        WriteAttachedVolume("pvc-1", 4096);
+
+        await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
+
+        await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
+        Assert.Equal([VolumePath("pvc-1")], host.CollapseCheckedOnto);
     }
 
     [WindowsOnlyFact]
@@ -2867,7 +2887,10 @@ public sealed class SnapshotServiceTests : IDisposable
         public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             throw Unexpected();
 
-        public Task<bool> AreVolumeChainsCollapsedAsync(string hostName, string vmId, string volumesRoot, CancellationToken cancellationToken) =>
+        public Task<IReadOnlyList<string>> ReadCheckpointDisksAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<string>>([]);
+
+        public Task<bool> IsCollapsedOntoAsync(string hostName, string vmId, IReadOnlyCollection<string> frozenDisks, CancellationToken cancellationToken) =>
             throw Unexpected();
     }
 
@@ -3033,7 +3056,7 @@ public sealed class SnapshotServiceTests : IDisposable
         public List<string> DestroyedCheckpointElementNames { get; } = [];
 
         /// <summary>
-        /// Makes <see cref="AreVolumeChainsCollapsedAsync"/> report the chain as
+        /// Makes <see cref="IsCollapsedOntoAsync"/> report the chain as
         /// still standing no matter what, for a test that needs a post-merge
         /// wait built on this member to time out rather than observe a
         /// collapse that never happens on a fake with no real merge to wait
@@ -3042,9 +3065,9 @@ public sealed class SnapshotServiceTests : IDisposable
         public bool ChainStaysUncollapsed { get; set; }
 
         /// <summary>
-        /// Makes <see cref="AreVolumeChainsCollapsedAsync"/> throw, the way it does
+        /// Makes <see cref="IsCollapsedOntoAsync"/> throw, the way it does
         /// against a host the VM has live migrated off in the hours a merge
-        /// wait can span - <see cref="IHyperVHostClient.AreVolumeChainsCollapsedAsync"/>
+        /// wait can span - <see cref="IHyperVHostClient.IsCollapsedOntoAsync"/>
         /// documents VmNotOnHostException for exactly that.
         /// </summary>
         public bool FailChainCollapsedChecks { get; set; }
@@ -3186,17 +3209,26 @@ public sealed class SnapshotServiceTests : IDisposable
         public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             Task.FromResult(!CheckpointsNotConfigured);
 
-        /// <summary>The volumes root the last post-merge wait asked about.</summary>
-        public string? CollapseCheckedUnder { get; private set; }
+        /// <summary>
+        /// What ReadCheckpointDisksAsync answers for any checkpoint: the disks
+        /// it froze. Empty by default, which the service treats as unknown.
+        /// </summary>
+        public IReadOnlyList<string> FrozenDisks { get; set; } = [];
 
-        public Task<bool> AreVolumeChainsCollapsedAsync(string hostName, string vmId, string volumesRoot, CancellationToken cancellationToken)
+        /// <summary>The disks the last post-merge wait watched collapse.</summary>
+        public IReadOnlyCollection<string>? CollapseCheckedOnto { get; private set; }
+
+        public Task<IReadOnlyList<string>> ReadCheckpointDisksAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
+            Task.FromResult(FrozenDisks);
+
+        public Task<bool> IsCollapsedOntoAsync(string hostName, string vmId, IReadOnlyCollection<string> frozenDisks, CancellationToken cancellationToken)
         {
             if (FailChainCollapsedChecks)
             {
                 throw new InvalidOperationException($"{vmId} is not registered on {hostName}");
             }
 
-            CollapseCheckedUnder = volumesRoot;
+            CollapseCheckedOnto = frozenDisks;
             return Task.FromResult(!ChainStaysUncollapsed && _checkpointsByElementName.Count == 0);
         }
 

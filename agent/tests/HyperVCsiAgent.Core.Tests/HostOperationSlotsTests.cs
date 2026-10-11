@@ -314,7 +314,10 @@ public sealed class HostOperationSlotsTests : IDisposable
         public Task<bool> CanCheckpointAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
-        public Task<bool> AreVolumeChainsCollapsedAsync(string hostName, string vmId, string volumesRoot, CancellationToken cancellationToken) =>
+        public Task<IReadOnlyList<string>> ReadCheckpointDisksAsync(string hostName, Checkpoint checkpoint, CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<string>>([]);
+
+        public Task<bool> IsCollapsedOntoAsync(string hostName, string vmId, IReadOnlyCollection<string> frozenDisks, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
     }
 }
