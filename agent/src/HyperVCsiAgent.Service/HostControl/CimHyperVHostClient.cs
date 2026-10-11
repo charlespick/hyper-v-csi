@@ -1365,10 +1365,31 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     {
         var checkpoints = new List<Checkpoint>();
 
-        foreach (var checkpoint in CheckpointSettings(session, vmId, deadline, cancellationToken))
+        // Materialized before any disk is read, as every other multi-query
+        // path in this file does: each frozen-disk read is a query of its
+        // own, and none is issued while the checkpoint enumeration is still
+        // open on the same session.
+        var instances = CheckpointSettings(session, vmId, deadline, cancellationToken).ToList();
+        try
         {
-            using (checkpoint)
+            foreach (var checkpoint in instances)
             {
+                // Per checkpoint, and unknown rather than fatal: one a backup
+                // product removes between the enumeration and this read must
+                // not take the whole answer down with it. Unknown leaves it
+                // out of ClassifyAttachment's behind-the-chain set and sends
+                // the merge wait back to the source alone - the safe side of
+                // both.
+                List<string>? frozenDisks;
+                try
+                {
+                    frozenDisks = ReadFrozenDisks(session, checkpoint, deadline, cancellationToken);
+                }
+                catch (CimException) when (!deadline.HasExpired)
+                {
+                    frozenDisks = null;
+                }
+
                 // Every checkpoint, named or not: an unnamed one cannot match
                 // this driver's identity, but it can still be what a disk's
                 // chain stands on, which ClassifyAttachment has to see.
@@ -1376,8 +1397,15 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                     FullPathTextOf(checkpoint),
                     checkpoint.CimInstanceProperties["ElementName"]?.Value as string ?? string.Empty,
                     ReadNotes(checkpoint),
-                    ReadFrozenDisks(session, checkpoint, deadline, cancellationToken),
+                    frozenDisks,
                     ReadCreationTime(checkpoint)));
+            }
+        }
+        finally
+        {
+            foreach (var checkpoint in instances)
+            {
+                checkpoint.Dispose();
             }
         }
 

@@ -206,8 +206,9 @@ public sealed class SnapshotService : ISnapshotService
     /// <summary>
     /// The last FailedPrecondition verdict a copy job reached for each
     /// snapshot ID - a foreign checkpoint named by
-    /// <see cref="DecideUntaggedRoot"/>, chiefly - kept until a copy of that
-    /// snapshot publishes.
+    /// <see cref="DecideUntaggedRoot"/>, chiefly - kept until a later copy's
+    /// classification gets through with nothing to refuse, a copy publishes,
+    /// or the snapshot is deleted.
     /// </summary>
     /// <remarks>
     /// That verdict is only ever reached by the copy job, which holds
@@ -503,6 +504,11 @@ public sealed class SnapshotService : ISnapshotService
 
     public async Task DeleteAsync(string snapshotId, CancellationToken cancellationToken)
     {
+        // A snapshot being deleted takes any copy verdict about it with it: a
+        // CreateSnapshot reusing the name maps to this same ID, and must not
+        // be told about the old one's checkpoint.
+        _lastCopyVerdicts.TryRemove(snapshotId, out _);
+
         // An ID that isn't one CreateAsync could have produced names a snapshot
         // that cannot exist, so there is nothing to delete and CSI wants a
         // success. Same reading as DeleteVolume's: rejecting it would strand the
@@ -1099,6 +1105,12 @@ public sealed class SnapshotService : ISnapshotService
                 }
             }
 
+            // Classification got through with nothing to refuse, so whatever
+            // verdict an earlier copy of this snapshot reached no longer
+            // holds - the operator dealt with it - and must stop being
+            // reported the moment a copy has looked again.
+            _lastCopyVerdicts.TryRemove(snapshotId, out _);
+
             // Step 5: the copy slot, bounded separately from the rest of
             // this job's own SnapshotCopyTimeout (Decision 6) so a VM is
             // never held hostage to an unrelated VM's I/O budget. Kept
@@ -1285,6 +1297,7 @@ public sealed class SnapshotService : ISnapshotService
                 // The marker's creation timestamp travels with it, which is where
                 // creationTimeUnixSeconds comes from.
                 File.Move(copyingPath, snapshotPath);
+                _lastCopyVerdicts.TryRemove(snapshotId, out _);
 
                 _logger.LogInformation(
                     "CopySnapshot {SnapshotId}: published {Path} after copying {Bytes} bytes ({Method}) in {Elapsed}",

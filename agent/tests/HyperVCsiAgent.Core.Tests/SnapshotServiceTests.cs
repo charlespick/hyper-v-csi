@@ -954,6 +954,14 @@ public sealed class SnapshotServiceTests : IDisposable
             Assert.Equal(AgentErrorCodes.FailedPrecondition, retried.ErrorCode);
             Assert.Contains("\"Veeam restore point\"", retried.Message);
             Assert.Contains("last copy attempt", retried.Message);
+
+            // Deleted, then created again under the same name - the same ID.
+            // The old snapshot's verdict goes with it, not on to the new one.
+            await harness.Service.DeleteAsync("pvc-2~snapshot-b", CancellationToken.None);
+            var recreated = await Assert.ThrowsAsync<JobFailureException>(
+                () => harness.Service.CreateAsync("pvc-2", "snapshot-b", CancellationToken.None));
+            Assert.Equal(AgentErrorCodes.Aborted, recreated.ErrorCode);
+            Assert.Contains("queued behind another copy", recreated.Message);
         }
         finally
         {
