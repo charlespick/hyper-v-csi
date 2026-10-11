@@ -981,9 +981,10 @@ public sealed class SnapshotServiceTests : IDisposable
             _ = Task.Delay(600).ContinueWith(_ => hostSlots.Release("host-1"), TaskScheduler.Default);
         };
 
-        // Look 1 is the fast job's; looks 2 and 3 are the copy job's, still
-        // unsettled; look 4 settles.
-        var host = new FakeHostClient { ClassifyFault = call => call is 2 or 3 ? Unreadable("pvc-1_EDDD347F.avhdx") : null };
+        // Look 1 is the fast job's; look 2, the copy job's first, is still
+        // unsettled; look 3 settles, one 250ms pause in - well inside the
+        // window once the slot wait is outside it, and past it when it was not.
+        var host = new FakeHostClient { ClassifyFault = call => call == 2 ? Unreadable("pvc-1_EDDD347F.avhdx") : null };
         var harness = NewHarness(
             cluster: cluster, location: TracedToVm1(), host: host, hostSlots: hostSlots,
             chainSettleTimeout: TimeSpan.FromMilliseconds(300));
@@ -992,7 +993,7 @@ public sealed class SnapshotServiceTests : IDisposable
         await harness.Service.CreateAsync("pvc-1", "snapshot-abc", CancellationToken.None);
 
         await WaitForAsync(() => File.Exists(SnapshotPath("pvc-1~snapshot-abc")));
-        Assert.Equal(4, host.ClassifyCalls);
+        Assert.Equal(3, host.ClassifyCalls);
     }
 
     private static readonly UntaggedCheckpoint SiblingCheckpoint =
