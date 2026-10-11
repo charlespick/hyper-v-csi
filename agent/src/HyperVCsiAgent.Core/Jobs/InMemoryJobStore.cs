@@ -27,9 +27,10 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
     /// <summary>
     /// <see cref="ExecuteAsync"/> calls started and not yet through their
     /// <c>finally</c> - Pending and Running jobs alike. Pending ones count
-    /// because they still read <see cref="_shutdown"/>'s token once their
-    /// predecessors finish, and still run their delegate, however briefly,
-    /// against a token that is already canceled.
+    /// because they still read <see cref="_shutdown"/> once their predecessors
+    /// finish - one that finds it canceled fails as <c>Aborted</c> without
+    /// running its delegate - and still release their queues in that
+    /// <c>finally</c>, which the drain has to wait for.
     /// </summary>
     private int _active;
 
@@ -295,9 +296,9 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
     /// wait early is treated the same as the bound expiring.
     /// </para>
     /// <para>
-    /// A Pending job counts as in flight: it is canceled along with the rest
-    /// and its delegate still runs, against a token that is already
-    /// canceled, once whatever it queued behind finishes.
+    /// A Pending job counts as in flight too: once whatever it queued behind
+    /// finishes, it fails as <c>Aborted</c> without running its delegate, and
+    /// the wait covers it releasing its queues on the way out.
     /// </para>
     /// </remarks>
     public async Task<IReadOnlyList<Job>> DrainAsync(TimeSpan timeout, CancellationToken cancellationToken)
@@ -429,11 +430,7 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
             // around each assignment is for cross-thread visibility, not
             // ordering - it is never held across the run(...) await, so it
             // does not serialize job execution.
-            //
-            // JobExecutionContext.Enter wraps only this call, and only this
-            // call: it exists so issue #14's D10 guard rail can assert that a
-            // VM-mutating call happens while this job's own targets are held,
-            // and holding starts and ends exactly where the run delegate does.
+
             // Queued behind a job that finished after the stop began: never
             // started, rather than started on a token already canceled. Run
             // delegates do real work before their first token check - a
@@ -446,6 +443,10 @@ public sealed class InMemoryJobStore : IJobStore, IDisposable
                 throw new JobFailureException(AgentErrorCodes.Aborted, "the agent shut down before this job started");
             }
 
+            // JobExecutionContext.Enter wraps only this call, and only this
+            // call: it exists so issue #14's D10 guard rail can assert that a
+            // VM-mutating call happens while this job's own targets are held,
+            // and holding starts and ends exactly where the run delegate does.
             using (JobExecutionContext.Enter(targets))
             {
                 await run(job, _shutdown.Token).ConfigureAwait(false);

@@ -101,6 +101,15 @@ public sealed class StaleMarkerSweeperTests : IDisposable
         Assert.False(File.Exists(creating));
     }
 
+    [Fact]
+    public async Task StartAsync_WhenTheHostAbandonsItsStart_LetsTheCancellationThrough()
+    {
+        // Not mistaken for the budget running out: the host asked to stop
+        // starting, and must not go on to start the reaper.
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => Sweeper().StartAsync(new CancellationToken(canceled: true)));
+    }
+
     private StaleMarkerSweeper Sweeper(string? snapshotsRoot = null) => new(
         Options.Create(new AgentOptions { CsvVolumesRoot = _volumes, CsvSnapshotsRoot = snapshotsRoot ?? _snapshots }),
         NullLogger<StaleMarkerSweeper>.Instance);

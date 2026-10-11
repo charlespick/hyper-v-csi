@@ -76,7 +76,7 @@ public sealed class StaleMarkerSweeper : IHostedService
         {
             await sweep.WaitAsync(StartupBudget, cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is TimeoutException or OperationCanceledException)
+        catch (TimeoutException)
         {
             // Canceled before the using above disposes it, and the sweep only
             // ever reads IsCancellationRequested, which stays answerable on a
@@ -85,6 +85,14 @@ public sealed class StaleMarkerSweeper : IHostedService
             _logger.LogWarning(
                 "The startup sweep for stale ~creating/~copying markers did not finish within {Budget}; " +
                 "starting without it, and it removes nothing further", StartupBudget);
+        }
+        catch (OperationCanceledException)
+        {
+            // The host abandoning its own start, not the budget: stop the
+            // sweep the same way, then let the host see the cancellation it
+            // asked for rather than carry on starting the reaper.
+            stop.Cancel();
+            throw;
         }
     }
 
