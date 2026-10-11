@@ -251,6 +251,19 @@ public sealed class OrphanedCheckpointReaper : BackgroundService
                     {
                         HandleOwnedCheckpoint(vm.VmId, checkpoint, host);
                     }
+                    catch (JobStoreStoppingException)
+                    {
+                        // The agent is draining on its way out - JobDrainService
+                        // stops before this service does - so nothing this
+                        // sweep enqueues from here on would be accepted. Not
+                        // a failure of this checkpoint, or of any after it:
+                        // the next process's startup pass finds them all
+                        // again. Ended quietly rather than logged as an error
+                        // per checkpoint.
+                        _logger.LogInformation(
+                            "OrphanedCheckpointReaper: the agent is stopping; ending this sweep");
+                        return;
+                    }
                     catch (Exception ex)
                     {
                         // Contained per checkpoint for the same reason the
