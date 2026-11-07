@@ -127,10 +127,30 @@ func TestCreateVolumePassesTheClassQoSToTheAgent(t *testing.T) {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 
-	got := agent.onlyEnqueued(t).Payload.Qos
+	enqueued := agent.onlyEnqueued(t)
 	want := qosSettings{MaximumIops: 1000, MaximumBandwidthBytesPerSecond: 100 << 20}
-	if got == nil || *got != want {
+	if got := enqueued.Payload.Qos; got == nil || *got != want {
 		t.Errorf("payload qos = %+v, want %+v", got, want)
+	}
+	// A retry after the class changed must not attach to a create still
+	// running with the old class's values.
+	if enqueued.IdempotencyKey != "pvc-1#qos=0,1000,104857600" {
+		t.Errorf("idempotency key = %q, want the name and the requested QoS", enqueued.IdempotencyKey)
+	}
+}
+
+func TestCreateVolumeWithoutQoSKeepsTheNameAsItsKey(t *testing.T) {
+	agent := newFakeAgent(t, created(gibibyte))
+	server := newControllerServer(agent)
+
+	req := createVolumeRequest("pvc-1", gibibyte, 0)
+	req.MutableParameters = map[string]string{"qos": "none"}
+	if _, err := server.CreateVolume(context.Background(), req); err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+
+	if key := agent.onlyEnqueued(t).IdempotencyKey; key != "pvc-1" {
+		t.Errorf("idempotency key = %q, want the bare volume name, as before QoS existed", key)
 	}
 }
 

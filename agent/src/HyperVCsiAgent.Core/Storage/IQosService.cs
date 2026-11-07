@@ -22,7 +22,13 @@ public interface IQosService
     /// Runs inside the CreateVolume job, after the VHDX exists. Nothing can have
     /// attached the volume yet, so only the policy is written.
     /// </remarks>
-    Task ApplyOnCreateAsync(string volumeId, QosSettings? qos, CancellationToken cancellationToken);
+    /// <param name="replay">
+    /// The VHDX was already there - a provisioner retry. A retry asking for no
+    /// QoS then removes any policy an earlier attempt left, since the unbound
+    /// PVC can have been pointed at <c>hyperv-none</c> in between; a fresh
+    /// create without QoS never touches the policy store.
+    /// </param>
+    Task ApplyOnCreateAsync(string volumeId, QosSettings? qos, bool replay, CancellationToken cancellationToken);
 
     /// <summary>
     /// Makes the volume's QoS what <paramref name="qos"/> says - creating,

@@ -176,8 +176,16 @@ func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 
 	// The CSI volume name is the idempotency key (docs/rpc-surface-overview.md),
 	// so a provisioner retry for the same PVC re-attaches to this job instead of
-	// racing a second create for the same file.
-	job, err := s.driver.Agent.EnqueueJob(ctx, req.GetName(), operationCreateVolume, createVolumePayload{
+	// racing a second create for the same file. With QoS in the key too: a
+	// retry made after the unbound PVC was pointed at a different class must
+	// not attach to a create still running with the old class's values and
+	// report success for them. It queues behind that create on the agent's
+	// volume target instead, and its replay applies its own class.
+	key := req.GetName()
+	if qos != nil {
+		key += "#qos=" + qos.key()
+	}
+	job, err := s.driver.Agent.EnqueueJob(ctx, key, operationCreateVolume, createVolumePayload{
 		Name:             req.GetName(),
 		SizeBytes:        sizeBytes,
 		SourceSnapshotID: sourceSnapshotID,

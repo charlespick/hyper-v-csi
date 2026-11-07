@@ -35,6 +35,14 @@ public sealed class QosService : IQosService
     private readonly AgentOptions _options;
     private readonly ILogger<QosService> _logger;
 
+    /// <summary>
+    /// Per volume, the most recently enqueued <see cref="ApplyQos"/> job - see
+    /// <see cref="EnqueueChange"/>. In memory like the job store itself: after a
+    /// restart there are no queued changes left to order against.
+    /// </summary>
+    private readonly Dictionary<string, (string JobId, string Key, string Settings)> _latestChanges =
+        new(StringComparer.Ordinal);
+
     public QosService(
         IStorageQosPolicyStore policies,
         IVhdxLocationService location,
@@ -53,17 +61,28 @@ public sealed class QosService : IQosService
         _logger = logger;
     }
 
-    public async Task ApplyOnCreateAsync(string volumeId, QosSettings? qos, CancellationToken cancellationToken)
+    public async Task ApplyOnCreateAsync(string volumeId, QosSettings? qos, bool replay, CancellationToken cancellationToken)
     {
-        if (qos is null)
+        if (qos is null && !replay)
         {
             return;
         }
 
-        RequireUsable(qos);
+        if (qos is not null)
+        {
+            RequireUsable(qos);
+        }
 
         using var attempt = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         attempt.CancelAfter(_options.HostOperationTimeout);
+
+        if (qos is null)
+        {
+            await BoundedAsync(
+                "removing a stale QoS policy from replayed volume", volumeId, attempt, cancellationToken,
+                () => RemovePolicyAsync(volumeId, attempt.Token)).ConfigureAwait(false);
+            return;
+        }
 
         await BoundedAsync(
             "applying QoS to new volume", volumeId, attempt, cancellationToken,
@@ -89,6 +108,11 @@ public sealed class QosService : IQosService
         await BoundedAsync(
             "removing the QoS policy of deleted volume", volumeId, attempt, cancellationToken,
             () => RemovePolicyAsync(volumeId, attempt.Token)).ConfigureAwait(false);
+
+        lock (_latestChanges)
+        {
+            _latestChanges.Remove(volumeId);
+        }
     }
 
     /// <remarks>
@@ -104,7 +128,11 @@ public sealed class QosService : IQosService
     /// A change of values on a volume that already has QoS does not need it:
     /// the disk already names the policy, and Hyper-V's QoS manager pushes new
     /// values to whichever host has the disk open, so no VM slot is taken and
-    /// no snapshot copy on the VM can hold the change up.
+    /// the change does not queue behind a snapshot copy's hold on the VM. It
+    /// still reads the disk to confirm it names the policy, though, and that
+    /// read is refused while a checkpoint stands over the disk - so for as long
+    /// as a checkpoint does (a snapshot copy of any volume on that VM, or a
+    /// backup product's), every change to the volume fails and is retried.
     /// </para>
     /// </remarks>
     public async Task ModifyAsync(string volumeId, QosSettings? qos, CancellationToken cancellationToken)
@@ -139,15 +167,57 @@ public sealed class QosService : IQosService
             ? [JobTargets.Qos(volumeId)]
             : [JobTargets.Qos(volumeId), JobTargets.Vm(vmId)];
 
-        // Keyed on the requested QoS too, as ControllerModifyVolume's own key
-        // is: a retry waits on the change already queued, but a PVC repointed
-        // again never attaches to the earlier class's change - it queues behind
-        // it on the same targets and then applies its own.
-        var change = _jobs.GetOrCreate(
-            $"{volumeId}#{(qos is null ? "none" : qos.ToString())}", ApplyQos, targets,
-            (_, ct) => ApplyAsync(volumeId, qos, vmId, ct));
+        var change = EnqueueChange(volumeId, qos, targets, vmId);
 
         await AwaitApplyAsync(change, volumeId, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The <see cref="ApplyQos"/> job this request waits on: the volume's most
+    /// recently enqueued change, when that one is still queued or running and
+    /// asks for these same settings - a retry - and otherwise a fresh one,
+    /// queued behind every change already enqueued for the volume.
+    /// </summary>
+    /// <remarks>
+    /// Rejoining by settings alone is not enough, and the difference is the
+    /// whole point. A PVC repointed A → B → A while A's change sits queued
+    /// behind a snapshot copy would otherwise rejoin that first A, ahead of B's
+    /// change on <c>qos:</c>: it would report success as soon as A ran, the
+    /// resizer would record class A, and B's change would then run and leave
+    /// the policy at B's values for good. Only the newest change for a volume
+    /// is ever rejoined, so whatever this waits on is the last change the
+    /// volume will get.
+    /// <para>
+    /// ModifyVolume jobs for one volume run one at a time on
+    /// <see cref="JobTargets.Modification"/>, so this map is only ever written
+    /// for a volume by one caller at a time; the lock is for the map itself.
+    /// </para>
+    /// </remarks>
+    private Job EnqueueChange(string volumeId, QosSettings? qos, string[] targets, string? vmId)
+    {
+        var settings = qos is null ? "none" : qos.ToString();
+
+        lock (_latestChanges)
+        {
+            if (_latestChanges.TryGetValue(volumeId, out var latest)
+                && latest.Settings == settings
+                && _jobs.Get(latest.JobId)?.Status is JobStatus.Pending or JobStatus.Running)
+            {
+                return _jobs.FindActive(latest.Key, ApplyQos) ?? Enqueue();
+            }
+
+            return Enqueue();
+        }
+
+        Job Enqueue()
+        {
+            // A key of its own every time: a change is only ever reached again
+            // through _latestChanges, never by colliding with an older one.
+            var key = $"{volumeId}#{settings}#{Guid.NewGuid():n}";
+            var job = _jobs.GetOrCreate(key, ApplyQos, targets, (_, ct) => ApplyAsync(volumeId, qos, vmId, ct));
+            _latestChanges[volumeId] = (job.Id, key, settings);
+            return job;
+        }
     }
 
     /// <summary>
@@ -366,11 +436,15 @@ public sealed class QosService : IQosService
         }
         catch (InvalidOperationException ex)
         {
-            // Most plausibly a checkpoint standing over the disk, which every
-            // other VM-side operation on it refuses too.
+            // Most plausibly a checkpoint standing over the disk - a snapshot
+            // copy of any volume on the VM, or a backup's - which every other
+            // VM-side operation on it refuses too. Whether the disk names the
+            // policy cannot be confirmed through one, so the change is not
+            // reported done; it succeeds on a retry once the checkpoint is gone.
             throw new JobFailureException(
                 AgentErrorCodes.Internal,
-                $"volume {volumeId}: could not read its disk's Storage QoS policy on {location.VmId}: {ex.Message}",
+                $"volume {volumeId}: could not confirm the Storage QoS policy its disk names on {location.VmId}, " +
+                $"so the change is not reported done; if the VM has a checkpoint, this clears once it is merged: {ex.Message}",
                 ex);
         }
     }

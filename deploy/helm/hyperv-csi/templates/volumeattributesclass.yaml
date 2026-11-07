@@ -31,9 +31,12 @@ metadata:
   {{- end }}
 driverName: {{ include "hyperv-csi.driverName" $ }}
 parameters:
-  {{- /* Every value is a string to the API. An unquoted number in values
-  arrives here as a float64, which would print as 1e+06; render it whole. */}}
+  {{- /* Every value is a string to the API. An unquoted whole number in
+  values arrives here as a float64, which would print as 1e+06, so it is
+  rendered as an integer. Anything fractional is passed through as written,
+  for the driver to refuse, rather than truncated into a class whose
+  parameters can never be edited. */}}
   {{- range $key, $value := required (printf "volumeAttributesClasses entry %s needs parameters" .name) .parameters }}
-  {{ $key }}: {{ if kindIs "float64" $value }}{{ $value | int64 | quote }}{{ else }}{{ $value | quote }}{{ end }}
+  {{ $key }}: {{ if and (kindIs "float64" $value) (eq (float64 (int64 $value)) $value) }}{{ $value | int64 | quote }}{{ else }}{{ $value | toString | quote }}{{ end }}
   {{- end }}
 {{- end }}

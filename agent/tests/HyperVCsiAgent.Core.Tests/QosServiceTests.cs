@@ -54,7 +54,7 @@ public sealed class QosServiceTests : IDisposable
     [Fact]
     public async Task ApplyOnCreate_WithoutQoS_TouchesNothing()
     {
-        await NewService().ApplyOnCreateAsync("pvc-1", null, CancellationToken.None);
+        await NewService().ApplyOnCreateAsync("pvc-1", null, replay: false, CancellationToken.None);
 
         // A volume without QoS is created exactly as it always was: not even
         // the policy store is asked anything.
@@ -64,7 +64,7 @@ public sealed class QosServiceTests : IDisposable
     [Fact]
     public async Task ApplyOnCreate_WritesTheClassValuesAsADedicatedPolicyNamedForTheVolume()
     {
-        await NewService().ApplyOnCreateAsync("pvc-1", Gold, CancellationToken.None);
+        await NewService().ApplyOnCreateAsync("pvc-1", Gold, replay: false, CancellationToken.None);
 
         var policy = _policies.Find(PolicyOf("pvc-1"));
         Assert.NotNull(policy);
@@ -78,7 +78,7 @@ public sealed class QosServiceTests : IDisposable
     {
         _policies.Add(new StorageQosPolicy(PolicyOf("pvc-1"), "pvc-1", Silver, Dedicated: true));
 
-        await NewService().ApplyOnCreateAsync("pvc-1", Gold, CancellationToken.None);
+        await NewService().ApplyOnCreateAsync("pvc-1", Gold, replay: false, CancellationToken.None);
 
         Assert.Equal(Gold, _policies.Find(PolicyOf("pvc-1"))!.Settings);
     }
@@ -89,7 +89,7 @@ public sealed class QosServiceTests : IDisposable
         _policies.WritesDoNothing = true;
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
-            () => NewService().ApplyOnCreateAsync("pvc-1", Gold, CancellationToken.None));
+            () => NewService().ApplyOnCreateAsync("pvc-1", Gold, replay: false, CancellationToken.None));
 
         Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
     }
@@ -100,7 +100,7 @@ public sealed class QosServiceTests : IDisposable
         _policies.Unreadable = true;
 
         var failure = await Assert.ThrowsAsync<JobFailureException>(
-            () => NewService().ApplyOnCreateAsync("pvc-1", Gold, CancellationToken.None));
+            () => NewService().ApplyOnCreateAsync("pvc-1", Gold, replay: false, CancellationToken.None));
 
         Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
         Assert.Contains("Storage QoS", failure.Message);
@@ -110,12 +110,23 @@ public sealed class QosServiceTests : IDisposable
     public async Task ApplyOnCreate_SettingsNoClassCouldProduce_AreInvalidArgument()
     {
         var failure = await Assert.ThrowsAsync<JobFailureException>(
-            () => NewService().ApplyOnCreateAsync("pvc-1", new QosSettings(0, 0, 0), CancellationToken.None));
+            () => NewService().ApplyOnCreateAsync("pvc-1", new QosSettings(0, 0, 0), replay: false, CancellationToken.None));
 
         Assert.Equal(AgentErrorCodes.InvalidArgument, failure.ErrorCode);
         Assert.Empty(_policies.Calls);
     }
 
+    [Fact]
+    public async Task ApplyOnCreate_AReplayWithoutQoS_RemovesAPolicyAnEarlierAttemptLeft()
+    {
+        // The unbound PVC was pointed at hyperv-none between the first attempt
+        // and this retry: the volume has to end up with no policy.
+        _policies.Add(new StorageQosPolicy(PolicyOf("pvc-1"), "pvc-1", Gold, Dedicated: true));
+
+        await NewService().ApplyOnCreateAsync("pvc-1", null, replay: true, CancellationToken.None);
+
+        Assert.Null(_policies.Find(PolicyOf("pvc-1")));
+    }
     [Fact]
     public async Task RemoveOnDelete_RemovesThePolicy()
     {
@@ -348,6 +359,60 @@ public sealed class QosServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task Modify_RepointedBackToAnEarlierClass_WaitsForTheLatestChangeNotTheQueuedOne()
+    {
+        // A, then B, then A again, while the first A sits queued behind an
+        // attach. Rejoining that first A would report success once it ran -
+        // ahead of B's change - and leave the policy at B's values.
+        GivenVolume("pvc-1");
+        var release = new TaskCompletionSource();
+        _jobs.GetOrCreate(
+            "pvc-1/node-a", JobDispatcher.AttachVolume, [JobTargets.Vm(VmId), JobTargets.Qos("pvc-1")],
+            (_, _) => release.Task);
+        var impatient = NewService(new FakeLocation(), modifyWait: TimeSpan.FromMilliseconds(200));
+
+        await Assert.ThrowsAsync<JobFailureException>(() => impatient.ModifyAsync("pvc-1", Gold, CancellationToken.None));
+        await Assert.ThrowsAsync<JobFailureException>(() => impatient.ModifyAsync("pvc-1", Silver, CancellationToken.None));
+
+        // The same service: the agent has one, and which change is the
+        // volume's latest is its to remember.
+        var backToGold = impatient.ModifyAsync("pvc-1", Gold, CancellationToken.None);
+        release.SetResult();
+        try
+        {
+            await backToGold;
+        }
+        catch (JobFailureException ex) when (ex.ErrorCode == AgentErrorCodes.Aborted)
+        {
+            // Its wait may run out before both earlier changes have run; the
+            // change it queued still runs, and the resizer's retry rejoins it.
+        }
+
+        // Three changes queued, not two, and once every one of them has run
+        // the volume holds the class the last request asked for.
+        var changes = _recordingJobs.JobsOf(QosService.ApplyQos);
+        Assert.Equal(3, changes.Select(job => job.Id).Distinct().Count());
+        await WaitForTerminalAsync(changes);
+        Assert.Equal(Gold, _policies.Find(PolicyOf("pvc-1"))!.Settings);
+    }
+    [Fact]
+    public async Task Modify_ARetryOfTheLatestChange_WaitsOnTheSameJob()
+    {
+        GivenVolume("pvc-1");
+        var release = new TaskCompletionSource();
+        _jobs.GetOrCreate(
+            "pvc-1/node-a", JobDispatcher.AttachVolume, [JobTargets.Vm(VmId), JobTargets.Qos("pvc-1")],
+            (_, _) => release.Task);
+        var service = NewService(new FakeLocation(), modifyWait: TimeSpan.FromMilliseconds(200));
+
+        await Assert.ThrowsAsync<JobFailureException>(() => service.ModifyAsync("pvc-1", Gold, CancellationToken.None));
+        await Assert.ThrowsAsync<JobFailureException>(() => service.ModifyAsync("pvc-1", Gold, CancellationToken.None));
+        release.SetResult();
+
+        // Two requests, one queued change: retries never stack.
+        Assert.Single(_recordingJobs.JobsOf(QosService.ApplyQos).Select(job => job.Id).Distinct());
+    }
+    [Fact]
     public async Task Modify_QueuedTooLong_IsAbortedAndSaysWhatItIsBehind()
     {
         GivenVolume("pvc-1");
@@ -368,6 +433,20 @@ public sealed class QosServiceTests : IDisposable
         finally
         {
             release.SetResult();
+        }
+    }
+
+    private static async Task WaitForTerminalAsync(IEnumerable<Job> jobs)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (jobs.Any(job => job.Status is JobStatus.Pending or JobStatus.Running))
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                throw new TimeoutException("a queued QoS change never finished");
+            }
+
+            await Task.Delay(20);
         }
     }
 
@@ -430,6 +509,16 @@ public sealed class QosServiceTests : IDisposable
     {
         private readonly List<(string OperationType, IReadOnlyCollection<string> Targets)> _enqueued = [];
 
+        private readonly List<(string OperationType, Job Job)> _returned = [];
+
+        public IReadOnlyList<Job> JobsOf(string operationType)
+        {
+            lock (_enqueued)
+            {
+                return _returned.Where(entry => entry.OperationType == operationType).Select(entry => entry.Job).ToList();
+            }
+        }
+
         public IReadOnlyCollection<string> TargetsOf(string operationType)
         {
             lock (_enqueued)
@@ -446,7 +535,13 @@ public sealed class QosServiceTests : IDisposable
                 _enqueued.Add((operationType, targets));
             }
 
-            return inner.GetOrCreate(idempotencyKey, operationType, targets, run);
+            var job = inner.GetOrCreate(idempotencyKey, operationType, targets, run);
+            lock (_enqueued)
+            {
+                _returned.Add((operationType, job));
+            }
+
+            return job;
         }
 
         public Job? FindActive(string idempotencyKey, string operationType) => inner.FindActive(idempotencyKey, operationType);

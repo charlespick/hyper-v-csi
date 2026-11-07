@@ -85,6 +85,14 @@ public sealed class JobDispatcher(
                     [JobTargets.Volume(request.Name)],
                     async (job, cancellationToken) =>
                     {
+                        // Before the VHDX, not after: a QoS the agent refuses
+                        // is a terminal InvalidArgument, and the provisioner
+                        // that reads it never learns of a volume to delete.
+                        if (request.Qos?.Problem() is { } problem)
+                        {
+                            throw JobFailureException.InvalidArgument(problem);
+                        }
+
                         var created = await vhdxService
                             .CreateAsync(request.Name, request.SizeBytes, request.SourceSnapshotId, cancellationToken)
                             .ConfigureAwait(false);
@@ -93,7 +101,7 @@ public sealed class JobDispatcher(
                         // only worth anything once there is a volume for it to
                         // describe, and a create that stopped between the two
                         // leaves a volume its retry gives the policy to.
-                        await qosService.ApplyOnCreateAsync(created.VolumeId, request.Qos, cancellationToken)
+                        await qosService.ApplyOnCreateAsync(created.VolumeId, request.Qos, created.AlreadyPresent, cancellationToken)
                             .ConfigureAwait(false);
                         job.Result = created;
                     });

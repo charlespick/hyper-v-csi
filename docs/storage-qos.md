@@ -142,6 +142,12 @@ has none.
   policy but not the disk's ID. A value change still takes effect (the disk
   already names the policy), but turning QoS on or off for that disk does not
   reach it until it is next attached.
+- **No change completes while a checkpoint stands on the VM.** A change has
+  to confirm which policy the disk names, and the disk can't be read that way
+  while a checkpoint stands over it. That covers a snapshot copy of any volume
+  on the VM, and a backup product's checkpoint. The change fails, and the
+  resizer retries it until the checkpoint is merged. A change of values alone
+  still doesn't queue behind the VM.
 - **Not surfaced to Kubernetes:** `InsufficientThroughput` and
   `UnknownPolicyId`.
 - **Leftover policies** — for example after a `Retain` volume's VHDX is removed

@@ -63,6 +63,36 @@ public class JobDispatcherTests
     }
 
     [Fact]
+    public async Task Resolve_CreateVolume_UnusableQoS_IsRefusedBeforeTheVhdxExists()
+    {
+        // A terminal InvalidArgument after the create would orphan the VHDX:
+        // the provisioner never learns of a volume to delete.
+        var vhdx = new RecordingVhdxService();
+        var qos = new RecordingQosService();
+        var resolved = new JobDispatcher(vhdx, new RecordingAttachService(), new RecordingSnapshotService(), qos, NullLogger<JobDispatcher>.Instance).Resolve(
+            JobDispatcher.CreateVolume,
+            Payload("""{"name":"pvc-1","sizeBytes":2048,"qos":{"minimumIops":0,"maximumIops":0,"maximumBandwidthBytesPerSecond":0}}"""),
+            WireOptions);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(() => resolved.Run(NewJob(), CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.InvalidArgument, failure.ErrorCode);
+        Assert.Null(vhdx.LastCreate);
+        Assert.Empty(qos.Calls);
+    }
+
+    [Fact]
+    public async Task Resolve_CreateVolume_TellsTheQoSServiceWhetherItWasAReplay()
+    {
+        var qos = new RecordingQosService();
+        var resolved = new JobDispatcher(new RecordingVhdxService(), new RecordingAttachService(), new RecordingSnapshotService(), qos, NullLogger<JobDispatcher>.Instance).Resolve(
+            JobDispatcher.CreateVolume, Payload("""{"name":"pvc-1","sizeBytes":2048}"""), WireOptions);
+
+        await resolved.Run(NewJob(), CancellationToken.None);
+
+        Assert.False(qos.LastReplay);
+    }
+    [Fact]
     public async Task Resolve_CreateVolume_WithoutQoS_PassesNoQoS()
     {
         var qos = new RecordingQosService();
@@ -517,10 +547,13 @@ public class JobDispatcherTests
 
         public (string VolumeId, QosSettings? Qos)? LastModify { get; private set; }
 
-        public Task ApplyOnCreateAsync(string volumeId, QosSettings? qos, CancellationToken cancellationToken)
+        public bool? LastReplay { get; private set; }
+
+        public Task ApplyOnCreateAsync(string volumeId, QosSettings? qos, bool replay, CancellationToken cancellationToken)
         {
             Calls.Add(Call($"ApplyOnCreate {volumeId}"));
             LastApplyOnCreate = qos;
+            LastReplay = replay;
             return Task.CompletedTask;
         }
 
