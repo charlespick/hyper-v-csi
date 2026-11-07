@@ -5,7 +5,7 @@ Three layers, in the order they run:
 | Layer | Where | What it proves |
 | --- | --- | --- |
 | .NET unit tests | `agent/tests/` | `dotnet test agent/HyperVCsiAgent.slnx` — job store, dispatcher, wire format, certificate selection and pinning, VHDX service logic against fakes |
-| Go unit tests | `csi-driver/` | `cd csi-driver && make test` — RPC argument handling, error codes, job polling, KVP parsing, mount plumbing against fakes |
+| Go unit tests | `csi-driver/` | `cd csi-driver && make test` — RPC argument handling, error codes, job polling, node discovery and identity, mount plumbing against fakes |
 | Storage e2e | `test/e2e/` | The upstream Kubernetes external storage suite, against a real cluster and a real Hyper-V failover cluster |
 
 The first two run anywhere and gate nothing external. This document is about the
@@ -71,10 +71,11 @@ cluster, and anything to do with the agent failing over between hosts.
 
 - **The chart is installed and a PVC provisions by hand.** `helm install` prints
   one; watch it bind before automating anything.
-- **Two or more schedulable Linux nodes**, each with `hyperv-daemons` installed,
-  `hv_kvp_daemon` running, and Data Exchange enabled on its VM. The node plugin
-  refuses to start otherwise, and a single-node cluster silently loses every
-  cross-node test.
+- **Two or more schedulable Linux nodes**, each a VM on the failover cluster
+  with its own BIOSGUID, and each carrying the
+  `csi.hyper-v.makerland.xyz/vm-id` annotation the controller records once it
+  has discovered the node's VM. A node plugin waits at startup until its node
+  has one, and a single-node cluster silently loses every cross-node test.
 - **`kubectl` reaches the cluster** as an admin — the suite creates namespaces,
   PVCs, pods and priority classes, and reads `CSINode` and `VolumeAttachment`.
 - **You have watched one `DeleteVolume` succeed on your own hosts.** This is the

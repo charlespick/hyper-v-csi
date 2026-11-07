@@ -330,8 +330,8 @@ public sealed class MsClusterService : IClusterService
             var fresh = new Dictionary<string, ResourceNameMatch>(StringComparer.OrdinalIgnoreCase);
             foreach (var (resourceId, resourceName, candidateVmId) in EnumerateVmResources(cancellationToken))
             {
-                // Braces are stripped because clustering and the guest's
-                // key-value pools do not agree on whether to include them, and
+                // Braces are stripped because clustering and the node ID
+                // (which has come from more than one source over time) do not agree on whether to include them, and
                 // the comparison is case-insensitive because neither agrees on
                 // case either. Doing this in memory is also why the match is
                 // not a WQL predicate: WQL compares case-insensitively but does

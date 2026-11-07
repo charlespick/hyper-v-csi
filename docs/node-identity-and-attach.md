@@ -3,12 +3,9 @@
 ## Resolving a Kubernetes node to a Hyper-V VM
 
 `ControllerPublishVolume` identifies a node by its Hyper-V VM ID, end to
-end. The node plugin reads `VirtualMachineId` out of the guest's Hyper-V
-key-value pools — the values the host publishes through the Data Exchange
-integration service, which `hv_kvp_daemon` writes to
-`/var/lib/hyperv/.kvp_pool_*` — and reports that GUID as the CSI node ID.
-kubelet records it in `CSINode`, `external-attacher` hands it to this RPC,
-and the agent resolves it in two steps:
+end. The node plugin reports that GUID as the CSI node ID, kubelet records
+it in `CSINode`, `external-attacher` hands it to this RPC, and the agent
+resolves it in two steps:
 
 1. Scan the local CLUSDB mirror under `HKLM\Cluster\Resources` and match
    `Parameters\VmID` in memory (brace-insensitive and case-insensitive) on
@@ -35,20 +32,114 @@ The same GUID then identifies the VM on its host: `Msvm_ComputerSystem.Name`
 chain depends on a Kubernetes node, a cluster group, and a virtual machine
 all being called the same thing.
 
-Two things this requires of every node, and both fail loudly rather than
-silently: the `hyperv-daemons` package installed with `hv_kvp_daemon`
-running, and the Data Exchange integration service enabled on the VM.
-Without either, the pools are absent or lack the key, and the node plugin
-refuses to start rather than falling back to its hostname — a fallback
-would let a misconfigured node register anyway and attach disks against
-whatever VM happened to share its name.
+### Discovering a node's VM ID
 
-Not `systemUUID`, which Kubernetes already collects and which would need
-no guest-side work: that is the VM's BIOSGUID, a different value from the
-VM ID, and CLUSDB does not index it. Resolving it would mean an
-`Msvm_VirtualSystemSettingData` query per Hyper-V host — the fan-out this
-design avoids everywhere else — or a cache to be invalidated. The KVP
-dependency buys the O(1) lookup.
+The guest cannot read its VM ID from anything it has. The VM ID appears in
+no firmware table — SMBIOS, ACPI or EFI variables, in any byte order or
+encoding — and the only stable per-VM identifier the guest *can* read is
+its SMBIOS Type 1 UUID, which is the VM's `BIOSGUID`, a different value
+with no relationship to the VM ID. Linux exposes it, already decoded from
+the table's mixed-endian bytes, as `/sys/class/dmi/id/product_uuid`, and
+kubelet reports the same value as the Node's `status.nodeInfo.systemUUID`.
+
+So the VM ID is discovered once per node, by the controller:
+
+1. The controller watches Node objects. A node whose recorded VM ID is
+   missing, or was discovered from a different `systemUUID` than the
+   node's current one, needs discovery.
+2. It calls the agent's `GET /v1/vm-discovery/{systemUUID}`. The agent
+   lists the cluster's nodes that are up (local, no fan-out) and asks
+   every one of them at once:
+
+   ```
+   SELECT ConfigurationID FROM Msvm_VirtualSystemSettingData
+   WHERE VirtualSystemType = 'Microsoft:Hyper-V:System:Realized' AND BIOSGUID = '<bare GUID>'
+   ```
+
+   `BIOSGUID` lives only in `root\virtualization\v2` on the host a VM is
+   registered with — CLUSDB does not store it, and the cluster-wide
+   `root\HyperVCluster\v2` view declares it but returns null — so this is
+   the one fan-out in the design: at most 64 hosts, the failover cluster
+   limit, once per node, on no request path. The literal is bare: vmms
+   stores the value without braces, and a braced literal silently matches
+   nothing. The comparison is case-insensitive.
+
+   The first host to report a match ends it; the rest are not waited for.
+   No match is only an answer (404) when every host that is up answered;
+   if any did not, the VM may be on exactly that host, so the result is a
+   retryable 503.
+3. The controller writes the VM ID onto the Node object as two
+   annotations, in one merge patch:
+   - `csi.hyper-v.makerland.xyz/vm-id` — the VM ID, lowercase
+   - `csi.hyper-v.makerland.xyz/vm-id-source-system-uuid` — the
+     `systemUUID` it was discovered from, lowercase
+4. The node plugin, at startup, reads its own `product_uuid`, then polls
+   its Node object until it carries a VM ID whose source UUID matches,
+   and reports that VM ID from `NodeGetInfo`. It does not open its CSI
+   socket until then, so it never registers with kubelet under a guessed
+   identity, and it never falls back to its hostname — that would let a
+   node register before its identity is known and attach disks against
+   whatever VM happened to share its name.
+
+   In the chart that wait is an init container (`--mode=node-identity`),
+   so the pod reads `Init:0/1` until the record is there and no sidecar
+   starts early. It matters for `node-driver-registrar` in particular:
+   it gives up on a CSI socket that has not appeared within a fixed 30
+   seconds, so waiting inside the plugin container would crash-loop it
+   through any longer wait and leave it in backoff once the identity
+   arrived. The plugin container repeats the check, which then passes at
+   once.
+
+Annotations rather than `spec.providerID`: providerID cannot be changed
+once set, which rules out rediscovery, and it belongs to a cloud
+controller manager if one is ever installed.
+
+**Staleness is detected by comparing UUIDs, without calling the agent.**
+A VM rebuilt behind the same Node object has a new `BIOSGUID`, so kubelet
+reports a new `systemUUID`, and the record's source no longer matches: the
+controller rediscovers, and a restarting node plugin keeps waiting rather
+than registering with the previous VM's ID. A node whose record is current
+costs nothing — no agent call and no write.
+
+A node no host claims is asked about again every five minutes: a VM
+outside the cluster, or on a host that was Down and so not asked, can turn
+up later. Other failures retry with exponential backoff.
+
+The trust model is unchanged from what came before: the identity is
+self-reported by the node, through kubelet's `systemUUID`. `--node-id`
+remains as an explicit override, and with it set the node plugin makes no
+Kubernetes call at all.
+
+### Unique BIOSGUIDs
+
+Discovery is complete at the first match and does not look for
+duplicates, so **every node VM needs its own `BIOSGUID`**. Hyper-V keeps it
+when a VM is copied: `Import-VM -Copy -GenerateNewId` gives the copy a new
+VM ID but the original's `BIOSGUID` and serial number. A node VM built by
+copying another node, rather than from a golden image that has never run
+as a node, would claim the original's identity, and whichever of the two
+hosts answered first would win. Two Kubernetes nodes claiming one VM goes
+badly in other ways too; it is a documented requirement rather than
+something the driver designs around.
+
+`BIOSGUID` can be changed only while the VM is off, and the value written
+must be braced (`{GUID}`) even though it reads back bare. With the VM off,
+from Windows PowerShell on its host:
+
+```powershell
+$name = 'csidevnode03'
+$vssd = Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_VirtualSystemSettingData `
+    -Filter "ElementName = '$name' AND VirtualSystemType = 'Microsoft:Hyper-V:System:Realized'"
+$vssd.BIOSGUID = '{' + [guid]::NewGuid() + '}'
+$service = Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_VirtualSystemManagementService
+$service.ModifySystemSettings($vssd.GetText(1))
+```
+
+A return value of 0 means it was applied. A node rebuilt this way is
+picked up by the staleness check above as soon as kubelet reports the new
+`systemUUID`.
+
+### The node ID stays opaque
 
 The node ID stays opaque above the resolution, which is what keeps this
 swap local. Nothing but `IClusterService.ResolveVmAsync` interprets it,

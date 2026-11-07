@@ -15,10 +15,10 @@ namespace HyperVCsiAgent.Core.Jobs;
 /// by agreement.
 /// <para>
 /// <see cref="Vm"/> is the case that proves it. A VM's ID reaches this agent
-/// from at least two directions - the CSI node ID the node plugin read out of
-/// the guest's key-value pools, and the <c>VmID</c> the cluster database
+/// from at least two directions - the CSI node ID the node plugin reports, which
+/// discovery recorded on its Node object, and the <c>VmID</c> the cluster database
 /// records - and, per <c>MsClusterService</c>'s own comment on the subject,
-/// clustering and the KVP pools agree on neither braces nor case. Two spellings
+/// clustering and other sources agree on neither braces nor case. Two spellings
 /// of one VM are two FIFO queues, which is not a slightly-degraded serialization
 /// but no serialization at all, arrived at silently. Canonicalizing at the one
 /// site where the string is made is what removes that failure rather than

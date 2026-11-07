@@ -18,7 +18,7 @@ public interface IClusterService
     /// <remarks>
     /// This is the only place a node ID is interpreted. Everything downstream
     /// uses the <see cref="ClusteredVm"/> this returns, so what a node ID is -
-    /// the VM's GUID, read out of the guest's key-value pools by the node
+    /// the VM's GUID, which discovery recorded on the Node object and the node
     /// plugin - is known to this method and to nothing else.
     ///
     /// Nothing about it is a name, deliberately: an implementation must match

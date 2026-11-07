@@ -35,6 +35,38 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      # Waits until the controller has recorded this node's Hyper-V VM ID on
+      # its Node object - discovered from the node's SMBIOS UUID - and exits.
+      # Normally seconds; as long as the controller or the agent is down
+      # otherwise, and the pod reads Init:0/1 meanwhile.
+      #
+      # An init container rather than a wait inside the plugin, so nothing
+      # else in the pod starts until the plugin can say who it is:
+      # node-driver-registrar gives up on a CSI socket that has not appeared
+      # within a fixed 30 seconds, and would crash-loop through a longer wait
+      # and then sit out its backoff after the identity arrived. Init
+      # containers are not liveness-probed, so the wait needs no probe tuning
+      # either.
+      initContainers:
+        - name: node-identity
+          image: {{ include "hyperv-csi.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --mode=node-identity
+            - --v={{ .Values.logging.verbosity }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          # Reads /sys/class/dmi/id/product_uuid (root-owned, mode 0400 - root
+          # in the container reads it as its owner, no capability needed) and
+          # the Node object. Nothing else.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
       containers:
         - name: node-driver-registrar
           image: {{ .Values.node.registrar.image }}
@@ -75,18 +107,26 @@ spec:
           args:
             - --mode=node
             # No --node-id: the node identifies itself by its Hyper-V VM ID,
-            # read from the key-value pools below. That is the value kubelet
-            # records in CSINode and external-attacher hands to
-            # ControllerPublishVolume, so the agent resolves a node to a VM by
-            # identity rather than by matching names.
+            # which the controller discovers from the node's SMBIOS UUID and
+            # records on its Node object. The init container above waits for
+            # that record; this re-checks it against its own
+            # /sys/class/dmi/id/product_uuid, and reports the VM ID - the value
+            # kubelet records in CSINode and
+            # external-attacher hands to ControllerPublishVolume, so the agent
+            # resolves a node to a VM by identity rather than by matching names.
             - --endpoint=unix:///csi/csi.sock
             - --v={{ .Values.logging.verbosity }}
-            - --kvp-pool-dir=/var/lib/hyperv
             {{- if .Values.node.unsafeAllowMissingDiskId }}
             # See node.unsafeAllowMissingDiskId in values.yaml - a migration
             # escape hatch, not meant to stay on.
             - --allow-missing-disk-id
             {{- end }}
+          env:
+            # Which Node object to read the recorded VM ID from.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
@@ -108,13 +148,6 @@ spec:
             # include host block devices without this.
             - name: device-dir
               mountPath: /dev
-            # Read-only: the host publishes into these pools and the guest only
-            # reads them. hv_kvp_daemon must be running on the node (the
-            # hyperv-daemons package) or this directory is empty and the plugin
-            # refuses to start rather than guessing at its own identity.
-            - name: hyperv-kvp
-              mountPath: /var/lib/hyperv
-              readOnly: true
           # Served by the liveness-probe sidecar above, which shares this pod's
           # network namespace; named here so the probe below can reference it.
           ports:
@@ -153,14 +186,6 @@ spec:
         - name: device-dir
           hostPath:
             path: /dev
-            type: Directory
-        - name: hyperv-kvp
-          hostPath:
-            path: {{ .Values.node.kvpPoolDir }}
-            # Directory, not DirectoryOrCreate: conjuring an empty one would
-            # turn "integration services are not running" into a pod that starts
-            # and then fails to find its VM ID, which is a longer path to the
-            # same answer.
             type: Directory
       {{- with .Values.node.nodeSelector }}
       nodeSelector:

@@ -516,7 +516,7 @@ const volumeContextDiskID = "diskId"
 // Idempotency key: volume ID + node ID.
 //
 // The node ID is opaque here and stays that way. It is the guest's own Hyper-V
-// VM ID, read from the key-value pools by the node plugin and reported by
+// VM ID, recorded on its Node object by discovery, read back by the node plugin and reported by
 // NodeGetInfo; the agent alone interprets it, by matching that GUID against the
 // cluster database. Nothing in this file depends on what the value is.
 //

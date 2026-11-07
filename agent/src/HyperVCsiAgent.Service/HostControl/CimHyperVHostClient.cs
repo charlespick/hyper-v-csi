@@ -51,7 +51,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     /// configuration, as opposed to a checkpoint's or a planned VM's. Read off
     /// a live host.
     /// </summary>
-    private const string RealizedVirtualSystemType = "Microsoft:Hyper-V:System:Realized";
+    internal const string RealizedVirtualSystemType = "Microsoft:Hyper-V:System:Realized";
 
     /// <summary>
     /// Addresses per synthetic SCSI controller. Hyper-V's own limit; a VM with

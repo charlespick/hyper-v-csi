@@ -12,22 +12,17 @@ metadata:
   {{- end }}
 {{- end }}
 {{- if .Values.rbac.create }}
-{{- if .Values.controller.nodeFencing.enabled }}
 ---
 # Scoped to what the driver container itself needs, independent of any
-# sidecar - which is node fencing and nothing else, so the whole role is
-# rendered only when controller.nodeFencing.enabled is set, for the same reason
-# the snapshotter role below is conditional: an install that has not opted in
-# should not be carrying grants for a controller it is not running, least of
-# all a standing grant to write to every Node in the cluster.
+# sidecar: node discovery always, and node fencing when
+# controller.nodeFencing.enabled is set. The fencing rules are conditional for
+# the same reason the snapshotter role below is: an install that has not opted
+# in should not be carrying grants for a controller it is not running, least of
+# all a standing update on every Node in the cluster.
 #
-# The CSINode read is how node fencing turns a tainted node into this driver's
-# VM ID - the CSI node ID kubelet recorded there. The attacher role below
-# already permits the same read, but it is declared again here because this
-# need is the driver's own and does not depend on external-attacher being
-# deployed. The nodes rule is of a different kind: a write onto a core object
-# outside storage, whose effect is to make Kubernetes force-delete pods and
-# detach their disks.
+# The node plugin runs under this same ServiceAccount, and its startup read of
+# its own Node object (for the VM ID discovery recorded there) is covered by
+# the get below.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -35,11 +30,28 @@ metadata:
   labels:
     {{- include "hyperv-csi.labels" . | nindent 4 }}
 rules:
+  # Node discovery: get/list/watch feed the Node informer that spots a node
+  # with no VM ID recorded for its current systemUUID, and patch writes the
+  # csi.hyper-v.makerland.xyz/vm-id annotations back. patch is safe here, in a
+  # way it is not for the fencing taint below: a JSON merge patch on
+  # metadata.annotations merges key by key, so it touches only those two
+  # annotations and cannot drop anything another writer added.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch"]
+  {{- if .Values.controller.nodeFencing.enabled }}
+  # The CSINode read is how node fencing turns a tainted node into this
+  # driver's VM ID - the CSI node ID kubelet recorded there. The attacher role
+  # below already permits the same read, but it is declared again here because
+  # this need is the driver's own and does not depend on external-attacher being
+  # deployed.
   - apiGroups: ["storage.k8s.io"]
     resources: ["csinodes"]
     verbs: ["get", "list", "watch"]
-  # get/list/watch feed the Node informer that spots the unreachable:NoExecute
-  # taint. update is what writes node.kubernetes.io/out-of-service back.
+  # update is what writes node.kubernetes.io/out-of-service back - a write onto
+  # a core object outside storage, whose effect is to make Kubernetes
+  # force-delete pods and detach their disks. The informer that spots the
+  # unreachable:NoExecute taint is fed by the get/list/watch above.
   #
   # It has to be update, not patch, and this is not the usual "we were lazy"
   # case — do not tighten it. NodeSpec.Taints is +listType=atomic with no
@@ -56,7 +68,8 @@ rules:
   # No nodes/status: taints live in spec, not status.
   - apiGroups: [""]
     resources: ["nodes"]
-    verbs: ["get", "list", "watch", "update"]
+    verbs: ["update"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -72,7 +85,6 @@ roleRef:
   kind: ClusterRole
   name: {{ include "hyperv-csi.fullname" . }}-driver
   apiGroup: rbac.authorization.k8s.io
-{{- end }}
 ---
 # Scoped to what external-provisioner actually needs. Resize has its own role
 # below. The snapshot reads at the end are what restore-from-snapshot costs the
