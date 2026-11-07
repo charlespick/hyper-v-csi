@@ -434,6 +434,85 @@ func (c *Client) GetVMClusterState(ctx context.Context, vmID string) (*VMCluster
 	return &state, nil
 }
 
+// ErrVMNotDiscovered is what DiscoverVM returns for a 404: every Hyper-V host
+// in the cluster that is up answered, and none of them runs a VM with that
+// SMBIOS UUID. The node is not a VM in this cluster, or its VM is somewhere the
+// cluster does not manage.
+var ErrVMNotDiscovered = errors.New("no Hyper-V host in the cluster runs a VM with this SMBIOS UUID")
+
+// ErrDiscoveryIncomplete is what DiscoverVM returns for a 503: no match, but
+// the answer is not complete either - the cluster's node list was unreadable,
+// or some host that is up did not answer, and the VM may be on exactly that
+// host. Retryable, and distinct from ErrVMNotDiscovered on purpose.
+var ErrDiscoveryIncomplete = errors.New("discovery could not hear from every Hyper-V host")
+
+// DiscoveredVM mirrors DiscoveredVm on the .NET side - the answer to "which VM
+// is this node", as GET /v1/vm-discovery/{biosGuid} serializes it. Field names
+// are pinned there by VmDiscoveryEndpointTests; change this struct and those
+// tests together.
+type DiscoveredVM struct {
+	// BiosGUID is the SMBIOS UUID that was searched for, lowercase.
+	BiosGUID string `json:"biosGuid"`
+
+	// VMID is the VM's ID, lowercase: the value the node plugin reports as its
+	// CSI node ID once it is recorded on the Node object.
+	VMID string `json:"vmId"`
+
+	// HostName is the host that reported the match. Informational only - the
+	// VM can move, and nothing should hold on to where it was found.
+	HostName string `json:"hostName"`
+}
+
+// DiscoverVM calls GET /v1/vm-discovery/{biosGuid}: which VM in the cluster
+// has this SMBIOS UUID, which is what kubelet reports as a node's
+// status.nodeInfo.systemUUID. Synchronous like GetVMClusterState, but a
+// fan-out on the agent side - it asks every host - so it is for the one-time
+// discovery of a node's VM, not for any request path.
+//
+//   - 404 is ErrVMNotDiscovered - every host answered, none matched.
+//   - 503 is ErrDiscoveryIncomplete - retryable.
+//   - Anything else non-2xx, a body that will not decode, or an answer
+//     without a VM ID is a descriptive error.
+//
+// On every error path the returned pointer is nil.
+func (c *Client) DiscoverVM(ctx context.Context, biosGUID string) (*DiscoveredVM, error) {
+	path := "/v1/vm-discovery/" + url.PathEscape(biosGUID)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url(path), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		drainBody(resp)
+		return nil, ErrVMNotDiscovered
+	case resp.StatusCode == http.StatusServiceUnavailable:
+		// The agent's message names the hosts that did not answer, which is
+		// the one thing an operator needs from this, so it is kept.
+		return nil, fmt.Errorf("%w: %w", ErrDiscoveryIncomplete, readAgentError(resp, req.URL.Path))
+	case resp.StatusCode >= 300:
+		return nil, readAgentError(resp, req.URL.Path)
+	}
+
+	var found DiscoveredVM
+	if err := json.NewDecoder(resp.Body).Decode(&found); err != nil {
+		return nil, fmt.Errorf("decoding discovered VM from %s: %w", req.URL.Path, err)
+	}
+	if found.VMID == "" {
+		return nil, fmt.Errorf("agent returned a discovered VM with no id from %s", req.URL.Path)
+	}
+
+	klog.V(3).InfoS("agentclient: VM discovered", "biosGuid", biosGUID, "vmId", found.VMID, "host", found.HostName)
+	return &found, nil
+}
+
 func (c *Client) do(req *http.Request) (*Job, error) {
 	start := time.Now()
 	resp, err := c.HTTPClient.Do(req)

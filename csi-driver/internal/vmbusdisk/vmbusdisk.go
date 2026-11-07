@@ -41,7 +41,7 @@ import (
 // this information. Resolve takes them as parameters, rather than hardcoding
 // them, so a test can substitute a temporary directory for both and drive
 // the resolution logic without a real VMBus/SCSI stack — the same shape as
-// hypervkvp.VirtualMachineID taking a pool directory.
+// nodeidentity.ReadProductUUID taking a path.
 const (
 	DefaultSysRoot = "/sys"
 	DefaultDevRoot = "/dev"

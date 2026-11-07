@@ -1,6 +1,7 @@
 using HyperVCsiAgent.Core;
 using HyperVCsiAgent.Core.Cluster;
 using HyperVCsiAgent.Core.Configuration;
+using HyperVCsiAgent.Core.Discovery;
 using HyperVCsiAgent.Core.HostControl;
 using HyperVCsiAgent.Core.Jobs;
 using HyperVCsiAgent.Core.Security;
@@ -121,6 +122,7 @@ if (OperatingSystem.IsWindows())
     builder.Services.AddSingleton<NetFtAddressTable>();
     builder.Services.AddSingleton<IVhdxLocationService, CsvFileOwnershipService>();
     builder.Services.AddSingleton<IStorageQosPolicyStore, CimStorageQosPolicyStore>();
+    builder.Services.AddSingleton<IVmBiosGuidLookup, CimVmBiosGuidLookup>();
 }
 else
 {
@@ -130,6 +132,7 @@ else
     builder.Services.AddSingleton<IDiskCopier, UnsupportedDiskCopier>();
     builder.Services.AddSingleton<IVhdxLocationService, UnsupportedVhdxLocationService>();
     builder.Services.AddSingleton<IStorageQosPolicyStore, UnsupportedStorageQosPolicyStore>();
+    builder.Services.AddSingleton<IVmBiosGuidLookup, UnsupportedVmBiosGuidLookup>();
 }
 
 #if DEBUG
@@ -161,6 +164,7 @@ builder.Services.AddSingleton<SnapshotCopySlots>();
 builder.Services.AddSingleton<HostOperationSlots>();
 
 builder.Services.AddSingleton<IVhdxService, VhdxService>();
+builder.Services.AddSingleton<VmDiscoveryService>();
 builder.Services.AddSingleton<IAttachService, AttachService>();
 
 // Depends on IJobStore for the same one-way reason SnapshotService below does:
@@ -324,6 +328,58 @@ app.MapGet("/v1/jobs/{id}", (string id, IJobStore jobStore) =>
 {
     var job = jobStore.Get(id);
     return job is null ? Results.NotFound() : Results.Ok(job);
+});
+
+// Node discovery: which VM a Kubernetes node is running in, from the node's
+// SMBIOS UUID (status.nodeInfo.systemUUID, the VM's BIOSGUID). The controller
+// calls this once per node and records the VM ID on the Node object; see
+// VmDiscoveryService for why it is a fan-out and why that is acceptable here.
+//
+// Synchronous, and not behind JobIntakeGate, for the reasons the cluster-state
+// read below gives: it mutates nothing and claims no vm:<id> target, so it has
+// no job to serialize against and no race with the reaper's sweep to lose.
+//
+// The per-host lookups are bounded at 20 seconds, inside the driver's 30-second
+// HTTP timeout, so a silent host comes back as a 503 that names it. The node
+// listing ahead of them is a local MSCluster_Node query bounded only by
+// HostOperationTimeout, so a cluster service that wedges there can outlast the
+// driver's timeout; the driver then sees a client-side timeout, which it
+// retries with backoff exactly as it does a 503 - never as "not found".
+//
+// The status codes are the contract. 404 means every node that is up answered
+// and none runs the VM. 503 means that answer could not be completed - the node
+// list was unreadable, or some node did not answer - and the caller retries.
+// The two must not blur: a 404 built from a partial answer would tell the
+// controller to stop looking for a VM that may be on exactly the host that was
+// silent.
+app.MapGet("/v1/vm-discovery/{biosGuid}", async (
+    string biosGuid,
+    VmDiscoveryService discovery,
+    ILogger<Program> logger,
+    CancellationToken cancellationToken) =>
+{
+    if (!WqlNames.IsBiosGuid(biosGuid))
+    {
+        return Results.BadRequest(new { error = $"{biosGuid} is not an 8-4-4-4-12 BIOSGUID" });
+    }
+
+    try
+    {
+        var found = await discovery.DiscoverAsync(biosGuid, cancellationToken);
+        return found is null
+            ? Results.NotFound(new { error = $"no cluster node runs a VM with BIOSGUID {biosGuid}" })
+            : Results.Ok(found);
+    }
+    catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+    {
+        // VmDiscoveryIncompleteException is the expected case, and the service
+        // has already logged each silent host; anything else gets the same
+        // answer - nothing was concluded, so ask again.
+        logger.LogWarning(ex, "Could not complete discovery of the VM with BIOSGUID {BiosGuid}", biosGuid);
+        return Results.Json(
+            new { error = $"discovery of BIOSGUID {biosGuid} was incomplete; retry shortly: {ex.Message}" },
+            statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
 });
 
 // A plain synchronous read, deliberately not a job. POST /v1/jobs exists to

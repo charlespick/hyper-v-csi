@@ -43,9 +43,12 @@ VolumeAttributesClass — see [docs/storage-qos.md](docs/storage-qos.md).
 - A domain service account for the agent, with Hyper-V Administrators rights on
   every Hyper-V host and enough Failover Cluster permissions to act on a failed
   node's role (needed for forced detach)
-- The `hyperv-daemons` package (including `hv_kvp_daemon`) installed in every
-  guest node, with the Data Exchange integration service enabled — this is how
-  the driver discovers a guest's own VM identity
+- A **unique BIOSGUID** (SMBIOS UUID) on every node VM. The driver finds each
+  node's VM from it — kubelet already reports it as the node's `systemUUID` —
+  so nothing needs installing in the guest. Hyper-V keeps the BIOSGUID when a
+  VM is copied or copy-imported, so a node VM copied from another node (rather
+  than built from a golden image) must be given a new one; see
+  [Node identity](docs/node-identity-and-attach.md#unique-biosguids)
 - `kubectl` and `helm` access to the target Kubernetes cluster
 
 ### Snapshots need ReFS

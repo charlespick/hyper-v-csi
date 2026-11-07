@@ -170,8 +170,9 @@ controller:
   # assumption, and the cost of it being wrong is the double-mount this whole
   # design exists to avoid.
   #
-  # Enabling this also grants the driver's ClusterRole get/list/watch/update on
-  # nodes, which is a new privilege category for this chart — see rbac.yaml.
+  # Enabling this also grants the driver's ClusterRole update on nodes (on top
+  # of the get/list/watch/patch node discovery always has) and CSINode reads —
+  # see rbac.yaml.
   #
   # The taint is applied and never removed. Clearing it is a manual step during
   # node recovery (kubectl taint nodes <node> node.kubernetes.io/out-of-service-)
@@ -238,11 +239,12 @@ controller:
 # it passes to ControllerPublishVolume. Without it there is no node ID to
 # resolve and no attach can complete, whatever attachRequired says.
 #
-# Two things the guest must have, and the plugin refuses to start without them
-# rather than falling back to its hostname: the hyperv-daemons package with
-# hv_kvp_daemon running, and the Data Exchange integration service enabled on
-# the VM. That is where the Hyper-V VM ID it reports as the CSI node ID comes
-# from.
+# The Hyper-V VM ID it reports as the CSI node ID needs nothing installed in
+# the guest. The controller discovers it from the node's SMBIOS UUID
+# (status.nodeInfo.systemUUID) by asking the agent, and records it on the Node
+# object; the plugin waits for that record at startup rather than falling back
+# to its hostname. See docs/node-identity-and-attach.md, including why every
+# node VM needs a unique BIOSGUID.
 node:
   enabled: true
 
@@ -256,14 +258,6 @@ node:
     image: registry.k8s.io/sig-storage/livenessprobe:v2.14.0
 
   kubeletDir: /var/lib/kubelet
-
-  # Where hv_kvp_daemon keeps the Hyper-V key-value pools. The node plugin reads
-  # its own VM ID from these and reports it as the CSI node ID, which is what
-  # lets the agent resolve a node to a VM by identity instead of by name. Every
-  # node therefore needs the hyperv-daemons package installed and the Data
-  # Exchange integration service enabled on its VM; without them the pools are
-  # absent and the node plugin refuses to start.
-  kvpPoolDir: /var/lib/hyperv
 
   # Migration escape hatch for upgrading from a release candidate installed
   # before NodeStageVolume verified the resolved disk's own identity (see

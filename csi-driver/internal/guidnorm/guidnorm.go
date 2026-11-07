@@ -1,6 +1,6 @@
 // Package guidnorm normalizes the canonical Windows/Hyper-V GUID string
 // format. Every package that reads a GUID from a Hyper-V-published source
-// (KVP data exchange, CIM) needs the same normalization, since the host may
+// (the agent, CIM, SMBIOS via sysfs) needs the same normalization, since the host may
 // or may not brace or case it depending on version, but what receives the
 // value afterward (a WQL query, a sysfs path) expects the canonical form.
 package guidnorm

@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc"
@@ -22,9 +23,17 @@ import (
 
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/agentclient"
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/driver"
-	"github.com/charlespick/hyper-v-csi/csi-driver/internal/hypervkvp"
+	"github.com/charlespick/hyper-v-csi/csi-driver/internal/nodediscovery"
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/nodefencing"
+	"github.com/charlespick/hyper-v-csi/csi-driver/internal/nodeidentity"
 )
+
+// nodeIdentityPollInterval is how often a starting node plugin re-reads its
+// Node object for the VM ID the controller records. Discovery is one agent
+// round trip after the node registers, so a short interval gets the plugin
+// serving promptly; it is one keyed GET per node per interval, only while
+// starting.
+const nodeIdentityPollInterval = 2 * time.Second
 
 func main() {
 	klog.InitFlags(nil)
@@ -32,11 +41,12 @@ func main() {
 
 	var (
 		endpoint = flag.String("endpoint", "unix:///csi/csi.sock", "CSI endpoint")
-		mode     = flag.String("mode", "node", "driver mode: controller or node")
+		mode     = flag.String("mode", "node",
+			"driver mode: controller, node, or node-identity (wait until this node's VM ID is recorded on its Node object, then exit - the node DaemonSet's init container)")
 		nodeID   = flag.String("node-id", "",
-			"node ID override. In node mode this is read from the Hyper-V key-value pools when unset, which is the supported configuration")
-		kvpPoolDir = flag.String("kvp-pool-dir", hypervkvp.DefaultPoolDir,
-			"directory holding the Hyper-V key-value pool files hv_kvp_daemon maintains")
+			"node ID override. In node mode this is the Hyper-V VM ID the controller records on this node's Node object when unset, which is the supported configuration")
+		nodeName = flag.String("node-name", os.Getenv("NODE_NAME"),
+			"name of the Kubernetes Node this plugin runs on, whose recorded VM ID it reports. Defaults to $NODE_NAME. Node mode only")
 		agentAddress = flag.String("agent-address", "", "hyperv-csi-agent base URL (required in controller mode)")
 
 		// Off by default, and deliberately so - see Driver.AllowMissingDiskID.
@@ -91,33 +101,89 @@ func main() {
 		if *allowMissingDiskID {
 			klog.Fatal("--allow-missing-disk-id is a node-mode flag; the controller server does not run NodeStageVolume")
 		}
-	case "node":
+	case "node", "node-identity":
 		if *nodeFencing {
-			klog.Fatal("--node-fencing is a controller-mode flag; the node server has no Kubernetes client and does not watch Node objects")
+			klog.Fatal("--node-fencing is a controller-mode flag; the node server does not watch Node objects")
 		}
-		// The node's identity is its Hyper-V VM ID, which only the guest can
-		// learn and only through the host's key-value pools. Reported verbatim
-		// by NodeGetInfo, recorded by kubelet in the CSINode object, and handed
+	default:
+		klog.Fatalf("invalid --mode %q: must be \"controller\", \"node\" or \"node-identity\"", *mode)
+	}
+
+	// Kubelet stops the container with SIGTERM. Established here, ahead of
+	// everything that can block, because the node plugin's wait for its VM ID
+	// below and the controller's background loops all have to stop on it, as
+	// well as the gRPC server.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Both modes talk to Kubernetes for node identity: the controller records
+	// each node's VM ID on its Node object, and the node plugin reads its own
+	// back. In-cluster config is what a pod under its own ServiceAccount uses,
+	// the same way every sidecar in this chart talks to the API server. The
+	// one configuration that needs no client is a node plugin given --node-id.
+	var kubeClient kubernetes.Interface
+	if *mode == "controller" || *nodeID == "" {
+		config, err := rest.InClusterConfig()
+		if err != nil {
+			klog.Fatalf("building in-cluster Kubernetes config: %v", err)
+		}
+		kubeClient, err = kubernetes.NewForConfig(config)
+		if err != nil {
+			klog.Fatalf("building Kubernetes client: %v", err)
+		}
+	}
+
+	if *mode == "node" || *mode == "node-identity" {
+		// The node's identity is its Hyper-V VM ID. Reported verbatim by
+		// NodeGetInfo, recorded by kubelet in the CSINode object, and handed
 		// back to ControllerPublishVolume by external-attacher, which is what
 		// lets the agent resolve a node to a VM by identity rather than by
 		// matching names.
 		//
-		// Fatal rather than falling back to the node name: a fallback would let
-		// a node whose Data Exchange service is off register anyway and attach
-		// against whatever VM happens to share its name.
+		// The guest cannot learn it from firmware - only its SMBIOS UUID - so
+		// the controller discovers it from that UUID and records it on the
+		// Node. This waits for that record, and accepts it only when it was
+		// discovered from this VM's own product_uuid. No fallback to the node
+		// name: that would let a node register before its identity is known
+		// and attach against whatever VM happens to share its name.
+		//
+		// In the chart, the long wait happens in an init container running
+		// --mode=node-identity, which exits once the record is there. Waiting
+		// there rather than here is what keeps the sidecars from starting
+		// early: node-driver-registrar gives up on a CSI socket that has not
+		// appeared within a fixed 30 seconds and would crash-loop through any
+		// longer wait, then sit out its backoff after the identity arrived.
+		// This container repeats the same check, which by then passes at once.
 		if *nodeID == "" {
-			id, err := hypervkvp.VirtualMachineID(*kvpPoolDir)
-			if err != nil {
-				klog.Fatalf("resolving this node's Hyper-V VM ID: %v", err)
+			if *nodeName == "" {
+				klog.Fatal("--node-name (or $NODE_NAME from the downward API) is required to read this node's recorded VM ID")
 			}
 
-			klog.InfoS("node identity resolved from the Hyper-V key-value pools", "vmId", id)
+			productUUID, err := nodeidentity.ReadProductUUID(nodeidentity.DefaultProductUUIDPath)
+			if err != nil {
+				klog.Fatal(err)
+			}
+
+			klog.InfoS("waiting for this node's Hyper-V VM ID to be recorded on its Node object",
+				"node", *nodeName, "productUUID", productUUID)
+			id, err := nodeidentity.WaitForVMID(ctx, nodeidentity.Nodes(kubeClient), *nodeName, productUUID, nodeIdentityPollInterval)
+			if err != nil {
+				// The only way out of the wait is ctx, so this is a stop
+				// signal arriving before the node was identified - an
+				// ordinary shutdown, not a failure.
+				klog.InfoS("stopped while waiting for this node's Hyper-V VM ID", "reason", err)
+				return
+			}
+
+			klog.InfoS("node identity read from the Node object", "node", *nodeName, "vmId", id)
 			*nodeID = id
 		} else {
-			klog.Warningf("--node-id %q was set explicitly, bypassing resolution of this node's identity from the Hyper-V key-value pools", *nodeID)
+			klog.Warningf("--node-id %q was set explicitly, bypassing this node's VM ID recorded by discovery", *nodeID)
 		}
-	default:
-		klog.Fatalf("invalid --mode %q: must be \"controller\" or \"node\"", *mode)
+
+		if *mode == "node-identity" {
+			return
+		}
 	}
 
 	// Built in either mode when an address is given. Node mode has no RPC that
@@ -135,26 +201,25 @@ func main() {
 
 	d := driver.New(*nodeID, agent, *allowMissingDiskID)
 
-	// Kubelet stops the container with SIGTERM. Established here rather than
-	// just before Serve because the node-fencing controller below shares it:
-	// one signal has to stop both the gRPC server and every background loop.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	if *mode == "controller" {
+		// Unconditional, unlike fencing: without a recorded VM ID no node
+		// plugin finishes starting, so nothing could attach anywhere.
+		discoverer, err := nodediscovery.New(kubeClient, agent)
+		if err != nil {
+			klog.Fatal(err)
+		}
+
+		go func() {
+			// Like fencing below, a watch that cannot be set up is logged
+			// loudly rather than taking down the CSI RPCs, which keep serving
+			// the nodes that are already identified.
+			if err := discoverer.Run(ctx); err != nil && ctx.Err() == nil {
+				klog.Errorf("node discovery stopped; new nodes will not be identified until this pod restarts: %v", err)
+			}
+		}()
+	}
 
 	if *nodeFencing {
-		// Node fencing is the only thing that talks to Kubernetes, so the client
-		// is built only when it is on. In-cluster config is what a pod running
-		// under its own ServiceAccount uses, the same way every sidecar in this
-		// chart already talks to the API server.
-		config, err := rest.InClusterConfig()
-		if err != nil {
-			klog.Fatalf("building in-cluster Kubernetes config: %v", err)
-		}
-		kubeClient, err := kubernetes.NewForConfig(config)
-		if err != nil {
-			klog.Fatalf("building Kubernetes client: %v", err)
-		}
-
 		fencer, err := nodefencing.New(nodefencing.Config{
 			KubeClient:    kubeClient,
 			ClusterStates: agent,
