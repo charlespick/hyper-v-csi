@@ -18,7 +18,7 @@ public class VmTargetAssertingHyperVHostClientTests
         var client = new VmTargetAssertingHyperVHostClient(new RecordingHostClient());
 
         await Assert.ThrowsAsync<InvalidOperationException>(
-            () => client.AttachDiskAsync("hv-01", VmId, @"C:\path.vhdx", new DiskSlot("ctrl", "ctrl-guid", 0), CancellationToken.None));
+            () => client.AttachDiskAsync("hv-01", VmId, @"C:\path.vhdx", new DiskSlot("ctrl", "ctrl-guid", 0), Guid.Empty, CancellationToken.None));
     }
 
     [Fact]
@@ -29,7 +29,7 @@ public class VmTargetAssertingHyperVHostClientTests
         using (JobExecutionContext.Enter(["vm:some-other-vm"]))
         {
             await Assert.ThrowsAsync<InvalidOperationException>(
-                () => client.AttachDiskAsync("hv-01", VmId, @"C:\path.vhdx", new DiskSlot("ctrl", "ctrl-guid", 0), CancellationToken.None));
+                () => client.AttachDiskAsync("hv-01", VmId, @"C:\path.vhdx", new DiskSlot("ctrl", "ctrl-guid", 0), Guid.Empty, CancellationToken.None));
         }
     }
 
@@ -42,7 +42,7 @@ public class VmTargetAssertingHyperVHostClientTests
 
         using (JobExecutionContext.Enter(["vm:" + VmId, "volume:pvc-1"]))
         {
-            await client.AttachDiskAsync("hv-01", VmId, @"C:\path.vhdx", slot, CancellationToken.None);
+            await client.AttachDiskAsync("hv-01", VmId, @"C:\path.vhdx", slot, Guid.Empty, CancellationToken.None);
         }
 
         Assert.Equal(("hv-01", VmId, @"C:\path.vhdx", slot), inner.LastAttach);
@@ -91,6 +91,30 @@ public class VmTargetAssertingHyperVHostClientTests
 
         Assert.NotNull(inner.LastResize);
         Assert.NotNull(inner.LastCreateCheckpoint);
+    }
+
+    [Fact]
+    public async Task SetDiskQosPolicyAsync_IsAsserted()
+    {
+        // Writing a policy ID onto a running VM's disk reaches into the VM as
+        // surely as an attach does, so a QoS change has to hold vm: for it.
+        // qos: alone - the volume's own lock - is not that.
+        var inner = new RecordingHostClient();
+        var client = new VmTargetAssertingHyperVHostClient(inner);
+        var policy = Guid.NewGuid();
+
+        using (JobExecutionContext.Enter(["qos:pvc-1"]))
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => client.SetDiskQosPolicyAsync("hv-01", VmId, @"C:\path.vhdx", policy, CancellationToken.None));
+        }
+
+        using (JobExecutionContext.Enter(["qos:pvc-1", "vm:" + VmId]))
+        {
+            await client.SetDiskQosPolicyAsync("hv-01", VmId, @"C:\path.vhdx", policy, CancellationToken.None);
+        }
+
+        Assert.Equal(("hv-01", VmId, @"C:\path.vhdx", policy), inner.LastSetQos);
     }
 
     [Fact]
@@ -155,6 +179,8 @@ public class VmTargetAssertingHyperVHostClientTests
 
         public (string HostName, string VmId, string VhdxPath)? LastDetach { get; private set; }
 
+        public (string HostName, string VmId, string VhdxPath, Guid PolicyId)? LastSetQos { get; private set; }
+
         public (string HostName, string VmId, string VhdxPath, long NewSizeBytes)? LastResize { get; private set; }
 
         public (string HostName, string VmId, string ElementName)? LastCreateCheckpoint { get; private set; }
@@ -175,9 +201,15 @@ public class VmTargetAssertingHyperVHostClientTests
         public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             Task.FromResult<DiskSlot?>(null);
 
-        public Task AttachDiskAsync(string hostName, string vmId, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken)
+        public Task AttachDiskAsync(string hostName, string vmId, string vhdxPath, DiskSlot slot, Guid qosPolicyId, CancellationToken cancellationToken)
         {
             LastAttach = (hostName, vmId, vhdxPath, slot);
+            return Task.CompletedTask;
+        }
+
+        public Task SetDiskQosPolicyAsync(string hostName, string vmId, string vhdxPath, Guid qosPolicyId, CancellationToken cancellationToken)
+        {
+            LastSetQos = (hostName, vmId, vhdxPath, qosPolicyId);
             return Task.CompletedTask;
         }
 

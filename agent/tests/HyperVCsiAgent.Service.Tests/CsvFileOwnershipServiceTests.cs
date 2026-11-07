@@ -1110,7 +1110,10 @@ public sealed class CsvFileOwnershipServiceTests
         public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
-        public Task AttachDiskAsync(string hostName, string vmId, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken) =>
+        public Task AttachDiskAsync(string hostName, string vmId, string vhdxPath, DiskSlot slot, Guid qosPolicyId, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task SetDiskQosPolicyAsync(string hostName, string vmId, string vhdxPath, Guid qosPolicyId, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
         public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>

@@ -19,4 +19,11 @@ public sealed class CreateVolumePayload
     /// operation would only duplicate that reasoning for the sake of a branch.
     /// </summary>
     public string? SourceSnapshotId { get; init; }
+
+    /// <summary>
+    /// The volume's QoS from its VolumeAttributesClass, or null for a PVC with
+    /// no class or one in a <c>qos: "none"</c> class - which is created exactly
+    /// as a volume always was, with no Storage QoS policy.
+    /// </summary>
+    public QosSettings? Qos { get; init; }
 }

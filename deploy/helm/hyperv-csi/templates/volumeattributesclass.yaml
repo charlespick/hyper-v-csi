@@ -1,0 +1,42 @@
+{{- /*
+VolumeAttributesClasses for this driver - Storage QoS. hyperv-none is always
+rendered: Kubernetes will not set a PVC's volumeAttributesClassName back to nil
+once one has been applied, and a class needs at least one parameter, so a class
+whose only parameter is qos: "none" is the way back to no QoS. The others come
+from .Values.volumeAttributesClasses. Parameters are not checked here; the
+driver validates them when a PVC is pointed at the class, and an unusable class
+leaves that PVC Infeasible. See docs/storage-qos.md.
+*/}}
+---
+apiVersion: storage.k8s.io/v1
+kind: VolumeAttributesClass
+metadata:
+  name: hyperv-none
+  labels:
+    {{- include "hyperv-csi.labels" $ | nindent 4 }}
+driverName: {{ include "hyperv-csi.driverName" $ }}
+parameters:
+  qos: "none"
+{{- range .Values.volumeAttributesClasses }}
+---
+apiVersion: storage.k8s.io/v1
+kind: VolumeAttributesClass
+metadata:
+  name: {{ required "every volumeAttributesClasses entry needs a name" .name }}
+  labels:
+    {{- include "hyperv-csi.labels" $ | nindent 4 }}
+  {{- with .annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+driverName: {{ include "hyperv-csi.driverName" $ }}
+parameters:
+  {{- /* Every value is a string to the API. An unquoted whole number in
+  values arrives here as a float64, which would print as 1e+06, so it is
+  rendered as an integer. Anything fractional is passed through as written,
+  for the driver to refuse, rather than truncated into a class whose
+  parameters can never be edited. */}}
+  {{- range $key, $value := required (printf "volumeAttributesClasses entry %s needs parameters" .name) .parameters }}
+  {{ $key }}: {{ if and (kindIs "float64" $value) (eq (float64 (int64 $value)) $value) }}{{ $value | int64 | quote }}{{ else }}{{ $value | toString | quote }}{{ end }}
+  {{- end }}
+{{- end }}

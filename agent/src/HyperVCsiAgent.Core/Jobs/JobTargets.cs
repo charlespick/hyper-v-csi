@@ -48,6 +48,37 @@ public static class JobTargets
     public static string Expansion(string volumeId) => "expand:" + volumeId;
 
     /// <summary>
+    /// The per-volume lock between a volume's Storage QoS policy and its disk's
+    /// attachment, held by attach, detach, delete and the QoS change itself -
+    /// around the policy read or write together with the disk change.
+    /// </summary>
+    /// <remarks>
+    /// Attach and detach serialize on the VM and modify on whatever VM the disk
+    /// is on, so without this an attach and a modify of one volume can run at
+    /// once: the attach finds no policy, the modify creates one and finds the
+    /// disk not yet attached, the attach finishes without the ID, and both
+    /// report success with QoS silently not applied.
+    /// <para>
+    /// Not <see cref="Volume"/>, which a snapshot copy holds for hours: an
+    /// attach queued behind that would wait for the whole copy. Nothing that
+    /// takes this runs for longer than a few host calls.
+    /// </para>
+    /// </remarks>
+    public static string Qos(string volumeId) => "qos:" + volumeId;
+
+    /// <summary>
+    /// The fast half of a ModifyVolume: repeat requests for one volume queue
+    /// behind each other here, while the change itself - an internal job,
+    /// <c>QosService.ApplyQos</c> - takes <see cref="Qos"/> and, when it has to
+    /// write the disk's policy ID on a running VM, <see cref="Vm"/>.
+    /// </summary>
+    /// <remarks>
+    /// Not <see cref="Qos"/> itself, for <see cref="Expansion"/>'s reason: the
+    /// fast job waits on the internal one, which needs that target.
+    /// </remarks>
+    public static string Modification(string volumeId) => "modify:" + volumeId;
+
+    /// <summary>
     /// The VM, for anything that reaches into it. Two attaches to one VM must
     /// not run at once - they would race for the same free SCSI slot - and,
     /// more sharply, nothing else may touch a VM while a snapshot copy is

@@ -29,6 +29,7 @@
 | Online/offline expansion | `ControllerExpandVolume` / `NodeExpandVolume` |
 | Snapshots | `CreateSnapshot` / `DeleteSnapshot` / restore via `CreateVolume(source)` |
 | Reclaim (delete/retain) | `DeleteVolume` |
+| Per-volume storage QoS | `VolumeAttributesClass` → `CreateVolume` / `ControllerModifyVolume`, enforced by a Hyper-V Storage QoS policy per volume — see [docs/storage-qos.md](docs/storage-qos.md) |
 
 ## Architecture
 

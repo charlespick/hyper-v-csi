@@ -120,6 +120,7 @@ if (OperatingSystem.IsWindows())
     builder.Services.AddSingleton<ICsvNodeProbe, CimCsvNodeProbe>();
     builder.Services.AddSingleton<NetFtAddressTable>();
     builder.Services.AddSingleton<IVhdxLocationService, CsvFileOwnershipService>();
+    builder.Services.AddSingleton<IStorageQosPolicyStore, CimStorageQosPolicyStore>();
 }
 else
 {
@@ -128,6 +129,7 @@ else
     builder.Services.AddSingleton<IHyperVHostClient, UnsupportedHyperVHostClient>();
     builder.Services.AddSingleton<IDiskCopier, UnsupportedDiskCopier>();
     builder.Services.AddSingleton<IVhdxLocationService, UnsupportedVhdxLocationService>();
+    builder.Services.AddSingleton<IStorageQosPolicyStore, UnsupportedStorageQosPolicyStore>();
 }
 
 #if DEBUG
@@ -160,6 +162,10 @@ builder.Services.AddSingleton<HostOperationSlots>();
 
 builder.Services.AddSingleton<IVhdxService, VhdxService>();
 builder.Services.AddSingleton<IAttachService, AttachService>();
+
+// Depends on IJobStore for the same one-way reason SnapshotService below does:
+// a QoS change that has to reach a running VM starts its own internal job.
+builder.Services.AddSingleton<IQosService, QosService>();
 
 // Depends on IJobStore, which is registered above and depends on nothing: the
 // snapshot service starts its own long-running copy job rather than doing the

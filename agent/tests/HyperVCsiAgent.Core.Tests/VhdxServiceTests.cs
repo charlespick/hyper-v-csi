@@ -1901,8 +1901,11 @@ public sealed class VhdxServiceTests : IDisposable
         public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             throw new NotSupportedException("VhdxService never attaches anything");
 
-        public Task AttachDiskAsync(string hostName, string vmId, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken) =>
+        public Task AttachDiskAsync(string hostName, string vmId, string vhdxPath, DiskSlot slot, Guid qosPolicyId, CancellationToken cancellationToken) =>
             throw new NotSupportedException("VhdxService never attaches anything");
+
+        public Task SetDiskQosPolicyAsync(string hostName, string vmId, string vhdxPath, Guid qosPolicyId, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
 
         public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
             throw new NotSupportedException("VhdxService never detaches anything");
@@ -1959,8 +1962,11 @@ public sealed class VhdxServiceTests : IDisposable
         public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
 
-        public Task AttachDiskAsync(string hostName, string vmId, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken) =>
+        public Task AttachDiskAsync(string hostName, string vmId, string vhdxPath, DiskSlot slot, Guid qosPolicyId, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");
+
+        public Task SetDiskQosPolicyAsync(string hostName, string vmId, string vhdxPath, Guid qosPolicyId, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
 
         public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("ExpandAsync's fallback should not be reached in this test");

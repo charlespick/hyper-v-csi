@@ -119,7 +119,11 @@ keeps.
 ## CreateVolume
 
 StorageClass `parameters` are ignored rather than consumed or rejected —
-tracked in [#23](https://github.com/charlespick/hyper-v-csi/issues/23).
+tracked in [#23](https://github.com/charlespick/hyper-v-csi/issues/23) — with one exception: the Storage QoS keys
+(`minIOPS`, `maxIOPS`, `maxBandwidth`, `qos`) are rejected with
+`InvalidArgument`, since QoS set there could never be changed. QoS comes
+from the PVC's VolumeAttributesClass, as `mutable_parameters`; see
+[storage-qos.md](storage-qos.md).
 `volume_context` is no longer empty, though: it carries one entry,
 `diskId` — the VHDX's own `VirtualDiskId`, read off the file at creation
 time — which `NodeStageVolume` checks the resolved device against before
@@ -129,6 +133,23 @@ another volume (`VolumeContentSource_Volume`) returns `Unimplemented` —
 `CLONE_VOLUME` is not advertised — but restoring from a snapshot
 (`VolumeContentSource_Snapshot`) is implemented and goes through the same
 RPC.
+
+## ControllerModifyVolume
+
+Applies a PVC's new VolumeAttributesClass, which for this driver is only
+ever Storage QoS — see [storage-qos.md](storage-qos.md) for the whole
+lifecycle. The idempotency key carries the requested QoS as well as the
+volume ID, for `ControllerExpandVolume`'s reason: a PVC repointed again
+while the first change is in flight must not come back as that change's
+job. The agent traces which VM, if any, has the disk open, and only takes
+that VM's `vm:` target when the disk's policy ID actually has to change on
+it; a change of values on a volume that already has QoS touches no VM.
+
+`mutable_parameters` is read as the whole of the volume's QoS, so a key
+the class leaves out is 0, not "unchanged". The CSI spec asks plugins
+not to act on an absent key, but Kubernetes always sends the entire new
+class, and full replacement is what keeps a volume's QoS a function of its
+current class alone.
 
 ## DeleteVolume
 

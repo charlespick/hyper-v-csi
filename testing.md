@@ -135,6 +135,15 @@ suite — passed all 64 reachable specs with nothing left behind. That is one
 data point, not a characterization, so the default stays 1; but it is
 evidence, not just caution.
 
+The volume-modify suite (`[Feature:VolumeAttributesClass]`, Storage QoS) was
+first run on 2026-11-06 with `-Focus 'csi\.hyper-v\.makerland\.xyz.*VolumeAttributesClass'`:
+all four filesystem specs passed - create with a class, modify a volume with
+none, modify one that has one, and the `vac-protection` finalizer. Focus on
+the driver name as well as the feature: the bare feature tag also selects the
+suite's own `csi-hostpath` driver, which deploys itself and does not run on
+this cluster. The `[Flaky]` invalid-class recovery spec stays silenced; it was
+checked by hand instead (see docs/storage-qos.md).
+
 Each run writes to `test/e2e/_artifacts/<profile>-<timestamp>/`: `junit.xml`,
 Ginkgo's aggregated report and the one for CI to read, alongside `e2e.test`'s
 own per-process `junit_NN.xml` and whatever it dumps from the cluster on a
@@ -182,7 +191,7 @@ flag is a statement about the driver, a skip regex is a statement about us.
 | **Volume limits per node** | `volumeLimits: false` | `NodeGetInfo` reports no `max_volumes_per_node`. There is a real Hyper-V SCSI controller limit behind this; reporting it is separate work |
 | **Two PVs sharing one volume handle** | `multiplePVsSameID: false` | The original reason — the controller resolving an expansion's node by matching a `VolumeAttachment` on PV name — is gone, since the agent now resolves attachment from the VHDX path. The capability stays off until the case has actually been run against the suite |
 | **xfs** | absent from `SupportedFsType`, `\[Feature:` | The node image ships only `e2fsprogs`. `NodeStageVolume` would fail at `mkfs`, and `NodeExpandVolume` has no `xfs_growfs` |
-| **VolumeAttributesClass, SELinux mount, Windows nodes** | `\[Feature:` in `skips.txt` | Not implemented, not implemented, and not what our nodes are |
+| **SELinux mount, Windows nodes** | `\[Feature:` in `skips.txt` | Not implemented, and not what our nodes are. `[Feature:VolumeAttributesClass]` is no longer in this row: Storage QoS implements `ControllerModifyVolume`, and `testdriver.yaml` gives the volume-modify suite `test/e2e/volumeattributesclass.yaml` to provision into and modify to |
 | **Inline CSI ephemeral volumes** | no `InlineVolumes` in `testdriver.yaml` | The CSIDriver object declares `Persistent` only. Generic ephemeral volumes — the PVC-backed kind — *are* tested |
 | **Pre-provisioned PVs** | not supported by the external suite for CSI drivers | The suite lists these patterns but skips them at runtime |
 

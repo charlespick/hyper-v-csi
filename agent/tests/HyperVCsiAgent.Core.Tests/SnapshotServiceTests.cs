@@ -1,4 +1,4 @@
-﻿using HyperVCsiAgent.Core.Cluster;
+using HyperVCsiAgent.Core.Cluster;
 using HyperVCsiAgent.Core.Configuration;
 using HyperVCsiAgent.Core.HostControl;
 using HyperVCsiAgent.Core.Jobs;
@@ -2971,8 +2971,11 @@ public sealed class SnapshotServiceTests : IDisposable
         public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             throw Unexpected();
 
-        public Task AttachDiskAsync(string hostName, string vmId, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken) =>
+        public Task AttachDiskAsync(string hostName, string vmId, string vhdxPath, DiskSlot slot, Guid qosPolicyId, CancellationToken cancellationToken) =>
             throw Unexpected();
+
+        public Task SetDiskQosPolicyAsync(string hostName, string vmId, string vhdxPath, Guid qosPolicyId, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
 
         public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
             throw Unexpected();
@@ -3439,8 +3442,11 @@ public sealed class SnapshotServiceTests : IDisposable
         public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             throw new NotSupportedException("SnapshotService never attaches anything");
 
-        public Task AttachDiskAsync(string hostName, string vmId, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken) =>
+        public Task AttachDiskAsync(string hostName, string vmId, string vhdxPath, DiskSlot slot, Guid qosPolicyId, CancellationToken cancellationToken) =>
             throw new NotSupportedException("SnapshotService never attaches anything");
+
+        public Task SetDiskQosPolicyAsync(string hostName, string vmId, string vhdxPath, Guid qosPolicyId, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
 
         public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
             throw new NotSupportedException("SnapshotService never detaches anything");

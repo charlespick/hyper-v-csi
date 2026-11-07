@@ -22,7 +22,11 @@ public sealed class UnsupportedHyperVHostClient : IHyperVHostClient
         throw Unsupported();
 
     public Task AttachDiskAsync(
-        string hostName, string vmId, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken) =>
+        string hostName, string vmId, string vhdxPath, DiskSlot slot, Guid qosPolicyId, CancellationToken cancellationToken) =>
+        throw Unsupported();
+
+    public Task SetDiskQosPolicyAsync(
+        string hostName, string vmId, string vhdxPath, Guid qosPolicyId, CancellationToken cancellationToken) =>
         throw Unsupported();
 
     public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
