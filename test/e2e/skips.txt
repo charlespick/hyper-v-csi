@@ -28,13 +28,16 @@
 # longer real tag names too — [Feature:SELinuxMountReadWriteOncePod] and the
 # like. What stays hidden, in descending order of count:
 #   [Feature:Windows]                 — Windows worker nodes. Ours are Linux.
-#   [Feature:VolumeAttributesClass]   — mutable volume attributes. Not implemented.
 #   [Feature:VolumeSourceXFS]         — xfs. The node image has only e2fsprogs.
 #   [Feature:SELinux]                 — SELinux mount options. Not implemented.
 #   [Feature:volumegroupsnapshot]     — group snapshots. Not implemented; also
 #                                       off via the groupSnapshot capability.
 #   [Feature:snapshotmetadata]        — snapshot metadata. Not implemented.
 #   [Feature:OffByDefault]            — gates disabled on a default cluster.
+#
+# [Feature:VolumeAttributesClass] is no longer hidden either: ControllerModifyVolume
+# is implemented (Storage QoS), and testdriver.yaml's VolumeAttributesClass
+# gives the volume-modify suite a class to use.
 #
 # What is deliberately no longer hidden is [Feature:VolumeSnapshotDataSource]:
 # CreateSnapshot, DeleteSnapshot and ListSnapshots are implemented and
@@ -48,7 +51,7 @@
 # tag upstream adds later now runs instead of being silenced. That is the right
 # way round — a new tag deserves a look — but it ties this list to the e2e.test
 # version, so reread it when that moves.
-\[Feature:(Windows|VolumeAttributesClass|VolumeSourceXFS|SELinux|volumegroupsnapshot|snapshotmetadata|OffByDefault)
+\[Feature:(Windows|VolumeSourceXFS|SELinux|volumegroupsnapshot|snapshotmetadata|OffByDefault)
 
 # Upstream's own acknowledged flakes. A failure here says nothing about this
 # driver.

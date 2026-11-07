@@ -2056,16 +2056,17 @@ type enqueuedJob struct {
 	// The union of every operation's payload, so one decode covers whichever
 	// one the test under way enqueued.
 	Payload struct {
-		Name             string `json:"name"`
-		SizeBytes        int64  `json:"sizeBytes"`
-		SourceSnapshotID string `json:"sourceSnapshotId"`
-		VolumeID         string `json:"volumeId"`
-		NodeID           string `json:"nodeId"`
-		SourceVolumeID   string `json:"sourceVolumeId"`
-		SnapshotName     string `json:"snapshotName"`
-		SnapshotID       string `json:"snapshotId"`
-		StartingToken    string `json:"startingToken"`
-		MaxEntries       int32  `json:"maxEntries"`
+		Name             string       `json:"name"`
+		SizeBytes        int64        `json:"sizeBytes"`
+		SourceSnapshotID string       `json:"sourceSnapshotId"`
+		VolumeID         string       `json:"volumeId"`
+		NodeID           string       `json:"nodeId"`
+		SourceVolumeID   string       `json:"sourceVolumeId"`
+		SnapshotName     string       `json:"snapshotName"`
+		SnapshotID       string       `json:"snapshotId"`
+		StartingToken    string       `json:"startingToken"`
+		MaxEntries       int32        `json:"maxEntries"`
+		Qos              *qosSettings `json:"qos"`
 	} `json:"payload"`
 	// PayloadFields is the same payload keyed by JSON field name, for asserting
 	// a key is absent rather than merely empty - which the union above cannot

@@ -50,10 +50,18 @@ public sealed class VmTargetAssertingHyperVHostClient(IHyperVHostClient inner) :
     public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
         inner.FindFreeSlotAsync(hostName, vmId, cancellationToken);
 
-    public Task AttachDiskAsync(string hostName, string vmId, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken)
+    public Task AttachDiskAsync(
+        string hostName, string vmId, string vhdxPath, DiskSlot slot, Guid qosPolicyId, CancellationToken cancellationToken)
     {
         AssertHoldsVm(nameof(AttachDiskAsync), vmId);
-        return inner.AttachDiskAsync(hostName, vmId, vhdxPath, slot, cancellationToken);
+        return inner.AttachDiskAsync(hostName, vmId, vhdxPath, slot, qosPolicyId, cancellationToken);
+    }
+
+    public Task SetDiskQosPolicyAsync(
+        string hostName, string vmId, string vhdxPath, Guid qosPolicyId, CancellationToken cancellationToken)
+    {
+        AssertHoldsVm(nameof(SetDiskQosPolicyAsync), vmId);
+        return inner.SetDiskQosPolicyAsync(hostName, vmId, vhdxPath, qosPolicyId, cancellationToken);
     }
 
     public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken)

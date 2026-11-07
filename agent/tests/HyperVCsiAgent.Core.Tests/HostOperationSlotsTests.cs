@@ -98,7 +98,7 @@ public sealed class HostOperationSlotsTests : IDisposable
 
         var attachOptions = new AgentOptions { CsvVolumesRoot = volumesRoot };
         using var attachService = new AttachService(
-            cluster, host, Options.Create(attachOptions), hostSlots, NullLogger<AttachService>.Instance);
+            cluster, host, Options.Create(attachOptions), hostSlots, new FakeQosPolicyStore(), NullLogger<AttachService>.Instance);
 
         var snapshotOptions = Options.Create(new AgentOptions
         {
@@ -274,13 +274,16 @@ public sealed class HostOperationSlotsTests : IDisposable
         public Task<DiskSlot?> FindFreeSlotAsync(string hostName, string vmId, CancellationToken cancellationToken) =>
             Task.FromResult<DiskSlot?>(new DiskSlot("controller-path", "controller-guid", 0));
 
-        public Task AttachDiskAsync(string hostName, string vmId, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken)
+        public Task AttachDiskAsync(string hostName, string vmId, string vhdxPath, DiskSlot slot, Guid qosPolicyId, CancellationToken cancellationToken)
         {
             _attached = true;
             return Task.CompletedTask;
         }
 
         public Task<bool> IsDiskAttachedAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task SetDiskQosPolicyAsync(string hostName, string vmId, string vhdxPath, Guid qosPolicyId, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
         public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>

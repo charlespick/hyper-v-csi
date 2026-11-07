@@ -1,0 +1,15 @@
+# The VolumeAttributesClass the volume-modify suite ([Feature:VolumeAttributesClass])
+# provisions into and modifies volumes to. The framework copies it per test
+# under a generated name, so nothing here outlives a run.
+#
+# A limit high enough never to slow a test down: what the suite checks is that
+# the class reaches the volume - CreateVolume's mutable_parameters, then
+# ControllerModifyVolume - and that the PVC's status records it, not how fast
+# the disk then runs.
+apiVersion: storage.k8s.io/v1
+kind: VolumeAttributesClass
+metadata:
+  name: hyperv-csi-e2e
+driverName: csi.hyper-v.makerland.xyz
+parameters:
+  maxIOPS: "100000"

@@ -200,11 +200,12 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
         }, cancellationToken);
 
     public Task AttachDiskAsync(
-        string hostName, string vmId, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken) =>
+        string hostName, string vmId, string vhdxPath, DiskSlot slot, Guid qosPolicyId, CancellationToken cancellationToken) =>
         Task.Run(() =>
         {
             _logger.LogDebug(
-                "attaching {VhdxPath} to {VmId} on {HostName} at LUN {Lun}", vhdxPath, vmId, hostName, slot.Lun);
+                "attaching {VhdxPath} to {VmId} on {HostName} at LUN {Lun} with Storage QoS policy {QosPolicyId}",
+                vhdxPath, vmId, hostName, slot.Lun, qosPolicyId);
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
             using var settings = GetActiveSettings(session, hostName, vmId, deadline, cancellationToken);
@@ -296,6 +297,15 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                 disk["Parent"] = drivePath;
                 disk["HostResource"] = new[] { vhdxPath };
 
+                // In the same AddResourceSettings call as HostResource, so the
+                // disk never runs for a moment without its QoS. Left at the
+                // template's default for a volume without QoS, which attaches
+                // exactly as it did before QoS existed.
+                if (qosPolicyId != Guid.Empty)
+                {
+                    disk["StorageQoSPolicyID"] = qosPolicyId.ToString("D");
+                }
+
                 _ = AddResource(
                     hostName,
                     FullPathTextOf(settings),
@@ -316,6 +326,53 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
 
             _logger.LogInformation(
                 "attached {VhdxPath} to {VmId} on {HostName} at LUN {Lun}", vhdxPath, vmId, hostName, slot.Lun);
+        }, cancellationToken);
+
+    public Task SetDiskQosPolicyAsync(
+        string hostName, string vmId, string vhdxPath, Guid qosPolicyId, CancellationToken cancellationToken) =>
+        Task.Run(() =>
+        {
+            _logger.LogDebug(
+                "setting Storage QoS policy {QosPolicyId} on {VhdxPath} attached to {VmId} on {HostName}",
+                qosPolicyId, vhdxPath, vmId, hostName);
+            var deadline = CimDeadline.After(_hostOperationTimeout);
+            using var session = CimSession.Create(hostName);
+            using var settings = GetActiveSettings(session, hostName, vmId, deadline, cancellationToken);
+
+            var located = LocateDisk(session, settings, vmId, vhdxPath, deadline, cancellationToken)
+                ?? throw new InvalidOperationException(
+                    $"{vhdxPath} is not in {vmId}'s configuration on {hostName}, so it has no Storage QoS policy to set");
+
+            using var current = session.GetInstance(
+                NamespaceName,
+                ReferenceToPath(located.DiskPath),
+                deadline.Options($"reading disk settings for {vhdxPath}", cancellationToken));
+
+            // A local rebuild carries the disk's own InstanceID, which is what
+            // makes ModifyResourceSettings change this attachment in place - the
+            // same trick TagCheckpoint uses with ModifySystemSettings. The
+            // all-zero GUID, not an empty string, is how Hyper-V itself reads
+            // back a disk that names no policy.
+            using var disk = BuildLocalInstance(current);
+            disk["StorageQoSPolicyID"] = qosPolicyId.ToString("D");
+
+            using var management = GetManagementService(session, deadline, cancellationToken);
+            var parameters = new CimMethodParametersCollection
+            {
+                CimMethodParameter.Create(
+                    "ResourceSettings", new[] { disk.GetText(TextFormat.WmiDtd20) }, CimType.StringArray, CimFlags.In),
+            };
+
+            using var result = session.InvokeMethod(
+                NamespaceName, management, "ModifyResourceSettings", parameters,
+                deadline.Options("ModifyResourceSettings (Storage QoS policy)", cancellationToken));
+
+            _ = CimJobs.WaitForCompletion(
+                session, NamespaceName, result, "ModifyResourceSettings (Storage QoS policy)", deadline, cancellationToken, _logger);
+
+            _logger.LogInformation(
+                "set Storage QoS policy {QosPolicyId} on {VhdxPath} attached to {VmId} on {HostName}",
+                qosPolicyId, vhdxPath, vmId, hostName);
         }, cancellationToken);
 
     public Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken) =>
@@ -1632,7 +1689,7 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                 $"the drive holding {vhdxPath} reports no address on its controller");
         }
 
-        return new AttachedDisk(VmBusInstanceIdOf(controller, vhdxPath), lun);
+        return new AttachedDisk(VmBusInstanceIdOf(controller, vhdxPath), lun, QosPolicyIdOf(located.QosPolicyIdText, vhdxPath));
     }
 
     /// <summary>
@@ -1704,7 +1761,9 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                 // it was found by: the two are the same object, but only this
                 // one has the same provenance as the disk path beside it, and
                 // both are handed straight back to vmms as REFs.
-                return new DiskLocation(FullPathTextOf(disk), FullPathTextOf(drive), controllerPath, AddressOf(drive));
+                return new DiskLocation(
+                    FullPathTextOf(disk), FullPathTextOf(drive), controllerPath, AddressOf(drive),
+                    disk.CimInstanceProperties["StorageQoSPolicyID"]?.Value as string);
             }
         }
 
@@ -1861,7 +1920,32 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
     }
 
     /// <param name="Lun">Null when the drive reports no readable address, which each caller decides what to do about.</param>
-    private sealed record DiskLocation(string DiskPath, string DrivePath, string ControllerPath, int? Lun);
+    /// <param name="QosPolicyIdText">
+    /// The attachment's <c>StorageQoSPolicyID</c> as read, unparsed: detach
+    /// shares this traversal and must not fail on a value it never uses - see
+    /// <see cref="IHyperVHostClient.IsDiskAttachedAsync"/>.
+    /// </param>
+    private sealed record DiskLocation(string DiskPath, string DrivePath, string ControllerPath, int? Lun, string? QosPolicyIdText);
+
+    /// <summary>
+    /// The Storage QoS policy a disk's attachment names. Hyper-V reads a disk
+    /// with no policy back as the all-zero GUID, and the pool's template as no
+    /// value at all; both are <see cref="Guid.Empty"/> here. Anything else that
+    /// is not a GUID is refused rather than read as "none", since attach and
+    /// modify both report success on the strength of this value.
+    /// </summary>
+    private static Guid QosPolicyIdOf(string? text, string vhdxPath)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return Guid.Empty;
+        }
+
+        return Guid.TryParse(text, out var id)
+            ? id
+            : throw new InvalidOperationException(
+                $"the disk setting for {vhdxPath} names Storage QoS policy '{text}', which is not a GUID");
+    }
 
     private static string? FindDrivePath(
         CimSession session,

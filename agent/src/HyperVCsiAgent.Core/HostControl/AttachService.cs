@@ -20,6 +20,7 @@ public sealed class AttachService : IAttachService, IDisposable
     private readonly IHyperVHostClient _host;
     private readonly AgentOptions _options;
     private readonly HostOperationSlots _hostSlots;
+    private readonly IStorageQosPolicyStore _qosPolicies;
     private readonly ILogger<AttachService> _logger;
 
     public AttachService(
@@ -27,12 +28,14 @@ public sealed class AttachService : IAttachService, IDisposable
         IHyperVHostClient host,
         IOptions<AgentOptions> options,
         HostOperationSlots hostSlots,
+        IStorageQosPolicyStore qosPolicies,
         ILogger<AttachService> logger)
     {
         _cluster = cluster;
         _host = host;
         _options = options.Value;
         _hostSlots = hostSlots;
+        _qosPolicies = qosPolicies;
         _logger = logger;
     }
 
@@ -60,11 +63,18 @@ public sealed class AttachService : IAttachService, IDisposable
         // retry would surface as a bare "A task was canceled".
         try
         {
+            // The attach request carries no QoS - ControllerPublishVolume has no
+            // mutable_parameters, and volume_context goes stale after a class
+            // change - so the policy store is the one place to ask. Read under
+            // the job's qos: target, which a modify of this volume also holds,
+            // so the answer cannot change before the disk lands.
+            var qosPolicyId = await ReadQosPolicyIdAsync(volumeId, attempt.Token).ConfigureAwait(false);
+
             var vm = await ResolveVmAsync(nodeId, attempt).ConfigureAwait(false);
 
             try
             {
-                return await AttachOnHostAsync(vm, volumeId, path, attempt, cancellationToken).ConfigureAwait(false);
+                return await AttachOnHostAsync(vm, volumeId, path, qosPolicyId, attempt, cancellationToken).ConfigureAwait(false);
             }
             catch (VmNotOnHostException ex)
             {
@@ -77,7 +87,7 @@ public sealed class AttachService : IAttachService, IDisposable
                     "AttachVolume {VolumeId}: {Message}; re-resolving its owner and retrying once", volumeId, ex.Message);
 
                 var current = await ResolveVmAsync(nodeId, attempt).ConfigureAwait(false);
-                return await AttachOnHostAsync(current, volumeId, path, attempt, cancellationToken).ConfigureAwait(false);
+                return await AttachOnHostAsync(current, volumeId, path, qosPolicyId, attempt, cancellationToken).ConfigureAwait(false);
             }
         }
         catch (TimeoutException ex)
@@ -239,6 +249,7 @@ public sealed class AttachService : IAttachService, IDisposable
         ClusteredVm vm,
         string volumeId,
         string path,
+        Guid qosPolicyId,
         CancellationTokenSource attempt,
         CancellationToken callerToken)
     {
@@ -252,6 +263,7 @@ public sealed class AttachService : IAttachService, IDisposable
             var existing = await _host.FindAttachedDiskAsync(vm.OwningHost, vm.VmId, path, attempt.Token).ConfigureAwait(false);
             if (existing is not null)
             {
+                await EnsureQosPolicyAsync(vm, volumeId, path, existing, qosPolicyId, attempt.Token).ConfigureAwait(false);
                 _logger.LogInformation(
                     "AttachVolume {VolumeId}: already attached to {VmId} on {Host} at controller {Controller} LUN {Lun}",
                     volumeId, vm.VmId, vm.OwningHost, existing.ControllerInstanceId, existing.Lun);
@@ -262,7 +274,7 @@ public sealed class AttachService : IAttachService, IDisposable
                 ?? throw JobFailureException.ResourceExhausted(
                     $"every SCSI slot on {vm.VmId} is occupied, so volume {volumeId} cannot be attached");
 
-            await _host.AttachDiskAsync(vm.OwningHost, vm.VmId, path, slot, attempt.Token).ConfigureAwait(false);
+            await _host.AttachDiskAsync(vm.OwningHost, vm.VmId, path, slot, qosPolicyId, attempt.Token).ConfigureAwait(false);
 
             // Read back rather than trust the slot we asked for: this confirms
             // the change actually landed in the VM's configuration, and the LUN
@@ -272,14 +284,89 @@ public sealed class AttachService : IAttachService, IDisposable
                     AgentErrorCodes.Internal,
                     $"attaching volume {volumeId} to {vm.VmId} reported success but the disk is not in the VM's configuration");
 
+            await EnsureQosPolicyAsync(vm, volumeId, path, placed, qosPolicyId, attempt.Token).ConfigureAwait(false);
+
             _logger.LogInformation(
-                "AttachVolume {VolumeId}: attached to {VmId} on {Host} at controller {Controller} LUN {Lun}",
-                volumeId, vm.VmId, vm.OwningHost, placed.ControllerInstanceId, placed.Lun);
+                "AttachVolume {VolumeId}: attached to {VmId} on {Host} at controller {Controller} LUN {Lun}{Qos}",
+                volumeId, vm.VmId, vm.OwningHost, placed.ControllerInstanceId, placed.Lun,
+                qosPolicyId == Guid.Empty ? "" : $" with Storage QoS policy {qosPolicyId}");
             return new AttachVolumeResult(path, placed.ControllerInstanceId, placed.Lun, AlreadyAttached: false);
         }
         finally
         {
             _hostSlots.Release(vm.OwningHost);
+        }
+    }
+
+    /// <summary>
+    /// The volume's derived Storage QoS policy ID if that policy exists, or
+    /// <see cref="Guid.Empty"/> when the volume has no QoS.
+    /// </summary>
+    /// <remarks>
+    /// A store that cannot be read fails the attach rather than attaching
+    /// without QoS: the job can only report success once it is certain the
+    /// disk carries what it should, and an unreadable store answers neither
+    /// way. This is the one thing the attach path does differently for a
+    /// volume without QoS - it still has to ask.
+    /// </remarks>
+    private async Task<Guid> ReadQosPolicyIdAsync(string volumeId, CancellationToken cancellationToken)
+    {
+        var policyId = StorageQosPolicyId.For(volumeId);
+        StorageQosPolicy? policy;
+        try
+        {
+            policy = await _qosPolicies.GetAsync(policyId, cancellationToken).ConfigureAwait(false);
+        }
+        catch (InvalidOperationException ex)
+        {
+            throw new JobFailureException(
+                AgentErrorCodes.Internal,
+                $"attaching volume {volumeId}: the cluster's Storage QoS policy store could not be read, so whether " +
+                $"the disk should carry policy {policyId} is unknown; is the Storage QoS Resource online? {ex.Message}",
+                ex);
+        }
+
+        return policy is null ? Guid.Empty : policyId;
+    }
+
+    /// <summary>
+    /// Makes the attached disk name the policy it should, and confirms it does.
+    /// Publish's half of the fail-closed rule: success is reported only once
+    /// the attachment is read back carrying the volume's policy.
+    /// </summary>
+    /// <remarks>
+    /// Correcting rather than only refusing, because a disk can legitimately be
+    /// found without its ID: a modify that created the policy and stopped
+    /// before writing the ID onto the disk leaves exactly that, and this job
+    /// holds both locks needed to finish the job the modify started.
+    /// <para>
+    /// A volume without QoS leaves whatever the disk names alone unless it is
+    /// this volume's own derived ID - see <see cref="StorageQosPolicyId.Satisfies"/>
+    /// - so the attach path for a volume that does not use QoS changes nothing
+    /// it did not change before.
+    /// </para>
+    /// </remarks>
+    private async Task EnsureQosPolicyAsync(
+        ClusteredVm vm, string volumeId, string path, AttachedDisk disk, Guid qosPolicyId, CancellationToken cancellationToken)
+    {
+        if (StorageQosPolicyId.Satisfies(disk.QosPolicyId, qosPolicyId, volumeId))
+        {
+            return;
+        }
+
+        _logger.LogInformation(
+            "AttachVolume {VolumeId}: the disk on {VmId} names Storage QoS policy {Actual}, not {Expected}; correcting it",
+            volumeId, vm.VmId, disk.QosPolicyId, qosPolicyId);
+
+        await _host.SetDiskQosPolicyAsync(vm.OwningHost, vm.VmId, path, qosPolicyId, cancellationToken).ConfigureAwait(false);
+
+        var reread = await _host.FindAttachedDiskAsync(vm.OwningHost, vm.VmId, path, cancellationToken).ConfigureAwait(false);
+        if (reread is null || !StorageQosPolicyId.Satisfies(reread.QosPolicyId, qosPolicyId, volumeId))
+        {
+            throw new JobFailureException(
+                AgentErrorCodes.Internal,
+                $"attaching volume {volumeId} to {vm.VmId}: set Storage QoS policy {qosPolicyId} on the disk, but it " +
+                $"reads back as {(reread is null ? "not attached" : reread.QosPolicyId.ToString())}");
         }
     }
 

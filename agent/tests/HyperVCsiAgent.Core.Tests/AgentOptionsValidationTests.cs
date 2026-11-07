@@ -133,6 +133,16 @@ public class AgentOptionsValidationTests
     }
 
     [Fact]
+    public void Validate_NonPositiveModifyVolumeWaitTimeout_IsRejected()
+    {
+        var options = NewOptions();
+        options.ModifyVolumeWaitTimeout = TimeSpan.Zero;
+
+        var failure = Assert.Throws<InvalidOperationException>(options.Validate);
+        Assert.Contains(nameof(AgentOptions.ModifyVolumeWaitTimeout), failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Validate_NonPositiveExpandDiskWaitTimeout_IsRejected()
     {
         var options = NewOptions();

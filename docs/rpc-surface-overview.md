@@ -17,6 +17,7 @@ in-flight jobs on the (operation type, idempotency key) pair.
 | ValidateVolumeCapabilities | Controller | Confirms a volume supports the requested access mode and type. | Volume ID (lookup only) |
 | ControllerGetCapabilities | Controller | Reports which controller RPCs this plugin implements. | N/A |
 | ControllerExpandVolume | Controller | Grows a volume's underlying storage. | Volume ID + requested size |
+| ControllerModifyVolume | Controller | Applies a VolumeAttributesClass change — Storage QoS, see [storage-qos.md](storage-qos.md). | Volume ID + requested QoS |
 | CreateSnapshot | Controller | Creates a point-in-time snapshot of a volume. | Snapshot name |
 | DeleteSnapshot | Controller | Removes a previously created snapshot. | Snapshot ID |
 | ListSnapshots | Controller | Lists existing snapshots known to the plugin. | Snapshot ID or source volume ID (optional filter, lookup only) |

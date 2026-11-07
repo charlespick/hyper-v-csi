@@ -1,4 +1,4 @@
-﻿using System.Net;
+using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using HyperVCsiAgent.Core.Cluster;
@@ -46,6 +46,7 @@ public sealed class JobsEndpointTests : IDisposable
             {
                 services.AddSingleton<IVirtualDiskManager>(_disks);
                 services.AddSingleton<IClusterService>(FakeClusterService.WithNoVms());
+                services.AddSingleton<IStorageQosPolicyStore>(new NoQosPolicies());
             });
         });
     }
@@ -373,6 +374,7 @@ public sealed class JobsEndpointTests : IDisposable
             {
                 services.AddSingleton<IVirtualDiskManager>(_disks);
                 services.AddSingleton(cluster);
+                services.AddSingleton<IStorageQosPolicyStore>(new NoQosPolicies());
             });
         });
 
@@ -383,6 +385,22 @@ public sealed class JobsEndpointTests : IDisposable
     /// <c>OrphanedCheckpointReaper</c>'s own sweep never gets far enough to
     /// ask - so both throw if that ever stops being true.
     /// </summary>
+    /// <summary>
+    /// A cluster with no Storage QoS policies, standing in for the real store -
+    /// which, on a host with no Storage QoS Resource, fails every call - so a
+    /// delete through the real host can run to completion.
+    /// </summary>
+    private sealed class NoQosPolicies : IStorageQosPolicyStore
+    {
+        public Task<StorageQosPolicy?> GetAsync(Guid policyId, CancellationToken cancellationToken) =>
+            Task.FromResult<StorageQosPolicy?>(null);
+
+        public Task CreateOrUpdateAsync(Guid policyId, string name, QosSettings settings, CancellationToken cancellationToken) =>
+            throw new NotSupportedException("no test in this file creates a volume with QoS");
+
+        public Task DeleteAsync(Guid policyId, CancellationToken cancellationToken) => Task.CompletedTask;
+    }
+
     private sealed class FakeClusterService : IClusterService
     {
         public bool IsClusterMember() => true;

@@ -80,6 +80,7 @@ func (s *controllerServer) ControllerGetCapabilities(ctx context.Context, req *c
 		csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 		csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
 		csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS,
+		csi.ControllerServiceCapability_RPC_MODIFY_VOLUME,
 	}
 
 	capabilities := make([]*csi.ControllerServiceCapability, 0, len(capabilityTypes))
@@ -105,6 +106,10 @@ type createVolumePayload struct {
 	// empty-VHDX create. One payload field rather than a second operation: see
 	// CreateVolume's own content-source handling for why.
 	SourceSnapshotID string `json:"sourceSnapshotId,omitempty"`
+	// Qos is the volume's QoS from its VolumeAttributesClass, or nil - left
+	// out of the payload - for a PVC with no class or one in a qos: "none"
+	// class, which the agent creates exactly as it always has.
+	Qos *qosSettings `json:"qos,omitempty"`
 }
 
 type createVolumeResult struct {
@@ -155,6 +160,20 @@ func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		return nil, err
 	}
 
+	if err := rejectQoSInStorageClass(req.GetParameters()); err != nil {
+		klog.V(2).InfoS("CreateVolume: rejected, QoS in StorageClass parameters", "name", req.GetName(), "err", err)
+		return nil, err
+	}
+
+	// The PVC's VolumeAttributesClass, if it has one. A restore takes its QoS
+	// from its own class like any other create; nothing is copied from the
+	// snapshot's source volume.
+	qos, err := parseQoS(req.GetMutableParameters())
+	if err != nil {
+		klog.V(2).InfoS("CreateVolume: rejected, invalid mutable parameters", "name", req.GetName(), "err", err)
+		return nil, err
+	}
+
 	// The CSI volume name is the idempotency key (docs/rpc-surface-overview.md),
 	// so a provisioner retry for the same PVC re-attaches to this job instead of
 	// racing a second create for the same file.
@@ -162,6 +181,7 @@ func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		Name:             req.GetName(),
 		SizeBytes:        sizeBytes,
 		SourceSnapshotID: sourceSnapshotID,
+		Qos:              qos,
 	})
 	if err != nil {
 		return nil, enqueueFailed(ctx, err, "enqueueing CreateVolume for %s", req.GetName())

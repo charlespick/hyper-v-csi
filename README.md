@@ -29,7 +29,9 @@ full node staging/mount path. Snapshots (create/delete/restore) are implemented
 but off by default — see [design.md](design.md) for status and architecture in
 more depth. Recovery from a node lost with its Hyper-V host is also built and
 also off by default — see [Node fencing](#node-fencing) below, including the
-manual recovery step it needs from you.
+manual recovery step it needs from you. Per-volume storage QoS (IOPS
+reservation and limits, bandwidth limit) is set through a
+VolumeAttributesClass — see [docs/storage-qos.md](docs/storage-qos.md).
 
 ## Prerequisites
 

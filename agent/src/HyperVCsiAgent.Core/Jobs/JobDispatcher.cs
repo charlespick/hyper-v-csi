@@ -1,4 +1,4 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using HyperVCsiAgent.Core.HostControl;
 using HyperVCsiAgent.Core.Storage;
 using Microsoft.Extensions.Logging;
@@ -22,7 +22,7 @@ namespace HyperVCsiAgent.Core.Jobs;
 /// </remarks>
 public sealed class JobDispatcher(
     IVhdxService vhdxService, IAttachService attachService, ISnapshotService snapshotService,
-    ILogger<JobDispatcher> logger)
+    IQosService qosService, ILogger<JobDispatcher> logger)
 {
     public const string CreateVolume = "CreateVolume";
 
@@ -41,6 +41,8 @@ public sealed class JobDispatcher(
     public const string DeleteSnapshot = "DeleteSnapshot";
 
     public const string ListSnapshots = "ListSnapshots";
+
+    public const string ModifyVolume = "ModifyVolume";
 
     /// <exception cref="InvalidJobRequestException">
     /// The operation is unknown or its payload is unusable.
@@ -82,9 +84,19 @@ public sealed class JobDispatcher(
                 return new ResolvedJob(
                     [JobTargets.Volume(request.Name)],
                     async (job, cancellationToken) =>
-                        job.Result = await vhdxService
+                    {
+                        var created = await vhdxService
                             .CreateAsync(request.Name, request.SizeBytes, request.SourceSnapshotId, cancellationToken)
-                            .ConfigureAwait(false));
+                            .ConfigureAwait(false);
+
+                        // After the VHDX, and on a replay too: the policy is
+                        // only worth anything once there is a volume for it to
+                        // describe, and a create that stopped between the two
+                        // leaves a volume its retry gives the policy to.
+                        await qosService.ApplyOnCreateAsync(created.VolumeId, request.Qos, cancellationToken)
+                            .ConfigureAwait(false);
+                        job.Result = created;
+                    });
 
             case DeleteVolume:
                 var deleteRequest = Decode<DeleteVolumePayload>(payload, jsonOptions);
@@ -96,8 +108,15 @@ public sealed class JobDispatcher(
                 // No job.Result: a deleted volume has nothing left to describe,
                 // so the controller reads only the status.
                 return new ResolvedJob(
-                    [JobTargets.Volume(deleteRequest.VolumeId)],
-                    (_, cancellationToken) => vhdxService.DeleteAsync(deleteRequest.VolumeId, cancellationToken));
+                    [JobTargets.Volume(deleteRequest.VolumeId), JobTargets.Qos(deleteRequest.VolumeId)],
+                    async (_, cancellationToken) =>
+                    {
+                        // The VHDX first and the policy after: a delete that
+                        // fails between the two leaves at most an unused
+                        // policy, which its retry removes.
+                        await vhdxService.DeleteAsync(deleteRequest.VolumeId, cancellationToken).ConfigureAwait(false);
+                        await qosService.RemoveOnDeleteAsync(deleteRequest.VolumeId, cancellationToken).ConfigureAwait(false);
+                    });
 
             case ExpandVolume:
                 var expandRequest = Decode<ExpandVolumePayload>(payload, jsonOptions);
@@ -156,8 +175,11 @@ public sealed class JobDispatcher(
                     throw new InvalidJobRequestException("payload.nodeId is required");
                 }
 
+                // qos: as well as the VM: attach reads the volume's QoS policy
+                // and puts its ID on the disk, and a modify of the same volume
+                // must not land in between - see JobTargets.Qos.
                 return new ResolvedJob(
-                    [JobTargets.Vm(attachRequest.NodeId)],
+                    [JobTargets.Vm(attachRequest.NodeId), JobTargets.Qos(attachRequest.VolumeId)],
                     async (job, cancellationToken) =>
                         job.Result = await attachService
                             .AttachAsync(attachRequest.VolumeId, attachRequest.NodeId, cancellationToken)
@@ -178,7 +200,7 @@ public sealed class JobDispatcher(
                 // No job.Result: a volume that is no longer attached has nothing
                 // left to describe, so the controller reads only the status.
                 return new ResolvedJob(
-                    [JobTargets.Vm(detachRequest.NodeId)],
+                    [JobTargets.Vm(detachRequest.NodeId), JobTargets.Qos(detachRequest.VolumeId)],
                     (_, cancellationToken) =>
                         attachService.DetachAsync(detachRequest.VolumeId, detachRequest.NodeId, cancellationToken));
 
@@ -236,6 +258,24 @@ public sealed class JobDispatcher(
                                 listSnapshotsRequest.MaxEntries,
                                 cancellationToken)
                             .ConfigureAwait(false));
+
+            case ModifyVolume:
+                var modifyRequest = Decode<ModifyVolumePayload>(payload, jsonOptions);
+                if (string.IsNullOrWhiteSpace(modifyRequest.VolumeId))
+                {
+                    throw new InvalidJobRequestException("payload.volumeId is required");
+                }
+
+                // Neither qos: nor vm:, for ExpandVolume's reason: which VM, if
+                // any, the change has to write through is only known once the
+                // disk has been traced, so this job traces it and then enqueues
+                // and waits on QosService's internal ApplyQos job, which takes
+                // qos: and, when it needs one, the VM. No job.Result: the change
+                // is read back before the job succeeds, and that is the answer.
+                return new ResolvedJob(
+                    [JobTargets.Modification(modifyRequest.VolumeId)],
+                    (_, cancellationToken) =>
+                        qosService.ModifyAsync(modifyRequest.VolumeId, modifyRequest.Qos, cancellationToken));
 
             // There is deliberately no case for SnapshotService.CopySnapshot,
             // and this is not an oversight to be tidied up later. The copy is

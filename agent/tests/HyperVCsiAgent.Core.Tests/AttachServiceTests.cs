@@ -80,6 +80,125 @@ public sealed class AttachServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task AttachAsync_AVolumeWithoutQoS_AttachesWithNoPolicy()
+    {
+        GivenVolume("pvc-1");
+        var host = new FakeHostClient { FreeSlot = new DiskSlot("controller-path", "controller-guid", 2) };
+        var policies = new FakeQosPolicyStore();
+        using var service = NewService(host, qosPolicies: policies);
+
+        await service.AttachAsync("pvc-1", Node, CancellationToken.None);
+
+        // Exactly as before QoS existed, apart from the one read that found
+        // nothing.
+        Assert.Equal(Guid.Empty, host.AttachedQosPolicyId);
+        Assert.Empty(host.QosPolicyWrites);
+        Assert.Equal([$"Get {Storage.StorageQosPolicyId.For("pvc-1")}"], policies.Calls);
+    }
+
+    [Fact]
+    public async Task AttachAsync_AVolumeWithQoS_NamesItsPolicyInTheSameCallAsTheDisk()
+    {
+        GivenVolume("pvc-1");
+        var policyId = Storage.StorageQosPolicyId.For("pvc-1");
+        var policies = new FakeQosPolicyStore();
+        policies.Add(new Storage.StorageQosPolicy(policyId, "pvc-1", new Storage.QosSettings(0, 500, 0), Dedicated: true));
+        var host = new FakeHostClient { FreeSlot = new DiskSlot("controller-path", "controller-guid", 2) };
+        using var service = NewService(host, qosPolicies: policies);
+
+        await service.AttachAsync("pvc-1", Node, CancellationToken.None);
+
+        Assert.Equal(policyId, host.AttachedQosPolicyId);
+        // In the attach itself, never as a second write after the disk is live.
+        Assert.Empty(host.QosPolicyWrites);
+    }
+
+    [Fact]
+    public async Task AttachAsync_AnUnreadablePolicyStore_FailsRatherThanAttachingWithoutQoS()
+    {
+        GivenVolume("pvc-1");
+        var host = new FakeHostClient { FreeSlot = new DiskSlot("controller-path", "controller-guid", 2) };
+        using var service = NewService(host, qosPolicies: new FakeQosPolicyStore { Unreadable = true });
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => service.AttachAsync("pvc-1", Node, CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
+        Assert.Contains("Storage QoS", failure.Message);
+        Assert.Null(host.Attached);
+    }
+
+    [Fact]
+    public async Task AttachAsync_APolicyThatDidNotLandOnTheDisk_IsNotASuccess()
+    {
+        GivenVolume("pvc-1");
+        var policyId = Storage.StorageQosPolicyId.For("pvc-1");
+        var policies = new FakeQosPolicyStore();
+        policies.Add(new Storage.StorageQosPolicy(policyId, "pvc-1", new Storage.QosSettings(0, 500, 0), Dedicated: true));
+        var host = new FakeHostClient
+        {
+            FreeSlot = new DiskSlot("controller-path", "controller-guid", 2),
+            // Reads back with no policy no matter what was asked, and refuses
+            // to change on a correction either.
+            PlacedAt = new AttachedDisk("controller-guid", 2, Guid.Empty),
+            QosPolicyWriteDoesNothing = true,
+        };
+        using var service = NewService(host, qosPolicies: policies);
+
+        var failure = await Assert.ThrowsAsync<JobFailureException>(
+            () => service.AttachAsync("pvc-1", Node, CancellationToken.None));
+
+        Assert.Equal(AgentErrorCodes.Internal, failure.ErrorCode);
+        Assert.Contains("reads back", failure.Message);
+    }
+
+    [Fact]
+    public async Task AttachAsync_AlreadyAttachedWithoutItsPolicy_PutsItThere()
+    {
+        // A modify that created the policy and stopped before writing the ID
+        // leaves exactly this; the replayed attach holds both locks it needs
+        // to finish the job.
+        GivenVolume("pvc-1");
+        var policyId = Storage.StorageQosPolicyId.For("pvc-1");
+        var policies = new FakeQosPolicyStore();
+        policies.Add(new Storage.StorageQosPolicy(policyId, "pvc-1", new Storage.QosSettings(0, 500, 0), Dedicated: true));
+        var host = new FakeHostClient { Existing = new AttachedDisk("controller-guid", 4, Guid.Empty) };
+        using var service = NewService(host, qosPolicies: policies);
+
+        var result = await service.AttachAsync("pvc-1", Node, CancellationToken.None);
+
+        Assert.True(result.AlreadyAttached);
+        Assert.Equal([policyId], host.QosPolicyWrites);
+    }
+
+    [Fact]
+    public async Task AttachAsync_AlreadyAttachedNamingItsOwnDeletedPolicy_ClearsIt()
+    {
+        GivenVolume("pvc-1");
+        var host = new FakeHostClient
+        {
+            Existing = new AttachedDisk("controller-guid", 4, Storage.StorageQosPolicyId.For("pvc-1")),
+        };
+        using var service = NewService(host);
+
+        await service.AttachAsync("pvc-1", Node, CancellationToken.None);
+
+        Assert.Equal([Guid.Empty], host.QosPolicyWrites);
+    }
+
+    [Fact]
+    public async Task AttachAsync_AlreadyAttachedNamingSomeoneElsesPolicy_LeavesItForAVolumeWithoutQoS()
+    {
+        GivenVolume("pvc-1");
+        var host = new FakeHostClient { Existing = new AttachedDisk("controller-guid", 4, Guid.NewGuid()) };
+        using var service = NewService(host);
+
+        await service.AttachAsync("pvc-1", Node, CancellationToken.None);
+
+        Assert.Empty(host.QosPolicyWrites);
+    }
+
+    [Fact]
     public async Task AttachAsync_NoVhdxOnTheCsv_IsNotFound()
     {
         // Terminal, not transient: no retry produces a disk nobody provisioned.
@@ -496,7 +615,11 @@ public sealed class AttachServiceTests : IDisposable
     }
 
     private AttachService NewService(
-        FakeHostClient host, FakeClusterService? cluster = null, TimeSpan? timeout = null, HostOperationSlots? hostSlots = null)
+        FakeHostClient host,
+        FakeClusterService? cluster = null,
+        TimeSpan? timeout = null,
+        HostOperationSlots? hostSlots = null,
+        FakeQosPolicyStore? qosPolicies = null)
     {
         var options = new AgentOptions { CsvVolumesRoot = _root };
         if (timeout is { } budget)
@@ -509,6 +632,7 @@ public sealed class AttachServiceTests : IDisposable
             host,
             Options.Create(options),
             hostSlots ?? new HostOperationSlots(Options.Create(options)),
+            qosPolicies ?? new FakeQosPolicyStore(),
             NullLogger<AttachService>.Instance);
     }
 
@@ -631,6 +755,17 @@ public sealed class AttachServiceTests : IDisposable
 
         public (string Host, string Vm, string Path, int Lun)? Attached { get; private set; }
 
+        /// <summary>The Storage QoS policy the attach named, set in the same call as the disk.</summary>
+        public Guid? AttachedQosPolicyId { get; private set; }
+
+        /// <summary>Every policy ID SetDiskQosPolicyAsync was asked to write, in order.</summary>
+        public List<Guid> QosPolicyWrites { get; } = [];
+
+        /// <summary>A host that accepts SetDiskQosPolicyAsync and changes nothing.</summary>
+        public bool QosPolicyWriteDoesNothing { get; init; }
+
+        private Guid? _writtenQosPolicyId;
+
         public (string Host, string Vm, string Path)? Detached { get; private set; }
 
         private readonly object _gate = new();
@@ -651,7 +786,7 @@ public sealed class AttachServiceTests : IDisposable
 
             if (Existing is not null)
             {
-                return Existing;
+                return _writtenQosPolicyId is { } written ? Existing with { QosPolicyId = written } : Existing;
             }
 
             if (Attached is null || AttachDoesNothing)
@@ -659,7 +794,8 @@ public sealed class AttachServiceTests : IDisposable
                 return null;
             }
 
-            return PlacedAt ?? new AttachedDisk(FreeSlot!.ControllerInstanceId, Attached.Value.Lun);
+            var placed = PlacedAt ?? new AttachedDisk(FreeSlot!.ControllerInstanceId, Attached.Value.Lun, AttachedQosPolicyId ?? Guid.Empty);
+            return _writtenQosPolicyId is { } rewritten ? placed with { QosPolicyId = rewritten } : placed;
         }
 
         public async Task<bool> IsDiskAttachedAsync(
@@ -702,10 +838,24 @@ public sealed class AttachServiceTests : IDisposable
         }
 
         public Task AttachDiskAsync(
-            string hostName, string vmId, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken)
+            string hostName, string vmId, string vhdxPath, DiskSlot slot, Guid qosPolicyId, CancellationToken cancellationToken)
         {
             Migrated(hostName, vmId);
             Attached = (hostName, vmId, vhdxPath, slot.Lun);
+            AttachedQosPolicyId = qosPolicyId;
+            return Task.CompletedTask;
+        }
+
+        public Task SetDiskQosPolicyAsync(
+            string hostName, string vmId, string vhdxPath, Guid qosPolicyId, CancellationToken cancellationToken)
+        {
+            Migrated(hostName, vmId);
+            QosPolicyWrites.Add(qosPolicyId);
+            if (!QosPolicyWriteDoesNothing)
+            {
+                _writtenQosPolicyId = qosPolicyId;
+            }
+
             return Task.CompletedTask;
         }
 

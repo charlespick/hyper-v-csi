@@ -10,4 +10,9 @@ namespace HyperVCsiAgent.Core.HostControl;
 /// tell this disk from every other one attached to the VM.
 /// </param>
 /// <param name="Lun">The disk's address on that controller.</param>
-public sealed record AttachedDisk(string ControllerInstanceId, int Lun);
+/// <param name="QosPolicyId">
+/// The Storage QoS policy the disk's attachment names (<c>StorageQoSPolicyID</c>),
+/// or <see cref="Guid.Empty"/> when it names none - which Hyper-V reads back as
+/// the all-zero GUID.
+/// </param>
+public sealed record AttachedDisk(string ControllerInstanceId, int Lun, Guid QosPolicyId = default);

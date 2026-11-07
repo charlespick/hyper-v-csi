@@ -129,6 +129,20 @@ public sealed class AgentOptions
     public TimeSpan ExpandDiskWaitTimeout { get; set; } = TimeSpan.FromSeconds(20);
 
     /// <summary>
+    /// How long a ModifyVolume waits for the internal job that actually changes
+    /// the volume's QoS to finish before answering <c>Aborted</c>.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="ExpandDiskWaitTimeout"/>'s counterpart, for the same shape and
+    /// the same reasons: that job holds the volume's <c>qos:</c> target and,
+    /// when it writes the disk's policy ID on a running VM, the VM's - so it can
+    /// queue behind an attach, or behind a snapshot copy on that VM for hours.
+    /// Giving up leaves it queued, and the resizer's retry waits on the same
+    /// job again.
+    /// </remarks>
+    public TimeSpan ModifyVolumeWaitTimeout { get; set; } = TimeSpan.FromSeconds(20);
+
+    /// <summary>
     /// How long a snapshot keeps re-reading a source volume's differencing
     /// chain while it is in motion - a disk on it that reads back empty, or a
     /// chain with no checkpoint behind it whose merge has not re-pointed the
@@ -314,6 +328,12 @@ public sealed class AgentOptions
         {
             throw new InvalidOperationException(
                 $"{SectionName}:{nameof(ExpandDiskWaitTimeout)} must be positive");
+        }
+
+        if (ModifyVolumeWaitTimeout <= TimeSpan.Zero)
+        {
+            throw new InvalidOperationException(
+                $"{SectionName}:{nameof(ModifyVolumeWaitTimeout)} must be positive");
         }
 
         if (ChainSettleTimeout <= TimeSpan.Zero)

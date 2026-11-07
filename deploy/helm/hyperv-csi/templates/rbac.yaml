@@ -106,6 +106,11 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
+  # A PVC's volumeAttributesClassName is resolved to the class's parameters,
+  # which reach CreateVolume as mutable_parameters - Storage QoS.
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattributesclasses"]
+    verbs: ["get", "list", "watch"]
   {{- if .Values.controller.snapshotter.enabled }}
   - apiGroups: ["snapshot.storage.k8s.io"]
     resources: ["volumesnapshots"]
@@ -178,6 +183,9 @@ roleRef:
 # provisioner's role does not already cover. The pods read is for the in-use
 # check: an expansion of a mounted volume has to be followed by
 # NodeExpandVolume, so the resizer has to know which pods are using the claim.
+# It is also what calls ControllerModifyVolume when a PVC is repointed at a
+# different VolumeAttributesClass, reading the class to pass its parameters
+# and recording the new one on the PV and in the claim's status.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -199,6 +207,9 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: ["storage.k8s.io"]
     resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattributesclasses"]
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["events"]

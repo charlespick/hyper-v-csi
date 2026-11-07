@@ -45,8 +45,29 @@ public interface IHyperVHostClient
     /// <summary>
     /// Attaches the VHDX at the given slot.
     /// </summary>
+    /// <param name="qosPolicyId">
+    /// The Storage QoS policy to name on the disk's attachment, set in the same
+    /// <c>AddResourceSettings</c> call that adds the disk - or
+    /// <see cref="Guid.Empty"/> to attach it exactly as a disk without QoS
+    /// always was, leaving <c>StorageQoSPolicyID</c> at the template's default.
+    /// </param>
     /// <exception cref="VmNotOnHostException">The VM is not registered on this host.</exception>
-    Task AttachDiskAsync(string hostName, string vmId, string vhdxPath, DiskSlot slot, CancellationToken cancellationToken);
+    Task AttachDiskAsync(
+        string hostName, string vmId, string vhdxPath, DiskSlot slot, Guid qosPolicyId, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Sets, or with <see cref="Guid.Empty"/> clears, the Storage QoS policy an
+    /// attached disk names, on the VM as it runs - <c>ModifyResourceSettings</c>
+    /// on the disk's <c>Msvm_StorageAllocationSettingData</c>, without detaching
+    /// it.
+    /// </summary>
+    /// <exception cref="VmNotOnHostException">The VM is not registered on this host.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The VHDX is not in the VM's configuration, or sits behind a differencing
+    /// chain - the refusal <see cref="IsDiskAttachedAsync"/> makes too.
+    /// </exception>
+    Task SetDiskQosPolicyAsync(
+        string hostName, string vmId, string vhdxPath, Guid qosPolicyId, CancellationToken cancellationToken);
 
     Task DetachDiskAsync(string hostName, string vmId, string vhdxPath, CancellationToken cancellationToken);
 

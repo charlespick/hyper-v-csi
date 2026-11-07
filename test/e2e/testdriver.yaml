@@ -33,6 +33,13 @@ StorageClass:
 SnapshotClass:
   FromName: true
 
+# Required for the volume-modify tests, which skip outright without it, the same
+# way the snapshot tests do without SnapshotClass. A file rather than FromName
+# because a VolumeAttributesClass needs at least one parameter; see the file
+# for why its limit is set as high as it is.
+VolumeAttributesClass:
+  FromFile: test/e2e/volumeattributesclass.yaml
+
 DriverInfo:
   # Must match DriverName in csi-driver/internal/driver/driver.go and the
   # provisioner of storageclass.yaml. It is also what the focus regex in the
