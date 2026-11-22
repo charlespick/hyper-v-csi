@@ -18,30 +18,44 @@ type identityServer struct {
 
 func (s *identityServer) GetPluginInfo(ctx context.Context, req *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {
 	return &csi.GetPluginInfoResponse{
-		Name:          DriverName,
+		Name:          s.driver.Name,
 		VendorVersion: Version,
 	}, nil
 }
 
 func (s *identityServer) GetPluginCapabilities(ctx context.Context, req *csi.GetPluginCapabilitiesRequest) (*csi.GetPluginCapabilitiesResponse, error) {
-	return &csi.GetPluginCapabilitiesResponse{
-		Capabilities: []*csi.PluginCapability{
-			{
-				Type: &csi.PluginCapability_Service_{
-					Service: &csi.PluginCapability_Service{
-						Type: csi.PluginCapability_Service_CONTROLLER_SERVICE,
-					},
-				},
-			},
-			{
-				Type: &csi.PluginCapability_VolumeExpansion_{
-					VolumeExpansion: &csi.PluginCapability_VolumeExpansion{
-						Type: csi.PluginCapability_VolumeExpansion_ONLINE,
-					},
+	capabilities := []*csi.PluginCapability{
+		{
+			Type: &csi.PluginCapability_Service_{
+				Service: &csi.PluginCapability_Service{
+					Type: csi.PluginCapability_Service_CONTROLLER_SERVICE,
 				},
 			},
 		},
-	}, nil
+		{
+			Type: &csi.PluginCapability_VolumeExpansion_{
+				VolumeExpansion: &csi.PluginCapability_VolumeExpansion{
+					Type: csi.PluginCapability_VolumeExpansion_ONLINE,
+				},
+			},
+		},
+	}
+
+	// Only with zone topology on. Advertising it is what makes
+	// external-provisioner send accessibility requirements and record the
+	// answer as the PV's nodeAffinity, and kubelet record the node's topology
+	// keys in CSINode, so an install that has not opted in must not carry it.
+	if s.driver.ZoneTopology {
+		capabilities = append(capabilities, &csi.PluginCapability{
+			Type: &csi.PluginCapability_Service_{
+				Service: &csi.PluginCapability_Service{
+					Type: csi.PluginCapability_Service_VOLUME_ACCESSIBILITY_CONSTRAINTS,
+				},
+			},
+		})
+	}
+
+	return &csi.GetPluginCapabilitiesResponse{Capabilities: capabilities}, nil
 }
 
 // probeBudget bounds the health check. Deliberately far shorter than the

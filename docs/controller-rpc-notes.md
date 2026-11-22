@@ -13,8 +13,10 @@ capabilities are added:
 
 - `GetPluginCapabilities` claims ONLINE volume expansion only, and both
   halves (`ControllerExpandVolume`, `NodeExpandVolume`) are built. It
-  correctly omits `VOLUME_ACCESSIBILITY_CONSTRAINTS` — this driver
-  advertises no topology.
+  adds `VOLUME_ACCESSIBILITY_CONSTRAINTS` only with `--zone-topology`, where
+  `NodeGetInfo` reports the node's zone label and `CreateVolume` pins each
+  volume to a zone; without it the driver advertises no topology. See
+  [multiple-failover-clusters.md](multiple-failover-clusters.md).
 - `NodeGetCapabilities` claims `STAGE_UNSTAGE_VOLUME`,
   `GET_VOLUME_STATS`, and `EXPAND_VOLUME`. All three are built.
 - `ControllerGetCapabilities` claims `CREATE_DELETE_SNAPSHOT` and

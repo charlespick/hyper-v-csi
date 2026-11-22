@@ -67,6 +67,38 @@ clientCertificate:
   cert: ""
   key: ""
 
+# The CSI driver name this release registers as. Leave it empty for the default,
+# csi.hyper-v.makerland.xyz, which is what every single-failover-cluster install
+# uses. Set it only for a Kubernetes cluster stretched across failover clusters,
+# which runs one complete release per failover cluster: each needs a name of its
+# own (e.g. fc-b.csi.hyper-v.makerland.xyz), or every release's sidecars claim
+# every volume. See docs/multiple-failover-clusters.md.
+#
+# Setting it also gives the release's other fixed names a per-release form so
+# two releases cannot collide: the no-QoS VolumeAttributesClass becomes
+# <fullname>-none instead of hyperv-none, and the node fencing lease
+# node-fencing-<driverName>. StorageClass, VolumeSnapshotClass and
+# volumeAttributesClasses names come from their own values below, are
+# cluster-wide, and need changing too.
+#
+# Never change it on a release that already has volumes: their PVs name the
+# driver that serves them.
+driverName: ""
+
+# CSI topology from the topology.kubernetes.io/zone node label, for a stretched
+# cluster: label each node with its failover cluster's zone (one zone per
+# failover cluster), and every new PV gets a nodeAffinity for the zone it was
+# created in, which keeps its pods on the failover cluster that holds the VHDX.
+# The driver does not work the zone out or label anything; it repeats the label
+# you set, as a cloud controller would on a cloud.
+#
+# With this on, a node plugin refuses to start on a node without the label, so
+# label nodes first. Kubelet reads a node's topology only when the plugin
+# registers: restart the plugin on a node whose label you change. Volumes
+# created before this was turned on have no nodeAffinity and never get one.
+zoneTopology:
+  enabled: false
+
 controller:
   replicaCount: 1
 
@@ -357,7 +389,8 @@ storageClasses:
 #
 # The chart always renders one more class, hyperv-none (qos: "none"), which
 # is how a PVC goes back to no QoS: Kubernetes refuses to set a PVC's class
-# back to empty once one has been applied.
+# back to empty once one has been applied. A release with its own driverName
+# names it <fullname>-none instead, since class names are cluster-wide.
 #
 # Each entry renders one class whose driverName is fixed to this driver:
 #   name         (required)

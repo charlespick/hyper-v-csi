@@ -16,7 +16,13 @@
    multiple Hyper-V clusters, the driver can only manage storage for the subset
    of K8s nodes which reside on a single cluster. Multiple instances of the
    driver with descrete storageClasses can be used within a K8s cluster to
-   provide storage across multiple Hyper-V clusters
+   provide storage across multiple Hyper-V clusters: one complete, independent
+   release per failover cluster, each under its own driver name. Nodes are
+   labelled with `topology.kubernetes.io/zone` (one zone per failover cluster)
+   by the operator, as a cloud controller would, and the driver only repeats
+   that label back as CSI topology so PVs are pinned to their failover cluster.
+   It decides nothing about topology and never asks the agent about it. See
+   [docs/multiple-failover-clusters.md](docs/multiple-failover-clusters.md).
 
 ## In-scope capabilities
 

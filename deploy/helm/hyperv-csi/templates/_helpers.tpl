@@ -1,11 +1,50 @@
 {{/*
-The CSI driver name. Not configurable on purpose: it has to match the
-DriverName constant compiled into the binary, the CSIDriver object's
-metadata.name, and every StorageClass's provisioner. Changing it once volumes
-exist orphans their PersistentVolumes.
+The CSI driver name: the CSIDriver object's metadata.name, every StorageClass's
+provisioner, the VolumeSnapshotClass's and VolumeAttributesClasses' driver,
+the kubelet plugin directory, and what the binary registers as. The default
+matches the binary's own default, so an install that leaves driverName unset
+passes no --driver-name at all. Changing it once volumes exist orphans their
+PersistentVolumes.
 */}}
-{{- define "hyperv-csi.driverName" -}}
+{{- define "hyperv-csi.defaultDriverName" -}}
 csi.hyper-v.makerland.xyz
+{{- end -}}
+
+{{- define "hyperv-csi.driverName" -}}
+{{- .Values.driverName | default (include "hyperv-csi.defaultDriverName" .) -}}
+{{- end -}}
+
+{{/*
+"true" when this release registers under a name of its own - an additional
+install, one per failover cluster. It is the one switch that also gives the
+release's other cluster-wide and per-namespace names a per-release form, so a
+release that leaves driverName unset renders exactly what it always has.
+*/}}
+{{- define "hyperv-csi.customDriverName" -}}
+{{- if ne (include "hyperv-csi.driverName" .) (include "hyperv-csi.defaultDriverName" .) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+"true" when zone topology is on. Read through this rather than
+.Values.zoneTopology.enabled directly: `helm upgrade --reuse-values` from a
+release made before the value existed carries no zoneTopology map at all, and
+the direct path then fails the upgrade on a nil pointer.
+*/}}
+{{- define "hyperv-csi.zoneTopology" -}}
+{{- if and .Values.zoneTopology .Values.zoneTopology.enabled -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+The always-rendered no-QoS VolumeAttributesClass. Cluster-scoped, so a second
+release under its own driver name would collide on the fixed name; it gets
+one after the release instead.
+*/}}
+{{- define "hyperv-csi.noneVolumeAttributesClassName" -}}
+{{- if include "hyperv-csi.customDriverName" . -}}
+{{- printf "%s-none" (include "hyperv-csi.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+hyperv-none
+{{- end -}}
 {{- end -}}
 
 {{- define "hyperv-csi.name" -}}
@@ -66,6 +105,17 @@ Rejects configurations the driver itself would reject at startup, so the
 mistake surfaces at `helm install` rather than as a CrashLoopBackOff.
 */}}
 {{- define "hyperv-csi.validate" -}}
+{{- $driverName := include "hyperv-csi.driverName" . -}}
+{{- if not (regexMatch "^[a-zA-Z][A-Za-z0-9-._]{0,61}[a-zA-Z0-9]$" $driverName) -}}
+{{- fail (printf "driverName %q is not a valid CSI driver name: at most 63 characters of letters, digits, '-', '.' and '_', starting with a letter and ending with a letter or digit" $driverName) -}}
+{{- end -}}
+{{- /* Stricter than CSI: the chart also uses the name as the CSIDriver's
+metadata.name, which the API server only accepts as a lowercase DNS
+subdomain, so a name CSI allows (uppercase, '_') would otherwise fail only
+at apply time. */ -}}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" $driverName) -}}
+{{- fail (printf "driverName %q must be lowercase letters, digits, '-' and '.': it is also the CSIDriver object's name, which Kubernetes requires to be a DNS subdomain" $driverName) -}}
+{{- end -}}
 {{- if not .Values.agent.address -}}
 {{- fail "agent.address is required: the https:// URL of hyperv-csi-agent on the failover cluster" -}}
 {{- end -}}

@@ -26,6 +26,7 @@ import (
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/nodediscovery"
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/nodefencing"
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/nodeidentity"
+	"github.com/charlespick/hyper-v-csi/csi-driver/internal/nodetopology"
 )
 
 // nodeIdentityPollInterval is how often a starting node plugin re-reads its
@@ -43,11 +44,23 @@ func main() {
 		endpoint = flag.String("endpoint", "unix:///csi/csi.sock", "CSI endpoint")
 		mode     = flag.String("mode", "node",
 			"driver mode: controller, node, or node-identity (wait until this node's VM ID is recorded on its Node object, then exit - the node DaemonSet's init container)")
-		nodeID   = flag.String("node-id", "",
+		nodeID = flag.String("node-id", "",
 			"node ID override. In node mode this is the Hyper-V VM ID the controller records on this node's Node object when unset, which is the supported configuration")
 		nodeName = flag.String("node-name", os.Getenv("NODE_NAME"),
 			"name of the Kubernetes Node this plugin runs on, whose recorded VM ID it reports. Defaults to $NODE_NAME. Node mode only")
 		agentAddress = flag.String("agent-address", "", "hyperv-csi-agent base URL (required in controller mode)")
+
+		// One name per install. Only a second install in the same Kubernetes
+		// cluster - one per failover cluster - needs anything but the
+		// default, and an install keeps the name it started with: its PVs
+		// reference it.
+		driverName = flag.String("driver-name", driver.DefaultDriverName,
+			"CSI driver name to register as. Must match the CSIDriver object, every StorageClass's provisioner and, in node mode, the kubelet plugin directory. Change it only for an additional install, one per failover cluster, never on an install that already has volumes")
+
+		// Off by default, so nodes need no label unless asked for. See
+		// Driver.ZoneTopology.
+		zoneTopology = flag.Bool("zone-topology", false,
+			"report CSI topology from the topology.kubernetes.io/zone node label, which the operator sets to one zone per failover cluster. Node mode refuses to start on a node without the label; controller mode pins every new volume to the zone it is asked for. Both modes need it")
 
 		// Off by default, and deliberately so - see Driver.AllowMissingDiskID.
 		// This exists to let a PV created before resolve github issue 30's
@@ -109,6 +122,10 @@ func main() {
 		klog.Fatalf("invalid --mode %q: must be \"controller\", \"node\" or \"node-identity\"", *mode)
 	}
 
+	if err := driver.ValidateDriverName(*driverName); err != nil {
+		klog.Fatal(err)
+	}
+
 	// Kubelet stops the container with SIGTERM. Established here, ahead of
 	// everything that can block, because the node plugin's wait for its VM ID
 	// below and the controller's background loops all have to stop on it, as
@@ -120,9 +137,10 @@ func main() {
 	// each node's VM ID on its Node object, and the node plugin reads its own
 	// back. In-cluster config is what a pod under its own ServiceAccount uses,
 	// the same way every sidecar in this chart talks to the API server. The
-	// one configuration that needs no client is a node plugin given --node-id.
+	// one configuration that needs no client is a node plugin given --node-id
+	// with zone topology off; zone topology reads the node's label.
 	var kubeClient kubernetes.Interface
-	if *mode == "controller" || *nodeID == "" {
+	if *mode == "controller" || *nodeID == "" || *zoneTopology {
 		config, err := rest.InClusterConfig()
 		if err != nil {
 			klog.Fatalf("building in-cluster Kubernetes config: %v", err)
@@ -131,6 +149,26 @@ func main() {
 		if err != nil {
 			klog.Fatalf("building Kubernetes client: %v", err)
 		}
+	}
+
+	var zone string
+	if *zoneTopology && (*mode == "node" || *mode == "node-identity") {
+		if *nodeName == "" {
+			klog.Fatal("--node-name (or $NODE_NAME from the downward API) is required to read this node's zone label")
+		}
+
+		// Read once, at startup, and fatal without it rather than waiting:
+		// a missing label is a configuration mistake for the operator to fix,
+		// not something the driver will ever fill in. Before the VM ID wait,
+		// in both modes, so the chart's init container fails on it at once
+		// instead of after discovery. Kubelet asks NodeGetInfo only at
+		// registration, so this one read is all it ever reports.
+		var err error
+		zone, err = nodetopology.ReadZone(ctx, nodeidentity.Nodes(kubeClient), *nodeName)
+		if err != nil {
+			klog.Fatal(err)
+		}
+		klog.InfoS("zone topology on: this node's zone read from its label", "node", *nodeName, "zone", zone)
 	}
 
 	if *mode == "node" || *mode == "node-identity" {
@@ -200,6 +238,9 @@ func main() {
 	}
 
 	d := driver.New(*nodeID, agent, *allowMissingDiskID)
+	d.Name = *driverName
+	d.ZoneTopology = *zoneTopology
+	d.Zone = zone
 
 	if *mode == "controller" {
 		// Unconditional, unlike fencing: without a recorded VM ID no node
@@ -223,7 +264,10 @@ func main() {
 		fencer, err := nodefencing.New(nodefencing.Config{
 			KubeClient:    kubeClient,
 			ClusterStates: agent,
-			DriverName:    driver.DriverName,
+			// This install's own name, so it fences only nodes whose CSINode
+			// lists it: another failover cluster's nodes, registered under
+			// another install's name, are left to that install.
+			DriverName:    *driverName,
 			GracePeriod:   nodeFencingGracePeriod,
 			PollInterval:  nodeFencingPollInterval,
 			Confirmations: nodeFencingConfirmations,

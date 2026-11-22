@@ -74,6 +74,15 @@ while volumes are still detaching would undo the thing it was applied for.
 
   kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints
 {{- end }}
+{{- if include "hyperv-csi.zoneTopology" . }}
+
+Zone topology is on. Every node the node plugin runs on needs a
+topology.kubernetes.io/zone label naming its failover cluster's zone, set by
+you before the plugin starts; on a node without one the plugin fails to start
+and says so. New PVs get a nodeAffinity for the zone they were created in.
+
+  kubectl get nodes -L topology.kubernetes.io/zone
+{{- end }}
 {{- if .Values.agent.allowInsecure }}
 
 WARNING: agent.allowInsecure is set. The connection to the agent has no TLS and

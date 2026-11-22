@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"strings"
 	"sync"
 	"testing"
 
@@ -19,11 +20,11 @@ import (
 var csiPluginName = regexp.MustCompile(`^[a-zA-Z][A-Za-z0-9-.\_]{0,61}[a-zA-Z0-9]$`)
 
 func TestDriverNameIsAValidPluginName(t *testing.T) {
-	if !csiPluginName.MatchString(DriverName) {
-		t.Errorf("DriverName %q does not satisfy the CSI plugin name format", DriverName)
+	if !csiPluginName.MatchString(DefaultDriverName) {
+		t.Errorf("DefaultDriverName %q does not satisfy the CSI plugin name format", DefaultDriverName)
 	}
-	if len(DriverName) > 63 {
-		t.Errorf("DriverName %q is %d chars, over the spec's 63 limit", DriverName, len(DriverName))
+	if len(DefaultDriverName) > 63 {
+		t.Errorf("DefaultDriverName %q is %d chars, over the spec's 63 limit", DefaultDriverName, len(DefaultDriverName))
 	}
 }
 
@@ -44,6 +45,50 @@ func TestGetPluginInfoReportsTheDriverIdentity(t *testing.T) {
 	}
 	if resp.GetVendorVersion() == "" {
 		t.Error("vendor version is empty; the Makefile is supposed to inject it via -ldflags")
+	}
+}
+
+func TestGetPluginInfoReportsAConfiguredDriverName(t *testing.T) {
+	// An additional install, one per failover cluster, registers under its
+	// own name so the two never claim each other's volumes.
+	d := New("", nil, false)
+	d.Name = "fc-b.csi.hyper-v.makerland.xyz"
+
+	resp, err := (&identityServer{driver: d}).GetPluginInfo(context.Background(), &csi.GetPluginInfoRequest{})
+	if err != nil {
+		t.Fatalf("GetPluginInfo: %v", err)
+	}
+
+	if resp.GetName() != "fc-b.csi.hyper-v.makerland.xyz" {
+		t.Errorf("name = %q, want fc-b.csi.hyper-v.makerland.xyz", resp.GetName())
+	}
+}
+
+func TestValidateDriverName(t *testing.T) {
+	valid := []string{
+		DefaultDriverName,
+		"fc-b.csi.hyper-v.makerland.xyz",
+		"a1",
+		"x" + strings.Repeat("y", 61) + "z", // 63, the limit
+	}
+	for _, name := range valid {
+		if err := ValidateDriverName(name); err != nil {
+			t.Errorf("ValidateDriverName(%q) = %v, want accepted", name, err)
+		}
+	}
+
+	invalid := []string{
+		"",
+		"x" + strings.Repeat("y", 62) + "z", // 64
+		"1csi.example.com",                  // must start with a letter
+		"csi.example.com.",                  // must end with an alphanumeric
+		"csi/example",                       // a path separator, and it names a kubelet directory
+		"csi example",
+	}
+	for _, name := range invalid {
+		if err := ValidateDriverName(name); err == nil {
+			t.Errorf("ValidateDriverName(%q) accepted, want refused", name)
+		}
 	}
 }
 

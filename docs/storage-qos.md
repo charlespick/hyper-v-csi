@@ -57,8 +57,10 @@ Repoint it at another class at any time, attached or not, to change its QoS.
 Kubernetes refuses to set a PVC's `volumeAttributesClassName` back to empty
 once a class has been applied, and a class needs at least one parameter. The
 chart therefore always renders `hyperv-none` (`qos: "none"`): point a PVC at it
-to remove its QoS. It leaves exactly the Hyper-V state of a volume that never
-had a class.
+to remove its QoS. (A release with its own `driverName`, one per failover
+cluster, names it `<release fullname>-none` instead; see
+[multiple-failover-clusters.md](multiple-failover-clusters.md).) It leaves
+exactly the Hyper-V state of a volume that never had a class.
 
 ### Normalized IOPS
 

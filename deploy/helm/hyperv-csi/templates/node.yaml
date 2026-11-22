@@ -54,6 +54,13 @@ spec:
           args:
             - --mode=node-identity
             - --v={{ .Values.logging.verbosity }}
+            {{- if include "hyperv-csi.zoneTopology" . }}
+            # Fails at once, naming the fix, on a node without a
+            # topology.kubernetes.io/zone label - before waiting for the VM ID,
+            # so a node left unlabelled shows Init:CrashLoopBackOff rather
+            # than a plugin that registers with no zone.
+            - --zone-topology
+            {{- end }}
           env:
             - name: NODE_NAME
               valueFrom:
@@ -116,6 +123,18 @@ spec:
             # resolves a node to a VM by identity rather than by matching names.
             - --endpoint=unix:///csi/csi.sock
             - --v={{ .Values.logging.verbosity }}
+            {{- if include "hyperv-csi.customDriverName" . }}
+            # Registers under this release's own name, matching the registrar's
+            # kubelet-registration-path and socket directory, which are named
+            # after it too.
+            - --driver-name={{ include "hyperv-csi.driverName" . }}
+            {{- end }}
+            {{- if include "hyperv-csi.zoneTopology" . }}
+            # NodeGetInfo reports the node's topology.kubernetes.io/zone label,
+            # which kubelet records in CSINode for external-provisioner to pin
+            # new volumes to.
+            - --zone-topology
+            {{- end }}
             {{- if .Values.node.unsafeAllowMissingDiskId }}
             # See node.unsafeAllowMissingDiskId in values.yaml - a migration
             # escape hatch, not meant to stay on.

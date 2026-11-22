@@ -13,6 +13,8 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"k8s.io/klog/v2"
+
+	"github.com/charlespick/hyper-v-csi/csi-driver/internal/nodetopology"
 )
 
 // operationCreateVolume is the operationType the agent dispatches on; it must
@@ -174,6 +176,18 @@ func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		return nil, err
 	}
 
+	// Chosen before anything reaches the agent, so a request this install
+	// cannot pin to a zone never leaves a VHDX behind.
+	var accessibleTopology []*csi.Topology
+	if s.driver.ZoneTopology {
+		zone, err := zoneFromRequirements(req.GetAccessibilityRequirements())
+		if err != nil {
+			klog.V(2).InfoS("CreateVolume: rejected, no zone to pin the volume to", "name", req.GetName(), "err", err)
+			return nil, err
+		}
+		accessibleTopology = []*csi.Topology{{Segments: map[string]string{nodetopology.ZoneKey: zone}}}
+	}
+
 	// The CSI volume name is the idempotency key (docs/rpc-surface-overview.md),
 	// so a provisioner retry for the same PVC re-attaches to this job instead of
 	// racing a second create for the same file. With QoS in the key too: a
@@ -308,8 +322,42 @@ func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 			// external-provisioner records this on the PV. Nil for an empty
 			// create, exactly mirroring the request.
 			ContentSource: req.GetVolumeContentSource(),
+			// external-provisioner turns this into the PV's nodeAffinity, which
+			// is what keeps pods using the volume on the failover cluster that
+			// holds it. Nil with zone topology off, as before.
+			AccessibleTopology: accessibleTopology,
 		},
 	}, nil
+}
+
+// zoneFromRequirements picks the zone CreateVolume pins a new volume to: the
+// first preferred segment that names one, else the first requisite segment
+// that does. external-provisioner builds both lists from the topology this
+// driver's node plugins registered in CSINode, and an install's driver name is
+// registered only on its own failover cluster's nodes, so every zone it offers
+// is this failover cluster's. Nothing here decides which zone that is.
+//
+// Preferred is scanned rather than its first entry taken, as
+// external-provisioner asks: a segment from a node that registered other keys
+// can come first.
+//
+// No zone at all is refused rather than answered with an unpinned volume. A PV
+// with no nodeAffinity is schedulable onto every failover cluster's nodes,
+// which is the mistake zone topology exists to prevent. external-provisioner
+// sends no requirements until a node plugin has registered with a zone, and
+// retries, so this clears once one has.
+func zoneFromRequirements(requirements *csi.TopologyRequirement) (string, error) {
+	for _, segments := range [][]*csi.Topology{requirements.GetPreferred(), requirements.GetRequisite()} {
+		for _, topology := range segments {
+			if zone := topology.GetSegments()[nodetopology.ZoneKey]; zone != "" {
+				return zone, nil
+			}
+		}
+	}
+
+	return "", status.Errorf(codes.InvalidArgument,
+		"zone topology is on but the request names no %s to create the volume in; "+
+			"no node with this driver has registered a zone yet", nodetopology.ZoneKey)
 }
 
 // volumeContentSourceSnapshotID extracts the snapshot ID CreateVolume should

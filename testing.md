@@ -145,6 +145,30 @@ suite's own `csi-hostpath` driver, which deploys itself and does not run on
 this cluster. The `[Flaky]` invalid-class recovery spec stays silenced; it was
 checked by hand instead (see docs/storage-qos.md).
 
+### A second release, with zone topology
+
+A release with its own `driverName` and `zoneTopology.enabled`
+([docs/multiple-failover-clusters.md](docs/multiple-failover-clusters.md)) is
+run through the same suite with a driver definition of its own: a copy of
+`testdriver.yaml`, `storageclass.yaml` and `volumeattributesclass.yaml` with
+the release's driver name, plus `topology: true` and
+`TopologyKeys: [topology.kubernetes.io/zone]`. `--storage.testdriver` can be
+given more than once, so pass the copy after `--` and focus on its name
+(`External.Storage.*<escaped driver name>`). Keep the copies inside the
+repository, since only the repository is mounted into the runner container;
+`test/e2e/_artifacts/` is gitignored and works.
+
+First run on 2026-11-22, `full` profile minus snapshots (this cluster had no
+snapshot CRDs), against a second release installed next to an unchanged
+default one on the single-node dev cluster: 55 specs, all passed, including
+both topology specs a single zone can run ("provision a volume and schedule a
+pod with AllowedTopologies", immediate and delayed binding). The two
+"conflict with AllowedTopologies" specs need a second zone and skip. Two
+failover clusters were not available, so the cross-cluster behaviour (a
+node of one failover cluster never getting another's volume) was checked by
+hand: relabelling the node into another zone left a pod on a zone-pinned PV
+unschedulable with "didn't match PersistentVolume's node affinity".
+
 Each run writes to `test/e2e/_artifacts/<profile>-<timestamp>/`: `junit.xml`,
 Ginkgo's aggregated report and the one for CI to read, alongside `e2e.test`'s
 own per-process `junit_NN.xml` and whatever it dumps from the cluster on a
@@ -187,7 +211,7 @@ flag is a statement about the driver, a skip regex is a statement about us.
 | **Raw block volumes** | `block: false` | `requireMountVolume` rejects them; nothing formats or maps a raw device |
 | **ReadWriteMany, ReadOnlyMany** | `RWX: false`, `capReadOnlyMany: false` | A VHDX attaches to one VM at a time |
 | **Volume cloning** (`pvcDataSource`) | `pvcDataSource: false` | `CreateVolume` rejects a volume content source |
-| **Topology-aware scheduling** | `topology: false` | `NodeGetInfo` reports no accessible topology, deliberately — a CSV is reachable from every host |
+| **Topology-aware scheduling** (default install) | `topology: false` | By default `NodeGetInfo` reports no accessible topology, deliberately — a CSV is reachable from every host in its failover cluster. Zone topology for one release per failover cluster is covered separately; see [A second release, with zone topology](#a-second-release-with-zone-topology) |
 | **Storage capacity reporting** | `capacity: false` | `GetCapacity` is not implemented |
 | **Volume limits per node** | `volumeLimits: false` | `NodeGetInfo` reports no `max_volumes_per_node`. There is a real Hyper-V SCSI controller limit behind this; reporting it is separate work |
 | **Two PVs sharing one volume handle** | `multiplePVsSameID: false` | The original reason — the controller resolving an expansion's node by matching a `VolumeAttachment` on PV name — is gone, since the agent now resolves attachment from the VHDX path. The capability stays off until the case has actually been run against the suite |

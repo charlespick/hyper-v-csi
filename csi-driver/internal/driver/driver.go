@@ -6,6 +6,9 @@
 package driver
 
 import (
+	"fmt"
+	"regexp"
+
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/agentclient"
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/vmbusdisk"
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -14,12 +17,30 @@ import (
 )
 
 const (
-	// DriverName is what GetPluginInfo reports, and it has to match the
-	// CSIDriver object's metadata.name and every StorageClass's provisioner
-	// field. Changing it after anything references it orphans existing
-	// PersistentVolumes, so it is fixed from here on.
-	DriverName = "csi.hyper-v.makerland.xyz"
+	// DefaultDriverName is what GetPluginInfo reports unless --driver-name
+	// says otherwise, and it has to match the CSIDriver object's
+	// metadata.name and every StorageClass's provisioner field. Changing it
+	// after anything references it orphans existing PersistentVolumes, so an
+	// install keeps the name it started with. Another name exists only for
+	// running more than one independent install in one Kubernetes cluster -
+	// one per failover cluster - where two installs claiming the same name
+	// would race each other for every volume.
+	DefaultDriverName = "csi.hyper-v.makerland.xyz"
 )
+
+// pluginNameFormat is the CSI spec's constraint on GetPluginInfo's name: at
+// most 63 characters, starting with a letter and ending with an alphanumeric.
+var pluginNameFormat = regexp.MustCompile(`^[a-zA-Z][A-Za-z0-9-.\_]{0,61}[a-zA-Z0-9]$`)
+
+// ValidateDriverName reports whether name is usable as this plugin's CSI name.
+// Checked at startup, because otherwise the first thing to reject it is
+// kubelet's plugin registration, far from the flag that caused it.
+func ValidateDriverName(name string) error {
+	if !pluginNameFormat.MatchString(name) {
+		return fmt.Errorf("driver name %q is not a valid CSI plugin name: at most 63 characters of letters, digits, '-', '.' and '_', starting with a letter and ending with a letter or digit", name)
+	}
+	return nil
+}
 
 // Version is overridden at build time via -ldflags.
 var Version = "dev"
@@ -28,8 +49,29 @@ var Version = "dev"
 // servers: driver identity, the node's own ID (only meaningful in node
 // mode), and the client used to talk to hyperv-csi-agent.
 type Driver struct {
+	// Name is the CSI driver name GetPluginInfo reports. New sets it to
+	// DefaultDriverName.
+	Name string
+
 	NodeID string
 	Agent  *agentclient.Client
+
+	// ZoneTopology turns on CSI topology taken from the
+	// topology.kubernetes.io/zone node label: the identity server advertises
+	// VOLUME_ACCESSIBILITY_CONSTRAINTS, NodeGetInfo reports Zone, and
+	// CreateVolume pins each new volume to the zone external-provisioner asks
+	// for. Off by default, so an install whose nodes carry no zone label
+	// behaves as it always has.
+	//
+	// The driver decides nothing about zones. The operator labels each node
+	// with its failover cluster's zone, as a cloud controller manager would on
+	// a cloud, and the driver only repeats that label back. The agent is never
+	// asked anything about topology.
+	ZoneTopology bool
+
+	// Zone is this node's topology.kubernetes.io/zone label, read from its
+	// Node object at startup. Node mode with ZoneTopology only.
+	Zone string
 
 	// AllowMissingDiskID relaxes NodeStageVolume's requirement that
 	// volume_context carry volumeContextDiskID, and skips diskidentity.Verify
@@ -44,7 +86,7 @@ type Driver struct {
 }
 
 func New(nodeID string, agent *agentclient.Client, allowMissingDiskID bool) *Driver {
-	return &Driver{NodeID: nodeID, Agent: agent, AllowMissingDiskID: allowMissingDiskID}
+	return &Driver{Name: DefaultDriverName, NodeID: nodeID, Agent: agent, AllowMissingDiskID: allowMissingDiskID}
 }
 
 func (d *Driver) IdentityServer() csi.IdentityServer {

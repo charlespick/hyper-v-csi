@@ -144,10 +144,12 @@ picked up by the staleness check above as soon as kubelet reports the new
 The node ID stays opaque above the resolution, which is what keeps this
 swap local. Nothing but `IClusterService.ResolveVmAsync` interprets it,
 and `JobTargets.Vm` canonicalizes it: the Go controller only concatenates
-it into an idempotency key, and no PV field records it, because the driver
-advertises no topology and `VOLUME_ACCESSIBILITY_CONSTRAINTS` would put a
-node identity into `PV.spec.nodeAffinity`, where it is immutable for the
-life of the volume. The only persisted copy is in `CSINode`, which kubelet
+it into an idempotency key, and no PV field records it. The only topology
+the driver ever advertises is the operator's own zone label, with zone
+topology on ([multiple-failover-clusters.md](multiple-failover-clusters.md));
+a topology key carrying the node ID would put a node identity into
+`PV.spec.nodeAffinity`, where it is immutable for the life of the volume.
+The only persisted copy is in `CSINode`, which kubelet
 rewrites whenever the node plugin re-registers. Keep it that way: the day
 something parses the node ID, or a topology key starts carrying it, this
 stops being a local change.

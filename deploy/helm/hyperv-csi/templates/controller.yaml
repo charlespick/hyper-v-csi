@@ -205,6 +205,20 @@ spec:
             - --endpoint=unix:///csi/csi.sock
             - --v={{ .Values.logging.verbosity }}
             - --agent-address={{ .Values.agent.address }}
+            {{- if include "hyperv-csi.customDriverName" . }}
+            # This release's own name. The sidecars name their leader-election
+            # leases after the name the driver reports, so this alone also
+            # keeps them apart from another release's.
+            - --driver-name={{ include "hyperv-csi.driverName" . }}
+            {{- end }}
+            {{- if include "hyperv-csi.zoneTopology" . }}
+            # Advertises VOLUME_ACCESSIBILITY_CONSTRAINTS and pins each new
+            # volume to the zone external-provisioner asks for, which it takes
+            # from the topology the node plugins registered. csi-provisioner
+            # has had its Topology feature gate on by default since v5, so the
+            # sidecar needs no flag for it.
+            - --zone-topology
+            {{- end }}
             {{- if .Values.agent.allowInsecure }}
             - --allow-insecure-agent
             {{- else }}
@@ -229,6 +243,15 @@ spec:
             # The lease namespace defaults to $POD_NAMESPACE below; the driver
             # exits rather than guessing if neither is set.
             - --node-fencing-lease-namespace=$(POD_NAMESPACE)
+            {{- if include "hyperv-csi.customDriverName" . }}
+            # A lease named after this release's own driver name, which no other
+            # release shares and which can never equal the default
+            # hyperv-csi-node-fencing whatever the release is called. Two
+            # releases in one namespace sharing a lease would elect one fencer
+            # between them, and the other failover cluster's nodes would never
+            # be fenced.
+            - --node-fencing-lease-name=node-fencing-{{ include "hyperv-csi.driverName" . }}
+            {{- end }}
             {{- end }}
           {{- if .Values.controller.nodeFencing.enabled }}
           env:
