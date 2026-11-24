@@ -117,7 +117,7 @@ controller:
     extraArgs: []
 
   attacher:
-    image: registry.k8s.io/sig-storage/csi-attacher:v4.7.0
+    image: registry.k8s.io/sig-storage/csi-attacher:v4.13.1
     timeout: 30s
     extraArgs: []
 
@@ -136,7 +136,7 @@ controller:
   # port 9808 for a kubelet livenessProbe — the driver binary serves no HTTP
   # itself. Pinned to the same sidecar release wave as the three above.
   livenessProbe:
-    image: registry.k8s.io/sig-storage/livenessprobe:v2.14.0
+    image: registry.k8s.io/sig-storage/livenessprobe:v2.20.1
 
   # external-snapshotter. Off by default — not because the snapshot path is
   # unproven (CreateSnapshot, DeleteSnapshot, ListSnapshots and
@@ -282,13 +282,13 @@ node:
   enabled: true
 
   registrar:
-    image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0
+    image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.1
 
   # livenessprobe exposes the driver's CSI Probe RPC as an HTTP /healthz on
   # port 9808 for a kubelet livenessProbe — the driver binary serves no HTTP
   # itself. Pinned to the same sidecar release wave as the registrar above.
   livenessProbe:
-    image: registry.k8s.io/sig-storage/livenessprobe:v2.14.0
+    image: registry.k8s.io/sig-storage/livenessprobe:v2.20.1
 
   kubeletDir: /var/lib/kubelet
 
