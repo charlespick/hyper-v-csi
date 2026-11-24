@@ -116,6 +116,11 @@ at apply time. */ -}}
 {{- if not (regexMatch "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" $driverName) -}}
 {{- fail (printf "driverName %q must be lowercase letters, digits, '-' and '.': it is also the CSIDriver object's name, which Kubernetes requires to be a DNS subdomain" $driverName) -}}
 {{- end -}}
+{{- if include "hyperv-csi.zoneTopology" . -}}
+  {{- if not (index (.Values.node.nodeSelector | default dict) "topology.kubernetes.io/zone") -}}
+{{- fail "zoneTopology.enabled requires node.nodeSelector to set topology.kubernetes.io/zone to this failover cluster's zone: without it the node plugin also registers on other failover clusters' nodes, and volumes can be pinned to a zone that cannot attach them. See docs/multiple-failover-clusters.md" -}}
+  {{- end -}}
+{{- end -}}
 {{- if not .Values.agent.address -}}
 {{- fail "agent.address is required: the https:// URL of hyperv-csi-agent on the failover cluster" -}}
 {{- end -}}

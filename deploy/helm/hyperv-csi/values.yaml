@@ -93,7 +93,8 @@ driverName: ""
 # you set, as a cloud controller would on a cloud.
 #
 # With this on, a node plugin refuses to start on a node without the label, so
-# label nodes first. Kubelet reads a node's topology only when the plugin
+# label nodes first. It also requires node.nodeSelector to set
+# topology.kubernetes.io/zone to this failover cluster's zone. Kubelet reads a node's topology only when the plugin
 # registers: restart the plugin on a node whose label you change. Volumes
 # created before this was turned on have no nodeAffinity and never get one.
 zoneTopology:

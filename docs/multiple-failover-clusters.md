@@ -30,8 +30,9 @@ A single release that routes to several agents is not supported.
    - **its own `driverName`**. Two releases with the same name would both claim
      every PVC, VolumeAttachment, resize and snapshot for it.
    - **`zoneTopology.enabled: true`**.
-   - **a `node.nodeSelector`** that keeps its node DaemonSet on its own
-     failover cluster's nodes.
+   - **a `node.nodeSelector` on `topology.kubernetes.io/zone`** that keeps its
+     node DaemonSet on its own failover cluster's nodes. The chart refuses to
+     render `zoneTopology.enabled` without it.
    - **its own `agent.address`**, and StorageClass, VolumeSnapshotClass and
      `volumeAttributesClasses` names that don't collide with the other
      releases'. All three are cluster-wide.
@@ -59,8 +60,8 @@ A single release that routes to several agents is not supported.
 One release can keep the default driver name. An existing single-cluster
 install can become the first failover cluster's release, so long as its own
 name is not changed (its PVs name the driver that serves them), but it needs
-the same `zoneTopology.enabled` and, just as important, a `node.nodeSelector`
-for its own zone. The node DaemonSet tolerates every taint and has no selector
+the same `zoneTopology.enabled` and the `node.nodeSelector` for its own zone
+that the chart requires with it. The node DaemonSet tolerates every taint and has no selector
 by default, so without one its plugin also starts on the other failover
 clusters' nodes, registers their zones under this release's name, and this
 release's provisioner can then pin a volume on its own CSV to a zone whose
