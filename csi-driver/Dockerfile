@@ -9,7 +9,7 @@ RUN CGO_ENABLED=0 go build -ldflags "-X github.com/charlespick/hyper-v-csi/csi-d
 # Not distroless/static: the node plugin's k8s.io/mount-utils shells out to
 # blkid, mkfs.<fstype>, mount, and umount to stage/unstage a volume, none of
 # which a static distroless image has.
-FROM debian:12-slim
+FROM debian:13.8-slim@sha256:8aa5a7bf5a1955bddbe7d74fcdd0b91ab30e74362a8b73af672b0481b35b44a0
 RUN apt-get update && apt-get install -y --no-install-recommends \
         e2fsprogs \
         util-linux \
