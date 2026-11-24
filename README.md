@@ -21,8 +21,10 @@ The driver has two halves that talk to each other over mutual TLS:
 Kubernetes nodes must themselves be VMs clustered on that same failover cluster,
 since the agent needs to resolve a node to a VM and act on it even if the VM's
 host has died. A Kubernetes cluster whose nodes span more than one Hyper-V
-cluster is supported by running one instance of the driver (with its own
-StorageClass) per Hyper-V cluster.
+cluster is supported by running one release of the chart per Hyper-V cluster,
+each with its own driver name and StorageClass, and labelling each node with
+its cluster's `topology.kubernetes.io/zone` — see
+[docs/multiple-failover-clusters.md](docs/multiple-failover-clusters.md).
 
 What works today: dynamic provisioning, attach/detach, online expansion, and the
 full node staging/mount path. Snapshots (create/delete/restore) are implemented

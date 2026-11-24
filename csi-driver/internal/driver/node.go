@@ -18,6 +18,7 @@ import (
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/diskidentity"
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/fsstats"
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/guidnorm"
+	"github.com/charlespick/hyper-v-csi/csi-driver/internal/nodetopology"
 	"github.com/charlespick/hyper-v-csi/csi-driver/internal/vmbusdisk"
 )
 
@@ -564,9 +565,34 @@ func (s *nodeServer) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCa
 // NodeGetInfo reports node identity used for scheduling and attach
 // decisions. NodeID must match what ControllerPublishVolume resolves
 // through cluster APIs (the VM's identity), not the guest hostname.
+//
+// With zone topology on it also reports the node's zone label, which kubelet
+// records in CSINode and external-provisioner turns into each new PV's
+// nodeAffinity. Kubelet asks only when the plugin registers, so a changed
+// label takes effect when the plugin restarts.
 func (s *nodeServer) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
-	klog.V(2).InfoS("NodeGetInfo", "nodeId", s.driver.NodeID)
-	return &csi.NodeGetInfoResponse{NodeId: s.driver.NodeID}, nil
+	klog.V(2).InfoS("NodeGetInfo", "nodeId", s.driver.NodeID, "zone", s.driver.Zone)
+
+	if !s.driver.ZoneTopology {
+		return &csi.NodeGetInfoResponse{NodeId: s.driver.NodeID}, nil
+	}
+
+	// Startup refuses to get this far without a zone. Checked again here
+	// rather than reporting no topology, which kubelet would accept and record
+	// as a node every zone's volumes can reach.
+	if s.driver.Zone == "" {
+		err := status.Errorf(codes.FailedPrecondition,
+			"zone topology is on but this node has no %s label", nodetopology.ZoneKey)
+		klog.ErrorS(err, "NodeGetInfo: no zone")
+		return nil, err
+	}
+
+	return &csi.NodeGetInfoResponse{
+		NodeId: s.driver.NodeID,
+		AccessibleTopology: &csi.Topology{
+			Segments: map[string]string{nodetopology.ZoneKey: s.driver.Zone},
+		},
+	}, nil
 }
 
 // NodePublishVolume bind-mounts a staged volume into a pod's path. Idempotency key: volume ID + target path.

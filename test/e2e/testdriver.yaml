@@ -101,7 +101,7 @@ DriverInfo:
     # snapshot content source is being built, so this stays off - turning it
     # on would fail the clone tests rather than skip them.
     pvcDataSource: false
-    topology: false            # NodeGetInfo reports no accessible topology
+    topology: false            # off unless zoneTopology.enabled; see testing.md
     capacity: false            # GetCapacity is not implemented
     volumeLimits: false        # NodeGetInfo reports no max_volumes_per_node
     volumeMountGroup: false    # no VOLUME_MOUNT_GROUP node capability

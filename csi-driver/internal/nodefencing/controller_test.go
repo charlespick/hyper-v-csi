@@ -926,3 +926,71 @@ var _ ClusterStateSource = (*agentclient.Client)(nil)
 
 // Compile-time proof that the fake clientset satisfies what Config wants.
 var _ kubernetes.Interface = (*fake.Clientset)(nil)
+
+// TestStretchedClusterOnlyTheOwningInstallFences covers a Kubernetes cluster
+// stretched across two failover clusters, with one independent install per
+// failover cluster under different driver names, sharing one API server. A
+// node VM on failover cluster A goes down. Install A fences it; install B,
+// whose driver is not registered on that node, ignores it without asking its
+// own agent - which could only answer that it has no such VM.
+func TestStretchedClusterOnlyTheOwningInstallFences(t *testing.T) {
+	const driverA, driverB = "csi.hyper-v.makerland.xyz", "fc-b.csi.hyper-v.makerland.xyz"
+
+	kube := fake.NewSimpleClientset(unreachableNode(testNodeName), csiNode(testNodeName, driverA, testVMID))
+	fakeClock := clocktesting.NewFakeClock(time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC))
+
+	newInstall := func(driverName string, states *fakeStateSource) *Controller {
+		controller, err := New(Config{
+			KubeClient:    kube,
+			ClusterStates: states,
+			DriverName:    driverName,
+			GracePeriod:   ptr.To(testGracePeriod),
+			PollInterval:  ptr.To(testPollInterval),
+			Confirmations: ptr.To(testConfirmations),
+			Clock:         fakeClock,
+			Logger:        log.New(io.Discard, "", 0),
+		})
+		if err != nil {
+			t.Fatalf("New(%s): %v", driverName, err)
+		}
+		return controller
+	}
+
+	statesA := &fakeStateSource{responses: []stateResponse{notRunning()}}
+	statesB := &fakeStateSource{responses: []stateResponse{failing(agentclient.ErrVMClusterResourceNotFound)}}
+	installA, installB := newInstall(driverA, statesA), newInstall(driverB, statesB)
+
+	reconcile := func(controller *Controller) {
+		t.Helper()
+		if _, err := controller.Reconcile(context.Background(), testNodeName); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+	}
+
+	reconcile(installA)
+	reconcile(installB)
+	fakeClock.Step(testGracePeriod + time.Second)
+
+	// Once past the grace period, B looks the node up, finds no CSINode entry
+	// for its own driver and drops it, which makes the queue forget the key.
+	// Nothing re-enqueues it short of a new informer event, so B gets this one
+	// trip, while A polls on to its confirmation count.
+	reconcile(installB)
+	if tracked := installB.TrackedNodes(); len(tracked) != 0 {
+		t.Errorf("install B still tracks another failover cluster's node: %v", tracked)
+	}
+	for range testConfirmations {
+		reconcile(installA)
+	}
+
+	node, err := kube.CoreV1().Nodes().Get(context.Background(), testNodeName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("reading node: %v", err)
+	}
+	if !hasTaintKey(node, corev1.TaintNodeOutOfService) {
+		t.Error("install A did not fence its own failover cluster's node")
+	}
+	if statesB.callCount() != 0 {
+		t.Errorf("install B asked its agent about another failover cluster's node %d times", statesB.callCount())
+	}
+}

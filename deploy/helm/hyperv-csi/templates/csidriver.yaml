@@ -2,8 +2,8 @@
 apiVersion: storage.k8s.io/v1
 kind: CSIDriver
 metadata:
-  # Must equal the DriverName compiled into the binary and the provisioner of
-  # every StorageClass below.
+  # Must equal the name the driver registers as (its --driver-name, or the
+  # compiled-in default) and the provisioner of every StorageClass below.
   name: {{ include "hyperv-csi.driverName" . }}
   labels:
     {{- include "hyperv-csi.labels" . | nindent 4 }}
