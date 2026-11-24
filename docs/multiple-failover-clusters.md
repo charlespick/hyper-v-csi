@@ -123,6 +123,45 @@ failover clusters, so only the release whose agent finds the VM records it, and
 the others stop asking once it is recorded. Until then they ask again every five
 minutes and log that no host has the VM.
 
+## Several Kubernetes clusters on one failover cluster
+
+A failover cluster has one agent. A release from every Kubernetes cluster
+running on it talks to that agent, and all their volumes and snapshots go
+into the same CSV directories. The agent knows nothing about Kubernetes
+clusters: a volume's file name is its volume ID, and that ID is all that keeps
+one cluster's disks apart from another's.
+
+By default the volume ID is `pvc-<PVC UID>`. That is unique unless two clusters
+share PVC UIDs, which happens when one cluster is built from the other's etcd
+backup. If a CreateVolume names a file that already exists and fits the
+requested size, the agent treats it as a retry and returns the existing disk.
+The second cluster then takes over the first cluster's disk without any error,
+and deleting, expanding or snapshotting the volume from either cluster acts on
+both.
+
+Give each Kubernetes cluster its own name prefix, using the provisioner and
+snapshotter's own flags, in every release in that cluster:
+
+```yaml
+controller:
+  provisioner:
+    extraArgs:
+      - --volume-name-prefix=k2-pvc
+  snapshotter:
+    extraArgs:
+      - --snapshot-name-prefix=k2-snap
+```
+
+A prefix may use only `A-Z`, `a-z`, `0-9`, `.`, `_` and `-`. The finished
+volume ID is limited to 127 characters, and the UID takes 37 of them. Existing
+PVs keep the IDs they were created with, so a prefix can be added at any time
+and applies to new volumes only. One cluster can keep the default prefix.
+
+A prefix does not stop a `volumeHandle` or `snapshotHandle` copied into a
+static PV or VolumeSnapshotContent in another cluster from naming the same
+disk. The agent lets any client on its certificate allowlist act on every
+volume on its CSV.
+
 ## Caveats
 
 - Kubelet asks for a node's topology only when the plugin registers. Label each
