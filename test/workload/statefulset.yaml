@@ -18,7 +18,7 @@ spec:
     spec:
       containers:
         - name: postgres
-          image: postgres:16
+          image: postgres:16.15@sha256:f9a7b9ebf6f56201f949db745e47bc423c0f0f8294bafe991cc10bf74b029657
           env:
             - name: POSTGRES_PASSWORD
               value: workload
@@ -38,7 +38,7 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 5
         - name: workload
-          image: postgres:16
+          image: postgres:16.15@sha256:f9a7b9ebf6f56201f949db745e47bc423c0f0f8294bafe991cc10bf74b029657
           command: ["/bin/sh", "/scripts/workload.sh"]
           env:
             - name: POSTGRES_PASSWORD
