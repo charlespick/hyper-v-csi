@@ -100,21 +100,16 @@ jobs:
     name: Container image
     needs: [version, go]
     runs-on: ubuntu-latest
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-        with:
-          driver-opts: image=moby/buildkit:v0.35.0@sha256:aa632b921ef07411d2cb77292cd34213d4f7b384001d6fceef1e1f25bf9752bb
       - if: needs.version.outputs.is-release == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - id: build
-        uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v6
         with:
           context: csi-driver
           build-args: VERSION=${{ needs.version.outputs.version }}
@@ -131,16 +126,13 @@ jobs:
   chart:
     name: Helm chart
     if: needs.version.outputs.is-release == 'true'
-    needs: [version, go, dotnet, docker]
+    needs: [version, go, dotnet]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4
       - run: helm registry login ghcr.io -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
       - run: |
-          test -n "${{ needs.docker.outputs.digest }}"
-          sed -i 's/^  digest: ""$/  digest: "${{ needs.docker.outputs.digest }}"/' deploy/helm/hyperv-csi/values.yaml
-          grep -q '^  digest: "sha256:' deploy/helm/hyperv-csi/values.yaml
           helm package deploy/helm/hyperv-csi \
             --version "${{ needs.version.outputs.version }}" \
             --app-version "${{ needs.version.outputs.version }}" \
