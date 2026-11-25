@@ -682,6 +682,52 @@ public sealed class SnapshotServiceTests : IDisposable
     }
 
     [WindowsOnlyFact]
+    public async Task CreateAsync_AttachedVolumeWithLongNamePrefixes_TagsWithinHyperVsCapAndSucceeds()
+    {
+        // Issue #50: --volume-name-prefix=rke01-pvc and
+        // --snapshot-name-prefix=rke01-snap put the long-form name at 105
+        // characters, which Hyper-V refuses (FakeHostClient refuses it the
+        // same way). The snapshot has to succeed with those prefixes as they
+        // are, not only once they are shortened.
+        const string volumeId = "rke01-pvc-90856608-055c-41c9-8b85-541838035f6a";
+        const string snapshotName = "rke01-snap-233a54ff-db60-4bba-8fad-7a336db5bbe8";
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient();
+        var harness = NewHarness(cluster: cluster, location: TracedToVm1(), host: host);
+        WriteAttachedVolume(volumeId, 4096);
+
+        var result = await harness.Service.CreateAsync(volumeId, snapshotName, CancellationToken.None);
+
+        // The snapshot handle is unchanged: <volumeId>~<snapshotName>.
+        Assert.Equal($"{volumeId}~{snapshotName}", result.SnapshotId);
+        await WaitForAsync(() => File.Exists(SnapshotPath(result.SnapshotId)));
+
+        var tagged = Assert.Single(host.CreatedCheckpointElementNames);
+        Assert.Equal(CheckpointNaming.ElementNameFor(volumeId, snapshotName), tagged);
+        Assert.True(tagged.Length <= CheckpointNaming.MaxElementNameLength);
+        await WaitForAsync(() => host.DestroyedCheckpointElementNames.Count == 1);
+        Assert.Equal([tagged], host.DestroyedCheckpointElementNames);
+    }
+
+    [WindowsOnlyFact]
+    public async Task CreateAsync_AttachedVolumeAtExactlyTheCap_KeepsTheLongFormName()
+    {
+        // 11 + 44 + 1 + 44 = 100: the longest name an earlier build could tag,
+        // and still the name this build tags it with.
+        var volumeId = "v" + new string('a', 43);
+        var snapshotName = "s" + new string('b', 43);
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var host = new FakeHostClient();
+        var harness = NewHarness(cluster: cluster, location: TracedToVm1(), host: host);
+        WriteAttachedVolume(volumeId, 4096);
+
+        var result = await harness.Service.CreateAsync(volumeId, snapshotName, CancellationToken.None);
+        await WaitForAsync(() => File.Exists(SnapshotPath(result.SnapshotId)));
+
+        Assert.Equal([$"hyperv-csi/{volumeId}/{snapshotName}"], host.CreatedCheckpointElementNames);
+    }
+
+    [WindowsOnlyFact]
     public async Task CreateAsync_AttachedVolume_MergesTheCheckpointBeforePublishingNotAfter()
     {
         // The order that keeps a crash from stranding an unmerged checkpoint
@@ -3289,7 +3335,15 @@ public sealed class SnapshotServiceTests : IDisposable
                 throw new InvalidOperationException("CreateSnapshot said no");
             }
 
-            var checkpoint = new Checkpoint($"checkpoint:{elementName}", elementName, notesJson, FrozenDisksFor(elementName));
+            if (elementName.Length > CheckpointNaming.MaxElementNameLength)
+            {
+                // What Hyper-V's ModifySystemSettings does with a longer name
+                // (issue #50). The real client merges the checkpoint it just
+                // created away again, so nothing is left standing here either.
+                throw new InvalidOperationException($"The parameter is incorrect. (0x80070057): {elementName}");
+            }
+
+            var checkpoint = new Checkpoint($"checkpoint:{elementName}", elementName, notesJson, FrozenDisksFor(elementName, notesJson));
             _checkpointsByElementName[elementName] = checkpoint;
             CreatedCheckpointElementNames.Add(elementName);
             return Task.FromResult(checkpoint);
@@ -3368,12 +3422,12 @@ public sealed class SnapshotServiceTests : IDisposable
             {
                 if (checkpoint.FrozenDisks is { Count: 0 })
                 {
-                    _checkpointsByElementName[elementName] = checkpoint with { FrozenDisks = FrozenDisksFor(elementName) };
+                    _checkpointsByElementName[elementName] = checkpoint with { FrozenDisks = FrozenDisksFor(elementName, checkpoint.Notes) };
                 }
             }
         }
 
-        private IReadOnlyList<string>? FrozenDisksFor(string elementName)
+        private IReadOnlyList<string>? FrozenDisksFor(string elementName, string? notes)
         {
             if (FrozenDisksUnknown)
             {
@@ -3385,8 +3439,23 @@ public sealed class SnapshotServiceTests : IDisposable
                 return FrozenDisks;
             }
 
-            // hyperv-csi/<volumeId>/<snapshotName>
-            var volumeId = elementName.Split('/')[1];
+            // The volume the identity names: off Notes when it parses (the
+            // hashed ElementName form, issue #50, does not carry the whole
+            // volume ID), else off a long-form hyperv-csi/<volumeId>/<snapshotName>.
+            string? volumeId = null;
+            try
+            {
+                if (notes is { Length: > 0 }
+                    && System.Text.Json.JsonDocument.Parse(notes).RootElement.TryGetProperty("volumeId", out var id))
+                {
+                    volumeId = id.GetString();
+                }
+            }
+            catch (System.Text.Json.JsonException)
+            {
+            }
+
+            volumeId ??= elementName.Split('/')[1];
             return [Path.GetFullPath(Path.Combine(VolumesRoot, volumeId + VolumeNaming.VhdxExtension))];
         }
 

@@ -1697,8 +1697,10 @@ public sealed class SnapshotService : ISnapshotService
     /// <para>
     /// What remains untagged under that hold is ownerless: another tool's - a
     /// backup product's recovery point, an operator's checkpoint - or one this
-    /// driver created and never tagged, because <c>TagCheckpoint</c> failed or
-    /// a killed process left vmms to finish the create. Nothing retries a tag,
+    /// driver created and never tagged, because <c>TagCheckpoint</c> failed and
+    /// so did the merge <c>CreateCheckpointAsync</c> then starts (issue #50), a
+    /// build before that fix left one, or a killed process left vmms to finish
+    /// the create. Nothing retries a tag,
     /// and the reaper only ever looks at tagged checkpoints, so in every case
     /// it stays until an operator removes it, and saying so is correct. The
     /// agent is a single clustered role, so no other process holds jobs for
@@ -1784,10 +1786,12 @@ public sealed class SnapshotService : ISnapshotService
     /// This checkpoint's identity: unique to the (source volume, snapshot name)
     /// pair, which is what lets <see cref="IHyperVHostClient.FindOwnedCheckpointAsync"/>
     /// find exactly the checkpoint one specific snapshot attempt left behind,
-    /// never a different attempt's.
+    /// never a different attempt's - and bounded to Hyper-V's 100-character
+    /// cap however long the sidecars' name prefixes make either half (issue
+    /// #50). See <see cref="CheckpointNaming"/>.
     /// </summary>
     private static string CheckpointElementName(string sourceVolumeId, string snapshotName) =>
-        $"{CheckpointMatching.OwnedPrefix}{sourceVolumeId}/{snapshotName}";
+        CheckpointNaming.ElementNameFor(sourceVolumeId, snapshotName);
 
     private static string BuildCheckpointNotes(string sourceVolumeId, string snapshotName) =>
         JsonSerializer.Serialize(new

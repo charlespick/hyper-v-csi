@@ -213,12 +213,18 @@ public interface IHyperVHostClient
     /// <c>CreateSnapshot</c>'s <c>SnapshotSettings</c> input does not apply
     /// <c>ElementName</c> - measured, despite nothing in the schema saying so -
     /// so this method finds the checkpoint it just created and renames it via
-    /// <c>ModifySystemSettings</c> before returning.
+    /// <c>ModifySystemSettings</c> before returning. If that rename fails or is
+    /// cancelled, a merge of the checkpoint it just created is started,
+    /// best-effort, before the failure is rethrown (issue #50): left standing
+    /// untagged, it would read as foreign to every retry and strand the
+    /// snapshot until an operator removed it. Only a cleanup that itself fails
+    /// leaves it standing, and that is logged as an error naming its path.
     /// </para>
     /// </remarks>
     /// <param name="elementName">
-    /// This checkpoint's identity, conventionally
-    /// <c>hyperv-csi/&lt;volumeId&gt;/&lt;snapshotName&gt;</c> - see
+    /// This checkpoint's identity, built by
+    /// <see cref="Storage.CheckpointNaming.ElementNameFor"/> - at most 100
+    /// characters, which Hyper-V enforces - see
     /// <see cref="CheckpointMatching"/> for the driver-level prefix half of
     /// that convention, and <see cref="FindOwnedCheckpointAsync"/> and
     /// <see cref="ClassifyAttachmentAsync"/> for how each half is matched

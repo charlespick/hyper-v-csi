@@ -148,6 +148,53 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
     }
 
     [Fact]
+    public async Task SweepAsync_AHashedFormCheckpoint_IsResumedUnderTheIdentityItsNotesCarry()
+    {
+        // Issue #50: names too long for Hyper-V's cap are tagged with
+        // CheckpointNaming's hashed form, which keeps only part of the
+        // identity readable. Notes carries the whole of it, and the resumed
+        // copy has to find this same checkpoint again by the name it
+        // recomputes.
+        const string volumeId = "rke01-pvc-90856608-055c-41c9-8b85-541838035f6a";
+        const string snapshotName = "rke01-snap-233a54ff-db60-4bba-8fad-7a336db5bbe8";
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var harness = NewHarness(cluster);
+        WriteVolume(volumeId, 4096);
+        Directory.CreateDirectory(_snapshotsRoot);
+        harness.Host.SeedOwnedCheckpoint("host-1", "vm-1", volumeId, snapshotName);
+
+        await NewReaper(harness).SweepAsync(CancellationToken.None);
+
+        var expectedId = SnapshotNaming.ComposeId(volumeId, snapshotName);
+        var resumed = Assert.Single(harness.Store.Created);
+        Assert.Equal(SnapshotService.CopySnapshot, resumed.OperationType);
+        Assert.Equal(expectedId, resumed.IdempotencyKey);
+        await WaitForAsync(() => File.Exists(SnapshotPath(expectedId)));
+        Assert.Empty(harness.Host.CreatedCheckpointElementNames);
+        await WaitForAsync(() => harness.Host.DestroyedCheckpointElementNames.Count == 1);
+        Assert.Equal([CheckpointNaming.ElementNameFor(volumeId, snapshotName)], harness.Host.DestroyedCheckpointElementNames);
+    }
+
+    [Fact]
+    public async Task SweepAsync_AHashedFormCheckpointWithoutNotes_IsLeftAloneNotMisread()
+    {
+        // The hashed form has no '/' after the prefix, so the ElementName
+        // fallback declines it rather than reading its truncated readable
+        // part as a (volume, snapshot) pair.
+        var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
+        var harness = NewHarness(cluster);
+        harness.Host.SeedRawCheckpoint(
+            "host-1", "vm-1",
+            CheckpointNaming.ElementNameFor("rke01-pvc-90856608-055c-41c9-8b85-541838035f6a", "rke01-snap-233a54ff-db60-4bba-8fad-7a336db5bbe8"),
+            notes: null);
+
+        await NewReaper(harness).SweepAsync(CancellationToken.None);
+
+        Assert.Empty(harness.Store.Created);
+        Assert.Empty(harness.Host.DestroyedCheckpointElementNames);
+    }
+
+    [Fact]
     public async Task SweepAsync_IdentityRecovery_PrefersNotesOverTheElementNameWhenBothArePresent()
     {
         var cluster = new FakeClusterService { Vms = { ["vm-1"] = new ClusteredVm("vm-1", "host-1") } };
@@ -681,7 +728,7 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
         /// <summary>Seeds a checkpoint carrying this driver's real naming convention and valid Notes - the ordinary, resumable/reapable case.</summary>
         public void SeedOwnedCheckpoint(string host, string vmId, string sourceVolumeId, string snapshotName) =>
             SeedRawCheckpoint(
-                host, vmId, $"{CheckpointMatching.OwnedPrefix}{sourceVolumeId}/{snapshotName}",
+                host, vmId, CheckpointNaming.ElementNameFor(sourceVolumeId, snapshotName),
                 $$"""{"schema":1,"volumeId":"{{sourceVolumeId}}","snapshotName":"{{snapshotName}}","createdAtUtc":"2024-01-01T00:00:00Z"}""");
 
         /// <summary>Seeds a checkpoint with no owned prefix at all - what ListOwnedCheckpointsAsync's own filter must exclude.</summary>
@@ -700,12 +747,36 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
         /// names - what a real checkpoint of a VM holding just that disk would
         /// record - and nothing known for anything else.
         /// </summary>
-        private IReadOnlyList<string>? FrozenDisksFor(string elementName)
+        private IReadOnlyList<string>? FrozenDisksFor(string elementName, string? notes)
         {
+            if (VolumesRoot is null || !elementName.StartsWith(CheckpointMatching.OwnedPrefix, StringComparison.Ordinal))
+            {
+                return null;
+            }
+
             var parts = elementName.Split('/');
-            return VolumesRoot is not null && elementName.StartsWith(CheckpointMatching.OwnedPrefix, StringComparison.Ordinal) && parts.Length >= 3
-                ? [Path.GetFullPath(Path.Combine(VolumesRoot, parts[1] + VolumeNaming.VhdxExtension))]
-                : null;
+            var volumeId = VolumeIdInNotes(notes) ?? (parts.Length >= 3 ? parts[1] : null);
+            return volumeId is null ? null : [Path.GetFullPath(Path.Combine(VolumesRoot, volumeId + VolumeNaming.VhdxExtension))];
+        }
+
+        /// <summary>
+        /// The volume a checkpoint's Notes names, or null - read off Notes
+        /// rather than the ElementName because the hashed form (issue #50)
+        /// does not carry the whole volume ID.
+        /// </summary>
+        private static string? VolumeIdInNotes(string? notes)
+        {
+            try
+            {
+                return notes is { Length: > 0 }
+                    && System.Text.Json.JsonDocument.Parse(notes).RootElement.TryGetProperty("volumeId", out var id)
+                    ? id.GetString()
+                    : null;
+            }
+            catch (System.Text.Json.JsonException)
+            {
+                return null;
+            }
         }
 
         private void SeedRawCheckpoint(string host, string vmId, string elementName, string? notes, bool ownedOnly)
@@ -721,7 +792,7 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
                 _byHost[host] = entries;
             }
 
-            entries.Add(new Entry(vmId, new Checkpoint($"checkpoint:{elementName}", elementName, notes, FrozenDisksFor(elementName))));
+            entries.Add(new Entry(vmId, new Checkpoint($"checkpoint:{elementName}", elementName, notes, FrozenDisksFor(elementName, notes))));
         }
 
         public Task<IReadOnlyList<Checkpoint>> ListOwnedCheckpointsAsync(string hostName, string vmId, CancellationToken cancellationToken)
@@ -773,6 +844,12 @@ public sealed class OrphanedCheckpointReaperTests : IDisposable
         public Task<Checkpoint> CreateCheckpointAsync(
             string hostName, string vmId, string elementName, string notesJson, CancellationToken cancellationToken)
         {
+            if (elementName.Length > CheckpointNaming.MaxElementNameLength)
+            {
+                // What Hyper-V's ModifySystemSettings does with a longer name (issue #50).
+                throw new InvalidOperationException($"The parameter is incorrect. (0x80070057): {elementName}");
+            }
+
             CreatedCheckpointElementNames.Add(elementName);
             var checkpoint = new Checkpoint($"checkpoint:{elementName}", elementName, notesJson);
             SeedRawCheckpoint(hostName, vmId, elementName, notesJson);
