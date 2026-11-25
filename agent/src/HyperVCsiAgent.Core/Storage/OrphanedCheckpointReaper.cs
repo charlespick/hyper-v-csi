@@ -346,12 +346,12 @@ public sealed class OrphanedCheckpointReaper : BackgroundService
     /// </summary>
     /// <remarks>
     /// Notes wins for two reasons, not one. First, it does not depend on
-    /// <c>ElementName</c> surviving whatever length cap Hyper-V's
-    /// <c>ModifySystemSettings</c> may impose on it - an unmeasured Phase 0
-    /// item (issue #14's fifth comment, "Phase 0 amendments") that a
-    /// long volume ID and a long snapshot name together could plausibly
-    /// exceed, silently truncating one half of the identity this recovery
-    /// depends on. Second, splitting <c>ElementName</c> can only ever recover
+    /// <c>ElementName</c> holding the whole identity: Hyper-V caps it at 100
+    /// characters (measured in issue #50), so a pair too long for that is
+    /// tagged with <see cref="CheckpointNaming"/>'s hashed form, which keeps
+    /// only part of the identity readable. That form never has a <c>/</c>
+    /// after the prefix, so the split below declines it rather than misreading
+    /// it. Second, splitting <c>ElementName</c> can only ever recover
     /// the two strings that were already encoded into it; Notes is JSON
     /// (<see cref="SnapshotService.BuildCheckpointNotes"/>) and carries
     /// <c>createdAtUtc</c> alongside them, which is exactly the original
@@ -361,8 +361,8 @@ public sealed class OrphanedCheckpointReaper : BackgroundService
     /// Falling back to <c>ElementName</c> is still worth doing rather than
     /// giving up outright: <see cref="IHyperVHostClient.ListOwnedCheckpointsAsync"/>
     /// only ever returns checkpoints whose name already carries
-    /// <see cref="CheckpointMatching.OwnedPrefix"/>, so the two halves after
-    /// it are exactly what <c>SnapshotService.CheckpointElementName</c>
+    /// <see cref="CheckpointMatching.OwnedPrefix"/>, so for a long-form name
+    /// the two halves after it are exactly what <see cref="CheckpointNaming"/>
     /// composed - <c>&lt;volumeId&gt;/&lt;snapshotName&gt;</c> - and both
     /// already passed <see cref="VolumeNaming.IsSafeName"/>
     /// (<c>[A-Za-z0-9._-]</c>) before this driver ever wrote them, so neither

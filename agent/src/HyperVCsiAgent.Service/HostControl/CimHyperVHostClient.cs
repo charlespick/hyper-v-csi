@@ -576,7 +576,29 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                 ReferenceToPath(createdPath),
                 deadline.Options("reading the new checkpoint's settings", cancellationToken));
 
-            var taggedPath = TagCheckpoint(hostName, created, createdPath, elementName, notesJson, deadline, cancellationToken);
+            string taggedPath;
+            try
+            {
+                taggedPath = TagCheckpoint(hostName, created, createdPath, elementName, notesJson, deadline, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                // Issue #50: an untagged checkpoint left standing reads as
+                // foreign to every retry (ClassifyAttachment's "not one this
+                // driver tagged"), and nothing in this driver will ever touch
+                // it again - the snapshot is stuck until an operator removes
+                // it by hand. Right here it is certain to be this driver's own:
+                // this call created it moments ago, under the vm: target the
+                // caller holds. Merged away best-effort, on a fresh deadline
+                // and no token (the tag may have failed by running out the
+                // first, or been cancelled by the second), and the tag failure
+                // is what the caller sees either way. Cancellation included:
+                // a cancelled tag may never have reached ModifySystemSettings,
+                // and even one that did and lands later is a checkpoint of an
+                // attempt that is being abandoned, which a retry retakes.
+                DestroyUntaggedCheckpoint(hostName, vmId, createdPath, elementName, ex);
+                throw;
+            }
 
             _logger.LogInformation(
                 "created checkpoint {ElementName} of {VmId} on {HostName}", elementName, vmId, hostName);
@@ -622,34 +644,72 @@ public sealed class CimHyperVHostClient : IHyperVHostClient
                 "destroying checkpoint {ElementName} on {HostName}", checkpoint.ElementName, hostName);
             var deadline = CimDeadline.After(_hostOperationTimeout);
             using var session = CimSession.Create(hostName);
-            using var snapshotService = GetSnapshotService(session, deadline, cancellationToken);
-
-            var parameters = new CimMethodParametersCollection
-            {
-                CimMethodParameter.Create(
-                    "AffectedSnapshot", ReferenceToPath(checkpoint.SettingsPath), CimType.Reference, CimFlags.In),
-            };
-
-            using var result = session.InvokeMethod(
-                NamespaceName, snapshotService, "DestroySnapshot", parameters,
-                deadline.Options("DestroySnapshot", cancellationToken));
-
-            // Fire-and-forget by design: confirm the merge started (or
-            // finished inline, for a checkpoint nothing was ever written
-            // through) and return without waiting for it. vmms owns finishing
-            // a live merge independent of this process from here on - see
-            // IHyperVHostClient.DestroyCheckpointAsync's remarks for why that
-            // is deliberate rather than a shortcut.
-            var returnValue = Convert.ToUInt32(result.ReturnValue.Value);
-            if (returnValue is not (CimJobs.Completed or CimJobs.JobStarted))
-            {
-                throw new InvalidOperationException(
-                    $"DestroySnapshot for checkpoint {checkpoint.ElementName} failed with return value {returnValue}");
-            }
+            StartDestroySnapshot(session, checkpoint.SettingsPath, checkpoint.ElementName, deadline, cancellationToken);
 
             _logger.LogInformation(
                 "started merging checkpoint {ElementName} on {HostName}", checkpoint.ElementName, hostName);
         }, cancellationToken);
+
+    /// <summary>
+    /// Invokes <c>DestroySnapshot</c> on one checkpoint and confirms the merge
+    /// started. Fire-and-forget by design: confirm the merge started (or
+    /// finished inline, for a checkpoint nothing was ever written through)
+    /// and return without waiting for it. vmms owns finishing a live merge
+    /// independent of this process from here on - see
+    /// IHyperVHostClient.DestroyCheckpointAsync's remarks for why that is
+    /// deliberate rather than a shortcut.
+    /// </summary>
+    private static void StartDestroySnapshot(
+        CimSession session, string settingsPath, string description, CimDeadline deadline, CancellationToken cancellationToken)
+    {
+        using var snapshotService = GetSnapshotService(session, deadline, cancellationToken);
+
+        var parameters = new CimMethodParametersCollection
+        {
+            CimMethodParameter.Create(
+                "AffectedSnapshot", ReferenceToPath(settingsPath), CimType.Reference, CimFlags.In),
+        };
+
+        using var result = session.InvokeMethod(
+            NamespaceName, snapshotService, "DestroySnapshot", parameters,
+            deadline.Options("DestroySnapshot", cancellationToken));
+
+        var returnValue = Convert.ToUInt32(result.ReturnValue.Value);
+        if (returnValue is not (CimJobs.Completed or CimJobs.JobStarted))
+        {
+            throw new InvalidOperationException(
+                $"DestroySnapshot for checkpoint {description} failed with return value {returnValue}");
+        }
+    }
+
+    /// <summary>
+    /// <see cref="CreateCheckpointAsync"/>'s cleanup when tagging the
+    /// checkpoint it just created failed - see the call site. Never throws:
+    /// the tag failure is the one the caller needs to see, and a cleanup that
+    /// also failed is logged as the orphan it now is, naming the checkpoint by
+    /// the path an operator can find it under.
+    /// </summary>
+    private void DestroyUntaggedCheckpoint(
+        string hostName, string vmId, string createdPath, string elementName, Exception tagFailure)
+    {
+        try
+        {
+            var deadline = CimDeadline.After(_hostOperationTimeout);
+            using var session = CimSession.Create(hostName);
+            StartDestroySnapshot(
+                session, createdPath, $"{createdPath} (untagged, meant to be {elementName})", deadline, CancellationToken.None);
+            _logger.LogWarning(tagFailure,
+                "tagging the new checkpoint of {VmId} on {HostName} as {ElementName} failed; started merging the " +
+                "untagged checkpoint away so a retry is not refused over it", vmId, hostName, elementName);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "tagging the new checkpoint of {VmId} on {HostName} as {ElementName} failed ({TagFailure}), and so " +
+                "did merging the untagged checkpoint away; it stands at {CheckpointPath} and must be removed by hand " +
+                "before a snapshot of this VM can be retried", vmId, hostName, elementName, tagFailure.Message, createdPath);
+        }
+    }
 
     public Task<IReadOnlyList<Checkpoint>> ListOwnedCheckpointsAsync(
         string hostName, string vmId, CancellationToken cancellationToken) =>

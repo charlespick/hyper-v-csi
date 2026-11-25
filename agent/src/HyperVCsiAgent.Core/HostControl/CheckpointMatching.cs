@@ -11,7 +11,9 @@ namespace HyperVCsiAgent.Core.HostControl;
 /// A checkpoint's <c>ElementName</c> carries two levels of identity, not one:
 /// <see cref="OwnedPrefix"/> says "this driver took it", and the full name
 /// <c>SnapshotService.CheckpointElementName</c> builds on top of it -
-/// <c>hyperv-csi/&lt;volumeId&gt;/&lt;snapshotName&gt;</c> - says which one
+/// <c>hyperv-csi/&lt;volumeId&gt;/&lt;snapshotName&gt;</c>, or a hashed form
+/// when that exceeds Hyper-V's 100-character cap (see
+/// <see cref="Storage.CheckpointNaming"/>) - says which one
 /// specific (volume, snapshot) attempt it belongs to. Treating the whole
 /// string as one opaque prefix and matching it with <c>StartsWith</c>
 /// everywhere - what this driver did before this type existed - collapses
